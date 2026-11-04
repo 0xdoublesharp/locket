@@ -81,7 +81,7 @@ fn policy_refresh_requires_confirmation_and_rebinds_current_source()
     let approved = store
         .get_command_policy_index(resolved.config.project_id.as_str(), "dev")?
         .ok_or("missing policy")?;
-    assert_eq!(approved.normalized_json["source_path"], json!(path));
+    assert_eq!(approved.normalized_json["source_path"], json!(path.canonicalize()?));
     let document: toml::Value = toml::from_str(&original)?;
     assert_eq!(
         approved.normalized_json["source_digest"],

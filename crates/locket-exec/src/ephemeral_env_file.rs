@@ -454,7 +454,7 @@ mod tests {
             $directory = Get-Acl -LiteralPath $env:LOCKET_ACL_TEST_PATH
             if (-not $directory.AreAccessRulesProtected) { throw 'directory DACL is not protected' }
             if ($directory.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $user) { throw 'unexpected directory owner' }
-            foreach ($path in @($env:LOCKET_ACL_TEST_PATH, (Join-Path $env:LOCKET_ACL_TEST_PATH 'env'))) {
+            foreach ($path in @($env:LOCKET_ACL_TEST_PATH, [System.IO.Path]::Combine($env:LOCKET_ACL_TEST_PATH, 'env'))) {
                 $acl = Get-Acl -LiteralPath $path
                 # Elevated Windows tokens can default newly created file ownership to
                 # Administrators. Those privileged host principals are already trusted;

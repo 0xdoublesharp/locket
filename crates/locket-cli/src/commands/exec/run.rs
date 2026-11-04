@@ -260,8 +260,12 @@ fn resolve_run_policy(
         return load_command_policy_or_audit_denial(context, resolved, &policy.name);
     }
     let policy_name = next_command_name(&document);
+    // Match and persist authorization using the same resolved directory. In
+    // particular, Windows canonical paths include a verbatim prefix that the
+    // caller's cwd spelling may omit.
+    let canonical_cwd = context.cwd.canonicalize()?;
     let mut effective =
-        load_effective_command_policy_for_argv(resolved, policy_name, argv, &context.cwd)?;
+        load_effective_command_policy_for_argv(resolved, policy_name, argv, &canonical_cwd)?;
     let store = open_store(context)?;
     ensure_trusted_project_root(&store, resolved)?;
     let profile = effective_policy_profile(&store, resolved, &effective)?;
@@ -290,7 +294,7 @@ fn resolve_run_policy(
         &proposed_document,
         &effective.policy,
         &resolved.root,
-        &context.cwd,
+        &canonical_cwd,
     )?;
     writeln!(output, "proposed_command: {}", effective.policy.name)?;
     writeln!(output, "argv: {}", serde_json::to_string(&policy_argv(&effective.policy))?)?;
@@ -326,7 +330,7 @@ fn resolve_run_policy(
         }
     }
     let mut base_policy = effective.policy.clone();
-    if let Some(scope) = proposed_document.path_scope_for(&resolved.root, &context.cwd) {
+    if let Some(scope) = proposed_document.path_scope_for(&resolved.root, &canonical_cwd) {
         let scoped =
             scope.required_secrets.iter().chain(&scope.optional_secrets).collect::<BTreeSet<_>>();
         base_policy.required_secrets.retain(|name| !scoped.contains(name));
@@ -1858,7 +1862,10 @@ mod approval_tests {
             format!("{text}\n[paths.\"packages/api\"]\nrequired_secrets=[\"PACKAGE_ONLY\"]\n"),
         )?;
         std::fs::create_dir_all(directory.path().join("packages/api"))?;
-        context.cwd = directory.path().join("packages/api");
+        // Keep the caller's spelling noncanonical. Windows also adds a verbatim
+        // prefix when resolving the project root, so raw path comparisons must
+        // not accidentally widen this subtree-only authorization.
+        context.cwd = directory.path().join("packages/../packages/api");
         context.confirmation_reader =
             Arc::new(Confirmations(Mutex::new(VecDeque::from(["approve dev".into()]))));
         let resolved = crate::require_project(&context)?;
@@ -1877,6 +1884,27 @@ mod approval_tests {
         );
         let saved = crate::read_policy_document(&path)?;
         assert_eq!(saved.commands["dev"].required_secrets, [] as [locket_core::SecretName; 0]);
+        Ok(())
+    }
+
+    #[test]
+    fn secret_acl_rejects_working_directory_outside_project()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        let document = locket_core::PolicyDocument::from_toml_str(
+            "schema_version=1\n[commands.dev]\nargv=['true']\nrequired_secrets=['ROOT_ONLY']\n\
+             [secrets.ROOT_ONLY]\nallow_paths=['.']\n",
+        )?;
+        let error = crate::enforce_secret_access_policies(
+            &document,
+            &document.commands["dev"],
+            directory.path(),
+            outside.path(),
+        )
+        .err()
+        .ok_or("outside-project paths must not inherit root authorization")?;
+        assert!(error.to_string().contains("outside project root"));
         Ok(())
     }
 

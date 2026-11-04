@@ -2805,7 +2805,7 @@ pub(crate) fn load_effective_command_policy(
     let mut policy = policy_document.commands.get(policy_name).cloned().ok_or_else(|| {
         policy_not_found_error(format!("command policy not found: {policy_name}"))
     })?;
-    let canonical_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let canonical_cwd = cwd.canonicalize()?;
     let path_scope = policy_document.path_scope_for(&resolved.root, &canonical_cwd).cloned();
     if let Some(scope) = path_scope.as_ref() {
         apply_path_scope_to_policy(&mut policy, scope);
@@ -2842,7 +2842,7 @@ pub(crate) fn load_effective_command_policy_for_argv(
         ttl: LocketDuration::from_secs(15 * 60),
     };
     let policy_document = read_policy_document(&resolved.root.join(LOCKET_TOML))?;
-    let canonical_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let canonical_cwd = cwd.canonicalize()?;
     let path_scope = policy_document.path_scope_for(&resolved.root, &canonical_cwd).cloned();
     if let Some(scope) = path_scope.as_ref() {
         apply_path_scope_to_policy(&mut policy, scope);
@@ -2874,7 +2874,9 @@ fn enforce_secret_access_policies(
     project_root: &Path,
     canonical_cwd: &Path,
 ) -> Result<(), CliError> {
-    let relative_cwd = canonical_cwd.strip_prefix(project_root).unwrap_or_else(|_| Path::new("."));
+    let relative_cwd = canonical_cwd
+        .strip_prefix(project_root)
+        .map_err(|_| invalid_policy_error("working directory is outside project root"))?;
     let relative_cwd =
         if relative_cwd.as_os_str().is_empty() { Path::new(".") } else { relative_cwd };
     let argv = match &policy.command {

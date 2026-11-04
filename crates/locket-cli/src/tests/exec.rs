@@ -436,32 +436,55 @@ fn run_warns_when_implicit_locket_override_replaces_parent_name_without_values()
         &context,
         &mut Vec::new(),
     )?;
-    let home = test_secret_write_args("HOME");
-    crate::set_secret_value(&context, &home, "locket-home", "manual", 1_000)?;
+    // Use a native child on Windows so this exact-value fixture does not depend
+    // on Git's POSIX environment translation.
+    #[cfg(windows)]
+    let (name, argv) = (
+        "USERNAME",
+        vec![
+            std::env::var("COMSPEC")?,
+            "/D".to_owned(),
+            "/C".to_owned(),
+            "if %USERNAME%==locket-value (exit /b 0) else (exit /b 1)".to_owned(),
+        ],
+    );
+    #[cfg(not(windows))]
+    let (name, argv) = (
+        "HOME",
+        vec![
+            test_shell().to_owned(),
+            "-c".to_owned(),
+            "test \"$HOME\" = \"locket-value\"".to_owned(),
+        ],
+    );
+    assert!(std::env::var_os(name).is_some(), "fixture requires a parent {name}");
+    let secret = test_secret_write_args(name);
+    crate::set_secret_value(&context, &secret, "locket-value", "manual", 1_000)?;
 
     std::fs::OpenOptions::new()
         .append(true)
         .open(directory.path().join("locket.toml"))?
         .write_all(
-            (r#"
+            format!(
+                r#"
 [commands.env_check]
-argv = ["/bin/sh", "-c", "test \"$HOME\" = \"locket-home\""]
-required_secrets = ["HOME"]
+argv = {argv}
+required_secrets = ["{name}"]
+inherit_env = ["{name}"]
 env_mode = "minimal"
-"#
-            .replace("/bin/sh", test_shell())
-            .replace("/usr/bin/true", test_true()))
+"#,
+                argv = serde_json::to_string(&argv)?
+            )
             .as_bytes(),
         )?;
 
     let mut output = Vec::new();
     run_with_context(Cli::try_parse_from(["locket", "run", "env_check"])?, &context, &mut output)?;
     let output = String::from_utf8(output)?;
-    assert!(
-        output
-            .contains("warning: implicit override=locket will replace existing env name(s): HOME")
-    );
-    assert!(!output.contains("locket-home"));
+    assert!(output.contains(&format!(
+        "warning: implicit override=locket will replace existing env name(s): {name}"
+    )));
+    assert!(!output.contains("locket-value"));
     Ok(())
 }
 
