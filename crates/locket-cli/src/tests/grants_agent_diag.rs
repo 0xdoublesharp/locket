@@ -719,7 +719,9 @@ fn doctor_reports_locked_safe_diagnostics_and_exit_codes() -> Result<(), Box<dyn
     assert_eq!(doctor_metadata["action"], "DOCTOR");
     assert_eq!(doctor_metadata["status"], "SUCCESS");
     assert_eq!(doctor_metadata["fail_count"], 0);
-    assert_eq!(doctor_metadata["skip_count"], 6);
+    // Windows validates its named-pipe path above; Unix skips the socket check
+    // when this isolated test has no agent data directory.
+    assert_eq!(doctor_metadata["skip_count"], if cfg!(windows) { 5 } else { 6 });
     assert!(
         doctor_metadata["check_names"]
             .as_array()

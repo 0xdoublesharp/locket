@@ -167,8 +167,9 @@ jobs:
             "$name=$locketTmp" >> $env:GITHUB_ENV
           }
 
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - name: Restore Windows cargo cache
+        id: windows_cargo_cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
@@ -187,3 +188,13 @@ jobs:
       - name: Test Windows workspace
         if: ${{ !cancelled() && (steps.windows_lint.outcome == 'success' || steps.windows_lint.outcome == 'failure') }}
         run: cargo test --workspace --all-targets --all-features --locked --no-fail-fast
+
+      - name: Save Windows cargo cache
+        if: ${{ !cancelled() && steps.windows_cargo_cache.outcome == 'success' && steps.windows_cargo_cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.windows_cargo_cache.outputs.cache-primary-key }}

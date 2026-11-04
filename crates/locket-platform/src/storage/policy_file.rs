@@ -106,7 +106,7 @@ impl PolicyFileDocument {
         // Recheck after preparing the replacement so a detected concurrent editor
         // cannot be overwritten by a stale snapshot.
         self.check_locked_source(&mut original)?;
-        temporary.persist(&self.path).map_err(|error| error.error)?;
+        persist_replacement(temporary, &self.path)?;
         #[cfg(unix)]
         std::fs::File::open(parent)?.sync_all()?;
         Ok(())
@@ -131,6 +131,22 @@ impl PolicyFileDocument {
         }
         Ok(())
     }
+}
+
+#[cfg(windows)]
+fn persist_replacement(mut temporary: tempfile::NamedTempFile, path: &Path) -> std::io::Result<()> {
+    // Rust's Windows rename supports replacing an open destination through
+    // FileRenameInfoEx/POSIX semantics. tempfile's MoveFileEx-only persist does
+    // not, so retain the original lock and the cleanup guard during this call.
+    // The copied source permissions above also clear FILE_ATTRIBUTE_TEMPORARY.
+    fs::rename(temporary.path(), path)?;
+    temporary.disable_cleanup(true);
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn persist_replacement(temporary: tempfile::NamedTempFile, path: &Path) -> std::io::Result<()> {
+    temporary.persist(path).map(|_| ()).map_err(|error| error.error)
 }
 
 #[cfg(unix)]
@@ -226,7 +242,8 @@ mod tests {
         locked.lock()?;
         let mut replacement = tempfile::NamedTempFile::new_in(directory.path())?;
         replacement.write_all(SOURCE.as_bytes())?;
-        replacement.persist(&path)?;
+        replacement.as_file().set_permissions(locked.metadata()?.permissions())?;
+        persist_replacement(replacement, &path)?;
         assert!(matches!(
             document.check_locked_source(&mut locked),
             Err(PolicyFileError::ConcurrentModification)

@@ -513,6 +513,9 @@ mod tests {
     fn run_acl_script(path: &Path, script: &str) -> Result<(), EphemeralEnvFileError> {
         let output = std::process::Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            // A PowerShell 7 parent can pass incompatible module paths through
+            // Cargo. Let Windows PowerShell reconstruct its own module search.
+            .env_remove("PSModulePath")
             .env("LOCKET_ACL_TEST_PATH", path)
             .output()?;
         if !output.status.success() {

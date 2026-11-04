@@ -2,7 +2,7 @@
 
 #[cfg(target_os = "linux")]
 use std::fs;
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
@@ -161,27 +161,7 @@ fn parse_macos_lstart(value: &str) -> Result<(), PlatformError> {
 
 #[cfg(target_os = "windows")]
 fn process_start_time_for_pid(pid: u32) -> Result<String, PlatformError> {
-    let output = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &format!(
-                "(Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\").CreationDate.ToUniversalTime().ToString('o')"
-            ),
-        ])
-        .output()
-        .map_err(PlatformError::Io)?;
-    if !output.status.success() {
-        return Err(PlatformError::ProcessStartTimeUnavailable);
-    }
-    let text =
-        String::from_utf8(output.stdout).map_err(|_| PlatformError::ProcessStartTimeUnavailable)?;
-    let rendered = text.trim();
-    if rendered.is_empty() {
-        return Err(PlatformError::ProcessStartTimeUnavailable);
-    }
-    Ok(rendered.to_owned())
+    windows_process_impl::start_time_for_pid(pid)
 }
 
 #[cfg(target_os = "windows")]
@@ -190,11 +170,85 @@ mod windows_process_impl {
 
     use std::io;
 
-    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-        TerminateProcess, WaitForSingleObject,
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_INVALID_PARAMETER, FILETIME, HANDLE, WAIT_FAILED, WAIT_TIMEOUT,
     };
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+    };
+
+    use crate::PlatformError;
+
+    struct ProcessHandle(HANDLE);
+
+    impl ProcessHandle {
+        fn open_query(pid: u32) -> Result<Self, PlatformError> {
+            // SAFETY: request only query/synchronize rights for the supplied PID.
+            let handle = unsafe {
+                OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE, 0, pid)
+            };
+            if handle.is_null() {
+                let error = io::Error::last_os_error();
+                if error
+                    .raw_os_error()
+                    .is_some_and(|code| u32::try_from(code) == Ok(ERROR_INVALID_PARAMETER))
+                {
+                    return Err(PlatformError::ProcessStartTimeUnavailable);
+                }
+                return Err(PlatformError::Io(error));
+            }
+            Ok(Self(handle))
+        }
+
+        fn require_live(&self) -> Result<(), PlatformError> {
+            // SAFETY: this owned process handle has SYNCHRONIZE access. A zero
+            // timeout probes liveness without waiting or relying on exit codes.
+            match unsafe { WaitForSingleObject(self.0, 0) } {
+                WAIT_TIMEOUT => Ok(()),
+                WAIT_FAILED => Err(PlatformError::Io(io::Error::last_os_error())),
+                _ => Err(PlatformError::ProcessStartTimeUnavailable),
+            }
+        }
+    }
+
+    impl Drop for ProcessHandle {
+        fn drop(&mut self) {
+            // SAFETY: this handle came from OpenProcess and is closed once.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    pub(super) fn start_time_for_pid(pid: u32) -> Result<String, PlatformError> {
+        // Keep the same kernel process object alive through both liveness
+        // probes and the creation-time query so PID reuse cannot mix identities.
+        let process = ProcessHandle::open_query(pid)?;
+        process.require_live()?;
+        let mut created = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let mut exited = created;
+        let mut kernel = created;
+        let mut user = created;
+        // SAFETY: the handle has QUERY_LIMITED_INFORMATION rights, stays alive,
+        // and all four FILETIME outputs are distinct writable local values.
+        if unsafe {
+            GetProcessTimes(
+                process.0,
+                &raw mut created,
+                &raw mut exited,
+                &raw mut kernel,
+                &raw mut user,
+            )
+        } == 0
+        {
+            return Err(PlatformError::Io(io::Error::last_os_error()));
+        }
+        process.require_live()?;
+        let ticks = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
+        if ticks == 0 {
+            return Err(PlatformError::ProcessStartTimeUnavailable);
+        }
+        Ok(ticks.to_string())
+    }
 
     pub(super) fn process_is_live(pid: u32) -> bool {
         // SAFETY: `OpenProcess` is called with query/synchronize
@@ -233,6 +287,83 @@ mod windows_process_impl {
             return Err(error);
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::{
+            ProcessBinding, current_process_binding, process_binding_for_pid,
+            process_binding_matches_live_process,
+        };
+
+        struct ChildGuard(std::process::Child);
+
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _kill = self.0.kill();
+                let _wait = self.0.wait();
+            }
+        }
+
+        #[test]
+        fn windows_process_creation_token_is_stable_and_rejects_stale_bindings()
+        -> Result<(), PlatformError> {
+            let first = current_process_binding()?;
+            let second = current_process_binding()?;
+            assert_eq!(first, second);
+            assert!(first.process_start_time.parse::<u64>().is_ok_and(|ticks| ticks > 0));
+            assert!(process_binding_matches_live_process(&first)?);
+            let stale =
+                ProcessBinding::new(first.pid, format!("{}-stale", first.process_start_time));
+            assert!(!process_binding_matches_live_process(&stale)?);
+            assert!(!process_binding_matches_live_process(&ProcessBinding::new(u32::MAX, "0"))?);
+            Ok(())
+        }
+
+        #[test]
+        fn windows_process_binding_rejects_terminated_child()
+        -> Result<(), Box<dyn std::error::Error>> {
+            use std::io::Read;
+            use std::process::{Command, Stdio};
+
+            const CHILD: &str = "LOCKET_PROCESS_BINDING_CHILD";
+            if std::env::var_os(CHILD).is_some() {
+                let mut byte = [0];
+                let _read = io::stdin().read(&mut byte)?;
+                return Ok(());
+            }
+            let mut child = ChildGuard(
+                Command::new(std::env::current_exe()?)
+                    .args([
+                        "--exact",
+                        "ipc::process::windows_process_impl::tests::windows_process_binding_rejects_terminated_child",
+                    ])
+                    .env(CHILD, "1")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()?,
+            );
+            let binding = process_binding_for_pid(child.0.id())?;
+            let held_process = ProcessHandle::open_query(binding.pid)?;
+            assert!(process_binding_matches_live_process(&binding)?);
+            child.0.kill()?;
+            child.0.wait()?;
+
+            // Keep a kernel handle alive after exit: creation metadata remains
+            // queryable, but it must never make this dead process valid again.
+            assert!(matches!(
+                held_process.require_live(),
+                Err(PlatformError::ProcessStartTimeUnavailable)
+            ));
+            assert!(!process_binding_matches_live_process(&binding)?);
+            assert!(matches!(
+                start_time_for_pid(binding.pid),
+                Err(PlatformError::ProcessStartTimeUnavailable)
+            ));
+            Ok(())
+        }
     }
 }
 

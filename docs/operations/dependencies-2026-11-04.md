@@ -67,6 +67,8 @@ Named-pipe clients verify the connected object's owner and the server process's
 token user before sending RPC data. The descriptor explicitly sets the owner,
 and clients request identification-only access so a server cannot impersonate
 them. These checks reuse the isolated `ipc/agent_pipe.rs` native boundary.
+Windows process bindings read creation timestamps and liveness through one held
+kernel process handle, preserving PID-reuse detection without PowerShell/WMI.
 Temporary env-file creation on Windows uses an isolated filesystem boundary in
 `locket-platform`. It creates a protected inheritable ACL for the current SID
 before writing, verifies the resulting descriptor, and rejects parent paths
@@ -78,6 +80,7 @@ dependency rather than adding unsafe code to its execution logic.
 to query 128-bit file identifiers without reading a byte range through a second
 handle. Policy updates read through the handle owning their mandatory Windows
 lock and verify that the pathname still refers to that file before replacement.
+Replacement uses Rust's Windows rename path while retaining the original lock.
 Linux authentication uses a fixed polkit executable and policy rather than a
 new native FFI dependency; child environment and timeout are bounded.
 

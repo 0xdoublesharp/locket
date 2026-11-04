@@ -98,7 +98,9 @@ fn named_pipe_server_options(first_instance: bool) -> ServerOptions {
 }
 
 /// Opens a client connection to the agent pipe, retrying while all
-/// server instances are busy. Verifies the connected object's owner and the
+/// server instances are busy.
+///
+/// Verifies the connected object's owner and the
 /// kernel-reported server's user before returning a handle capable of RPC I/O.
 /// Connection retries stop after two seconds; subsequent RPCs are unaffected.
 ///
