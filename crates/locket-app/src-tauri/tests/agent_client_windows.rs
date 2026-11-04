@@ -18,6 +18,7 @@ use tempfile as _;
 use thiserror as _;
 use tokio as _;
 use toml as _;
+use zeroize as _;
 
 #[cfg(target_os = "windows")]
 mod windows {

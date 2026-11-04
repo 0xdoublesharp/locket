@@ -135,6 +135,83 @@ fn tighten_directory(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[test]
+fn agent_run_delivers_path_scoped_secret_from_cached_passphrase_unlock()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = fixture(&directory)?;
+    let project = crate::require_project(&context)?;
+    let path = directory.path().join("locket.toml");
+    let source = std::fs::read_to_string(&path)?;
+    let source = source
+        .replace(
+            "external_env_sources = [\"ide\"]",
+            "external_env_sources = [\"ide\"]\nrequire_agent = true",
+        )
+        .replace("required_secrets = [\"DATABASE_URL\"]", "");
+    std::fs::write(
+        &path,
+        format!(
+            "{source}\n[paths.'apps/api']\nrequired_secrets=['DATABASE_URL']\n[secrets.DATABASE_URL]\nallow_commands=['ide_run']\nallow_paths=['apps/api/**']\n"
+        ),
+    )?;
+    crate::commands::policy::refresh_command_policy_for_run(&context, &project, "ide_run")?;
+    let master = context.key_store.load_master_key(project.config.project_id.as_str())?;
+    context.passphrase_store.store_master_key(
+        project.config.project_id.as_str(),
+        &master,
+        b"test passphrase",
+        100,
+    )?;
+    context.key_store.delete_master_key(project.config.project_id.as_str())?;
+    let api = directory.path().join("apps/api");
+    std::fs::create_dir_all(&api)?;
+    let context = RuntimeContext { cwd: api, ..context };
+    let agent = IdeTestAgent::start(&context)?;
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let _: serde_json::Value = crate::commands::exec::run::agent_invoke(
+            &context,
+            locket_agent::AgentMethod::Unlock,
+            &serde_json::json!({"project_id":project.config.project_id,"passphrase":"test passphrase","ttl_seconds":30,"method":"Passphrase"}),
+            "test passphrase unlock",
+        )?;
+        let effective = crate::load_effective_command_policy(&project, "ide_run", &context.cwd)?;
+        assert!(
+            effective.policy.allowed_secrets.iter().any(|name| name.as_str() == "DATABASE_URL")
+        );
+        let store = crate::open_store(&context)?;
+        let profile = crate::default_profile(&store, &project.config)?;
+        let access = crate::prepare_agent_policy_access_for_tests(
+            &context,
+            &project,
+            &profile,
+            &effective.policy,
+        )?;
+        let session_id = "path-passphrase";
+        agent.seed_ide_session(
+            session_id,
+            project.config.project_id.as_str(),
+            vec!["DATABASE_URL".into()],
+            30,
+        )?;
+        let ide_context = crate::ide_env_source_context_for_tests(
+            &context,
+            &project,
+            &profile,
+            &effective.policy,
+            &access,
+        );
+        let env = crate::resolve_external_env_ide_with_session_id(&ide_context, session_id)?;
+        assert_eq!(
+            env.get("DATABASE_URL").map(|value| value.as_str()),
+            Some("postgres://localhost/app")
+        );
+        Ok(())
+    })();
+    agent.stop()?;
+    result
+}
+
 /// Builds the project + secret + policy fixture shared by every IDE
 /// consumer test.
 fn fixture(directory: &tempfile::TempDir) -> Result<RuntimeContext, Box<dyn std::error::Error>> {

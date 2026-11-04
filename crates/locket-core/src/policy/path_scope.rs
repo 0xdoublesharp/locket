@@ -28,6 +28,32 @@ pub struct PathEnvSet {
 }
 
 impl PathEnvSet {
+    /// Adds this scope's names to a command without changing its execution options.
+    pub fn apply_to(&self, policy: &mut super::CommandPolicy) {
+        use std::collections::BTreeSet;
+        let mut required = policy.required_secrets.iter().cloned().collect::<BTreeSet<_>>();
+        let mut optional = policy.optional_secrets.iter().cloned().collect::<BTreeSet<_>>();
+        for name in &self.required_secrets {
+            required.insert(name.clone());
+            optional.remove(name);
+        }
+        for name in &self.optional_secrets {
+            if !required.contains(name) {
+                optional.insert(name.clone());
+            }
+        }
+        policy.required_secrets = required.into_iter().collect();
+        policy.optional_secrets = optional.into_iter().collect();
+        policy.allowed_secrets = policy
+            .required_secrets
+            .iter()
+            .chain(&policy.optional_secrets)
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+    }
+
     pub(super) fn from_toml_value(
         path: &str,
         value: toml::Value,

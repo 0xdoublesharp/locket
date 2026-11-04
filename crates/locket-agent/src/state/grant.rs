@@ -11,13 +11,36 @@ pub struct GrantBinding {
     pub pid: u32,
     /// Opaque platform start-time token captured when the grant was issued.
     pub process_start_time: String,
+    /// Optional execution context. Bound to the grant alongside process identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<ExecutionScope>,
+}
+
+/// Command and directory whose effective policy governs reference delivery.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExecutionScope {
+    /// Saved command identity; command argv is loaded from its durable policy.
+    pub policy_name: String,
+    /// Canonical absolute working directory selected for execution.
+    pub cwd: std::path::PathBuf,
 }
 
 impl GrantBinding {
     /// Creates a process-bound grant identity.
     #[must_use]
     pub fn new(pid: u32, process_start_time: impl Into<String>) -> Self {
-        Self { pid, process_start_time: process_start_time.into() }
+        Self { pid, process_start_time: process_start_time.into(), execution: None }
+    }
+
+    /// Binds this grant to a saved command and its working directory.
+    #[must_use]
+    pub fn with_execution(
+        mut self,
+        policy_name: impl Into<String>,
+        cwd: std::path::PathBuf,
+    ) -> Self {
+        self.execution = Some(ExecutionScope { policy_name: policy_name.into(), cwd });
+        self
     }
 }
 

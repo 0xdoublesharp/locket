@@ -21,7 +21,7 @@ Cryptographic choices must use maintained RustCrypto, dalek, age/rage, or simila
 Key hierarchy:
 
 ```text
-Local Identity Master Key (OS protected or recovered, machine/user scoped)
+Local Project Master Key (OS protected or recovered, project scoped)
   -> HKDF key-wrap keys by project id and key purpose
     -> Wrapped random Project Metadata Key
     -> Wrapped random Project Audit Key
@@ -35,7 +35,7 @@ Local Identity Master Key (OS protected or recovered, machine/user scoped)
   -> Project Audit Key
 ```
 
-The local identity master key is scoped to the OS user/device, not to one project directory. A machine that already has a valid local identity must reuse that identity when initializing another project; `locket init` creates only the project/profile keys needed by the new project. Project metadata, project audit, profile secret, and profile fingerprint keys are random 32-byte keys stored only as wrapped material in the `keys` table. They are not deterministically derived from the master key. HKDF is used to derive purpose-separated wrapping keys from the master key, so wrapped keys can be independently rotated and audited without making one project/profile key substitutable for another.
+Each project currently has its own local master key and device identity. `locket init` creates a new master key for a new project and reuses the existing key when completing that same project. Recovery is also per project: back up each project's encrypted `.locket/recovery/envelope.bin` and its recovery code. A code for one project does not recover another project. Project metadata, project audit, profile secret, and profile fingerprint keys are random 32-byte keys stored only as wrapped material in the `keys` table. They are not deterministically derived from the master key. HKDF is used to derive purpose-separated wrapping keys from the master key, so wrapped keys can be independently rotated and audited without making one project/profile key substitutable for another.
 
 Global reusable secrets are addressed by canonical absolute secret paths such as `/work/acme/aws/dev/db-password`. A global secret has its own random secret key id and per-version DEK; projects consume that secret through links/aliases and policy grants rather than by copying private key material or duplicating encrypted values. Project-local secrets remain supported for values that should not leave a project boundary.
 
@@ -122,7 +122,7 @@ KDF parameters:
 
 - Recovery envelope Argon2id parameters: memory `m=65536 KiB`, iterations `t=3`, parallelism `p=4`.
 - Passphrase fallback Argon2id parameters: memory `m=32768 KiB`, iterations `t=2`, parallelism `p=4`.
-- `recovery/kdf.toml` uses the following canonical TOML key names: `kdf_profile_id` (string, `lk_kdf_*` prefix), `algorithm` (string, `"argon2id"` for v1), `version` (integer, schema version of this file, `1` for v1), `salt` (string, unpadded base64url), `m_cost` (integer, memory in KiB), `t_cost` (integer, iterations), `p_cost` (integer, parallelism), `output_len` (integer, derived key length in bytes, `32` for v1), and `created_at` (integer, UTC Unix nanoseconds as `i64`). These names are normative; implementations must use them exactly for recovery interoperability. `kdf_profile_id` is an opaque random 128-bit id with prefix `lk_kdf_`, generated for each recovery envelope creation or recovery-code rotation. It is not derived from the recovery code, salt, device id, or project id. `kdf_profile_id` must match the id stored in `recovery/envelope.bin`; mismatch means the KDF file and envelope are not a valid pair and recovery fails closed.
+- Recovery KDF metadata uses the following canonical TOML key names (embedded in the atomic envelope container, or stored in `recovery/kdf.toml` for legacy backups): `kdf_profile_id` (string, `lk_kdf_*` prefix), `algorithm` (string, `"argon2id"` for v1), `version` (integer, schema version of this file, `1` for v1), `salt` (string, unpadded base64url), `m_cost` (integer, memory in KiB), `t_cost` (integer, iterations), `p_cost` (integer, parallelism), `output_len` (integer, derived key length in bytes, `32` for v1), and `created_at` (integer, UTC Unix nanoseconds as `i64`). These names are normative; implementations must use them exactly for recovery interoperability. `kdf_profile_id` is an opaque random 128-bit id with prefix `lk_kdf_`, generated for each recovery envelope creation or recovery-code rotation. It is not derived from the recovery code, salt, device id, or project id. `kdf_profile_id` must match the id stored in `recovery/envelope.bin`; mismatch means the KDF metadata and envelope are not a valid pair and recovery fails closed.
 - Recovery envelope re-wraps may upgrade KDF parameters but must never silently downgrade them. If the running binary cannot meet stored parameters, recovery fails closed with a typed error rather than using weaker parameters.
 - Stored KDF parameters are authoritative for future recovery; the binary default is used only for new envelopes or explicit upgrades.
 
@@ -168,11 +168,12 @@ Recovery code model:
 
 Recovery envelope v1:
 
-- `recovery/envelope.bin` is a versioned binary container. All integers are little-endian and all strings are UTF-8 length-prefixed.
+- New `recovery/envelope.bin` files contain the ASCII magic `LOCKET-RECOVERY-STATE-V1` followed by a NUL byte, a `u32` little-endian TOML byte length, that many bytes of KDF TOML, then the recovery envelope described below. Both parts are replaced through one synced temporary file and atomic rename. Embedded KDF metadata is authoritative; a remaining legacy `kdf.toml` is ignored by readers. Legacy raw envelopes plus `kdf.toml` remain readable.
+- The inner recovery envelope is a versioned binary container. All integers are little-endian and all strings are UTF-8 length-prefixed.
 - Header: magic bytes `LOCKET-RECOVERY\0`, `u16 schema_version = 1`, `field("kdf_profile_id", id)`, `i128 created_at_unix_nanos_utc`, `u32 entry_count`.
 - Entry: `field("entry_kind", kind)`, `field("entry_id", id)`, `u16 algorithm_id`, `u16 nonce_len = 24`, `nonce`, `u32 ciphertext_len`, `ciphertext`.
 - `algorithm_id = 1` means XChaCha20-Poly1305.
-- The recovery unwrap root is `Argon2id(recovery_code, recovery/kdf.toml.salt, stored params)`.
+- The recovery unwrap root is `Argon2id(recovery_code, stored KDF salt, stored params)`.
 - Each entry encryption key is `HKDF-SHA256(recovery_unwrap_root, info = "locket-recovery-entry-v1" || field("entry_kind", entry_kind) || field("entry_id", entry_id) || field("kdf_profile_id", kdf_profile_id))`.
 - Each entry AAD is `locket-recovery-envelope-v1 || u16_le(schema_version) || field("kdf_profile_id", kdf_profile_id) || field("entry_kind", entry_kind) || field("entry_id", entry_id)`.
 - Required wrapped entries are `master_key`, `device_signing_private_key`, and `device_sealing_private_key`; Locket-managed automation client private keys may be included as `automation_client_private_key:<client_id>` entries.
@@ -194,7 +195,7 @@ Component checks:
 
 - Decryption fails with wrong key, nonce, AAD, project, profile, secret id, secret name, or version.
 - Fingerprints are keyed HMACs, not raw hashes.
-- Audit verification detects row deletion, insertion, reordering, or mutation.
+- Audit verification detects breaks, insertion, reordering, or mutation in the retained chain. A valid prefix remains valid: tail truncation or whole-database rollback requires an independently retained checkpoint to detect.
 
 ## Local User Verification And Passkeys
 

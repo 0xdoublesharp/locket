@@ -144,16 +144,12 @@ impl UnlockCache {
     /// Returns the project ids that were evicted so the caller can
     /// emit `LOCK` audit rows for them.
     pub fn evict_expired(&mut self, now_unix_nanos: i128) -> Vec<String> {
-        let expired: Vec<String> = self
-            .entries
-            .iter()
-            .filter(|(_, entry)| entry.is_expired(now_unix_nanos))
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in &expired {
-            self.entries.remove(id);
-        }
-        expired
+        self.drain_expired(now_unix_nanos).into_iter().map(|(id, _)| id).collect()
+    }
+
+    /// Removes expired keys, retaining their audit context until the caller records the lock.
+    pub(crate) fn drain_expired(&mut self, now_unix_nanos: i128) -> Vec<(String, UnlockEntry)> {
+        self.entries.extract_if(.., |_, entry| entry.is_expired(now_unix_nanos)).collect()
     }
 
     /// Clears every entry (`Lock` for all projects).

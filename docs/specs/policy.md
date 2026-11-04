@@ -53,6 +53,7 @@ allow_paths = ["apps/api/**"]
 Command ACL semantics:
 
 - `allow_commands` matches the saved policy name for `locket run <policy>` and the generated runner identity for adapter invocations such as `npm:dev`, `pnpm:test`, `cargo:test`, or `make:deploy`.
+- Explicit `locket exec` uses command identity `exec` and evaluates `allow_argv` against its actual arguments and `allow_paths` against its working directory, including when `--all --force` selects the names.
 - `allow_argv` matches structured argv tokens only. `*` matches within one token, so `release:*` matches `release:prod`; `**` may appear as a whole token to match the remaining argv tail, such as `["cargo", "test", "**"]`.
 - `allow_argv` does not match `shell = "..."` policies because shell strings are not parsed into trusted argv tokens. Use `allow_commands` for shell policies, and keep high-risk secrets behind `confirm` or `require_user_verification`.
 - `allow_paths` entries are project-relative. A plain entry such as `apps/api` matches that directory and descendants; `apps/api/**` is accepted as the explicit subtree form. Absolute paths and `..` are rejected.

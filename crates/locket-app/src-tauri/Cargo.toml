@@ -38,6 +38,7 @@ serde_json = { workspace = true }
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+zeroize = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 tempfile = { workspace = true }

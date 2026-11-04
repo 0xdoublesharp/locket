@@ -21,6 +21,17 @@ import {
 const PROJECT_ID = 'project-1';
 const PROFILE_ID = 'profile-1';
 
+describe('imported portable secret names', () => {
+  it('allows underscore-prefixed names through create, rotate, and delete', () => {
+    const name = '_SERVICE_2';
+    expect(validateSetForm({ ...defaultSetForm(), name, value: 'initial' }).valid).toBe(true);
+    expect(validateRotateForm({ ...defaultRotateForm(), name, value: 'rotated' }).valid).toBe(true);
+    expect(validateDeleteForm({ ...defaultDeleteForm(), name, confirmation: name }).valid).toBe(
+      true,
+    );
+  });
+});
+
 describe('validateSetForm', () => {
   it('accepts a typical KEY value pair', () => {
     const result = validateSetForm({

@@ -549,12 +549,27 @@ fn redact_ai_safe_bytes(
     unterminated_partial_line: bool,
 ) -> AiSafeRedactedChunk {
     let input = String::from_utf8_lossy(bytes);
+    // Streaming flushes at newlines. Match each nonempty line of a known
+    // value so a multiline credential cannot escape in separate chunks.
+    // This deliberately redacts standalone occurrences of those lines too.
+    let known_lines = known_redactions
+        .iter()
+        .flat_map(|entry| {
+            entry
+                .value
+                .split('\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| KnownRedaction { value: line, marker: entry.marker.as_str() })
+        })
+        .collect::<Vec<_>>();
     let redacted_secret_names = known_redactions
         .iter()
-        .filter(|entry| input.contains(entry.value.as_str()))
+        .filter(|entry| {
+            entry.value.split('\n').any(|line| !line.is_empty() && input.contains(line))
+        })
         .filter_map(|entry| entry.secret_name.clone())
         .collect::<BTreeSet<_>>();
-    let result = redact_input(&input, known_redactions);
+    let result = redact_text_with_known_values(&input, &known_lines);
     AiSafeRedactedChunk {
         stream,
         text: result.text,

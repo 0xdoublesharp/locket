@@ -822,8 +822,10 @@ pub fn run_internal_agent_serve(args: &InternalAgentServeArgs) -> Result<(), Cli
     let result = runtime.block_on(async {
         let (listener, state) = bind_and_record(args)?;
         let sync_task = locket_agent::team_sync::spawn_team_sync_poll(state.clone());
+        let expiry_task = state.spawn_unlock_expiry();
         let result = serve_until_signal(listener, state).await.map_err(CliError::Io);
         sync_task.abort();
+        expiry_task.abort();
         result
     });
 
@@ -923,6 +925,7 @@ pub fn run_internal_agent_serve(args: &InternalAgentServeArgs) -> Result<(), Cli
         let state = locket_agent::AgentSocketState::locked(env!("CARGO_PKG_VERSION"));
         write_pid_file(&args.pid_file).map_err(|error| io::Error::other(error.to_string()))?;
         let sync_task = locket_agent::team_sync::spawn_team_sync_poll(state.clone());
+        let expiry_task = state.spawn_unlock_expiry();
         loop {
             tokio::select! {
                 connected = listener.connect() => {
@@ -940,6 +943,7 @@ pub fn run_internal_agent_serve(args: &InternalAgentServeArgs) -> Result<(), Cli
             }
         }
         sync_task.abort();
+        expiry_task.abort();
         Ok::<(), io::Error>(())
     });
     let _ignored = fs::remove_file(&args.pid_file);

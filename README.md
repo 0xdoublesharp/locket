@@ -123,7 +123,7 @@ locket status
 locket emit-example
 ```
 
-`locket setup` shows the next missing action. In an interactive terminal it can offer to import an existing `.env` and approve a detected development command. It never starts a project script during setup. `locket init` creates the project configuration, prepares the local vault, updates `.gitignore`, and creates a managed `.env.example` block. It reuses the local device identity when one already exists on the machine, so new projects do not require a new backup phrase by default. Pass `--recovery-code` when you want an offline backup code during setup; otherwise you can add or rotate one later with `locket recovery rotate`.
+`locket setup` shows the next missing action. In an interactive terminal it can offer to import an existing `.env` and approve a detected development command. It never starts a project script during setup. `locket init` creates the project configuration, prepares the local vault, updates `.gitignore`, and creates a managed `.env.example` block. Each project has its own master key and device identity. Pass `--recovery-code` when you want an offline backup code during setup; otherwise you can add or rotate one later with `locket recovery rotate`.
 
 ### Secrets And Profiles
 
@@ -279,7 +279,7 @@ locket recover
 locket recovery rotate
 ```
 
-Recovery and verification flows are local-first and avoid putting recovery material in project files.
+Recovery and verification flows are local-first. Keep each project's recovery code separately from its encrypted recovery files in `.locket/recovery` and back up both the recovery files and local vault. The encrypted files are excluded from Git; one project's recovery code does not recover other projects.
 
 ### Team And Sync
 

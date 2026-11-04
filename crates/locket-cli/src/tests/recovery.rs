@@ -630,7 +630,11 @@ fn recover_with_corrupted_kdf_file_exits_with_metadata_invalid()
         &context,
         &mut Vec::new(),
     )?;
-    let kdf_path = directory.path().join(".locket/recovery/kdf.toml");
+    let recovery_dir = directory.path().join(".locket/recovery");
+    // A legacy two-file backup must still reject a damaged KDF.
+    let legacy = crate::load_recovery_envelope(&recovery_dir)?;
+    fs::write(recovery_dir.join("envelope.bin"), legacy.serialize()?)?;
+    let kdf_path = recovery_dir.join("kdf.toml");
     std::fs::write(&kdf_path, "this-is-not-valid-toml = = = corrupted\n")?;
 
     let recover_context = context_with_recovery_code(&context, "ignored-code\n");
@@ -973,5 +977,96 @@ fn legacy_recovery_rotates_disclosed_signing_seed_and_preserves_sealing_key()
     assert_eq!(*storage.load(&device.id)?, *sealing);
     assert!(store.device_matches_bundle_recipient(&recovered, &fingerprint)?);
     crate::commands::team::device::load_device_signing_key(&context, &store, &recovered)?;
+    Ok(())
+}
+
+#[test]
+fn initial_recovery_with_default_device_restores_identity() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    let mut output = Vec::new();
+    run_with_context(
+        Cli::try_parse_from([
+            "locket",
+            "init",
+            "--recovery-code",
+            "--no-passkey",
+            "--name",
+            "app",
+            "--profile",
+            "dev",
+        ])?,
+        &context,
+        &mut output,
+    )?;
+    let output = String::from_utf8(output)?;
+    let code = locket_crypto::recovery_code_decode(recovery_code_from_output(&output)?)?;
+    let resolved = crate::require_project(&context)?;
+    let project = resolved.config.project_id.as_str();
+    let device = crate::open_store(&context)?.get_active_local_device(project)?.ok_or("device")?;
+    let storage =
+        crate::commands::team::device::build_device_private_key_storage(&context, project)?;
+    let sealing = storage.load(&device.id)?;
+    let signing = storage.clone().for_signing().load(&device.fingerprint)?;
+    let recovery_dir = directory.path().join(".locket/recovery");
+    let kdf = crate::load_recovery_kdf_toml(&recovery_dir)?;
+    let envelope = crate::load_recovery_envelope(&recovery_dir)?;
+    storage.delete(&device.id)?;
+    storage.clone().for_signing().delete(&device.fingerprint)?;
+    context.key_store.delete_master_key(project)?;
+    crate::restore_from_recovery_code(
+        &context,
+        &mut Vec::new(),
+        &resolved,
+        &kdf,
+        &envelope,
+        &code,
+        false,
+    )?;
+    assert_eq!(*storage.load(&device.id)?, *sealing);
+    assert_eq!(*storage.for_signing().load(&device.fingerprint)?, *signing);
+    Ok(())
+}
+
+#[test]
+fn recovery_rotation_rejection_or_audit_failure_preserves_previous_backup()
+-> Result<(), Box<dyn std::error::Error>> {
+    for fail_audit in [false, true] {
+        let directory = tempdir()?;
+        let context = test_context(&directory);
+        let mut output = Vec::new();
+        run_with_context(
+            Cli::try_parse_from([
+                "locket",
+                "init",
+                "--recovery-code",
+                "--no-device",
+                "--no-passkey",
+                "--name",
+                "app",
+            ])?,
+            &context,
+            &mut output,
+        )?;
+        let output = String::from_utf8(output)?;
+        let old_code = recovery_code_from_output(&output)?;
+        let dir = directory.path().join(".locket/recovery");
+        let previous = fs::read(dir.join("envelope.bin"))?;
+        let old_kdf = crate::load_recovery_kdf_toml(&dir)?;
+        if fail_audit {
+            crate::open_store(&context)?.connection().execute_batch(
+                "CREATE TRIGGER deny_rotation BEFORE INSERT ON audit_log WHEN NEW.action='RECOVERY_ROTATE' BEGIN SELECT RAISE(ABORT, 'injected audit failure'); END;",
+            )?;
+        }
+        let rotate = context_with_confirmation(
+            &context_with_recovery_code(&context, old_code),
+            if fail_audit { "app" } else { "not acknowledged" },
+        );
+        let result = crate::recovery_rotate_command(&rotate, &mut Vec::new());
+        assert!(result.is_err(), "rotation must fail when confirmation or audit fails");
+        assert_eq!(fs::read(dir.join("envelope.bin"))?, previous);
+        assert_eq!(crate::load_recovery_kdf_toml(&dir)?.kdf_profile_id, old_kdf.kdf_profile_id);
+    }
     Ok(())
 }

@@ -260,11 +260,12 @@ fn write_field(buf: &mut Vec<u8>, name: &str, value: &[u8]) -> Result<(), Platfo
 }
 
 fn read_exact<'a>(cur: &mut usize, n: usize, data: &'a [u8]) -> Result<&'a [u8], PlatformError> {
-    if *cur + n > data.len() {
-        return Err(PlatformError::InvalidRecoveryEnvelope("truncated".into()));
-    }
-    let slice = &data[*cur..*cur + n];
-    *cur += n;
+    let end = cur
+        .checked_add(n)
+        .filter(|end| *end <= data.len())
+        .ok_or_else(|| PlatformError::InvalidRecoveryEnvelope("truncated".into()))?;
+    let slice = &data[*cur..end];
+    *cur = end;
     Ok(slice)
 }
 
@@ -302,6 +303,15 @@ fn read_field_string(cur: &mut usize, data: &[u8]) -> Result<String, PlatformErr
 /// Returns [`PlatformError::Io`] if the file cannot be read, or
 /// [`PlatformError::InvalidRecoveryEnvelope`] if the TOML is malformed.
 pub fn load_recovery_kdf_toml(recovery_dir: &Path) -> Result<RecoveryKdfToml, PlatformError> {
+    match fs::read(recovery_dir.join("envelope.bin")) {
+        Ok(data) => {
+            if let Some((kdf, _)) = decode_recovery_state(&data)? {
+                return Ok(kdf);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     let path = recovery_dir.join("kdf.toml");
     let text = fs::read_to_string(&path).map_err(PlatformError::Io)?;
     let kdf: RecoveryKdfToml =
@@ -337,6 +347,9 @@ pub fn save_recovery_kdf_toml(
 pub fn load_recovery_envelope(recovery_dir: &Path) -> Result<RecoveryEnvelope, PlatformError> {
     let path = recovery_dir.join("envelope.bin");
     let data = fs::read(&path).map_err(PlatformError::Io)?;
+    if let Some((_, envelope)) = decode_recovery_state(&data)? {
+        return Ok(envelope);
+    }
     RecoveryEnvelope::deserialize(&data)
 }
 
@@ -350,10 +363,101 @@ pub fn save_recovery_envelope(
     recovery_dir: &Path,
     envelope: &RecoveryEnvelope,
 ) -> Result<(), PlatformError> {
+    if recovery_dir.join("kdf.toml").exists()
+        || fs::read(recovery_dir.join("envelope.bin"))
+            .is_ok_and(|bytes| bytes.starts_with(RECOVERY_STATE_MAGIC))
+    {
+        // Entry updates must preserve the authoritative KDF, including its salt.
+        // Callers replacing the KDF must supply the full pair to save_recovery_state.
+        let kdf = load_recovery_kdf_toml(recovery_dir)?;
+        return save_recovery_state(recovery_dir, &kdf, envelope);
+    }
+    write_recovery_atomically(recovery_dir, &envelope.serialize()?)
+}
+
+const RECOVERY_STATE_MAGIC: &[u8] = b"LOCKET-RECOVERY-STATE-V1\0";
+
+/// Saves KDF metadata and encrypted entries as one durable atomic replacement.
+/// Legacy separate KDF/envelope files remain readable. Embedded metadata is authoritative.
+///
+/// # Errors
+/// Rejects mismatched metadata or filesystem failures without truncating the old envelope.
+pub fn save_recovery_state(
+    recovery_dir: &Path,
+    kdf: &RecoveryKdfToml,
+    envelope: &RecoveryEnvelope,
+) -> Result<(), PlatformError> {
+    kdf.validate()?;
+    if kdf.kdf_profile_id != envelope.kdf_profile_id {
+        return Err(PlatformError::InvalidRecoveryEnvelope("kdf profile mismatch".into()));
+    }
+    let metadata = toml::to_string(kdf)
+        .map_err(|error| PlatformError::InvalidRecoveryEnvelope(error.to_string()))?;
+    let length = u32::try_from(metadata.len())
+        .map_err(|_| PlatformError::InvalidRecoveryEnvelope("kdf metadata too large".into()))?;
+    let mut bytes = RECOVERY_STATE_MAGIC.to_vec();
+    bytes.extend_from_slice(&length.to_le_bytes());
+    bytes.extend_from_slice(metadata.as_bytes());
+    bytes.extend_from_slice(&envelope.serialize()?);
+    write_recovery_atomically(recovery_dir, &bytes)
+}
+
+/// Decodes a modern atomic recovery container, returning `None` for legacy input.
+///
+/// # Errors
+/// Rejects truncated containers, oversized KDF metadata, unsupported parameters,
+/// invalid inner envelopes and mismatched KDF profile identifiers.
+pub fn decode_recovery_state(
+    bytes: &[u8],
+) -> Result<Option<(RecoveryKdfToml, RecoveryEnvelope)>, PlatformError> {
+    if !bytes.starts_with(RECOVERY_STATE_MAGIC) {
+        return Ok(None);
+    }
+    let mut cursor = RECOVERY_STATE_MAGIC.len();
+    let length = u32::from_le_bytes(
+        read_exact(&mut cursor, 4, bytes)?
+            .try_into()
+            .map_err(|_| PlatformError::InvalidRecoveryEnvelope("invalid kdf length".into()))?,
+    ) as usize;
+    if length > 16 * 1024 {
+        return Err(PlatformError::InvalidRecoveryEnvelope("kdf metadata too large".into()));
+    }
+    let text = std::str::from_utf8(read_exact(&mut cursor, length, bytes)?)
+        .map_err(|_| PlatformError::InvalidRecoveryEnvelope("invalid kdf text".into()))?;
+    let kdf: RecoveryKdfToml = toml::from_str(text)
+        .map_err(|_| PlatformError::InvalidRecoveryEnvelope("invalid kdf metadata".into()))?;
+    kdf.validate()?;
+    let envelope = RecoveryEnvelope::deserialize(&bytes[cursor..])?;
+    if kdf.kdf_profile_id != envelope.kdf_profile_id {
+        return Err(PlatformError::InvalidRecoveryEnvelope("kdf profile mismatch".into()));
+    }
+    Ok(Some((kdf, envelope)))
+}
+
+fn write_recovery_atomically(recovery_dir: &Path, data: &[u8]) -> Result<(), PlatformError> {
     secure_directory(recovery_dir)?;
     let path = recovery_dir.join("envelope.bin");
-    let tmp = recovery_dir.join("envelope.bin.tmp");
-    let data = envelope.serialize()?;
-    write_user_only_file(&tmp, &data)?;
-    fs::rename(&tmp, &path).map_err(PlatformError::Io)
+    let suffix = BASE64URL_NOPAD.encode(&locket_crypto::random_bytes::<16>()?);
+    let temporary = recovery_dir.join(format!(".envelope-{suffix}.tmp"));
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| -> Result<(), PlatformError> {
+        use std::io::Write;
+        let mut file = options.open(&temporary)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        fs::rename(&temporary, &path)?;
+        #[cfg(unix)]
+        fs::File::open(recovery_dir)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }

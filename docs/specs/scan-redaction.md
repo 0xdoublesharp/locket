@@ -75,6 +75,8 @@ No secret values included.
 
 `locket ai-safe` writes a `REDACT` audit row when project context is available. Metadata includes child `argv0`, argument count, output destinations, whether `--pattern-only` was used, whether known-value coverage was active, redaction counts by rule, and exact known secret names redacted from output. Audit metadata never stores privacy aliases; aliases are applied only when rendering audit output or redacted transcripts. It never records child output or secret values.
 
+For streaming output, every nonempty line of a known multiline value is redacted independently. This also removes standalone occurrences of those lines, so line boundaries cannot expose pieces of a credential.
+
 ## Inline Suppressions
 
 Findings can be suppressed in source via inline directives. Three forms:

@@ -13,7 +13,7 @@ Design:
 - The HMAC covers sequence, timestamp, project/profile ids, action, status, safe metadata, previous HMAC, and the schema version recorded on the row at write time.
 - Verification recomputes each row's HMAC using the schema version stored on that row, not the current binary's schema version, so a `SCHEMA_MIGRATE` does not break the chain.
 - Audit append must run inside the same SQLite transaction as the metadata/blob change it records. Sequence numbers are assigned at commit so a rolled-back transaction never produces a gap or a phantom row.
-- Audit verification detects row deletion, insertion, mutation, and reordering.
+- Audit verification detects gaps, insertion, mutation, and reordering within the retained chain. It cannot detect deletion of a valid suffix, an emptied chain, or whole-database rollback without an independently retained checkpoint. Local audit verification establishes integrity of the rows present, not completeness against an external history.
 - Audit metadata never includes plaintext secret values.
 - The top-level `AuditLog.secret_name` and `AuditLog.command` columns are query/index conveniences only. When present, the same values must also be encoded inside `metadata_json` as `secret_name` and `command` fields so they are covered by `bytes("metadata_json", ...)` in the HMAC chain. When either convenience field is absent, the corresponding key must be omitted from `metadata_json`; implementations must never encode `"secret_name": null` or `"command": null`. Implementations must not treat the convenience columns as authoritative if they disagree with HMAC-covered metadata.
 

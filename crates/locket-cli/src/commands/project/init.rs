@@ -388,7 +388,8 @@ fn inspect_init_state(
 
 fn init_recovery_files_ready(root: &Path) -> bool {
     let recovery_dir = root.join(".locket").join("recovery");
-    recovery_dir.join("kdf.toml").exists() && recovery_dir.join("envelope.bin").exists()
+    locket_platform::load_recovery_kdf_toml(&recovery_dir).is_ok()
+        && locket_platform::load_recovery_envelope(&recovery_dir).is_ok()
 }
 
 #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
@@ -406,13 +407,19 @@ fn complete_init(
 ) -> Result<InitCompletion, CliError> {
     ensure_project_metadata(store, config, timestamp)?;
     let key_material = ensure_project_key_material(context, store, config, timestamp)?;
+    trust_root(store, config, root, timestamp)?;
+    maybe_init_device(context, output, no_device);
     let recovery_code_bytes = if recovery_code {
-        ensure_initial_recovery_envelope(root, config, &key_material.master_key, timestamp)?
+        ensure_initial_recovery_envelope(
+            context,
+            root,
+            config,
+            &key_material.master_key,
+            timestamp,
+        )?
     } else {
         None
     };
-    trust_root(store, config, root, timestamp)?;
-    maybe_init_device(context, output, no_device);
     maybe_register_passkey(context, output, register_passkey, no_passkey);
     ensure_gitignore(root)?;
     ensure_example_file(root)?;
@@ -602,13 +609,16 @@ fn ensure_wrapped_key(
 }
 
 fn ensure_initial_recovery_envelope(
+    context: &RuntimeContext,
     root: &Path,
     config: &ProjectConfig,
     master_key: &locket_crypto::KeyBytes,
     timestamp: i64,
 ) -> Result<Option<[u8; locket_crypto::RECOVERY_CODE_BYTES]>, CliError> {
     let recovery_dir = root.join(".locket").join("recovery");
-    if recovery_dir.join("kdf.toml").exists() && recovery_dir.join("envelope.bin").exists() {
+    if recovery_dir.join("envelope.bin").exists() {
+        locket_platform::load_recovery_kdf_toml(&recovery_dir)?;
+        locket_platform::load_recovery_envelope(&recovery_dir)?;
         return Ok(None);
     }
 
@@ -624,10 +634,19 @@ fn ensure_initial_recovery_envelope(
         config.project_id.as_str(),
         master_key,
     )?;
+    let mut entries = vec![entry];
+    let resolved = crate::require_project(context)?;
+    crate::commands::vault::recovery::replace_device_recovery_entries(
+        context,
+        &resolved,
+        &kdf,
+        &recovery_root,
+        &mut entries,
+    )?;
     let envelope = RecoveryEnvelope {
         kdf_profile_id: kdf.kdf_profile_id.clone(),
         created_at_unix_nanos: i128::from(timestamp),
-        entries: vec![entry],
+        entries,
     };
     save_recovery_kdf_toml(&recovery_dir, &kdf)
         .map_err(|error| metadata_invalid_error(format!("save recovery kdf: {error}")))?;

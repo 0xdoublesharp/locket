@@ -198,6 +198,7 @@ pub fn add(
         TeamRoleArg::Developer => "developer",
         TeamRoleArg::ReadOnly => "read-only",
     };
+    confirm_dangerous_sharing(context, output, &store, project, &profiles)?;
     let _ = load_master_key(context, project)?;
     team_sync::initialize_owner(
         &mut store,
@@ -267,6 +268,8 @@ pub fn publish(context: &RuntimeContext, output: &mut impl Write) -> Result<(), 
         now()?,
     )
     .map_err(failure)?;
+    let profiles = team_sync::shared_profile_ids(&store, project).map_err(failure)?;
+    confirm_dangerous_sharing(context, output, &store, project, &profiles)?;
     let queued =
         team_sync::publish(&mut store, project, &master, &signer, now()?).map_err(failure)?;
     let written = team_sync::flush_outbox(&store, project).map_err(failure)?;
@@ -501,6 +504,37 @@ pub fn remove_authenticated(
             output,
             "Revocation is saved locally; delivery is pending. Restore the shared folder and run `locket team publish`."
         )?,
+    }
+    Ok(())
+}
+
+/// Shared guard for both granting and manually delivering dangerous profile scope.
+fn confirm_dangerous_sharing(
+    context: &RuntimeContext,
+    output: &mut impl Write,
+    store: &locket_store::Store,
+    project: &str,
+    profiles: &[String],
+) -> Result<(), CliError> {
+    let mut names: Vec<_> = store
+        .list_profiles(project)?
+        .into_iter()
+        .filter(|profile| profile.dangerous && profiles.contains(&profile.id))
+        .map(|profile| profile.name)
+        .collect();
+    names.sort();
+    names.dedup();
+    if names.is_empty() {
+        return Ok(());
+    }
+    let expected = format!("team share {}", names.join(","));
+    writeln!(output, "type '{expected}' to confirm sharing these dangerous profiles")?;
+    output.flush()?;
+    let confirmation = context.confirmation_reader.read_confirmation("team share")?;
+    if confirmation.trim_end_matches(['\r', '\n']) != expected {
+        return Err(crate::confirmation_failed_error(
+            "confirmation did not match dangerous profile sharing scope",
+        ));
     }
     Ok(())
 }

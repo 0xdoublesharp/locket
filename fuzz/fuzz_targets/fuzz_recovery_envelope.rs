@@ -7,6 +7,11 @@ fuzz_target!(|data: &[u8]| {
     if data.len() > 16 * 1024 {
         return;
     }
+    // Exercise both persisted formats and drive mutations past the modern magic.
+    let _ = locket_platform::decode_recovery_state(data);
+    let mut modern = b"LOCKET-RECOVERY-STATE-V1\0".to_vec();
+    modern.extend_from_slice(data);
+    let _ = locket_platform::decode_recovery_state(&modern);
     let Ok(envelope) = RecoveryEnvelope::deserialize(data) else {
         return;
     };

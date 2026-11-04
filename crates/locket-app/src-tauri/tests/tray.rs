@@ -30,6 +30,7 @@ use tempfile as _;
 use thiserror as _;
 use tokio as _;
 use toml as _;
+use zeroize as _;
 
 use locket_app::{TrayIconState, tray_icon_states};
 use locket_desktop_lib::{LOCKET_TRAY_ID, icon_bytes_for, tooltip_for};

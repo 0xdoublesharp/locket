@@ -29,6 +29,7 @@ use tempfile as _;
 use thiserror as _;
 use tokio as _;
 use toml as _;
+use zeroize as _;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -238,8 +239,8 @@ fn capability_file_denies_default_and_lists_no_broad_permissions() {
     let permission_names: Vec<&str> = permissions.iter().filter_map(Value::as_str).collect();
     assert_eq!(
         permission_names,
-        ["desktop-commands"],
-        "desktop capability must grant only the local command allow-list",
+        ["desktop-commands", "core:event:allow-listen", "core:event:allow-unlisten"],
+        "desktop capability must grant the local commands and receive-only event lifecycle",
     );
 
     let raw = read_text("capabilities/desktop.json");

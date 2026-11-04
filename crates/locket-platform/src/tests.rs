@@ -679,3 +679,85 @@ fn signing_storage_is_separate_and_rejects_sealing_envelope_substitution()
     assert!(signing.load(DEVICE_ID_A).is_err());
     Ok(())
 }
+
+#[test]
+fn recovery_state_keeps_embedded_kdf_authoritative_until_atomic_replacement()
+-> Result<(), PlatformError> {
+    let directory = tempfile::tempdir()?;
+    let original_kdf =
+        RecoveryKdfToml::new_v1("lk_kdf_old".into(), &[3; locket_crypto::RECOVERY_SALT_LEN], 1);
+    let original = RecoveryEnvelope {
+        kdf_profile_id: original_kdf.kdf_profile_id.clone(),
+        created_at_unix_nanos: 1,
+        entries: vec![],
+    };
+    // Exercise compatibility with an actual legacy pair before migration.
+    save_recovery_kdf_toml(directory.path(), &original_kdf)?;
+    std::fs::write(directory.path().join("envelope.bin"), original.serialize()?)?;
+    assert_eq!(load_recovery_envelope(directory.path())?.kdf_profile_id, "lk_kdf_old");
+    crate::save_recovery_state(directory.path(), &original_kdf, &original)?;
+    // Updating encrypted entries must not promote a stale/tampered loose KDF
+    // into the authoritative container, even if its identifier still matches.
+    let tampered = RecoveryKdfToml::new_v1(
+        original_kdf.kdf_profile_id.clone(),
+        &[9; locket_crypto::RECOVERY_SALT_LEN],
+        1,
+    );
+    save_recovery_kdf_toml(directory.path(), &tampered)?;
+    save_recovery_envelope(directory.path(), &original)?;
+    assert_eq!(
+        load_recovery_kdf_toml(directory.path())?.decode_salt()?,
+        original_kdf.decode_salt()?
+    );
+    let next_kdf =
+        RecoveryKdfToml::new_v1("lk_kdf_next".into(), &[4; locket_crypto::RECOVERY_SALT_LEN], 2);
+    save_recovery_kdf_toml(directory.path(), &next_kdf)?;
+    // A crash after staging a loose KDF cannot corrupt the committed pair.
+    assert_eq!(load_recovery_kdf_toml(directory.path())?.kdf_profile_id, "lk_kdf_old");
+    assert_eq!(load_recovery_envelope(directory.path())?.kdf_profile_id, "lk_kdf_old");
+    assert!(crate::save_recovery_state(directory.path(), &next_kdf, &original).is_err());
+    assert_eq!(load_recovery_kdf_toml(directory.path())?.kdf_profile_id, "lk_kdf_old");
+    let next = RecoveryEnvelope { kdf_profile_id: next_kdf.kdf_profile_id.clone(), ..original };
+    crate::save_recovery_state(directory.path(), &next_kdf, &next)?;
+    // Modern recovery needs no separate file and cannot silently fall back to it.
+    std::fs::remove_file(directory.path().join("kdf.toml"))?;
+    assert_eq!(load_recovery_kdf_toml(directory.path())?.kdf_profile_id, "lk_kdf_next");
+    assert_eq!(load_recovery_envelope(directory.path())?.kdf_profile_id, "lk_kdf_next");
+    std::fs::write(directory.path().join("envelope.bin"), b"LOCKET-RECOVERY-STATE-V1\0")?;
+    assert!(load_recovery_kdf_toml(directory.path()).is_err());
+    Ok(())
+}
+
+#[test]
+fn recovery_atomic_container_rejects_truncation_lengths_and_mismatched_metadata()
+-> Result<(), PlatformError> {
+    let directory = tempfile::tempdir()?;
+    let kdf =
+        RecoveryKdfToml::new_v1("lk_kdf_test".into(), &[3; locket_crypto::RECOVERY_SALT_LEN], 1);
+    let envelope = RecoveryEnvelope {
+        kdf_profile_id: kdf.kdf_profile_id.clone(),
+        created_at_unix_nanos: 1,
+        entries: vec![],
+    };
+    crate::save_recovery_state(directory.path(), &kdf, &envelope)?;
+    let encoded = std::fs::read(directory.path().join("envelope.bin"))?;
+    let magic = b"LOCKET-RECOVERY-STATE-V1\0";
+    for end in magic.len()..encoded.len() {
+        assert!(crate::decode_recovery_state(&encoded[..end]).is_err(), "truncation at {end}");
+    }
+    for size in [0, 16 * 1024 + 1, u32::MAX] {
+        let mut bad = encoded.clone();
+        bad[magic.len()..magic.len() + 4].copy_from_slice(&size.to_le_bytes());
+        assert!(crate::decode_recovery_state(&bad).is_err());
+    }
+    let mut mismatched = encoded.clone();
+    let at = mismatched
+        .windows(b"lk_kdf_test".len())
+        .position(|window| window == b"lk_kdf_test")
+        .ok_or_else(|| PlatformError::InvalidRecoveryEnvelope("missing test id".into()))?;
+    mismatched[at + b"lk_kdf_".len()] = b'X';
+    assert!(crate::decode_recovery_state(&mismatched).is_err());
+    assert!(crate::decode_recovery_state(&encoded)?.is_some());
+    assert!(crate::decode_recovery_state(&envelope.serialize()?)?.is_none());
+    Ok(())
+}

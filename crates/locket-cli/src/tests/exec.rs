@@ -2,6 +2,35 @@
 use super::*;
 
 #[test]
+fn exec_enforces_secret_acl_before_spawning() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--no-device", "--no-passkey", "--name", "app"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    crate::set_secret_value(
+        &context,
+        &test_secret_write_args("DATABASE_URL"),
+        "local-test",
+        "manual",
+        1000,
+    )?;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(directory.path().join("locket.toml"))?
+        .write_all(b"\n[secrets.DATABASE_URL]\nallow_commands=['dev']\n")?;
+    let result = run_with_context(
+        Cli::try_parse_from(["locket", "exec", "--secret", "DATABASE_URL", "--", "/usr/bin/true"])?,
+        &context,
+        &mut Vec::new(),
+    );
+    assert_error_contains(result, "secret ACL denied command exec");
+    Ok(())
+}
+
+#[test]
 fn exec_all_force_injects_active_profile_secrets_and_writes_audit()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempdir()?;

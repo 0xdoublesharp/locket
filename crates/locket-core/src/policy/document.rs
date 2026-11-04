@@ -54,6 +54,35 @@ pub struct PolicyDocument {
 }
 
 impl PolicyDocument {
+    /// Returns the requested policy with the deepest matching path scope applied.
+    #[must_use]
+    pub fn effective_command(&self, name: &str, root: &Path, cwd: &Path) -> Option<CommandPolicy> {
+        let mut policy = self.commands.get(name)?.clone();
+        if let Some(scope) = self.path_scope_for(root, cwd) {
+            scope.apply_to(&mut policy);
+        }
+        Some(policy)
+    }
+
+    /// Lists explicitly selected names denied by the shared command, argv and path ACL rules.
+    #[must_use]
+    pub fn denied_secrets<'a>(
+        &self,
+        command: &str,
+        argv: Option<&[String]>,
+        relative_cwd: &Path,
+        names: &'a [crate::SecretName],
+    ) -> Vec<&'a crate::SecretName> {
+        names
+            .iter()
+            .filter(|name| {
+                self.secret_access
+                    .get(name.as_str())
+                    .is_some_and(|acl| !acl.allows(command, argv, relative_cwd))
+            })
+            .collect()
+    }
+
     /// Parses command policies from a TOML document.
     ///
     /// The document must declare `schema_version = 1` at the root. Top-level keys

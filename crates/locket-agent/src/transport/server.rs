@@ -461,10 +461,7 @@ impl AgentSocketState {
     /// longest remaining TTL across live entries; the agent reports
     /// `Locked` whenever no live entry remains.
     pub async fn status_snapshot(&self, now_unix_nanos: i128) -> StatusPayload {
-        {
-            let mut cache = self.unlock_cache.lock().await;
-            cache.evict_expired(now_unix_nanos);
-        }
+        let _ = self.expire_unlocks(now_unix_nanos).await;
         let summary = collect_live_summary(&self.unlock_cache, now_unix_nanos).await;
         let grant_count = {
             let grants = self.grants.lock().await;
@@ -567,13 +564,54 @@ impl AgentSocketState {
         append_lock_audits(source, now_unix_nanos, outcome, &audit_material)?;
         Ok(outcome)
     }
+
+    /// Evicts expired project keys and revokes grants before a subsequent unlock.
+    ///
+    /// # Errors
+    /// Returns an audit storage error after key and grant removal has completed.
+    pub async fn expire_unlocks(&self, now: i128) -> Result<usize, StoreError> {
+        let entries = self.unlock_cache.lock().await.drain_expired(now);
+        let count = entries.len();
+        let material = lock_audit_material(&entries);
+        let mut revoked = 0;
+        {
+            let mut grants = self.grants.lock().await;
+            for (project, _) in &entries {
+                revoked += grants.revoke_for_project(project);
+            }
+        }
+        drop(entries);
+        append_lock_audits(
+            SessionLockSource::IdleTimeout,
+            now,
+            SessionLockOutcome { cached_keys_cleared: count, live_grants_revoked: revoked },
+            &material,
+        )?;
+        Ok(count)
+    }
+
+    /// Runs daemon-owned key expiry independently of status subscribers.
+    #[must_use]
+    pub fn spawn_unlock_expiry(&self) -> tokio::task::JoinHandle<()> {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let mut timer = tokio::time::interval(std::time::Duration::from_millis(100));
+            loop {
+                tokio::select! { () = state.shutdown.notified() => break, _ = timer.tick() => {} }
+                let now = current_unix_nanos();
+                if state.expire_unlocks(now).await.is_ok_and(|count| count > 0) {
+                    state.publish_status_snapshot(now).await;
+                }
+            }
+        })
+    }
 }
 
 struct LockAuditMaterial {
     project_id: String,
     profile_id: Option<String>,
     store_path: PathBuf,
-    audit_key: zeroize::Zeroizing<Vec<u8>>,
+    master_key: zeroize::Zeroizing<Vec<u8>>,
 }
 
 fn lock_audit_material(
@@ -587,7 +625,7 @@ fn lock_audit_material(
                 project_id: project_id.clone(),
                 profile_id: context.profile_id.clone(),
                 store_path: context.store_path.clone(),
-                audit_key: zeroize::Zeroizing::new(entry.key_bytes().to_vec()),
+                master_key: zeroize::Zeroizing::new(entry.key_bytes().to_vec()),
             })
         })
         .collect()
@@ -602,12 +640,21 @@ fn append_lock_audits(
     let timestamp = i64::try_from(now_unix_nanos).unwrap_or(i64::MAX);
     for material in audit_material {
         let mut store = Store::open(&material.store_path)?;
+        let key_error = || StoreError::AuditIntegrity {
+            sequence: 0,
+            reason: "project audit key unavailable during lock".into(),
+        };
+        let master_key = zeroize::Zeroizing::new(
+            master_key_bytes_to_array(&material.master_key).ok_or_else(key_error)?,
+        );
+        let audit_key = unwrap_project_audit_key(&store, &material.project_id, &master_key)
+            .map_err(|_| key_error())?;
         append_lock_audit(
             &mut store,
             &SessionLockAudit {
                 project_id: &material.project_id,
                 profile_id: material.profile_id.as_deref(),
-                audit_key: &material.audit_key,
+                audit_key: audit_key.as_ref(),
                 source,
                 outcome,
                 timestamp,
@@ -812,6 +859,8 @@ struct UnlockPayload {
     project_id: String,
     #[serde(default)]
     passphrase: Option<String>,
+    #[serde(default)]
+    reuse_cached: bool,
     ttl_seconds: u64,
     /// Hint from the client for forward-compatibility. The agent
     /// derives the actual cached method from the path it took during
@@ -1023,10 +1072,25 @@ const AGENT_UNLOCK_COMMAND: &str = "unlock";
 /// unwrapped master key so subsequent RPCs can reuse it.
 async fn handle_unlock(envelope: &RequestEnvelope, state: &AgentSocketState) -> ResponseEnvelope {
     let now = current_unix_nanos();
+    if state.expire_unlocks(now).await.is_err() {
+        return error_response(envelope, "CorruptDb", "failed to audit expired unlock");
+    }
     let payload: UnlockPayload = match serde_json::from_value(envelope.payload.clone()) {
         Ok(payload) => payload,
         Err(_) => return error_response(envelope, "ProtocolError", "invalid Unlock payload"),
     };
+
+    // Execution reuses an existing authorization without re-prompting or extending
+    // its lifetime. An explicit unlock still authenticates through the key store.
+    if payload.reuse_cached
+        && payload.passphrase.is_none()
+        && state.unlock_cache.lock().await.lookup(&payload.project_id, now).is_some()
+    {
+        return ResponseEnvelope::Success(SuccessEnvelope::new(
+            envelope.id.clone(),
+            serde_json::Value::Null,
+        ));
+    }
 
     let (master_key_bytes, resolved_method) = match resolve_master_key(
         envelope,

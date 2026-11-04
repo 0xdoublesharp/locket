@@ -189,6 +189,7 @@ pub async fn handle_resolve(
         Path::new(store_path),
         &master_key,
         now_unix_nanos,
+        typed.binding.as_ref(),
     ) {
         Ok(response) => {
             let payload = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
@@ -231,6 +232,7 @@ impl ResolveFailure {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_reference(
     reference: &str,
     project_id: &str,
@@ -239,6 +241,7 @@ fn resolve_reference(
     store_path: &Path,
     master_key: &[u8],
     now_unix_nanos: i128,
+    binding: Option<&GrantBinding>,
 ) -> Result<ResolveResponse, ResolveFailure> {
     let parsed = LkReferenceUri::parse(reference).map_err(|_| {
         ResolveFailure::new(
@@ -257,6 +260,7 @@ fn resolve_reference(
         &parsed,
         &master_key,
         now_unix_nanos,
+        binding,
     ) {
         Ok(resolved) => {
             append_resolve_reference_audit(
@@ -287,6 +291,7 @@ fn resolve_reference(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_reference_inner(
     store: &Store,
     project_id: &str,
@@ -295,8 +300,16 @@ fn resolve_reference_inner(
     parsed: &LkReferenceUri,
     master_key: &locket_crypto::KeyBytes,
     now_unix_nanos: i128,
+    binding: Option<&GrantBinding>,
 ) -> Result<ResolvedReference, ResolveFailure> {
-    authorize_policy_reference(store, project_id, policy_name, parsed.key().as_str())?;
+    authorize_policy_reference_context(
+        store,
+        project_id,
+        policy_name,
+        parsed.key().as_str(),
+        binding,
+        Some(parsed.profile().as_str()),
+    )?;
     let profile = store
         .get_profile_by_name(project_id, parsed.profile().as_str())
         .map_err(|_| corrupt_db())?
@@ -432,12 +445,28 @@ fn append_resolve_reference_audit(
     Ok(())
 }
 
+#[cfg(test)]
 fn authorize_policy_reference(
     store: &Store,
     project_id: &str,
     policy_name: &str,
     secret_name: &str,
 ) -> Result<(), ResolveFailure> {
+    authorize_policy_reference_context(store, project_id, policy_name, secret_name, None, None)
+}
+
+fn authorize_policy_reference_context(
+    store: &Store,
+    project_id: &str,
+    policy_name: &str,
+    secret_name: &str,
+    binding: Option<&GrantBinding>,
+    profile_name: Option<&str>,
+) -> Result<(), ResolveFailure> {
+    let execution = binding.and_then(|binding| binding.execution.as_ref());
+    if execution.is_some_and(|scope| scope.policy_name != policy_name) {
+        return Err(reference_access_denied());
+    }
     let Some(policy) =
         store.get_command_policy_index(project_id, policy_name).map_err(|_| corrupt_db())?
     else {
@@ -483,25 +512,76 @@ fn authorize_policy_reference(
                 LocketError::AccessDenied,
             ));
         }
+        let document = current.ok_or_else(reference_access_denied)?;
+        let parsed = locket_core::PolicyDocument::from_toml_str(
+            &toml::to_string(&document).map_err(|_| reference_access_denied())?,
+        )
+        .map_err(|_| reference_access_denied())?;
+        let root = Path::new(path)
+            .parent()
+            .ok_or_else(reference_access_denied)?
+            .canonicalize()
+            .map_err(|_| reference_access_denied())?;
+        let cwd = match execution {
+            Some(scope) => scope.cwd.canonicalize().map_err(|_| reference_access_denied())?,
+            None => root.clone(),
+        };
+        let relative = cwd.strip_prefix(&root).map_err(|_| reference_access_denied())?;
+        let relative = if relative.as_os_str().is_empty() { Path::new(".") } else { relative };
+        if let Some(expected) =
+            parsed.path_scope_for(&root, &cwd).and_then(|scope| scope.profile.as_ref())
+            && profile_name.is_some_and(|name| name != expected.as_str())
+        {
+            return Err(reference_access_denied());
+        }
+        let effective = parsed
+            .effective_command(policy_name, &root, &cwd)
+            .ok_or_else(reference_access_denied)?;
+        let argv = match &effective.command {
+            locket_core::CommandSpec::Argv(argv) => Some(argv.as_slice()),
+            locket_core::CommandSpec::Shell(_) => None,
+        };
+        if !parsed
+            .denied_secrets(policy_name, argv, relative, &effective.allowed_secrets)
+            .is_empty()
+            || !effective.allowed_secrets.iter().any(|name| name.as_str() == secret_name)
+        {
+            return Err(reference_access_denied());
+        }
+        return Ok(());
     }
+    authorize_legacy_policy_reference(&policy.normalized_json, secret_name)
+}
+
+fn authorize_legacy_policy_reference(
+    normalized: &Value,
+    secret_name: &str,
+) -> Result<(), ResolveFailure> {
     let Some(allowed_secrets) =
-        policy.normalized_json.get("allowed_secrets").and_then(serde_json::Value::as_array)
+        normalized.get("allowed_secrets").and_then(serde_json::Value::as_array)
     else {
         return Err(corrupt_db());
     };
-    let authorized = allowed_secrets
+    allowed_secrets
         .iter()
         .filter_map(serde_json::Value::as_str)
-        .any(|allowed| allowed == secret_name);
-    if authorized {
-        Ok(())
-    } else {
-        Err(ResolveFailure::new(
-            ERROR_ACCESS_DENIED,
-            "command policy does not authorize the reference",
-            LocketError::AccessDenied,
-        ))
-    }
+        .any(|allowed| allowed == secret_name)
+        .then_some(())
+        .ok_or_else(|| {
+            ResolveFailure::new(
+                ERROR_ACCESS_DENIED,
+                "command policy does not authorize the reference",
+                LocketError::AccessDenied,
+            )
+        })
+}
+
+const fn reference_access_denied() -> ResolveFailure {
+    ResolveFailure::new(
+        ERROR_ACCESS_DENIED,
+        "command or directory policy does not authorize the reference",
+        LocketError::AccessDenied,
+    )
 }
 
 fn select_secret(
@@ -817,6 +897,118 @@ mod tests {
             profile_fingerprint_key,
             expected_value,
         })
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_reference_enforces_command_acl() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = build_fixture()?;
+        for acl in [
+            "allow_commands=['another-command']",
+            "allow_argv=[['pnpm','other']]",
+            "allow_paths=['apps/api/**']",
+        ] {
+            let source = format!(
+                "schema_version=1\nproject_id='{PROJECT_ID}'\n[commands.{POLICY_NAME}]\nargv=['pnpm','deploy']\nrequired_secrets=['{SECRET_NAME}']\n[secrets.{SECRET_NAME}]\n{acl}\n"
+            );
+            install_source_policy(&fixture, &source, &[SECRET_NAME])?;
+            let state = unlocked_state(&fixture).await;
+            let response = handle_resolve(
+                &RequestEnvelope::new(
+                    "acl",
+                    AgentMethod::ResolveReference,
+                    serde_json::to_value(resolve_request(&fixture))?,
+                ),
+                &state,
+                1,
+            )
+            .await;
+            assert_eq!(error_code(response)?, "AccessDenied");
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_reference_honors_bound_path_scope() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = build_fixture()?;
+        let api = fixture.directory.path().join("apps/api");
+        std::fs::create_dir_all(&api)?;
+        let api = api.canonicalize()?;
+        let source = format!(
+            "schema_version=1\nproject_id='{PROJECT_ID}'\n[commands.{POLICY_NAME}]\nargv=['pnpm','deploy']\n[paths.'apps/api']\nrequired_secrets=['{SECRET_NAME}']\n[secrets.{SECRET_NAME}]\nallow_argv=[['pnpm','deploy']]\nallow_paths=['apps/api/**']\n"
+        );
+        install_source_policy(&fixture, &source, &[])?;
+        let state = unlocked_state(&fixture).await;
+        let binding = serde_json::from_value(
+            json!({"pid": std::process::id(), "process_start_time":"0", "execution":{"policy_name":POLICY_NAME,"cwd":api}}),
+        )?;
+        let mut grant = test_grant_record(i128::MAX);
+        grant.binding = binding;
+        state.grants.lock().await.insert(grant);
+        let mut request = serde_json::to_value(resolve_request(&fixture))?;
+        request["binding"]["execution"] = json!({"policy_name":POLICY_NAME,"cwd":api});
+        let response = handle_resolve(
+            &RequestEnvelope::new("path", AgentMethod::ResolveReference, request.clone()),
+            &state,
+            1,
+        )
+        .await;
+        assert_eq!(resolve_payload(response)?.value, fixture.expected_value);
+        request["binding"]["execution"]["cwd"] = json!(fixture.directory.path());
+        let response = handle_resolve(
+            &RequestEnvelope::new("changed-path", AgentMethod::ResolveReference, request),
+            &state,
+            1,
+        )
+        .await;
+        assert_eq!(error_code(response)?, "GrantRequired");
+        Ok(())
+    }
+
+    fn install_source_policy(
+        fixture: &ResolveFixture,
+        source: &str,
+        allowed: &[&str],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let path = fixture.directory.path().join("locket.toml");
+        std::fs::write(&path, source)?;
+        let document: toml::Value = toml::from_str(source)?;
+        let digest = locket_core::policy::policy_source_digest(&document, POLICY_NAME)?;
+        let mut store = Store::open(&fixture.store_path)?;
+        store.upsert_command_policy_index(
+            PROJECT_ID,
+            POLICY_NAME,
+            &serde_json::to_value(&document["commands"][POLICY_NAME])?,
+            &json!({"allowed_secrets":allowed,"source_path":path,"source_digest":digest}),
+            2,
+            None,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn expiry_lock_audit_uses_wrapped_project_audit_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = build_fixture()?;
+        let state = unlocked_state(&fixture).await;
+        let entry = UnlockEntry::new(
+            fixture.master_key.to_vec(),
+            0,
+            Duration::from_secs(1),
+            UnlockMethod::Passphrase,
+        )
+        .with_audit_context(crate::unlock_cache::UnlockAuditContext {
+            store_path: fixture.store_path.clone(),
+            profile_id: Some(PROFILE_ID.into()),
+        });
+        state.unlock_cache.lock().await.insert(PROJECT_ID.into(), entry);
+        state.expire_unlocks(2_000_000_000).await?;
+        let verification = Store::open(&fixture.store_path)?
+            .verify_audit_chain_read_only(PROJECT_ID, &[10; 32])?;
+        assert_eq!(verification.rows_verified, 1);
+        assert!(verification.hmac_ok, "expiry LOCK HMAC must verify with the project audit key");
+        assert!(state.unlock_cache.lock().await.is_empty());
+        assert!(state.grants.lock().await.is_empty());
+        Ok(())
     }
 
     #[test]

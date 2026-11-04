@@ -904,22 +904,14 @@ async fn agent_copy_secret(
     )
     .await?;
     let ttl_seconds = request.ttl_seconds.unwrap_or(response.ttl_seconds.max(1));
-    if let Err(error) = clipboard::write_clipboard(&response.value) {
-        return Err(AgentClientError::Protocol {
-            reason: format!("clipboard write failed: {error}"),
-        });
-    }
-    let value_for_timer = response.value;
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(u64::from(ttl_seconds))).await;
-        let current = clipboard::read_clipboard().ok();
-        if matches!(
-            clipboard::decide_clear(current.as_deref(), &value_for_timer),
-            clipboard::ClipboardCopyDecision::Clear,
-        ) {
-            let _ = clipboard::clear_clipboard();
-        }
-    });
+    clipboard::copy_with_ttl(
+        response.value,
+        std::time::Duration::from_secs(u64::from(ttl_seconds)),
+    )
+    .await
+    .map_err(|error| AgentClientError::Protocol {
+        reason: format!("clipboard write failed: {error}"),
+    })?;
     Ok(DesktopClipboardCopyResponse::Copied { ttl_seconds })
 }
 

@@ -119,7 +119,7 @@ fn team_pending_cli_initial_join_advances_trust_but_holds_dangerous_values()
             "--profile",
             "dev",
         ])?,
-        &owner_context,
+        &context_with_confirmation(&owner_context, "team share dev"),
         &mut output,
     )?;
     let shared = tempdir()?;
@@ -131,7 +131,7 @@ fn team_pending_cli_initial_join_advances_trust_but_holds_dangerous_values()
     )?;
     run_with_context(
         Cli::try_parse_from(["locket", "team", "publish"])?,
-        &owner_context,
+        &context_with_confirmation(&owner_context, "team share dev"),
         &mut output,
     )?;
     run_with_context(
@@ -199,5 +199,77 @@ fn team_pending_cli_initial_join_advances_trust_but_holds_dangerous_values()
     assert_eq!(secret_count()?, 0);
     assert_eq!(locket_agent::team_sync::status(&receiver_store, project)?.epoch, status.epoch);
     assert!(!String::from_utf8(output)?.contains("team-pending-synthetic-canary"));
+    Ok(())
+}
+
+#[test]
+fn signed_team_dangerous_sharing_requires_sender_confirmation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let owner = tempdir()?;
+    let context = test_context(&owner);
+    for argv in [
+        vec!["locket", "init", "--name", "app", "--no-passkey"],
+        vec!["locket", "team", "init", "Team"],
+    ] {
+        run_with_context(Cli::try_parse_from(argv)?, &context, &mut Vec::new())?;
+    }
+    let resolved = crate::require_project(&context)?;
+    let project = resolved.config.project_id.as_str();
+    let store = crate::open_store(&context)?;
+    store.connection().execute("UPDATE profiles SET dangerous=1 WHERE project_id=?1", [project])?;
+    let receiver = tempdir()?;
+    fs::copy(owner.path().join("locket.toml"), receiver.path().join("locket.toml"))?;
+    let receiver_context = test_context(&receiver);
+    run_with_context(
+        Cli::try_parse_from(["locket", "team", "join", "--request"])?,
+        &receiver_context,
+        &mut Vec::new(),
+    )?;
+    let recipient = crate::open_store(&receiver_context)?
+        .get_active_local_device(project)?
+        .ok_or("receiver device")?;
+    let descriptor = crate::commands::team::device::encode_device_descriptor(&recipient)?;
+    let add = || {
+        Cli::try_parse_from([
+            "locket",
+            "team",
+            "add",
+            "Receiver",
+            "--device",
+            &descriptor,
+            "--confirm-device-fingerprint",
+            &recipient.fingerprint,
+            "--profile",
+            "dev",
+        ])
+    };
+    assert!(
+        run_with_context(add()?, &context, &mut Vec::new()).is_err(),
+        "dangerous grant needs explicit scope acknowledgement"
+    );
+    let approved = context_with_confirmation(&context, "team share dev");
+    run_with_context(add()?, &approved, &mut Vec::new())?;
+    let shared = tempdir()?;
+    run_with_context(
+        Cli::try_parse_from(["locket", "team", "folder", shared.path().to_str().ok_or("folder")?])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    assert!(
+        run_with_context(
+            Cli::try_parse_from(["locket", "team", "publish"])?,
+            &context,
+            &mut Vec::new()
+        )
+        .is_err(),
+        "manual publication also needs explicit scope acknowledgement"
+    );
+    assert_eq!(fs::read_dir(shared.path())?.count(), 0);
+    run_with_context(
+        Cli::try_parse_from(["locket", "team", "publish"])?,
+        &approved,
+        &mut Vec::new(),
+    )?;
+    assert!(fs::read_dir(shared.path())?.count() > 0);
     Ok(())
 }

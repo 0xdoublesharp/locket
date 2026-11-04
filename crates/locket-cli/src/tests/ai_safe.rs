@@ -2,6 +2,76 @@
 use super::*;
 
 #[test]
+fn ai_safe_redacts_multiline_known_secrets_across_reads_and_streams() {
+    let value = "quiet apple\nquiet pear";
+    let redactions = vec![crate::KnownSecretRedaction {
+        value: zeroize::Zeroizing::new(value.to_owned()),
+        marker: "lk_redacted_TEST".to_owned(),
+        secret_name: Some("TEST".to_owned()),
+    }];
+    for stream in [crate::AiSafeStream::Stdout, crate::AiSafeStream::Stderr] {
+        for split in 0..=value.len() {
+            let mut redactor = crate::AiSafeStreamRedactor::new(&redactions);
+            let mut chunks = redactor
+                .push(crate::AiSafeRawChunk { stream, bytes: value.as_bytes()[..split].to_vec() });
+            chunks.extend(
+                redactor.push(crate::AiSafeRawChunk {
+                    stream,
+                    bytes: value.as_bytes()[split..].to_vec(),
+                }),
+            );
+            chunks.extend(redactor.finish());
+            let text = chunks.iter().map(|chunk| chunk.text.as_str()).collect::<String>();
+            assert!(!text.contains("quiet apple"));
+            assert!(!text.contains("quiet pear"));
+            assert!(text.contains("lk_redacted_TEST"));
+            assert!(chunks.iter().any(|chunk| chunk.redacted_secret_names.contains("TEST")));
+        }
+    }
+}
+
+#[test]
+fn ai_safe_multiline_transcript_never_contains_known_value_lines()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--name", "app", "--profile", "dev"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    fs::write(directory.path().join(".env"), "MULTILINE=\"quiet apple\nquiet pear\"\n")?;
+    run_with_context(
+        Cli::try_parse_from(["locket", "import", ".env"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    let mut output = Vec::new();
+    run_with_context(
+        Cli::try_parse_from([
+            "locket",
+            "ai-safe",
+            "--output",
+            "transcript.log",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf 'quiet apple\nquiet pear\n'; printf 'quiet apple\nquiet pear\n' >&2",
+        ])?,
+        &context,
+        &mut output,
+    )?;
+    for text in
+        [String::from_utf8(output)?, fs::read_to_string(directory.path().join("transcript.log"))?]
+    {
+        assert!(!text.contains("quiet apple"));
+        assert!(!text.contains("quiet pear"));
+        assert!(text.contains("lk_redacted_MULTILINE"));
+    }
+    Ok(())
+}
+
+#[test]
 fn ai_safe_redacts_child_output_and_transcript() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempdir()?;
     let context = test_context(&directory);

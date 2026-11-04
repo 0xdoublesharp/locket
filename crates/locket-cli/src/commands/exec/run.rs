@@ -1075,7 +1075,7 @@ fn prepare_agent_policy_access(
 ) -> Result<AgentPolicyAccess, CliError> {
     unlock_agent_for_policy(context, resolved, policy)?;
     crate::commands::policy::refresh_command_policy_for_run(context, resolved, &policy.name)?;
-    let binding = agent_grant_binding()?;
+    let binding = agent_grant_binding()?.with_execution(&policy.name, context.cwd.canonicalize()?);
     let needs_reference_grant = policy_command_has_lk_references(policy)
         || selections.iter().any(|s| s.selected.is_some())
         || policy_has_ide_source(policy);
@@ -1111,6 +1111,7 @@ fn unlock_agent_for_policy(
     let payload = serde_json::json!({
         "project_id": resolved.config.project_id.as_str(),
         "passphrase": serde_json::Value::Null,
+        "reuse_cached": true,
         "ttl_seconds": policy.ttl.as_secs(),
         "method": locket_agent::UnlockMethod::OsKeychain,
     });

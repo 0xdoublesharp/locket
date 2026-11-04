@@ -52,6 +52,8 @@ pub fn exec_command(
         args.secrets.clone()
     };
 
+    enforce_exec_access(context, &resolved_project, &secret_names, &args.command)?;
+
     if args.all && !args.force {
         confirm_exec_all_scope(context, output, &profile, &args.command, &secret_names)?;
     }
@@ -103,7 +105,7 @@ pub fn exec_command(
                 policy_name: None,
                 secret_names: &unique_names,
                 prepared: &prepared,
-                current_dir: None,
+                current_dir: Some(&context.cwd),
                 run_policy_grant: None,
             },
         )?
@@ -129,6 +131,36 @@ pub fn exec_command(
     }
     writeln!(output, "child exited with status {status}")?;
     Err(child_exit_error(status))
+}
+
+fn enforce_exec_access(
+    context: &RuntimeContext,
+    resolved: &ResolvedProject,
+    secret_names: &[String],
+    command: &[String],
+) -> Result<(), CliError> {
+    // Explicit selection does not bypass the project's restrictions. Evaluate
+    // every requested name before decrypting anything or starting the child.
+    let document = crate::read_policy_document(&resolved.root.join(crate::LOCKET_TOML))?;
+    let cwd = context.cwd.canonicalize()?;
+    let relative = cwd.strip_prefix(&resolved.root).map_err(|_| {
+        crate::runtime::error::invalid_policy_error("exec directory is outside the project")
+    })?;
+    let relative =
+        if relative.as_os_str().is_empty() { std::path::Path::new(".") } else { relative };
+    let names = secret_names
+        .iter()
+        .map(|name| locket_core::SecretName::new(name.clone()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| crate::runtime::error::invalid_policy_error("invalid selected secret name"))?;
+    let denied = document.denied_secrets("exec", Some(command), relative, &names);
+    if !denied.is_empty() {
+        return Err(crate::runtime::error::invalid_policy_error(format!(
+            "secret ACL denied command exec for: {}",
+            denied.into_iter().map(locket_core::SecretName::as_str).collect::<Vec<_>>().join(",")
+        )));
+    }
+    Ok(())
 }
 
 fn validate_exec_configuration(

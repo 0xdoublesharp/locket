@@ -77,6 +77,8 @@ Team invite trust ceremony:
 
 Team security rules:
 
+- Signed `team add` and manual `team publish` require typed `team share <profile names>` confirmation before granting or delivering dangerous profiles. Automatic publication separately requires the owner's explicit dangerous-profile folder consent. Recipient-side holds are not a substitute for sender consent: an encrypted package already grants cryptographic access to its recipient.
+
 - Invites are sealed to recipient device sealing public keys; invite files never contain plaintext secret values outside the age-encrypted payload. Profile secret and fingerprint keys are included as plaintext key material inside the age-sealed payload so the recipient can rewrap them into their local `keys` table; the recipient device private key is the cryptographic protection for that payload.
 - Invites are profile-scoped and role-scoped.
 - Default teammate role is `Developer`, limited to non-dangerous profiles unless explicitly granted.
@@ -123,12 +125,12 @@ Team local-development UX:
 
 ## Backup, Recovery & Multi-Machine Sync
 
-Backup and recovery are required for a tool that owns local secrets. Recovery is local-identity scoped, not project scoped: one OS user/device has one recovery envelope for the local identity master key, device private keys, and Locket-managed automation client keys. Projects may still export/import encrypted project data, but they do not each require a separate recovery code or separate copy of private key material.
+Backup and recovery are required for a tool that owns local secrets. Current recovery is project scoped: each project has its own local master key, device identity, recovery envelope and recovery code. Back up the encrypted `<project>/.locket/recovery/envelope.bin` for every project separately from its code. Legacy backups also require their matching `kdf.toml`. Project vault data must be backed up separately; the recovery envelope restores keys, not a lost database.
 
 Initialization:
 
-- `locket identity init` emits a recovery code once when creating the local identity.
-- `locket init` emits a recovery code only when it has to bootstrap a missing local identity; otherwise it reuses the existing local identity and creates only project/profile-scoped keys and records.
+- `locket init --recovery-code` emits a recovery code for the project. Plain `locket init` leaves recovery creation to a later `locket recovery rotate`.
+- Initialization includes the current device keys when a device is created, so the initial backup can restore both vault access and bundle decryption.
 - The recovery code is the only recovery secret. It derives the unwrap key for the local recovery envelope with Argon2id and stored salt/KDF parameters.
 - Locket must clearly tell the user that the recovery code is shown once and is required if the OS keychain entry is lost.
 - The display flow must require a typed acknowledgement that the user has recorded the code before continuing, warn that terminal scrollback may persist the code, and offer to clear the visible screen after acknowledgement. The recovery code is never written to a Locket-managed file, log, or audit row in plaintext form.
@@ -155,7 +157,7 @@ Recovery error mapping:
 | --- | --- |
 | Recovery code checksum or format is invalid | `BackupRecoveryFailed` |
 | Recovery code is well-formed but cannot decrypt the envelope | `BackupRecoveryFailed` |
-| `recovery/kdf.toml` is missing, unparsable, uses unsupported KDF parameters, or its `kdf_profile_id` mismatches `envelope.bin` | `BackupRecoveryFailed` |
+| embedded KDF metadata (or legacy `recovery/kdf.toml`) is missing, unparsable, unsupported, or mismatches the inner envelope | `BackupRecoveryFailed` |
 | `recovery/envelope.bin` has a schema version newer than this binary understands | `ConfigError` with upgrade-required guidance |
 | `recovery/envelope.bin` is missing, corrupt, truncated, or fails AAD/authentication checks | `BackupRecoveryFailed` |
 | Required `master_key`, `device_signing_private_key`, or `device_sealing_private_key` entry is missing after successful envelope parse | `LocalVaultUnrecoverable` |
@@ -172,8 +174,8 @@ Behavior:
 
 - Requires an unlocked vault plus fresh local user verification through the configured platform prompt, hardware-key presence, or passphrase fallback.
 - Generates a fresh recovery code with the same entropy and encoding rules as `locket init`.
-- Re-wraps the recovery envelope under a new Argon2id-derived key from the new code, writes a new salt/KDF block, and atomically replaces the on-disk envelope plus `recovery/kdf.toml`. After a successful commit, prior KDF parameters and the prior recovery envelope are gone; they are not retained as fallback.
-- Displays the new code under the same one-time-display rules as `locket init` (typed acknowledgement, scrollback warning, optional screen clear).
+- Re-wraps the recovery envelope under a new Argon2id-derived key from the new code. Displays the code and requires typed acknowledgment before replacing recovery state. Then writes KDF metadata and the encrypted envelope as one atomic container; the old envelope is not retained as a fallback. A legacy loose KDF file may remain, but cannot recover keys without its old envelope.
+- The one-time display uses typed acknowledgment and a scrollback warning, and clears the terminal only after acknowledgment. Rejected acknowledgment or audit-write failure leaves the previous backup intact. If an error occurs after the atomic replacement, the user already has the acknowledged new code; retain both codes until verifying the committed backup.
 - Writes a `RECOVERY_ROTATE` audit row. The prior code is invalidated immediately on commit; an in-progress recovery using the prior code will fail with `BackupRecoveryFailed`.
 - Refuses to run from a merely unlocked agent session without fresh user verification. If the current recovery code is available, the user may provide it as the verification factor; otherwise fresh platform/hardware-key/passphrase verification is required so a briefly unattended unlocked session cannot silently rotate the user out of recovery.
 - When the current recovery code is used as the verification factor, `locket recovery rotate` prompts for it through the same no-echo secure TTY input path as `locket recover`. The current code must not be accepted through argv, environment variables, shell history, or ordinary stdin in v1. Non-interactive recovery-code rotation is refused.

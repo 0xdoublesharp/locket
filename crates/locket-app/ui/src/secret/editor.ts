@@ -42,7 +42,7 @@ export interface FormValidation<T> {
   valid: boolean;
 }
 
-const SECRET_NAME_PATTERN = /^[A-Z][A-Z0-9_]*$/;
+const SECRET_NAME_PATTERN = /^[A-Z_][A-Z0-9_]*$/;
 const VALUE_MAX_LENGTH = 65_536;
 const DESCRIPTION_MAX_LENGTH = 512;
 const NUL_BYTE = '\0';
@@ -66,7 +66,8 @@ export function validateSetForm(state: SecretSetFormState): FormValidation<Secre
   if (name.length === 0) {
     errors.name = 'Secret name is required.';
   } else if (!SECRET_NAME_PATTERN.test(name)) {
-    errors.name = 'Name must match KEY_FORMAT (start with A-Z, then A-Z, 0-9, underscore).';
+    errors.name =
+      'Name must match KEY_FORMAT (start with A-Z or underscore, then A-Z, 0-9, underscore).';
   } else if (name.length > 128) {
     errors.name = 'Name is too long (max 128).';
   }

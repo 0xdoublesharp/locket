@@ -100,9 +100,7 @@ use locket_crypto::{
 };
 use locket_platform::RecoveryEnvelopeEntry;
 #[cfg(test)]
-use locket_platform::{
-    RecoveryEnvelope, RecoveryKdfToml, save_recovery_envelope, save_recovery_kdf_toml,
-};
+use locket_platform::{RecoveryEnvelope, RecoveryKdfToml, save_recovery_kdf_toml};
 #[cfg(test)]
 use locket_platform::{load_recovery_envelope, load_recovery_kdf_toml};
 use locket_scan::{FindingKind, redact_text, scan_text};
@@ -2858,15 +2856,9 @@ fn enforce_secret_access_policies(
         CommandSpec::Argv(argv) => Some(argv.as_slice()),
         CommandSpec::Shell(_) => None,
     };
-    let denied = policy
-        .allowed_secrets
-        .iter()
-        .filter(|name| {
-            document
-                .secret_access
-                .get(name.as_str())
-                .is_some_and(|access| !access.allows(&policy.name, argv, relative_cwd))
-        })
+    let denied = document
+        .denied_secrets(&policy.name, argv, relative_cwd, &policy.allowed_secrets)
+        .into_iter()
         .map(locket_core::SecretName::as_str)
         .collect::<Vec<_>>();
     if denied.is_empty() {
@@ -2880,27 +2872,7 @@ fn enforce_secret_access_policies(
 }
 
 fn apply_path_scope_to_policy(policy: &mut CommandPolicy, scope: &PathEnvSet) {
-    let mut required = policy.required_secrets.iter().cloned().collect::<BTreeSet<_>>();
-    let mut optional = policy.optional_secrets.iter().cloned().collect::<BTreeSet<_>>();
-    for name in &scope.required_secrets {
-        required.insert(name.clone());
-        optional.remove(name);
-    }
-    for name in &scope.optional_secrets {
-        if !required.contains(name) {
-            optional.insert(name.clone());
-        }
-    }
-    policy.required_secrets = required.into_iter().collect();
-    policy.optional_secrets = optional.into_iter().collect();
-    policy.allowed_secrets = policy
-        .required_secrets
-        .iter()
-        .chain(policy.optional_secrets.iter())
-        .cloned()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    scope.apply_to(policy);
 }
 
 pub(crate) fn read_policy_document(path: &Path) -> Result<PolicyDocument, CliError> {

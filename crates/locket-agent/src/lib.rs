@@ -48,8 +48,8 @@ pub use envelope::{ErrorEnvelope, RequestEnvelope, ResponseEnvelope, SuccessEnve
 pub use error::ProtocolError;
 pub use framing::{decode_request_frame, decode_response_frame, encode_frame};
 pub use grant::{
-    GrantAction, GrantBinding, GrantIdPayload, GrantRecord, GrantRecordFields, GrantTable,
-    GrantValidation, RequestGrantPayload,
+    ExecutionScope, GrantAction, GrantBinding, GrantIdPayload, GrantRecord, GrantRecordFields,
+    GrantTable, GrantValidation, RequestGrantPayload,
 };
 pub use ide_env_session::{
     DEFAULT_IDE_ENV_SESSION_TTL_SECONDS, IdeEnvSessionEntry, IdeEnvSessionRegistry,

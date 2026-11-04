@@ -3,8 +3,8 @@ use locket_core::LocketError;
 use locket_crypto::{KeyPurpose, derive_recovery_key_v1, open_recovery_entry_v1, wrap_dek_v1};
 use locket_platform::{
     LocalDevicePrivateKeyStorage, RecoveryEnvelope, RecoveryEnvelopeEntry, RecoveryKdfToml,
-    load_recovery_envelope, load_recovery_kdf_toml, save_recovery_envelope, save_recovery_kdf_toml,
-    secure_directory, write_user_only_file,
+    load_recovery_envelope, load_recovery_kdf_toml, save_recovery_state, secure_directory,
+    write_user_only_file,
 };
 use locket_store::AuditWrite;
 use serde_json::json;
@@ -108,18 +108,23 @@ pub fn recovery_rotate_command(
         created_at_unix_nanos: i128::from(timestamp),
         entries,
     };
-    save_recovery_kdf_toml(&recovery_dir, &new_kdf)
-        .map_err(|error| metadata_invalid_error(format!("save recovery kdf: {error}")))?;
-    save_recovery_envelope(&recovery_dir, &new_envelope)
-        .map_err(|error| metadata_invalid_error(format!("save recovery envelope: {error}")))?;
-    write_recovery_rotate_audit(
-        context,
-        &resolved,
-        &new_kdf.kdf_profile_id,
-        timestamp,
-        user_verification,
-    )?;
-    display_recovery_code(output, &code_bytes)
+    display_recovery_code(context, output, &resolved.config.name, &code_bytes)?;
+    let mut store = open_store(context)?;
+    store.with_atomic_write(|store| {
+        write_recovery_rotate_audit(
+            context,
+            store,
+            &resolved,
+            &new_kdf.kdf_profile_id,
+            timestamp,
+            user_verification,
+        )?;
+        save_recovery_state(&recovery_dir, &new_kdf, &new_envelope)
+            .map_err(|error| metadata_invalid_error(format!("save recovery envelope: {error}")))?;
+        Ok::<_, CliError>(())
+    })?;
+    writeln!(output, "recovery_code_rotate: success")?;
+    Ok(())
 }
 
 pub fn restore_from_recovery_code(
@@ -535,7 +540,7 @@ fn rewrap_recovery_entries(
     Ok(entries)
 }
 
-fn replace_device_recovery_entries(
+pub fn replace_device_recovery_entries(
     context: &RuntimeContext,
     resolved: &ResolvedProject,
     new_kdf: &RecoveryKdfToml,
@@ -585,14 +590,21 @@ pub fn recovery_dir(resolved: &ResolvedProject) -> PathBuf {
 }
 
 fn display_recovery_code(
+    context: &RuntimeContext,
     output: &mut impl Write,
+    project_name: &str,
     code_bytes: &[u8; locket_crypto::RECOVERY_CODE_BYTES],
 ) -> Result<(), CliError> {
     let code = formatted_recovery_code(code_bytes)?;
-    writeln!(output, "recovery_code_rotate: success")?;
     writeln!(output, "recovery_code (shown once, store securely):")?;
     writeln!(output, "{code}")?;
     writeln!(output, "warning: terminal scrollback may retain this code")?;
+    writeln!(output, "type project name '{project_name}' after recording the recovery code")?;
+    output.flush()?;
+    let confirmation = context.confirmation_reader.read_confirmation("recovery rotate code")?;
+    if confirmation.trim_end_matches(['\r', '\n']) != project_name {
+        return Err(crate::confirmation_failed_error("confirmation did not match project name"));
+    }
     if io::stdout().is_terminal() {
         let _ = io::stdout().write_all(b"\x1b[2J\x1b[H");
     }
@@ -602,14 +614,14 @@ fn display_recovery_code(
 
 fn write_recovery_rotate_audit(
     context: &RuntimeContext,
+    store: &mut locket_store::Store,
     resolved: &ResolvedProject,
     kdf_profile_id: &str,
     timestamp: i64,
     user_verification: UserVerificationAudit,
 ) -> Result<(), CliError> {
-    let mut store = open_store(context)?;
     let audit_key =
-        load_project_key(context, &store, resolved.config.project_id.as_str(), KeyPurpose::Audit)?;
+        load_project_key(context, store, resolved.config.project_id.as_str(), KeyPurpose::Audit)?;
     let device_id = store
         .get_active_local_device(resolved.config.project_id.as_str())?
         .map_or_else(|| "unknown".to_owned(), |d| d.id);

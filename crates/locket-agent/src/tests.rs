@@ -931,10 +931,11 @@ async fn lock_with_audit_context_appends_metadata_only_lock_row()
          VALUES ('lk_prof_test', 'lk_proj_test', 'default', 0, 1)",
         [],
     )?;
+    insert_snapshot_fixture_audit_key(&store, "lk_proj_test")?;
     drop(store);
 
     let state = AgentSocketState::locked("test-version");
-    state.seed_master_key("lk_proj_test", &[7; 32])?;
+    state.seed_master_key("lk_proj_test", &[42; 32])?;
     let unlock = RequestEnvelope::new(
         "req-1",
         AgentMethod::Unlock,
@@ -964,7 +965,7 @@ async fn lock_with_audit_context_appends_metadata_only_lock_row()
     let (action, profile_id, metadata): (String, String, String) = store.connection().query_row(
         "SELECT action, profile_id, metadata_json
          FROM audit_log
-         WHERE project_id = 'lk_proj_test'",
+         WHERE project_id = 'lk_proj_test' AND action = 'LOCK'",
         [],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
@@ -976,6 +977,7 @@ async fn lock_with_audit_context_appends_metadata_only_lock_row()
     assert_eq!(metadata["live_grants_revoked"], 1);
     assert_eq!(metadata["metadata_only"], true);
     assert!(metadata.get("secret_name").is_none());
+    assert!(store.verify_audit_chain_read_only("lk_proj_test", &[11; 32])?.hmac_ok);
     Ok(())
 }
 
@@ -1342,6 +1344,87 @@ async fn unlock_with_no_passphrase_and_empty_keychain_returns_unlock_required() 
         panic!("empty keychain + no passphrase must return UnlockRequired");
     };
     assert_eq!(error.error, "UnlockRequired");
+    assert!(state.unlock_cache.lock().await.is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn policy_unlock_reuses_live_passphrase_cache_without_extending_ttl() {
+    let state = crate::server::AgentSocketState::locked("test");
+    let now = crate::server::current_unix_nanos();
+    let entry = crate::UnlockEntry::new(
+        vec![7; 32],
+        now,
+        std::time::Duration::from_secs(30),
+        crate::UnlockMethod::Passphrase,
+    );
+    let expiry = entry.expires_at_unix_nanos();
+    state.unlock_cache.lock().await.insert("project".into(), entry);
+    let request = crate::RequestEnvelope::new(
+        "cached",
+        crate::AgentMethod::Unlock,
+        serde_json::json!({"project_id":"project","ttl_seconds":900,"method":"OsKeychain","passphrase":null,"reuse_cached":true}),
+    );
+    let response = crate::server::dispatch(&request, &state).await;
+    assert!(
+        matches!(response, crate::ResponseEnvelope::Success(_)),
+        "cached unlock failed: {response:?}"
+    );
+    let cache = state.unlock_cache.lock().await;
+    assert_eq!(
+        cache.lookup("project", now).map(crate::UnlockEntry::expires_at_unix_nanos),
+        Some(expiry)
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn expired_unlock_revokes_its_grants() {
+    let state = crate::server::AgentSocketState::locked("test");
+    state.unlock_cache.lock().await.insert(
+        "project".into(),
+        crate::UnlockEntry::new(
+            vec![7; 32],
+            0,
+            std::time::Duration::from_secs(1),
+            crate::UnlockMethod::Passphrase,
+        ),
+    );
+    state
+        .grants
+        .lock()
+        .await
+        .issue(
+            crate::RequestGrantPayload {
+                project_id: "project".into(),
+                profile_id: "profile".into(),
+                policy_name: None,
+                action: crate::GrantAction::ResolveReference,
+                ttl_seconds: 900,
+                binding: crate::GrantBinding::new(123, "start"),
+            },
+            0,
+            900_000_000_000,
+        )
+        .unwrap();
+    let status = state.status_snapshot(2_000_000_000).await;
+    assert_eq!(status.live_grant_count, 0);
+    assert!(state.unlock_cache.lock().await.is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn daemon_expiry_removes_keys_without_status_requests() {
+    let state = crate::server::AgentSocketState::locked("test");
+    state.unlock_cache.lock().await.insert(
+        "project".into(),
+        crate::UnlockEntry::new(
+            vec![7; 32],
+            crate::server::current_unix_nanos(),
+            std::time::Duration::from_millis(20),
+            crate::UnlockMethod::Passphrase,
+        ),
+    );
+    let worker = state.spawn_unlock_expiry();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    worker.abort();
     assert!(state.unlock_cache.lock().await.is_empty());
 }
 

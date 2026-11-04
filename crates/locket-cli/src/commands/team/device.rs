@@ -924,7 +924,7 @@ fn save_bootstrap_recovery_envelope_with_device(
             sealing_private_key,
         )?,
     };
-    save_recovery_envelope(&recovery_dir, &envelope)
+    locket_platform::save_recovery_state(&recovery_dir, &material.kdf, &envelope)
         .map_err(|error| metadata_invalid_error(format!("save recovery envelope: {error}")))?;
     Ok(())
 }
