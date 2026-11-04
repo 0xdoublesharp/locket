@@ -1004,4 +1004,25 @@ mod tests {
         let error = BundleContainer::deserialize(&bytes).unwrap_err();
         assert!(matches!(error, BundleContainerError::Truncated(_)));
     }
+
+    #[test]
+    fn age_0_11_payload_decrypts_with_existing_raw_x25519_key() {
+        // Generated with age 0.11.5 and bech32 0.11.1 for the synthetic key below.
+        // Keep fixed bytes so a new-to-new round trip cannot mask format drift.
+        let encoded = concat!(
+            "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBuMDk3QS81YW80QnVQekZTc0JLcHM4aW5lQTNFYVRF",
+            "RzZvSC9UTkhubmxJCjhseWVkRVdqeHlidmFjY2xBRzUxbThsRFRRQS9PQXFjQUJqK1FvYUp2VVEKLT4gWmgh",
+            "LyMwTUYtZ3JlYXNlCnBiSVNUOU8vTGtENURVVGpyUnJjZWI3Vm0wb0hudVBDeVJza0tVY2lCVWd1cTJUeUlx",
+            "RnBCUDd6ajUyTnFlb08KbVNRMlFJajVVNjB1ZkRrdWhMNHdsQjQwaU9rejRWTGJnQWsycThjMEI2VSs5bEVP",
+            "WUxZd1o1SQotLS0gQ2d2RGhyQ0o4ak5tQi8vNEJqU0VKMG0vNU50OWFMODAzdEFmZzFHaGR6cwopeA9eVfll",
+            "cTqlRCqEH3F1/Kr1aih+OfwewzWwC90O55uMuvhB/KrmUL3KJV6PXf4ekSyjigIMIRWX1b+q0NZ2wvV/zGVs",
+        );
+        let payload = data_encoding::BASE64.decode(encoded.as_bytes()).unwrap();
+        verify_age_payload_structure(&payload).unwrap();
+        assert_eq!(
+            decrypt_bundle_payload_with_x25519_secret(&payload, &[42; 32]).unwrap(),
+            br#"{"schema_version":1,"profile_count":1}"#
+        );
+        assert!(decrypt_bundle_payload_with_x25519_secret(&payload, &[43; 32]).is_err());
+    }
 }

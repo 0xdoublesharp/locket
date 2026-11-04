@@ -6,12 +6,7 @@ import type {
   SecretRowMeta,
 } from '../types/views';
 export type StartHereTarget =
-  | 'connect'
-  | 'start-agent'
-  | 'unlock'
-  | 'refresh'
-  | 'secret-editor'
-  | 'policies';
+  'connect' | 'start-agent' | 'unlock' | 'refresh' | 'secret-editor' | 'policies';
 export type StartHereTone = 'ok' | 'warn' | 'critical' | 'neutral';
 export interface StartHereAction {
   id: string;

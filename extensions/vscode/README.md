@@ -19,6 +19,9 @@ Agent connections use the same defaults as the CLI: macOS Application Support, L
 
 ## Build
 
+Use Node.js 24 or newer for development and packaging. The extension still
+supports VS Code 1.80 and compiles against that host's API declarations.
+
 ```sh
 cd extensions/vscode
 pnpm install

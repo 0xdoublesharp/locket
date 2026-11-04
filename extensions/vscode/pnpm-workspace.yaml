@@ -1,3 +1,7 @@
 allowBuilds:
   '@vscode/vsce-sign': false
   keytar: false
+
+overrides:
+  # GHSA-g3hv-75wg-m249: upstream lint tooling still requests vulnerable 10.x.
+  'minimatch@>=7.0.0 <11.0.1': 11.0.4

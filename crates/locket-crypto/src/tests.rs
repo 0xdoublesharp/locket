@@ -835,3 +835,72 @@ fn passkey_prf_unwrap_rejects_wrong_project_id() -> Result<(), CryptoError> {
     assert!(matches!(result, Err(CryptoError::DecryptionFailed)));
     Ok(())
 }
+
+#[test]
+fn passphrase_key_matches_argon2_0_5_fixture() -> Result<(), CryptoError> {
+    // Generated with argon2 0.5.3, Argon2id v0x13, using synthetic inputs.
+    // Reduced memory cost keeps this compatibility check inexpensive.
+    let params = PassphraseKdfParams { m_cost: 32, t_cost: 2, p_cost: 4, output_len: 32 };
+    let key = derive_passphrase_fallback_key_v1(
+        b"synthetic legacy passphrase",
+        b"locket-compat-v1-salt",
+        params,
+    )?;
+    assert_eq!(
+        *key,
+        [
+            147, 101, 133, 193, 187, 13, 164, 45, 195, 230, 163, 13, 1, 146, 233, 232, 250, 248,
+            38, 130, 86, 135, 72, 81, 67, 221, 36, 192, 107, 166, 91, 248,
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn recovery_key_matches_argon2_0_5_fixture() -> Result<(), CryptoError> {
+    // Generated with argon2 0.5.3, Argon2id v0x13, using synthetic inputs.
+    let params = super::RecoveryKdfParams { m_cost: 64, t_cost: 3, p_cost: 4, output_len: 32 };
+    let key = super::derive_recovery_key_v1(
+        &[19; RECOVERY_CODE_BYTES],
+        b"locket-compat-v1-salt",
+        params,
+    )?;
+    assert_eq!(
+        *key,
+        [
+            202, 195, 207, 24, 142, 227, 144, 7, 97, 239, 11, 38, 10, 186, 206, 128, 193, 151, 197,
+            42, 23, 39, 86, 111, 193, 20, 249, 35, 228, 254, 229, 142,
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn xchacha20_poly1305_reads_0_10_ciphertext_and_wrapped_key() -> Result<(), CryptoError> {
+    // Generated with chacha20poly1305 0.10.1. Fixed keys/nonces are test-only.
+    let key = [7; KEY_LEN];
+    let nonce = [11; NONCE_LEN];
+    let aad = b"locket-compat-v1-aad";
+    let ciphertext = [
+        51, 191, 129, 92, 99, 73, 211, 187, 244, 110, 179, 83, 39, 105, 33, 5, 251, 88, 24, 165,
+        141, 39, 41, 127, 62, 94, 237, 178, 44, 186, 201, 154, 206, 140, 252, 183, 94, 19, 233,
+    ];
+    let plaintext = b"synthetic legacy secret";
+    assert_eq!(super::aead::aead_decrypt(&key, &nonce, &ciphertext, aad)?, plaintext);
+    assert_eq!(super::aead::aead_encrypt(&key, &nonce, plaintext, aad)?, ciphertext);
+
+    let wrapped = super::WrappedKeyMaterial {
+        nonce,
+        ciphertext: vec![
+            83, 213, 252, 59, 24, 63, 180, 193, 132, 93, 204, 37, 83, 27, 81, 111, 200, 56, 110,
+            213, 236, 81, 78, 192, 67, 0, 21, 253, 151, 179, 35, 81, 153, 87, 150, 126, 123, 201,
+            202, 207, 97, 20, 182, 85, 184, 205, 200, 234,
+        ],
+    };
+    assert_eq!(*unwrap_key_material_v1(&key, &wrapped, aad)?, [19; KEY_LEN]);
+    assert!(matches!(
+        unwrap_key_material_v1(&key, &wrapped, b"different aad"),
+        Err(CryptoError::DecryptionFailed)
+    ));
+    Ok(())
+}

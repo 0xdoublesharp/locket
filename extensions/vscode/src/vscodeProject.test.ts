@@ -22,7 +22,7 @@ loader._load=function(request,parent,isMain):unknown {
   return original.call(this,request,parent,isMain);
 };
 let adapter:typeof import('./vscodeProject');
-test.before(async()=>{adapter=await import('./vscodeProject');});
+test.before(async()=>{adapter=await import('./vscodeProject.js');});
 test.after(()=>{loader._load=original;});
 test.beforeEach(()=>{trusted=true;editor=undefined;terminal=undefined;picks=0;observed.length=0;});
 

@@ -12,11 +12,7 @@ import { invoke, isTauri } from '@tauri-apps/api/core';
 import type { AgentClientError, AgentStatus } from '../agent/types';
 
 export type TrayState =
-  | 'agent-unlocked'
-  | 'agent-locked'
-  | 'agent-stopped'
-  | 'scan-warning'
-  | 'error-degraded';
+  'agent-unlocked' | 'agent-locked' | 'agent-stopped' | 'scan-warning' | 'error-degraded';
 
 /**
  * Pure mapping from the current `AgentStatus` and `AgentClientError`

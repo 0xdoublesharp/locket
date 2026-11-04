@@ -602,7 +602,7 @@ fn recovery_rotate_carries_device_keys_and_recover_restores_device_envelope()
         false,
     )?;
 
-    assert_eq!(storage.load(&device.id)?.as_ref(), original_device_key.as_ref());
+    assert_eq!(storage.load(&device.id)?.as_slice(), original_device_key.as_slice());
     let signer = crate::commands::team::device::load_device_signing_key(&context, &store, &device)?;
     assert_eq!(signer.verifying_key().as_bytes().as_slice(), device.signing_public_key);
     let recover_output = String::from_utf8(recover_output)?;

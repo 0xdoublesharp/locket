@@ -357,7 +357,7 @@ function encodeResponse(response: object): Buffer {
 }
 
 function loadStatusBarModule(): Promise<typeof import('./statusBar')> {
-  return import('./statusBar');
+  return import('./statusBar.js');
 }
 
 function requiredAt<T>(values: ReadonlyArray<T>, index: number): T {

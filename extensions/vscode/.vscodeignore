@@ -7,7 +7,7 @@ out/**/*.test.js
 out/**/*.test.js.map
 *.vsix
 tsconfig.json
-.eslintrc.cjs
+eslint.config.cjs
 pnpm-lock.yaml
 
 # Installed-extension host tests are validation tools, not shipped code.

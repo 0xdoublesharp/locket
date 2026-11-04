@@ -40,7 +40,7 @@ const loader=Module as unknown as {_load:ModuleLoader};
 const originalLoad=loader._load;
 loader._load=function(request,parent,isMain):unknown {return request==='vscode'?vscodeStub:originalLoad.call(this,request,parent,isMain);};
 let register: (client:AgentClient,deps?:{resolveProject:()=>Promise<ProjectContext|undefined>})=>Disposable;
-test.before(async()=>{register=(await import('./commands')).registerLocketCommands as unknown as typeof register;});
+test.before(async()=>{register=(await import('./commands.js')).registerLocketCommands as unknown as typeof register;});
 test.after(()=>{loader._load=originalLoad;});
 test.beforeEach(()=>{registered.clear();inputs.length=0;prompts.length=0;errors.length=0;infos.length=0;terminals.length=0;trusted=true;pick='deploy';terminalShown=false;});
 function client(invoke:(method:AgentMethod,payload:unknown)=>Promise<unknown>):AgentClient {return {invoke,status:async()=>({project_id:'wrong-stale-project'})} as unknown as AgentClient;}

@@ -24,7 +24,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 arboard = { workspace = true }
-base64 = "0.22"
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 directories = { workspace = true }
 locket-agent = { path = "../../locket-agent" }
 locket-app = { path = ".." }

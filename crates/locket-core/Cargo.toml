@@ -14,8 +14,9 @@ version.workspace = true
 workspace = true
 
 [dependencies]
-age = "0.11.3"
-bech32 = "0.11.1"
+# age 0.12 pulls crypto-bigint <0.7.6 (RUSTSEC-2026-0387) through HPKE.
+age = "0.11.5"
+bech32 = "0.12"
 data-encoding = { workspace = true }
 ed25519-dalek = { workspace = true }
 getrandom = "0.4"

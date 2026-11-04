@@ -69,35 +69,35 @@ Required dependency direction:
 
 ```toml
 anyhow = "1"
-age = { version = "0.11", default-features = false }
-argon2 = "0.5"
+age = { version = "0.11.5", default-features = false }
+argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize"] }
 arboard = "3"
-chacha20poly1305 = "0.10"
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "zeroize"] }
 clap = { version = "4", features = ["derive", "env"] }
 data-encoding = "2"
 directories = "6"
 dotenvy = "0.15"
-ed25519-dalek = "2"
-hkdf = "0.12"
-hmac = "0.12"
+ed25519-dalek = "3"
+hkdf = "0.13"
+hmac = "0.13"
 ignore = "0.4"
 keyring = "3"
 libc = "0.2"
-rand = "0.9"
+rand = "0.10"
 regex = "1"
 rpassword = "7"
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.41", default-features = false, features = ["bundled", "cache"] }
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 tempfile = "3"
 thiserror = "2"
 time = { version = "0.3", features = ["serde", "formatting"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 toml = "1"
 tracing = "0.1"
-x25519-dalek = { version = "2", features = ["serde", "static_secrets"] }
+x25519-dalek = { version = "3", features = ["static_secrets"] }
 zeroize = "1"
 ```
 

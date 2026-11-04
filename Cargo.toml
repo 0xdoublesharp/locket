@@ -43,16 +43,16 @@ unwrap_used = "deny"
 
 [workspace.dependencies]
 anyhow = "1"
-argon2 = "0.5"
+argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize"] }
 arboard = "3"
-chacha20poly1305 = "0.10"
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "zeroize"] }
 clap = { version = "4", features = ["derive", "env"] }
 criterion = { version = "0.8", default-features = false, features = ["html_reports"] }
 clap_complete = "4.5.3"
 data-encoding = "2"
 directories = "6"
 dotenvy = "0.15"
-ed25519-dalek = "2"
+ed25519-dalek = "3"
 flate2 = "1"
 hkdf = "0.13"
 hmac = "0.13"
@@ -65,7 +65,7 @@ proptest = "1"
 rand = "0.10"
 regex = "1"
 rpassword = "7"
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.41", default-features = false, features = ["bundled", "cache"] }
 rustix = { version = "1", features = ["process"] }
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
@@ -81,5 +81,5 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync",
 toml = "1"
 toml_edit = "0.25"
 tracing = "0.1"
-x25519-dalek = "2"
+x25519-dalek = "3"
 zeroize = "1"

@@ -57,8 +57,7 @@ import type {
 } from './types';
 
 export type AgentStatusResult =
-  | { ok: true; status: AgentStatus }
-  | { ok: false; error: AgentClientError };
+  { ok: true; status: AgentStatus } | { ok: false; error: AgentClientError };
 
 export type AgentResult<T> = { ok: true; value: T } | { ok: false; error: AgentClientError };
 
@@ -396,8 +395,7 @@ export interface CopySecretRequest {
 }
 
 export type CopySecretResponse =
-  | { kind: 'copied'; ttl_seconds: number }
-  | { kind: 'unsupported'; unsupported_reason: string };
+  { kind: 'copied'; ttl_seconds: number } | { kind: 'unsupported'; unsupported_reason: string };
 
 export async function copySecret(
   request: CopySecretRequest,
