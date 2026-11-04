@@ -148,11 +148,13 @@ pub fn resolve_default_agent_data_dir(home: &std::path::Path) -> Option<PathBuf>
 #[allow(clippy::unnecessary_wraps)]
 fn resolve_agent_data_dir_for_platform(
     home: &std::path::Path,
-    _xdg_runtime_dir: Option<std::ffi::OsString>,
+    xdg_runtime_dir: Option<std::ffi::OsString>,
 ) -> Option<PathBuf> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = xdg_runtime_dir;
     #[cfg(target_os = "linux")]
     {
-        if let Some(value) = _xdg_runtime_dir {
+        if let Some(value) = xdg_runtime_dir {
             let path = PathBuf::from(value);
             if !path.as_os_str().is_empty() {
                 return Some(path.join("locket"));

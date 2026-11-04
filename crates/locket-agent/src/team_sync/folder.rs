@@ -168,7 +168,7 @@ pub fn read_package_file(path: &Path) -> Result<Vec<u8>> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        options.custom_flags(0x00200000);
+        options.custom_flags(0x0020_0000);
     }
     let file = options.open(path)?;
     if !file.metadata()?.is_file() {

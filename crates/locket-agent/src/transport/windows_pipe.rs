@@ -28,7 +28,7 @@ pub struct AgentPipeConfig {
 impl AgentPipeConfig {
     /// Convenience constructor for callers that already resolved the pipe name.
     #[must_use]
-    pub fn new(pipe_name: PathBuf) -> Self {
+    pub const fn new(pipe_name: PathBuf) -> Self {
         Self { pipe_name, security_descriptor_sddl: None }
     }
 
@@ -80,15 +80,16 @@ fn create_named_pipe_server(
     first_instance: bool,
 ) -> io::Result<NamedPipeServer> {
     let options = named_pipe_server_options(first_instance);
-    if let Some(sddl) = config.security_descriptor_sddl.as_deref() {
-        locket_platform::create_agent_pipe_server_with_sddl(
-            &options,
-            config.pipe_name.as_os_str(),
-            sddl,
-        )
-    } else {
-        options.create(config.pipe_name.as_os_str())
-    }
+    config.security_descriptor_sddl.as_deref().map_or_else(
+        || options.create(config.pipe_name.as_os_str()),
+        |sddl| {
+            locket_platform::create_agent_pipe_server_with_sddl(
+                &options,
+                config.pipe_name.as_os_str(),
+                sddl,
+            )
+        },
+    )
 }
 
 fn named_pipe_server_options(first_instance: bool) -> ServerOptions {
@@ -133,9 +134,8 @@ pub async fn handle_named_pipe_connection(
 
     let mut buffer = Vec::with_capacity(4 * 1024);
     loop {
-        let request = match super::server::read_one_frame(&mut stream, &mut buffer).await? {
-            Some(request) => request,
-            None => return Ok(()),
+        let Some(request) = super::server::read_one_frame(&mut stream, &mut buffer).await? else {
+            return Ok(());
         };
         let response = crate::server::dispatch(&request, &state).await;
         let frame = crate::framing::encode_frame(&response, crate::DEFAULT_MAX_MESSAGE_SIZE)

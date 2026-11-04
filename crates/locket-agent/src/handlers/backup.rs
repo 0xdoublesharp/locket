@@ -2132,7 +2132,8 @@ fn set_user_only_file_permissions(path: &Path) -> BackupResult<()> {
 }
 
 #[cfg(not(unix))]
-fn set_user_only_file_permissions(_path: &Path) -> BackupResult<()> {
+#[allow(clippy::unnecessary_wraps)] // Keep the shared fallible interface; Windows inherits ACLs.
+const fn set_user_only_file_permissions(_path: &Path) -> BackupResult<()> {
     Ok(())
 }
 
