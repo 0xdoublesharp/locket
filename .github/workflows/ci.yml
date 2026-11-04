@@ -15,6 +15,7 @@ on:
           - all
           - linux
           - windows
+          - windows-acl
 
 permissions:
   contents: read
@@ -26,13 +27,13 @@ env:
   RUST_BACKTRACE: "1"
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.ref }}-${{ inputs.platform == 'windows-acl' && 'acl' || 'checks' }}
   cancel-in-progress: true
 
 jobs:
   static:
     name: static checks
-    if: github.event_name != 'workflow_dispatch' || inputs.platform != 'windows'
+    if: github.event_name != 'workflow_dispatch' || (inputs.platform != 'windows' && inputs.platform != 'windows-acl')
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
@@ -112,7 +113,7 @@ jobs:
 
   desktop-ui:
     name: desktop UI checks
-    if: github.event_name != 'workflow_dispatch' || inputs.platform != 'windows'
+    if: github.event_name != 'workflow_dispatch' || (inputs.platform != 'windows' && inputs.platform != 'windows-acl')
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
@@ -148,6 +149,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
+        if: inputs.platform != 'windows-acl'
         run: rustup show
 
       - name: Prepare disposable test storage
@@ -157,7 +159,32 @@ jobs:
           New-Item -ItemType Directory -Path $locketTmp -Force | Out-Null
           "TMPDIR=$locketTmp" >> $env:GITHUB_ENV
 
+      - name: Report Windows temporary-directory ACLs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sidType = [System.Security.Principal.SecurityIdentifier]
+          $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          Write-Host "Current user SID: $user"
+          Write-Host "Native temp: $([System.IO.Path]::GetTempPath())"
+          Write-Host "TEMP: $env:TEMP; TMP: $env:TMP; TMPDIR: $env:TMPDIR"
+          $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+          foreach ($root in @([System.IO.Path]::GetTempPath(), $env:TMPDIR)) {
+            $path = [System.IO.DirectoryInfo]::new($root)
+            while ($null -ne $path) {
+              if ($seen.Add($path.FullName)) {
+                $acl = Get-Acl -LiteralPath $path.FullName
+                Write-Host "Directory: $($path.FullName); Owner: $($acl.GetOwner($sidType).Value); Protected: $($acl.AreAccessRulesProtected)"
+                foreach ($rule in $acl.GetAccessRules($true, $true, $sidType)) {
+                  Write-Host "  SID=$($rule.IdentityReference.Value); Type=$($rule.AccessControlType); Rights=$($rule.FileSystemRights); Inheritance=$($rule.InheritanceFlags); Propagation=$($rule.PropagationFlags); Inherited=$($rule.IsInherited)"
+                }
+              }
+              $path = $path.Parent
+            }
+          }
+
       - name: Cache cargo
+        if: inputs.platform != 'windows-acl'
         uses: actions/cache@v4
         with:
           path: |
@@ -170,6 +197,7 @@ jobs:
 
       - name: Lint Windows workspace
         id: windows_lint
+        if: inputs.platform != 'windows-acl'
         run: cargo clippy --workspace --all-targets --all-features --locked --keep-going -- -D warnings
 
       # These execute in a real Windows VM. Enrolled Windows Hello and physical
