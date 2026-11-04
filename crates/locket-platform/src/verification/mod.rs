@@ -1,3 +1,5 @@
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod external_fido2;
 #[cfg(target_os = "linux")]
 pub mod linux_local_authentication;
 #[cfg(target_os = "linux")]

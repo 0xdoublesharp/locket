@@ -22,8 +22,8 @@ Targets:
   auto                  Selects a target from uname.
 
 --require-fido2 verifies that a Linux FIDO2 token is visible to the host and
-prints the exact manual follow-up. The libfido2 ceremony is intentionally not
-marked complete until the production fallback is wired and touched on hardware.
+prints the terminal passkey acceptance commands. Inventory does not prove a
+successful PIN/touch or PRF ceremony.
 USAGE
 }
 
@@ -135,11 +135,20 @@ validate_linux_prereqs() {
   fi
   if [[ "${require_fido2}" == "1" ]]; then
     require_tool fido2-token
-    fido2-token -L
+    local devices
+    devices="$(fido2-token -L)"
+    if [[ -z "${devices}" ]]; then
+      echo "no FIDO2 key is visible; connect a supported key before this check" >&2
+      exit 65
+    fi
+    printf '%s\n' "${devices}"
     cat <<'EOF'
-manual follow-up [ ]: after the libfido2-sys fallback is wired, rerun this
-script on this host with --require-fido2 and touch the physical security key
-when Locket prompts for user presence.
+Manual follow-up in a disposable Locket project, from an interactive terminal:
+  locket passkey register --label validation-key
+  locket lock
+  locket passkey unlock validation-key
+Complete the PIN/touch prompts and the acceptance checks documented in
+docs/operations/os-host-validation.md. The local-auth harness below tests polkit.
 EOF
   fi
 }
@@ -173,7 +182,7 @@ esac
 if [[ "${dry_run}" == "1" ]]; then
   echo "dry-run: would run ${target} LocalUserVerifier harness via ${cargo_bin}"
   if [[ "${require_fido2}" == "1" ]]; then
-    echo "dry-run: would require fido2-token -L before the Linux FIDO2 manual touch"
+    echo "dry-run: would require a visible FIDO2 key and print manual passkey acceptance commands"
   fi
   exit 0
 fi

@@ -16,3 +16,6 @@ workspace = true
 [dependencies]
 locket-core = { version = "0.1.1", path = "../locket-core" }
 thiserror = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+locket-platform = { version = "0.1.1", path = "../locket-platform" }

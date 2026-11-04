@@ -63,6 +63,13 @@ carry session metadata and wait for bounded key-erasure acknowledgement.
 Windows token queries now allocate pointer-aligned storage before reading
 `TOKEN_USER`; session queries copy returned bytes into aligned local storage
 before interpreting `WTSINFOEXW`.
+Temporary env-file creation on Windows uses an isolated filesystem boundary in
+`locket-platform`. It creates a protected inheritable ACL for the current SID
+before writing, verifies the resulting descriptor, and rejects parent paths
+that another unprivileged account could replace. Descriptor/ACL pointers remain
+owned by Windows allocations through each synchronous call and are freed with
+the matching allocator. `locket-exec` reuses this boundary through a Windows-only
+dependency rather than adding unsafe code to its execution logic.
 Linux authentication uses a fixed polkit executable and policy rather than a
 new native FFI dependency; child environment and timeout are bounded.
 
@@ -70,6 +77,24 @@ CLI checkpoint files reuse tempfile and rustix's `fs` feature for atomic export
 and no-follow, nonblocking reads on Unix. Checkpoint authentication uses the
 existing HMAC implementation with a separate domain and constant-time tag
 verification. No encryption format or key derivation changes are introduced.
+
+## External FIDO2 tools
+
+The optional terminal passkey backend uses separately installed libfido2 tools
+(BSD-2-Clause), requiring version 1.17 or newer for forced-PIN registration.
+Version 1.17 also fixes the Windows library search issue and removes the tools
+from Windows SDK packaging; the terminal adapter remains macOS/Linux-only.
+See the upstream [release notes](https://developers.yubico.com/libfido2/Release_Notes.html)
+and [assertion tool contract](https://developers.yubico.com/libfido2/Manuals/fido2-assert.html).
+
+Locket verifies signatures using those tools, with fresh challenge/RP binding
+and the stored public key. Executables come from checked absolute installation
+paths with a cleared child environment. PIN input stays on the controlling
+terminal; PRF output stays in bounded, zeroizing memory. Only the public key PEM
+is written temporarily for signature verification. The existing rustix
+dependency enables `termios` to restore terminal settings when a helper is
+cancelled or times out. No new application unsafe code or Rust cryptographic
+dependency is required.
 
 ## JavaScript tooling
 

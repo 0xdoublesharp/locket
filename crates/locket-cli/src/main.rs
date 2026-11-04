@@ -2706,7 +2706,7 @@ fn set_user_only_file_options(options: &mut fs::OpenOptions) {
 }
 
 #[cfg(not(unix))]
-fn set_user_only_file_options(_options: &mut fs::OpenOptions) {}
+const fn set_user_only_file_options(_options: &mut fs::OpenOptions) {}
 
 #[cfg(unix)]
 fn set_user_only_file_permissions(path: &Path) -> Result<(), CliError> {
@@ -2715,7 +2715,8 @@ fn set_user_only_file_permissions(path: &Path) -> Result<(), CliError> {
 }
 
 #[cfg(not(unix))]
-fn set_user_only_file_permissions(_path: &Path) -> Result<(), CliError> {
+#[allow(clippy::unnecessary_wraps)] // Retain the shared fallible interface; Windows inherits ACLs.
+const fn set_user_only_file_permissions(_path: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
@@ -2726,7 +2727,8 @@ fn set_user_only_dir_permissions(path: &Path) -> Result<(), CliError> {
 }
 
 #[cfg(not(unix))]
-fn set_user_only_dir_permissions(_path: &Path) -> Result<(), CliError> {
+#[allow(clippy::unnecessary_wraps)] // Retain the shared fallible interface; Windows inherits ACLs.
+const fn set_user_only_dir_permissions(_path: &Path) -> Result<(), CliError> {
     Ok(())
 }
 

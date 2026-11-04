@@ -7,3 +7,6 @@ pub mod passphrase;
 pub mod recovery;
 
 pub mod policy_file;
+
+#[cfg(windows)]
+pub mod windows_directory;

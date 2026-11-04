@@ -196,7 +196,8 @@ fn make_executable(path: &Path) -> Result<(), CliError> {
 }
 
 #[cfg(not(unix))]
-fn make_executable(_path: &Path) -> Result<(), CliError> {
+#[allow(clippy::unnecessary_wraps)] // Executable mode bits apply only on Unix.
+const fn make_executable(_path: &Path) -> Result<(), CliError> {
     Ok(())
 }
 

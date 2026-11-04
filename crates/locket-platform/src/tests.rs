@@ -4,7 +4,7 @@ use super::{
     KeyringMasterKeyStore, LocalDevicePrivateKeyStorage, LocalUserVerificationMethod,
     LocalUserVerificationRequest, LocalUserVerifier, MasterKeyStore, MemoryDevicePrivateKeyStorage,
     MemoryLocalUserVerifier, MemoryMasterKeyStore, MemoryPlatformPasskeyRegistrar,
-    MockMasterKeyStore, MockMasterKeyStoreFailure, PasskeyRegistration,
+    MockMasterKeyStore, MockMasterKeyStoreFailure, PasskeyAssertionContext, PasskeyRegistration,
     PassphraseFallbackMasterKeyStore, PlatformError, PlatformPasskeyRegistrar, ProcessBinding,
     RecoveryEnvelope, RecoveryEnvelopeEntry, RecoveryKdfToml, UnavailableLocalUserVerifier,
     UnavailablePlatformPasskeyRegistrar, WrappedLocalFileDevicePrivateKeyStorage,
@@ -610,7 +610,14 @@ fn unavailable_passkey_registrar_reports_unsupported() {
         Err(PlatformError::PasskeyUnsupported)
     ));
     assert!(matches!(
-        registrar.evaluate_prf(&[1_u8; 4], &[2_u8; 32]),
+        registrar.evaluate_prf(
+            PasskeyAssertionContext {
+                credential_id: &[1_u8; 4],
+                relying_party_id: "rp",
+                public_key: &[],
+            },
+            &[2_u8; 32]
+        ),
         Err(PlatformError::PasskeyUnsupported)
     ));
 }
@@ -629,10 +636,18 @@ fn memory_passkey_registrar_round_trips_register_then_prf() -> Result<(), Platfo
     let registrar = MemoryPlatformPasskeyRegistrar::allowing(registration.clone(), [5_u8; 32]);
     let result = registrar.register_passkey("label", "rp")?;
     assert_eq!(result.credential_id, registration.credential_id);
-    let prf = registrar.evaluate_prf(&registration.credential_id, &[0xcc; 16])?;
+    let context = PasskeyAssertionContext {
+        credential_id: &registration.credential_id,
+        relying_party_id: "rp",
+        public_key: &registration.public_key,
+    };
+    let prf = registrar.evaluate_prf(context, &[0xcc; 16])?;
     assert_eq!(*prf, [5_u8; 32]);
     assert!(matches!(
-        registrar.evaluate_prf(&[0x99; 4], &[0xcc; 16]),
+        registrar.evaluate_prf(
+            PasskeyAssertionContext { credential_id: &[0x99; 4], ..context },
+            &[0xcc; 16]
+        ),
         Err(PlatformError::PasskeyNotFound)
     ));
     Ok(())

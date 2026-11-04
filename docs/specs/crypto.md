@@ -205,8 +205,8 @@ Default approval paths:
 
 - macOS: LocalAuthentication.framework.
 - Windows: Windows Hello user-consent APIs.
-- Linux: unavailable until a supported fresh-verification backend is integrated; Secret Service access alone is not accepted.
-- Hardware keys: unavailable until a genuine CTAP2/FIDO2 integration is provided.
+- Linux: fresh current-user polkit authentication with the packaged non-caching policy; Secret Service access alone is not accepted.
+- Hardware keys: optional PRF key wrapping through the terminal FIDO2 backend below. Ordinary approval gates continue to use the OS verifier.
 
 Protected use cases:
 
@@ -220,7 +220,9 @@ Rules:
 - Local user verification never replaces recovery codes.
 - Local user verification never bypasses project/profile policy, grants, team roles, or audit logging.
 - Production binaries ignore `LOCKET_TEST_LOCAL_AUTH`; test overrides are compiled only into unit tests.
-- New passkey registration is disabled in the default backend. It must not generate software keyring seeds and describe them as WebAuthn PRF credentials.
+- New external-key registration uses libfido2 1.17+ tools on macOS/Linux terminals, requiring a PIN, user presence, and hmac-secret support. Desktop/non-terminal and Windows ceremonies fail explicitly. It must not generate software keyring seeds and describe them as WebAuthn PRF credentials.
+- Credential attestation and assertion signatures must verify before accepting credential metadata or PRF output. Assertions bind a fresh challenge, the stored RP ID, and the stored public key, with both UP and UV required. Optional key wrapping uses the WebAuthn PRF salt transformation `SHA-256("WebAuthn PRF" || 0x00 || input)` before requesting CTAP hmac-secret output.
+- Registration completes the PRF ceremony before atomically storing the credential, master-key wrap, and successful audit row. Cancellation, verification failure, or a failed database write must not leave a partially enrolled credential.
 - Existing `platform-keyring` records remain readable through an explicitly labeled legacy recovery path after fresh local verification. Their seed derivation remains compatible; key material is zeroized after use. These credentials are not an independent hardware factor or an RP-bound WebAuthn ceremony.
 - Genuine biometric and authenticator private material must never be stored by Locket.
 - Browser-style WebAuthn/passkey ceremonies are not used for ordinary reveal/copy/unlock approvals. They may be used only for optional PRF/hmac-secret key-wrapping flows that require a WebAuthn-compatible authenticator.

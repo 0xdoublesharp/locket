@@ -289,9 +289,11 @@ Fresh user verification uses macOS LocalAuthentication, Windows Hello, or Linux 
 
 Use `locket agent start --require-session-monitoring` to require an available native session observer. Linux uses logind; Windows uses session and power notifications. Lock and suspend events clear cached keys and live grants. See [OS host validation](docs/operations/os-host-validation.md) for installation and native acceptance checks.
 
-New passkey registration is unavailable until a genuine WebAuthn/FIDO2 backend is integrated. Earlier `platform-keyring` credentials are software recovery factors stored in the OS keyring, not hardware passkeys. `locket passkey list` identifies them; `locket passkey unlock` preserves their recovery path and requires fresh local verification. Keep your recovery code available.
+External FIDO2 keys with PIN verification and hmac-secret support can wrap the project master key from an interactive macOS or Linux terminal. Install libfido2 1.17 or newer (`brew install libfido2` on macOS), connect one key, then run `locket passkey register --label security-key`. Use `locket passkey unlock security-key` for subsequent recovery. Desktop and Windows external-key ceremonies are not yet supported. See [hardware acceptance checks](docs/operations/os-host-validation.md#external-fido2-key) before relying on this recovery path.
 
-The macOS agent observes sleep and screen lock and clears cached keys and grants. `locket agent status` reports whether monitoring is active. When monitoring is unavailable, lock the vault explicitly before leaving the device; TTL expiry still applies.
+Earlier `platform-keyring` credentials are software recovery factors stored in the OS keyring. `locket passkey list` identifies them; their existing recovery path requires fresh local verification. Keep your recovery code available independently of either factor.
+
+`locket agent status` reports whether session monitoring is active. When monitoring is unavailable, lock the vault explicitly before leaving the device; TTL expiry still applies.
 
 ### Team And Sync
 

@@ -1,8 +1,7 @@
 //! Platform passkey/`WebAuthn` registration and PRF evaluation traits.
 //!
-//! Genuine WebAuthn/FIDO2 integration is currently unavailable. Existing
-//! software keyring credentials have a separate, explicit recovery path;
-//! they must never be represented as hardware-backed authenticators.
+//! External FIDO2 credentials use a terminal-only libfido2 backend where
+//! available. Software keyring credentials retain a separate recovery path.
 
 use std::sync::Mutex;
 
@@ -44,6 +43,17 @@ pub struct PasskeyRegistration {
     pub backup_state: Option<bool>,
 }
 
+/// Stored public bindings required to verify a fresh authenticator assertion.
+#[derive(Clone, Copy, Debug)]
+pub struct PasskeyAssertionContext<'a> {
+    /// Credential selected during registration.
+    pub credential_id: &'a [u8],
+    /// Relying party used during registration; never inferred from the device.
+    pub relying_party_id: &'a str,
+    /// Registered public key used to verify the returned signature.
+    pub public_key: &'a [u8],
+}
+
 /// Interface for registering and using platform passkeys.
 ///
 /// Implementations must never expose passkey/biometric private key material
@@ -72,7 +82,9 @@ pub trait PlatformPasskeyRegistrar {
         relying_party_id: &str,
     ) -> Result<PasskeyRegistration, PlatformError>;
 
-    /// Evaluates the `WebAuthn` PRF/hmac-secret extension for `credential_id`.
+    /// Evaluates the `WebAuthn` PRF/hmac-secret extension for a stored credential.
+    /// The backend must verify the fresh challenge, relying party, signature,
+    /// user presence, and user verification before returning the secret.
     ///
     /// The 32-byte PRF output is sensitive symmetric key material and must be
     /// zeroized on drop by the caller's wrapper. Implementations should not
@@ -87,7 +99,7 @@ pub trait PlatformPasskeyRegistrar {
     /// platform-level failure.
     fn evaluate_prf(
         &self,
-        credential_id: &[u8],
+        credential: PasskeyAssertionContext<'_>,
         salt: &[u8],
     ) -> Result<Zeroizing<[u8; 32]>, PlatformError>;
 
@@ -128,7 +140,7 @@ impl PlatformPasskeyRegistrar for UnavailablePlatformPasskeyRegistrar {
 
     fn evaluate_prf(
         &self,
-        _credential_id: &[u8],
+        _credential: PasskeyAssertionContext<'_>,
         _salt: &[u8],
     ) -> Result<Zeroizing<[u8; 32]>, PlatformError> {
         Err(PlatformError::PasskeyUnsupported)
@@ -159,7 +171,7 @@ impl PlatformPasskeyRegistrar for KeyringPlatformPasskeyRegistrar {
 
     fn evaluate_prf(
         &self,
-        _credential_id: &[u8],
+        _credential: PasskeyAssertionContext<'_>,
         _salt: &[u8],
     ) -> Result<Zeroizing<[u8; 32]>, PlatformError> {
         Err(PlatformError::PasskeyUnsupported)
@@ -273,7 +285,7 @@ impl PlatformPasskeyRegistrar for MemoryPlatformPasskeyRegistrar {
 
     fn evaluate_prf(
         &self,
-        credential_id: &[u8],
+        credential: PasskeyAssertionContext<'_>,
         _salt: &[u8],
     ) -> Result<Zeroizing<[u8; 32]>, PlatformError> {
         let known_credential_id = {
@@ -281,7 +293,9 @@ impl PlatformPasskeyRegistrar for MemoryPlatformPasskeyRegistrar {
             guard.clone()
         };
         match known_credential_id {
-            Some(known) if known.as_slice() == credential_id => Ok(Zeroizing::new(self.prf_output)),
+            Some(known) if known.as_slice() == credential.credential_id => {
+                Ok(Zeroizing::new(self.prf_output))
+            }
             Some(_) => Err(PlatformError::PasskeyNotFound),
             None => match self.outcome {
                 MemoryPlatformPasskeyOutcome::Unsupported => Err(PlatformError::PasskeyUnsupported),
@@ -295,14 +309,74 @@ impl PlatformPasskeyRegistrar for MemoryPlatformPasskeyRegistrar {
         credential_id: &[u8],
         salt: &[u8],
     ) -> Result<Zeroizing<[u8; 32]>, PlatformError> {
-        self.evaluate_prf(credential_id, salt)
+        self.evaluate_prf(
+            PasskeyAssertionContext { credential_id, relying_party_id: "legacy", public_key: &[] },
+            salt,
+        )
+    }
+}
+
+/// Default registrar: external FIDO2 ceremonies and explicit legacy recovery.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DefaultPlatformPasskeyRegistrar;
+
+impl PlatformPasskeyRegistrar for DefaultPlatformPasskeyRegistrar {
+    fn supports_registration(&self) -> bool {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            super::external_fido2::available()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            false
+        }
+    }
+
+    fn register_passkey(
+        &self,
+        label: &str,
+        relying_party_id: &str,
+    ) -> Result<PasskeyRegistration, PlatformError> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            super::external_fido2::register(label, relying_party_id)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = (label, relying_party_id);
+            Err(PlatformError::PasskeyUnsupported)
+        }
+    }
+
+    fn evaluate_prf(
+        &self,
+        credential: PasskeyAssertionContext<'_>,
+        salt: &[u8],
+    ) -> Result<Zeroizing<[u8; 32]>, PlatformError> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            super::external_fido2::evaluate(credential, salt)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = (credential, salt);
+            Err(PlatformError::PasskeyUnsupported)
+        }
+    }
+
+    fn recover_legacy_keyring_prf(
+        &self,
+        credential_id: &[u8],
+        salt: &[u8],
+    ) -> Result<Zeroizing<[u8; 32]>, PlatformError> {
+        KeyringPlatformPasskeyRegistrar.recover_legacy_keyring_prf(credential_id, salt)
     }
 }
 
 /// Returns the default passkey registrar for this build.
 #[must_use]
-pub const fn default_platform_passkey_registrar() -> KeyringPlatformPasskeyRegistrar {
-    KeyringPlatformPasskeyRegistrar
+pub const fn default_platform_passkey_registrar() -> DefaultPlatformPasskeyRegistrar {
+    DefaultPlatformPasskeyRegistrar
 }
 
 fn passkey_entry(credential_id: &[u8]) -> Result<Entry, PlatformError> {

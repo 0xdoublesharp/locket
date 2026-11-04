@@ -2,7 +2,8 @@
 #![allow(unused_crate_dependencies)]
 
 use locket_platform::{
-    PlatformError, PlatformPasskeyRegistrar, default_platform_passkey_registrar,
+    KeyringPlatformPasskeyRegistrar, PasskeyAssertionContext, PlatformError,
+    PlatformPasskeyRegistrar, default_platform_passkey_registrar,
 };
 
 #[test]
@@ -23,16 +24,56 @@ fn production_auth_ignores_test_environment() -> Result<(), Box<dyn std::error::
 
 #[test]
 fn production_does_not_offer_software_keyring_seeds_as_passkeys() {
-    let registrar = default_platform_passkey_registrar();
+    let registrar = KeyringPlatformPasskeyRegistrar;
     assert!(!registrar.supports_registration());
     assert!(matches!(
         registrar.register_passkey("test", "locket.localhost"),
         Err(PlatformError::PasskeyUnsupported)
     ));
     assert!(matches!(
-        registrar.evaluate_prf(&[1; 32], &[2; 32]),
+        registrar.evaluate_prf(
+            PasskeyAssertionContext {
+                credential_id: &[1; 32],
+                relying_party_id: "locket.localhost",
+                public_key: &[],
+            },
+            &[2; 32]
+        ),
         Err(PlatformError::PasskeyUnsupported)
     ));
+}
+
+#[test]
+fn production_passkey_nonterminal_fails_without_prompting() -> Result<(), Box<dyn std::error::Error>>
+{
+    const CHILD: &str = "LOCKET_PASSKEY_NONTERMINAL_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let registrar = default_platform_passkey_registrar();
+        assert!(!registrar.supports_registration());
+        assert!(matches!(
+            registrar.register_passkey("test", "locket.localhost"),
+            Err(PlatformError::PasskeyUnsupported)
+        ));
+        assert!(matches!(
+            registrar.evaluate_prf(
+                PasskeyAssertionContext {
+                    credential_id: &[1; 32],
+                    relying_party_id: "locket.localhost",
+                    public_key: &[],
+                },
+                &[2; 32]
+            ),
+            Err(PlatformError::PasskeyUnsupported)
+        ));
+        return Ok(());
+    }
+    let output = std::process::Command::new(std::env::current_exe()?)
+        .args(["--exact", "production_passkey_nonterminal_fails_without_prompting", "--nocapture"])
+        .env(CHILD, "1")
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]

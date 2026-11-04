@@ -169,9 +169,11 @@ jobs:
             cargo-windows-transport-${{ runner.os }}-
 
       - name: Lint Windows workspace
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        id: windows_lint
+        run: cargo clippy --workspace --all-targets --all-features --locked --keep-going -- -D warnings
 
       # These execute in a real Windows VM. Enrolled Windows Hello and physical
       # session lock/sleep ceremonies remain release-host acceptance checks.
       - name: Test Windows workspace
-        run: cargo test --workspace --all-targets --all-features --locked
+        if: ${{ !cancelled() && (steps.windows_lint.outcome == 'success' || steps.windows_lint.outcome == 'failure') }}
+        run: cargo test --workspace --all-targets --all-features --locked --no-fail-fast

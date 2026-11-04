@@ -42,16 +42,46 @@ scripts/validate-local-user-auth-real-host.sh --target windows-hello
 
 Run on an enrolled Windows user with an interactive desktop.
 
-Linux FIDO2 hardware-key follow-up:
+## External FIDO2 Key
+
+Use an interactive macOS or Linux terminal with libfido2 1.17 or newer and one
+USB FIDO2 key supporting PIN verification and hmac-secret. On macOS, install
+the tools with `brew install libfido2`. Linux needs the same tool version in a
+trusted system installation directory. Configure the key's PIN using its
+vendor's supported tool before enrollment. Enter the PIN only in the hidden
+terminal prompt, never in a command argument or environment variable.
+
+In a disposable Locket project with its recovery code retained separately:
+
+```sh
+locket passkey register --label validation-key
+locket passkey list
+locket lock
+locket passkey unlock validation-key
+```
+
+- Confirm registration requires local OS verification and the key's PIN/touch,
+  and reports a successful PRF wrap.
+- Lock and unlock twice with the same key; both must recover the same project.
+- Unplug the key and repeat unlock; it must fail without falling back to a
+  software keyring credential.
+- Cancel a new enrollment and confirm it leaves no credential or successful
+  registration audit row. Interrupt or time out a PIN prompt and verify terminal
+  echo is restored.
+- Verify ordinary recovery-code recovery remains usable independently.
+
+Desktop PIN entry and Windows external-key ceremonies are not implemented by
+this terminal backend. Do not run Locket elevated to obtain Windows HID access;
+that platform needs a native WebAuthn integration.
+
+The local-auth harness can additionally require that a key is visible on Linux:
 
 ```sh
 scripts/validate-local-user-auth-real-host.sh --target linux-polkit --require-fido2
 ```
 
-- [ ] Integrate a genuine FIDO2/WebAuthn backend for new passkey registration
-  and PRF evaluation. Existing software keyring recovery is a separate flow.
-- [ ] Rerun the command above on a Linux host with a physical security key and
-  record a successful touch.
+This option checks device inventory and prints the manual follow-up; it does not
+replace the registration/unlock ceremonies above or prove hardware user presence.
 
 ## Session Lock and Suspend
 

@@ -142,20 +142,20 @@ impl RuntimeContext {
 ///   the SID-scoped named pipe path resolved by `agent_socket_path`.
 #[must_use]
 pub fn resolve_default_agent_data_dir(home: &std::path::Path) -> Option<PathBuf> {
-    resolve_agent_data_dir_for_platform(home, std::env::var_os("XDG_RUNTIME_DIR"))
+    resolve_agent_data_dir_for_platform(home, std::env::var_os("XDG_RUNTIME_DIR").as_deref())
 }
 
 #[allow(clippy::unnecessary_wraps)]
 fn resolve_agent_data_dir_for_platform(
     home: &std::path::Path,
-    xdg_runtime_dir: Option<std::ffi::OsString>,
+    xdg_runtime_dir: Option<&std::ffi::OsStr>,
 ) -> Option<PathBuf> {
     #[cfg(not(target_os = "linux"))]
     let _ = xdg_runtime_dir;
     #[cfg(target_os = "linux")]
     {
         if let Some(value) = xdg_runtime_dir {
-            let path = PathBuf::from(value);
+            let path = std::path::Path::new(value);
             if !path.as_os_str().is_empty() {
                 return Some(path.join("locket"));
             }
@@ -229,7 +229,7 @@ mod tests {
         assert_eq!(
             resolve_agent_data_dir_for_platform(
                 Path::new("/home/alice"),
-                Some("/run/user/1000".into())
+                Some(std::ffi::OsStr::new("/run/user/1000"))
             ),
             Some(Path::new("/run/user/1000").join("locket"))
         );

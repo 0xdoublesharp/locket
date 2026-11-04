@@ -162,6 +162,7 @@ fn set_user_only_permissions(path: &PathBuf) -> Result<(), String> {
 }
 
 #[cfg(not(unix))]
-fn set_user_only_permissions(_path: &PathBuf) -> Result<(), String> {
+#[allow(clippy::unnecessary_wraps)] // Retain the shared fallible interface for this public fixture.
+const fn set_user_only_permissions(_path: &PathBuf) -> Result<(), String> {
     Ok(())
 }

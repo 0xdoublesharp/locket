@@ -48,8 +48,9 @@ pub use master_key::{
 };
 pub use memory_lock::{MemoryLockHardening, lock_process_memory, memory_lock_hardening_state};
 pub use passkey::{
-    KeyringPlatformPasskeyRegistrar, MemoryPlatformPasskeyOutcome, MemoryPlatformPasskeyRegistrar,
-    PasskeyRegistration, PlatformPasskeyRegistrar, UnavailablePlatformPasskeyRegistrar,
+    DefaultPlatformPasskeyRegistrar, KeyringPlatformPasskeyRegistrar, MemoryPlatformPasskeyOutcome,
+    MemoryPlatformPasskeyRegistrar, PasskeyAssertionContext, PasskeyRegistration,
+    PlatformPasskeyRegistrar, UnavailablePlatformPasskeyRegistrar,
     default_platform_passkey_registrar,
 };
 pub use passphrase::PassphraseFallbackMasterKeyStore;
@@ -70,6 +71,8 @@ pub use session::{
 pub use storage::policy_file::{
     PolicyFileDocument, PolicyFileError, SECRET_FILE_IGNORE_PATTERNS, ensure_secret_file_ignores,
 };
+#[cfg(windows)]
+pub use storage::windows_directory::create_user_only_windows_directory;
 pub use user_verification::{
     LocalUserVerification, LocalUserVerificationMethod, LocalUserVerificationRequest,
     LocalUserVerifier, MemoryLocalUserVerifier, UnavailableLocalUserVerifier,

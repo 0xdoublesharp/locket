@@ -6,7 +6,7 @@ use locket_crypto::{
     KeyPurpose, WrappedKeyMaterial, generate_key, unwrap_master_key_with_passkey_prf,
     wrap_master_key_with_passkey_prf,
 };
-use locket_platform::PlatformError;
+use locket_platform::{PasskeyAssertionContext, PlatformError};
 use locket_store::{AuditWrite, PasskeyCredentialRecord, PasskeyPrfWrapRecord, Store};
 use serde_json::json;
 use zeroize::Zeroizing;
@@ -117,21 +117,47 @@ pub(crate) fn passkey_register_command(
                 last_used_at: None,
                 revoked_at: None,
             };
-            store.insert_passkey_credential(&credential)?;
-            let prf_wrapped = if credential.prf_capable {
-                wrap_master_key_with_prf_if_possible(context, &store, &credential, timestamp)?
+            // Finish both authenticator ceremonies before recording enrollment.
+            // A failed PRF, wrap, or audit must not leave an unusable credential.
+            let prf_wrap = if credential.prf_capable {
+                Some(prepare_master_key_prf_wrap(context, &credential, timestamp).inspect_err(
+                    |_| {
+                        // The second PIN/touch ceremony is also an authentication
+                        // attempt. Record a safe denial without masking its error.
+                        let _audit = write_passkey_register_failure_audit(
+                            context,
+                            &mut store,
+                            &PasskeyRegisterFailureAudit {
+                                resolved: &resolved,
+                                label,
+                                relying_party_id,
+                                user_verification,
+                                error: &PlatformError::PasskeyAuthFailed,
+                                timestamp: now_unix_nanos().unwrap_or(timestamp),
+                            },
+                        );
+                    },
+                )?)
             } else {
-                false
+                None
             };
-            write_passkey_register_audit(
-                context,
-                &mut store,
-                &resolved,
-                &credential,
-                "success",
-                user_verification,
-                timestamp,
-            )?;
+            let audit_key = load_project_key(context, &store, project_id, KeyPurpose::Audit)?;
+            store.with_atomic_write::<_, CliError>(|store| {
+                store.insert_passkey_credential(&credential)?;
+                if let Some(wrap) = &prf_wrap {
+                    store.upsert_passkey_prf_wrap(wrap)?;
+                }
+                write_passkey_register_audit(
+                    audit_key.as_ref(),
+                    store,
+                    &resolved,
+                    &credential,
+                    "success",
+                    user_verification,
+                    timestamp,
+                )
+            })?;
+            let prf_wrapped = prf_wrap.is_some();
             writeln!(output, "passkey: registered")?;
             writeln!(output, "passkey_id: {}", credential.id)?;
             writeln!(output, "label: {}", credential.label)?;
@@ -186,12 +212,16 @@ struct PasskeyRegisterFailureAudit<'a> {
 fn map_platform_passkey_error(error: &PlatformError) -> CliError {
     match error {
         PlatformError::PasskeyUnsupported => unimplemented_in_build_error(
-            "WebAuthn/FIDO2 passkeys are unavailable in this build; use ordinary vault unlock \
-             with the OS keyring or passphrase. Existing legacy software keyring credentials \
-             can be recovered with `locket passkey unlock` on a platform with fresh user verification",
+            "external FIDO2 passkeys require a macOS or Linux terminal and trusted libfido2 1.17+ \
+             tools (fido2-token, fido2-cred, fido2-assert); install libfido2 and run Locket from \
+             a terminal. Desktop and Windows ceremonies are not supported. Existing legacy \
+             software keyring credentials remain recoverable with `locket passkey unlock`",
         ),
         PlatformError::PasskeyNotFound => invalid_reference_error("passkey credential not found"),
-        _ => user_verification_failed_error("passkey ceremony failed"),
+        _ => user_verification_failed_error(
+            "passkey ceremony failed; connect exactly one external FIDO2 security key with \
+             hmac-secret support and a configured PIN, then retry",
+        ),
     }
 }
 
@@ -201,33 +231,36 @@ fn generate_passkey_id() -> Result<String, CliError> {
 }
 
 /// Generates a fresh PRF salt and wraps the project master key under the
-/// resulting PRF output. Returns `Ok(true)` on success and `Ok(false)` when
-/// the platform did not honour the PRF evaluation.
-fn wrap_master_key_with_prf_if_possible(
+/// resulting verified PRF output before committing enrollment.
+fn prepare_master_key_prf_wrap(
     context: &RuntimeContext,
-    store: &Store,
     credential: &PasskeyCredentialRecord,
     timestamp: i64,
-) -> Result<bool, CliError> {
+) -> Result<PasskeyPrfWrapRecord, CliError> {
     let prf_salt: [u8; 32] = locket_crypto::generate_passphrase_salt()?;
-    let Ok(prf_output) =
-        context.passkey_registrar.evaluate_prf(&credential.credential_id, &prf_salt)
-    else {
-        return Ok(false);
-    };
+    let prf_output = context
+        .passkey_registrar
+        .evaluate_prf(assertion_context(credential), &prf_salt)
+        .map_err(|error| map_platform_passkey_error(&error))?;
     let (master_key, _) = load_master_key(context, &credential.project_id)?;
     let wrapped =
         wrap_master_key_with_passkey_prf(&master_key, &prf_output, &credential.project_id)?;
-    let record = PasskeyPrfWrapRecord {
+    Ok(PasskeyPrfWrapRecord {
         passkey_id: credential.id.clone(),
         project_id: credential.project_id.clone(),
         prf_salt: prf_salt.to_vec(),
         wrapped_master_key: wrapped.ciphertext,
         wrap_nonce: wrapped.nonce.to_vec(),
         created_at: timestamp,
-    };
-    store.upsert_passkey_prf_wrap(&record)?;
-    Ok(true)
+    })
+}
+
+fn assertion_context(credential: &PasskeyCredentialRecord) -> PasskeyAssertionContext<'_> {
+    PasskeyAssertionContext {
+        credential_id: &credential.credential_id,
+        relying_party_id: &credential.webauthn_relying_party_id,
+        public_key: &credential.public_key,
+    }
 }
 
 pub fn passkey_unlock_command(
@@ -317,7 +350,7 @@ fn recover_master_key_via_prf(
             .passkey_registrar
             .recover_legacy_keyring_prf(&credential.credential_id, &wrap.prf_salt)
     } else {
-        context.passkey_registrar.evaluate_prf(&credential.credential_id, &wrap.prf_salt)
+        context.passkey_registrar.evaluate_prf(assertion_context(credential), &wrap.prf_salt)
     };
     let prf_output = match result {
         Ok(output) => output,
@@ -474,7 +507,7 @@ fn render_optional_bool(value: Option<bool>) -> &'static str {
 }
 
 fn write_passkey_register_audit(
-    context: &RuntimeContext,
+    audit_key: &[u8],
     store: &mut Store,
     resolved: &ResolvedProject,
     credential: &PasskeyCredentialRecord,
@@ -482,8 +515,6 @@ fn write_passkey_register_audit(
     user_verification: UserVerificationAudit,
     timestamp: i64,
 ) -> Result<(), CliError> {
-    let audit_key =
-        load_project_key(context, store, resolved.config.project_id.as_str(), KeyPurpose::Audit)?;
     let metadata = json!({
         "schema_version": 1,
         "action": "PASSKEY_REGISTER",
@@ -511,7 +542,7 @@ fn write_passkey_register_audit(
         metadata_json: &metadata,
         timestamp,
     };
-    store.append_audit(audit_key.as_ref(), &audit)?;
+    store.append_audit(audit_key, &audit)?;
     Ok(())
 }
 

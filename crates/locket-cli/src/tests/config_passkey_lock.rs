@@ -508,7 +508,7 @@ fn passkey_unavailable_is_reported_before_requesting_user_verification()
         &context,
         &mut Vec::new(),
     );
-    assert_error_contains(result, "WebAuthn/FIDO2");
+    assert_error_contains(result, "libfido2 1.17+");
     Ok(())
 }
 
@@ -578,6 +578,101 @@ fn passkey_register_via_memory_registrar_writes_credential_and_audit()
         "passkey_id must be a `lk_passkey_*` identifier, got {:?}",
         metadata["passkey_id"],
     );
+    Ok(())
+}
+
+#[test]
+fn passkey_enrollment_failure_never_leaves_partial_credentials()
+-> Result<(), Box<dyn std::error::Error>> {
+    struct Registrar {
+        reject_prf: bool,
+    }
+    impl PlatformPasskeyRegistrar for Registrar {
+        fn supports_registration(&self) -> bool {
+            true
+        }
+        fn register_passkey(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<locket_platform::PasskeyRegistration, PlatformError> {
+            Ok(locket_platform::PasskeyRegistration {
+                credential_id: vec![3; 32],
+                public_key: vec![4; 65],
+                user_handle: vec![5; 32],
+                transports: vec!["usb".to_owned()],
+                prf_capable: true,
+                backup_eligible: None,
+                backup_state: None,
+            })
+        }
+        fn evaluate_prf(
+            &self,
+            _: locket_platform::PasskeyAssertionContext<'_>,
+            _: &[u8],
+        ) -> Result<zeroize::Zeroizing<[u8; 32]>, PlatformError> {
+            if self.reject_prf {
+                Err(PlatformError::PasskeyAuthFailed)
+            } else {
+                Ok(zeroize::Zeroizing::new([6; 32]))
+            }
+        }
+    }
+    for failure in ["prf", "wrap", "audit"] {
+        let directory = tempdir()?;
+        let context = test_context(&directory);
+        initialize_project_and_device(&context)?;
+        let context = super::context_with_passkey_registrar(
+            &context,
+            Arc::new(Registrar { reject_prf: failure == "prf" }),
+        );
+        let resolved = crate::resolve_project(&context.cwd)?.ok_or("missing project")?;
+        let store = locket_store::Store::open(directory.path().join("store.db"))?;
+        match failure {
+            "wrap" => store.connection().execute_batch(
+                "CREATE TRIGGER reject_wrap BEFORE INSERT ON passkey_prf_wraps BEGIN SELECT RAISE(ABORT,'fixture wrap failure'); END;",
+            )?,
+            "audit" => store.connection().execute_batch(
+                "CREATE TRIGGER reject_passkey_audit BEFORE INSERT ON audit_log WHEN NEW.action='PASSKEY_REGISTER' AND NEW.status='SUCCESS' BEGIN SELECT RAISE(ABORT,'fixture audit failure'); END;",
+            )?,
+            _ => {}
+        }
+        let mut output = Vec::new();
+        let result = run_with_context(
+            Cli::try_parse_from(["locket", "passkey", "register", "--label", "external-key"])?,
+            &context,
+            &mut output,
+        );
+        assert!(result.is_err(), "{failure} must fail enrollment");
+        assert_eq!(output, [] as [u8; 0]);
+        if failure == "prf" {
+            assert_eq!(
+                store.connection().query_row(
+                    "SELECT COUNT(*) FROM audit_log WHERE action='PASSKEY_REGISTER' AND status='DENIED'",
+                    [], |row| row.get::<_, i64>(0),
+                )?,
+                1,
+                "failed second authenticator ceremony must be audited",
+            );
+        }
+        assert_eq!(
+            store.list_passkey_credentials(resolved.config.project_id.as_str(), true)?,
+            vec![]
+        );
+        for table in
+            ["passkey_prf_wraps", "audit_log WHERE action='PASSKEY_REGISTER' AND status='SUCCESS'"]
+        {
+            assert_eq!(
+                store.connection().query_row(
+                    &format!("SELECT COUNT(*) FROM {table}"),
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )?,
+                0,
+                "{failure}: {table}"
+            );
+        }
+    }
     Ok(())
 }
 
