@@ -62,14 +62,20 @@ tokio = { workspace = true, features = ["net"] }
 windows = { version = "0.62", features = ["Security_Credentials_UI"] }
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
+  "Win32_Graphics_Gdi",
   "Win32_Security",
   "Win32_Security_Authorization",
   "Win32_System_Diagnostics_Debug",
   "Win32_System_Memory",
+  "Win32_System_LibraryLoader",
+  "Win32_System_RemoteDesktop",
   "Win32_System_Threading",
+  "Win32_UI_WindowsAndMessaging",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+zbus = { version = "6", default-features = false, features = ["tokio", "proxy"] }
 zbus-secret-service-keyring-store = { version = "1", features = ["rt-tokio-crypto-rust"] }
 
 [target.'cfg(target_os = "windows")'.dependencies.windows-native-keyring-store]

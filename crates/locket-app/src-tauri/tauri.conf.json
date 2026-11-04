@@ -50,10 +50,16 @@
     },
     "linux": {
       "deb": {
-        "depends": []
+        "depends": ["polkitd"],
+        "files": {
+          "/usr/share/polkit-1/actions/app.locket.policy": "../../locket-platform/resources/app.locket.policy"
+        }
       },
       "rpm": {
-        "depends": []
+        "depends": ["polkit"],
+        "files": {
+          "/usr/share/polkit-1/actions/app.locket.policy": "../../locket-platform/resources/app.locket.policy"
+        }
       }
     }
   }

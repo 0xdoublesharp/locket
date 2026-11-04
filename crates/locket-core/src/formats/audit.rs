@@ -1,12 +1,51 @@
 //! Audit canonicalization and HMAC byte construction.
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
-use crate::Timestamp;
+use crate::{ProjectId, Timestamp};
 
 /// Number of bytes in an audit HMAC digest.
 pub const AUDIT_HMAC_LEN: usize = 32;
+
+/// Maximum JSON size accepted for an externally retained audit checkpoint.
+pub const AUDIT_CHECKPOINT_MAX_BYTES: usize = 4096;
+
+/// Authenticated metadata anchoring one nonempty project audit history.
+///
+/// Retain the newest trusted checkpoint independently of the vault and its
+/// backups. Authentication detects alteration, not replacement by an older
+/// authentic checkpoint. The authentication tag uses the project audit key.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditCheckpoint {
+    /// Checkpoint format version, currently 1.
+    pub schema_version: u16,
+    /// Project to which the anchored audit chain belongs.
+    pub project_id: ProjectId,
+    /// Last verified sequence; zero is never a valid checkpoint.
+    pub sequence: u64,
+    /// HMAC of the anchored audit row.
+    pub row_hmac: [u8; AUDIT_HMAC_LEN],
+    /// Domain-separated HMAC authenticating the other checkpoint fields.
+    pub authentication_tag: [u8; AUDIT_HMAC_LEN],
+}
+
+/// Encodes the authenticated checkpoint fields independently of JSON formatting.
+///
+/// # Errors
+/// Returns [`AuditCanonicalizationError`] if the project identifier is too long.
+pub fn audit_checkpoint_v1_bytes(
+    checkpoint: &AuditCheckpoint,
+) -> Result<Vec<u8>, AuditCanonicalizationError> {
+    let mut encoded = b"locket-audit-checkpoint-v1".to_vec();
+    encoded.extend_from_slice(&checkpoint.schema_version.to_le_bytes());
+    encoded.extend_from_slice(&field("project_id", checkpoint.project_id.as_str())?);
+    encoded.extend_from_slice(&checkpoint.sequence.to_le_bytes());
+    encoded.extend_from_slice(&checkpoint.row_hmac);
+    Ok(encoded)
+}
 
 const DOMAIN_SEPARATOR: &[u8] = b"locket-audit-v1";
 
@@ -217,6 +256,33 @@ mod tests {
         canonical_json_bytes, field, insert_convenience_metadata,
     };
     use crate::Timestamp;
+
+    #[test]
+    fn audit_checkpoint_authentication_bytes_are_versioned_and_stable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let checkpoint = super::AuditCheckpoint {
+            schema_version: 1,
+            project_id: crate::ProjectId::new("lk_proj_test")?,
+            sequence: 7,
+            row_hmac: [42; super::AUDIT_HMAC_LEN],
+            authentication_tag: [11; super::AUDIT_HMAC_LEN],
+        };
+        let expected = [
+            b"locket-audit-checkpoint-v1".as_slice(),
+            &[1, 0],
+            &[10, 0],
+            b"project_id",
+            &[12, 0, 0, 0],
+            b"lk_proj_test",
+            &7_u64.to_le_bytes(),
+            &[42; super::AUDIT_HMAC_LEN],
+        ]
+        .concat();
+        assert_eq!(super::audit_checkpoint_v1_bytes(&checkpoint)?, expected);
+        let serialized = serde_json::to_vec(&checkpoint)?;
+        assert_eq!(serde_json::from_slice::<super::AuditCheckpoint>(&serialized)?, checkpoint);
+        Ok(())
+    }
 
     #[test]
     fn field_and_bytes_use_length_prefixed_encoding() {

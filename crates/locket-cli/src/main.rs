@@ -362,6 +362,9 @@ pub(crate) struct InternalAgentServeArgs {
     /// Filesystem path the agent should write its PID file to.
     #[arg(long)]
     pub(crate) pid_file: PathBuf,
+    /// Refuse to serve if native session monitoring cannot be initialized.
+    #[arg(long)]
+    pub(crate) require_session_monitoring: bool,
 }
 
 #[derive(Debug, Args)]
@@ -892,7 +895,7 @@ pub(crate) struct CopyArgs {
 #[derive(Clone, Debug, Subcommand)]
 enum AgentCommand {
     /// Start the local agent.
-    Start,
+    Start(AgentStartArgs),
     /// Print agent status.
     Status,
     /// Stop the local agent.
@@ -905,6 +908,13 @@ enum AgentCommand {
         #[command(subcommand)]
         command: AgentInviteCommand,
     },
+}
+
+#[derive(Clone, Debug, Args)]
+struct AgentStartArgs {
+    /// Refuse startup unless native lock/sleep monitoring is active.
+    #[arg(long)]
+    require_session_monitoring: bool,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -986,10 +996,20 @@ struct DebugBundleArgs {
     output: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand)]
 enum AuditCommand {
     /// Verify the local audit HMAC chain.
-    Verify,
+    Verify {
+        /// Require the chain to extend an independently retained checkpoint.
+        #[arg(long, value_name = "FILE")]
+        checkpoint: Option<PathBuf>,
+    },
+    /// Save an authenticated audit checkpoint for independent retention.
+    Checkpoint {
+        /// Create a new checkpoint file; existing files are never overwritten.
+        #[arg(long, value_name = "FILE")]
+        output: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]

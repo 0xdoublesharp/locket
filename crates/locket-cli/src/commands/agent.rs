@@ -29,7 +29,7 @@ pub fn agent_command(
     command: AgentCommand,
 ) -> Result<(), CliError> {
     match command {
-        AgentCommand::Start => agent_start_command(context, output),
+        AgentCommand::Start(args) => agent_start_command(context, output, &args),
         AgentCommand::Status => agent_status_command(context, output),
         AgentCommand::Stop => agent_stop_command(context, output),
         AgentCommand::Logs(args) => agent_logs_command(context, output, &args),
@@ -209,8 +209,17 @@ fn build_agent_invite_create_command(
     shell_words_command(parts)
 }
 
-fn agent_start_command(context: &RuntimeContext, output: &mut impl Write) -> Result<(), CliError> {
-    let report = ensure_agent_running_with_launcher(context, &ProcessAgentDaemonLauncher)?;
+fn agent_start_command(
+    context: &RuntimeContext,
+    output: &mut impl Write,
+    args: &crate::AgentStartArgs,
+) -> Result<(), CliError> {
+    let launcher =
+        ProcessAgentDaemonLauncher { require_session_monitoring: args.require_session_monitoring };
+    let report = ensure_agent_running_with_launcher(context, &launcher)?;
+    if args.require_session_monitoring {
+        require_active_session_monitoring(&report)?;
+    }
     if report.started {
         append_agent_log(context, "start", "running", "daemon started")?;
         writeln!(output, "agent: running")?;
@@ -229,7 +238,8 @@ fn agent_start_command(context: &RuntimeContext, output: &mut impl Write) -> Res
 
 #[cfg(not(test))]
 pub fn ensure_agent_running_for_execution(context: &RuntimeContext) -> Result<(), CliError> {
-    let report = ensure_agent_running_with_launcher(context, &ProcessAgentDaemonLauncher)?;
+    let report =
+        ensure_agent_running_with_launcher(context, &ProcessAgentDaemonLauncher::default())?;
     if report.started
         && !report.session_monitoring.as_deref().is_some_and(|status| status.starts_with("active:"))
     {
@@ -259,11 +269,14 @@ trait AgentDaemonLauncher {
     fn status_snapshot(&self, socket: &Path) -> Result<Value, io::Error>;
 }
 
-struct ProcessAgentDaemonLauncher;
+#[derive(Default)]
+struct ProcessAgentDaemonLauncher {
+    require_session_monitoring: bool,
+}
 
 impl AgentDaemonLauncher for ProcessAgentDaemonLauncher {
     fn spawn(&self, socket: &Path, pid_file: &Path) -> Result<(), CliError> {
-        spawn_agent_daemon(socket, pid_file)
+        spawn_agent_daemon(socket, pid_file, self.require_session_monitoring)
     }
 
     fn status_snapshot(&self, socket: &Path) -> Result<Value, io::Error> {
@@ -345,6 +358,17 @@ fn ensure_agent_running_with_launcher(
         pid,
         session_monitoring: session_monitoring_from_snapshot(&snapshot),
     })
+}
+
+fn require_active_session_monitoring(report: &AgentStartupReport) -> Result<(), CliError> {
+    if report.session_monitoring.as_deref().is_some_and(|value| value.starts_with("active:")) {
+        Ok(())
+    } else {
+        Err(typed_cli_error(
+            locket_core::LocketError::AgentUnavailable,
+            "native session monitoring is required; stop the existing agent and start it with --require-session-monitoring on a supported desktop session",
+        ))
+    }
 }
 
 fn session_monitoring_from_snapshot(snapshot: &Value) -> Option<String> {
@@ -497,7 +521,11 @@ fn agent_stop_command(context: &RuntimeContext, output: &mut impl Write) -> Resu
 
 /// Spawns the daemon child via `current_exe internal-agent-serve`.
 #[cfg(unix)]
-fn spawn_agent_daemon(socket: &Path, pid_file: &Path) -> Result<(), CliError> {
+fn spawn_agent_daemon(
+    socket: &Path,
+    pid_file: &Path,
+    require_session_monitoring: bool,
+) -> Result<(), CliError> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command as StdCommand, Stdio};
 
@@ -520,12 +548,19 @@ fn spawn_agent_daemon(socket: &Path, pid_file: &Path) -> Result<(), CliError> {
         // it is sufficient to detach the daemon from a controlling
         // terminal for both interactive and CI invocations.
         .process_group(0);
+    if require_session_monitoring {
+        command.arg("--require-session-monitoring");
+    }
     let _child = command.spawn()?;
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
-fn spawn_agent_daemon(socket: &Path, pid_file: &Path) -> Result<(), CliError> {
+fn spawn_agent_daemon(
+    socket: &Path,
+    pid_file: &Path,
+    require_session_monitoring: bool,
+) -> Result<(), CliError> {
     use std::process::{Command as StdCommand, Stdio};
 
     let exe = std::env::current_exe()?;
@@ -539,12 +574,19 @@ fn spawn_agent_daemon(socket: &Path, pid_file: &Path) -> Result<(), CliError> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if require_session_monitoring {
+        command.arg("--require-session-monitoring");
+    }
     let _child = command.spawn()?;
     Ok(())
 }
 
 #[cfg(not(any(unix, target_os = "windows")))]
-fn spawn_agent_daemon(_socket: &Path, _pid_file: &Path) -> Result<(), CliError> {
+fn spawn_agent_daemon(
+    _socket: &Path,
+    _pid_file: &Path,
+    _require_session_monitoring: bool,
+) -> Result<(), CliError> {
     Err(typed_cli_error(
         locket_core::LocketError::AgentUnavailable,
         "agent daemon is only supported on Unix targets",
@@ -857,8 +899,11 @@ pub fn request_status_snapshot(_socket_path: &Path) -> Result<Value, io::Error> 
 /// file and the socket so the next `agent start` is unblocked.
 #[cfg(unix)]
 pub fn run_internal_agent_serve(args: &InternalAgentServeArgs) -> Result<(), CliError> {
-    let args =
-        InternalAgentServeArgs { socket: args.socket.clone(), pid_file: args.pid_file.clone() };
+    let args = InternalAgentServeArgs {
+        socket: args.socket.clone(),
+        pid_file: args.pid_file.clone(),
+        require_session_monitoring: args.require_session_monitoring,
+    };
     locket_platform::run_with_native_session_loop(move || run_internal_agent_worker(&args))?
 }
 
@@ -881,7 +926,9 @@ fn run_internal_agent_worker(args: &InternalAgentServeArgs) -> Result<(), CliErr
         let sync_task = locket_agent::team_sync::spawn_team_sync_poll(state.clone());
         let expiry_task = state.spawn_unlock_expiry();
         let result =
-            serve_until_signal(listener, state, &args.pid_file).await.map_err(CliError::Io);
+            serve_until_signal(listener, state, &args.pid_file, args.require_session_monitoring)
+                .await
+                .map_err(CliError::Io);
         sync_task.abort();
         expiry_task.abort();
         result
@@ -915,6 +962,7 @@ async fn serve_until_signal(
     listener: tokio::net::UnixListener,
     state: locket_agent::AgentSocketState,
     pid_file: &Path,
+    require_session_monitoring: bool,
 ) -> io::Result<()> {
     use locket_agent::{SessionLockSource, handle_connection};
     use tokio::signal::unix::{SignalKind, signal};
@@ -922,8 +970,9 @@ async fn serve_until_signal(
     let mut term = signal(SignalKind::terminate())?;
     let mut intr = signal(SignalKind::interrupt())?;
     let mut hup = signal(SignalKind::hangup())?;
-    let mut observer = start_session_observer(&state).await;
+    let mut observer = start_session_observer(&state, require_session_monitoring).await?;
     write_pid_file(pid_file).map_err(|error| io::Error::other(error.to_string()))?;
+    let result: io::Result<()> = async {
     loop {
         tokio::select! {
             biased;
@@ -968,6 +1017,25 @@ async fn serve_until_signal(
         }
     }
     Ok(())
+    }.await;
+    // Clear keys and prevent in-flight requests from unlocking again before
+    // the observer drops and releases any outstanding suspend acknowledgement.
+    let cleanup = lock_before_observer_shutdown(&state).await;
+    drop(observer);
+    result.and(cleanup)
+}
+
+#[cfg(any(unix, target_os = "windows"))]
+async fn lock_before_observer_shutdown(state: &locket_agent::AgentSocketState) -> io::Result<()> {
+    state
+        .lock_for_native_session_event(
+            locket_agent::SessionLockSource::ProcessExit,
+            true,
+            agent_signal_unix_nanos(),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| io::Error::other(error.to_string()))
 }
 
 #[cfg(any(unix, target_os = "windows"))]
@@ -1008,15 +1076,23 @@ async fn handle_native_session_event(
 #[cfg(any(unix, target_os = "windows"))]
 async fn start_session_observer(
     state: &locket_agent::AgentSocketState,
-) -> Option<locket_platform::SessionObserver> {
+    required: bool,
+) -> io::Result<Option<locket_platform::SessionObserver>> {
     match locket_platform::SessionObserver::start(|| std::process::exit(1)).await {
-        Ok(observer) => {
-            state.set_session_monitoring_status("active: macOS native session notifications").await;
-            Some(observer)
+        Ok(mut observer) => {
+            // Apply the current lock/sleep state before accepting any client.
+            while let Some(event) = observer.try_next_event()? {
+                handle_native_session_event(state, Some(event.event)).await?;
+                observer.acknowledge_event(event);
+            }
+            state
+                .set_session_monitoring_status(format!("active: {}", observer.backend_name()))
+                .await;
+            Ok(Some(observer))
         }
         Err(error) => {
             state.set_session_monitoring_status(format!("unavailable: {error}")).await;
-            None
+            if required { Err(error) } else { Ok(None) }
         }
     }
 }
@@ -1039,10 +1115,11 @@ pub fn run_internal_agent_serve(args: &InternalAgentServeArgs) -> Result<(), Cli
             .map_err(|error| io::Error::other(error.to_string()))?;
         let mut listener = locket_agent::bind_named_pipe_listener(&config)?;
         let state = locket_agent::AgentSocketState::locked(env!("CARGO_PKG_VERSION"));
-        let mut observer = start_session_observer(&state).await;
+        let mut observer = start_session_observer(&state, args.require_session_monitoring).await?;
         write_pid_file(&args.pid_file).map_err(|error| io::Error::other(error.to_string()))?;
         let sync_task = locket_agent::team_sync::spawn_team_sync_poll(state.clone());
         let expiry_task = state.spawn_unlock_expiry();
+        let serving: io::Result<()> = async {
         loop {
             tokio::select! {
                 biased;
@@ -1065,9 +1142,13 @@ pub fn run_internal_agent_serve(args: &InternalAgentServeArgs) -> Result<(), Cli
                 () = state.shutdown.notified() => break,
             }
         }
+        Ok(())
+        }.await;
         sync_task.abort();
         expiry_task.abort();
-        Ok::<(), io::Error>(())
+        let cleanup = lock_before_observer_shutdown(&state).await;
+        drop(observer);
+        serving.and(cleanup)
     });
     let _ignored = fs::remove_file(&args.pid_file);
     result.map_err(CliError::Io)
@@ -1231,6 +1312,24 @@ pub(crate) mod framing_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn required_session_monitoring_rejects_unavailable_or_legacy_daemons() {
+        for status in [None, Some("unavailable: no desktop"), Some("inactive")] {
+            let report = super::AgentStartupReport {
+                started: false,
+                pid: None,
+                session_monitoring: status.map(str::to_owned),
+            };
+            assert!(super::require_active_session_monitoring(&report).is_err());
+        }
+        let report = super::AgentStartupReport {
+            started: false,
+            pid: None,
+            session_monitoring: Some("active: native session notifications".to_owned()),
+        };
+        assert!(super::require_active_session_monitoring(&report).is_ok());
+    }
+
     use std::cell::Cell;
     use std::sync::Arc;
 

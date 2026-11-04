@@ -37,10 +37,16 @@ fn production_does_not_offer_software_keyring_seeds_as_passkeys() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn linux_requires_fresh_verification_instead_of_keyring_access() {
+#[allow(clippy::print_stderr)]
+fn linux_missing_policy_fails_closed_without_prompting() {
+    if std::path::Path::new("/usr/share/polkit-1/actions/app.locket.policy").exists() {
+        // An installed desktop may legitimately prompt. Never launch an
+        // interactive ceremony from the unattended suite; use the host harness.
+        eprintln!("missing-policy probe skipped: Locket's polkit policy is installed");
+        return;
+    }
     assert!(matches!(
         locket_platform::linux_evaluate_local_user("Unlock vault"),
-        Err(locket_platform::LinuxLocalAuthError::Unavailable(reason))
-            if reason.contains("fresh") && reason.contains("Secret Service")
+        Err(locket_platform::LinuxLocalAuthError::Unavailable(_))
     ));
 }

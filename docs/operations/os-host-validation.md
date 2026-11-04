@@ -12,14 +12,27 @@ Dry-run probe for CI and non-target hosts:
 scripts/validate-local-user-auth-real-host.sh --dry-run
 ```
 
-Linux Secret Service real-host validation:
+Linux fresh-authentication validation (from an active desktop session):
 
 ```sh
-scripts/validate-local-user-auth-real-host.sh --target linux-secret-service
+scripts/validate-local-user-auth-real-host.sh --target linux-polkit
 ```
 
-Run once from an unlocked graphical session and once after locking the keyring
-or session so the desktop unlock prompt is exercised.
+Set `TMPDIR` and `CARGO_TARGET_DIR` to disposable storage before running the
+harness. Install Locket's Debian/RPM package, or install
+`crates/locket-platform/resources/app.locket.policy` as root at
+`/usr/share/polkit-1/actions/app.locket.policy` with mode `0644`, alongside
+polkit's `/usr/bin/pkcheck`. A graphical polkit agent or the terminal's internal
+agent must be available. Root sessions are rejected.
+
+Run twice consecutively: each request must require the current user's
+authentication, even when the Secret Service collection is unlocked. Repeat
+with cancellation and an unavailable authentication agent; both must fail.
+The action uses `auth_self` without caching and denies inactive sessions.
+The helper uses the fixed system bus and verifies the root-owned policy's
+contents. Administrative polkit rules remain part of the trusted host and can
+override polkit decisions; do not install a rule that automatically authorizes
+`app.locket.verify`.
 
 Windows Hello real-host validation:
 
@@ -32,13 +45,38 @@ Run on an enrolled Windows user with an interactive desktop.
 Linux FIDO2 hardware-key follow-up:
 
 ```sh
-scripts/validate-local-user-auth-real-host.sh --target linux-secret-service --require-fido2
+scripts/validate-local-user-auth-real-host.sh --target linux-polkit --require-fido2
 ```
 
-- [ ] Wire the production `libfido2-sys` user-presence ceremony behind the
-  Linux fallback.
+- [ ] Integrate a genuine FIDO2/WebAuthn backend for new passkey registration
+  and PRF evaluation. Existing software keyring recovery is a separate flow.
 - [ ] Rerun the command above on a Linux host with a physical security key and
   record a successful touch.
+
+## Session Lock and Suspend
+
+Start a fresh agent with `locket agent start --require-session-monitoring` and
+check `locket agent status`. Startup must fail when native monitoring is
+unavailable, including headless Linux hosts without a graphical logind session.
+An already-running daemon is accepted only if it reports active monitoring.
+
+Linux uses the root-owned logind service on the system bus, an initial
+`LockedHint`/`Active` snapshot, and a delay inhibitor for suspend. Windows uses
+WTS session notifications, an initial session snapshot, and a top-level window
+for power broadcasts. Both bound the time allowed for key erasure before
+suspend. macOS uses native notifications; its observer does not yet query the
+screen's lock state at startup.
+
+On each interactive OS, unlock a test project and obtain a grant, then lock the
+screen, switch users, suspend, and resume. Check that cached keys and old grants
+are cleared, requests are denied while locked, and fresh authorization is
+required after resuming. Repeat observer disconnection where supported; the
+agent must stop. Verify no stale keys survive agent shutdown.
+
+The Windows CI job executes workspace tests on a `windows-2025` VM. Docker can
+exercise Linux code and service-unavailable failures, but neither that container
+nor an unattended Windows runner proves real authentication prompts or physical
+lock/sleep delivery. Those checks require an interactive host.
 
 ## Packaged Canary Validation
 

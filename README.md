@@ -285,7 +285,9 @@ locket recovery rotate
 
 Recovery and verification flows are local-first. Keep each project's recovery code separately from its encrypted recovery files in `.locket/recovery` and back up both the recovery files and local vault. The encrypted files are excluded from Git; one project's recovery code does not recover other projects.
 
-Fresh user verification uses macOS LocalAuthentication or Windows Hello. Linux vault unlock with keyring or passphrase remains available, but actions requiring fresh verification fail closed until a supported Linux verification backend is installed in Locket. Reading an unlocked Secret Service keyring is not proof of fresh consent.
+Fresh user verification uses macOS LocalAuthentication, Windows Hello, or Linux polkit. Linux requires the packaged `app.locket.verify` policy, polkit, and an active user session with an authentication agent; missing prerequisites fail closed. Each verification requires current-user authentication without authorization caching. Reading an unlocked Secret Service keyring is not proof of fresh consent.
+
+Use `locket agent start --require-session-monitoring` to require an available native session observer. Linux uses logind; Windows uses session and power notifications. Lock and suspend events clear cached keys and live grants. See [OS host validation](docs/operations/os-host-validation.md) for installation and native acceptance checks.
 
 New passkey registration is unavailable until a genuine WebAuthn/FIDO2 backend is integrated. Earlier `platform-keyring` credentials are software recovery factors stored in the OS keyring, not hardware passkeys. `locket passkey list` identifies them; `locket passkey unlock` preserves their recovery path and requires fresh local verification. Keep your recovery code available.
 

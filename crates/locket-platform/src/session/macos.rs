@@ -259,7 +259,7 @@ pub(super) async fn start(failed: FailureCallback) -> io::Result<SessionObserver
             )
         })?
         .map_err(|_| io::Error::other("native observer stopped during startup"))??;
-    Ok(SessionObserver { receiver, guard })
+    Ok(SessionObserver { receiver, guard, backend_name: "macOS native session notifications" })
 }
 
 #[derive(Default)]

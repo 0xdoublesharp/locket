@@ -3,7 +3,7 @@
 //!
 //! This file contains zero `unsafe`. All platform interaction is
 //! confined to `linux_local_authentication.rs`. See that module's
-//! header comment for backend details and the FIDO2 follow-up.
+//! header comment for the trusted polkit policy and helper requirements.
 
 use crate::error::PlatformError;
 use crate::linux_local_authentication::{LocalAuthError, evaluate_local_user};
@@ -13,7 +13,7 @@ use crate::user_verification::{
     LocalUserVerifier,
 };
 
-/// Linux [`LocalUserVerifier`]; unavailable without a fresh consent backend.
+/// Linux [`LocalUserVerifier`] using fresh current-user polkit authentication.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LinuxLocalUserVerifier;
 

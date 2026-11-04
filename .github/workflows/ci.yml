@@ -5,6 +5,16 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Platform checks to run
+        type: choice
+        default: all
+        options:
+          - all
+          - linux
+          - windows
 
 permissions:
   contents: read
@@ -22,6 +32,7 @@ concurrency:
 jobs:
   static:
     name: static checks
+    if: github.event_name != 'workflow_dispatch' || inputs.platform != 'windows'
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
@@ -101,6 +112,7 @@ jobs:
 
   desktop-ui:
     name: desktop UI checks
+    if: github.event_name != 'workflow_dispatch' || inputs.platform != 'windows'
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
@@ -126,7 +138,9 @@ jobs:
 
   windows-transport:
     name: windows transport check
+    if: github.event_name != 'workflow_dispatch' || inputs.platform != 'linux'
     runs-on: windows-2025
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -135,6 +149,13 @@ jobs:
 
       - name: Install Rust toolchain
         run: rustup show
+
+      - name: Prepare disposable test storage
+        shell: pwsh
+        run: |
+          $locketTmp = Join-Path $env:RUNNER_TEMP 'locket/tmp'
+          New-Item -ItemType Directory -Path $locketTmp -Force | Out-Null
+          "TMPDIR=$locketTmp" >> $env:GITHUB_ENV
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -147,5 +168,10 @@ jobs:
           restore-keys: |
             cargo-windows-transport-${{ runner.os }}-
 
-      - name: Check agent and CLI Windows transport crates
-        run: cargo check -p locket-agent -p locket-cli --all-targets --locked
+      - name: Lint Windows workspace
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      # These execute in a real Windows VM. Enrolled Windows Hello and physical
+      # session lock/sleep ceremonies remain release-host acceptance checks.
+      - name: Test Windows workspace
+        run: cargo test --workspace --all-targets --all-features --locked

@@ -2,7 +2,8 @@
 
 use hmac::{Hmac, KeyInit, Mac};
 use locket_core::{
-    AUDIT_HMAC_LEN, AuditHmacInput, Timestamp, audit_hmac_v1_bytes, canonical_json_string,
+    AUDIT_HMAC_LEN, AuditCheckpoint, AuditHmacInput, ProjectId, Timestamp,
+    audit_checkpoint_v1_bytes, audit_hmac_v1_bytes, canonical_json_string,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Map, Value, json};
@@ -259,6 +260,61 @@ fn hmac_vec_to_array(sequence: u64, value: Vec<u8>) -> Result<[u8; AUDIT_HMAC_LE
     })
 }
 
+fn checkpoint_mac(
+    checkpoint: &AuditCheckpoint,
+    audit_key: &[u8; AUDIT_HMAC_LEN],
+) -> Result<Hmac<Sha256>, StoreError> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(audit_key)
+        .map_err(|_| StoreError::InvalidAuditKeyLength { actual: audit_key.len() })?;
+    mac.update(&audit_checkpoint_v1_bytes(checkpoint)?);
+    Ok(mac)
+}
+
+fn verify_checkpoint(
+    project_id: &str,
+    audit_key: &[u8; AUDIT_HMAC_LEN],
+    checkpoint: &AuditCheckpoint,
+    rows: &[StoredAuditRow],
+) -> Result<(), StoreError> {
+    let invalid = |reason: &str| StoreError::AuditIntegrity {
+        sequence: checkpoint.sequence,
+        reason: reason.to_owned(),
+    };
+    if checkpoint.schema_version != 1
+        || checkpoint.sequence == 0
+        || i64::try_from(checkpoint.sequence).is_err()
+    {
+        return Err(invalid("invalid audit checkpoint schema or sequence"));
+    }
+    if checkpoint.project_id.as_str() != project_id {
+        return Err(invalid("audit checkpoint belongs to a different project"));
+    }
+    checkpoint_mac(checkpoint, audit_key)?
+        .verify_slice(&checkpoint.authentication_tag)
+        .map_err(|_| invalid("audit checkpoint authentication failed"))?;
+    let Some(anchored) = rows.iter().find(|row| row.sequence == checkpoint.sequence) else {
+        return Err(invalid("audit history is older than the retained checkpoint"));
+    };
+    if anchored.hmac != checkpoint.row_hmac {
+        return Err(invalid("audit history does not match the retained checkpoint"));
+    }
+    Ok(())
+}
+
+fn require_verified_chain(verification: &AuditChainVerification) -> Result<(), StoreError> {
+    if verification.hmac_ok {
+        Ok(())
+    } else {
+        Err(StoreError::AuditIntegrity {
+            sequence: verification.first_break_sequence.unwrap_or(1),
+            reason: verification
+                .first_break_reason
+                .clone()
+                .unwrap_or_else(|| "audit verification failed".to_owned()),
+        })
+    }
+}
+
 /// Verifies imported remote audit rows against their plaintext bundle checkpoint.
 ///
 /// The source project's audit key is never exported in sealed bundles, so this
@@ -364,8 +420,7 @@ fn verify_audit_rows(
         let mut mac = Hmac::<Sha256>::new_from_slice(audit_key)
             .map_err(|_| StoreError::InvalidAuditKeyLength { actual: audit_key.len() })?;
         mac.update(&canonical);
-        let expected_hmac = mac.finalize().into_bytes();
-        if expected_hmac.as_slice() != row.hmac.as_slice() {
+        if mac.verify_slice(&row.hmac).is_err() {
             return Ok(AuditChainVerification {
                 hmac_ok: false,
                 first_break_sequence: Some(row.sequence),
@@ -1126,6 +1181,60 @@ impl Store {
         Ok(verification)
     }
 
+    /// Creates an authenticated checkpoint from a verified, nonempty audit chain.
+    ///
+    /// Retain the result outside the vault's rollback domain. This does not
+    /// append a row or establish whether the chain was rolled back before the
+    /// checkpoint was created. The chain and its last row share one snapshot.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::AuditIntegrity`] for an empty or invalid chain,
+    /// or a storage/cryptographic error when the checkpoint cannot be created.
+    pub fn audit_checkpoint(
+        &self,
+        project_id: &ProjectId,
+        audit_key: &[u8; AUDIT_HMAC_LEN],
+    ) -> Result<AuditCheckpoint, StoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let rows = read_audit_rows(&transaction, project_id.as_str())?;
+        require_verified_chain(&verify_audit_rows(&rows, audit_key)?)?;
+        let Some(last) = rows.last() else {
+            return Err(StoreError::AuditIntegrity {
+                sequence: 0,
+                reason: "cannot checkpoint an empty audit history".to_owned(),
+            });
+        };
+        let mut checkpoint = AuditCheckpoint {
+            schema_version: 1,
+            project_id: project_id.clone(),
+            sequence: last.sequence,
+            row_hmac: last.hmac,
+            authentication_tag: [0; AUDIT_HMAC_LEN],
+        };
+        checkpoint.authentication_tag =
+            checkpoint_mac(&checkpoint, audit_key)?.finalize().into_bytes().into();
+        transaction.commit()?;
+        Ok(checkpoint)
+    }
+
+    /// Verifies that the current chain extends an independently retained checkpoint.
+    ///
+    /// The full chain and checkpoint are checked in the same transaction as the
+    /// success audit append. Checkpoint, chain, or storage errors append nothing.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::AuditIntegrity`] when the checkpoint is invalid,
+    /// belongs to another project, or is not part of the verified local history.
+    pub fn verify_audit_checkpoint_and_append(
+        &mut self,
+        project_id: &ProjectId,
+        audit_key: &[u8; AUDIT_HMAC_LEN],
+        checkpoint: &AuditCheckpoint,
+        timestamp: i64,
+    ) -> Result<u64, StoreError> {
+        self.verify_and_append(project_id.as_str(), audit_key, Some(checkpoint), timestamp)
+    }
+
     /// Verifies the local audit HMAC chain and appends an `AUDIT_VERIFY` row on success.
     ///
     /// # Errors
@@ -1138,25 +1247,39 @@ impl Store {
         audit_key: &[u8],
         timestamp: i64,
     ) -> Result<u64, StoreError> {
+        self.verify_and_append(project_id, audit_key, None, timestamp)
+    }
+
+    fn verify_and_append(
+        &mut self,
+        project_id: &str,
+        audit_key: &[u8],
+        checkpoint: Option<&AuditCheckpoint>,
+        timestamp: i64,
+    ) -> Result<u64, StoreError> {
         let transaction = self.connection.transaction()?;
         let rows = read_audit_rows(&transaction, project_id)?;
         let verification = verify_audit_rows(&rows, audit_key)?;
-        if !verification.hmac_ok {
-            return Err(StoreError::AuditIntegrity {
-                sequence: verification.first_break_sequence.unwrap_or(1),
-                reason: verification
-                    .first_break_reason
-                    .unwrap_or_else(|| "audit verification failed".to_owned()),
-            });
+        require_verified_chain(&verification)?;
+        if let Some(checkpoint) = checkpoint {
+            let key = audit_key
+                .try_into()
+                .map_err(|_| StoreError::InvalidAuditKeyLength { actual: audit_key.len() })?;
+            verify_checkpoint(project_id, key, checkpoint, &rows)?;
         }
 
         let rows_verified = verification.rows_verified;
+        let check_names = if checkpoint.is_some() {
+            vec!["audit_hmac_chain", "external_audit_checkpoint"]
+        } else {
+            vec!["audit_hmac_chain"]
+        };
         let metadata = json!({
             "schema_version": 1,
             "action": "AUDIT_VERIFY",
             "status": "SUCCESS",
-            "check_names": ["audit_hmac_chain"],
-            "pass_count": 1,
+            "check_names": check_names,
+            "pass_count": check_names.len(),
             "warn_count": 0,
             "fail_count": 0,
             "skip_count": 0,

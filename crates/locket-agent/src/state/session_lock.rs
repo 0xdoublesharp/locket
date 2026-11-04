@@ -21,6 +21,8 @@ pub enum SessionLockSource {
     ScreenLock,
     /// User session switched, logged out, or the controlling session hung up.
     UserSessionSwitch,
+    /// Team sync observed removal, a history fork, or unreadable security state.
+    TeamSyncInvalidated,
 }
 
 impl SessionLockSource {
@@ -34,6 +36,7 @@ impl SessionLockSource {
             Self::SystemSleep => "system_sleep",
             Self::ScreenLock => "screen_lock",
             Self::UserSessionSwitch => "user_session_switch",
+            Self::TeamSyncInvalidated => "team_sync_invalidated",
         }
     }
 }
@@ -176,6 +179,7 @@ mod tests {
             (SessionLockSource::SystemSleep, "system_sleep"),
             (SessionLockSource::ScreenLock, "screen_lock"),
             (SessionLockSource::UserSessionSwitch, "user_session_switch"),
+            (SessionLockSource::TeamSyncInvalidated, "team_sync_invalidated"),
         ];
         for (source, expected) in cases {
             assert_eq!(source.as_str(), expected);

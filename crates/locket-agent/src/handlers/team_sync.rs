@@ -89,6 +89,14 @@ pub async fn handle_team_sync_status(
     };
     if !unlocked {
         result.state = "locked".into();
+    } else if ["removed", "fork"].contains(&result.state.as_str()) {
+        if state
+            .lock_for_team_sync_event(&typed.project_id, crate::server::current_unix_nanos())
+            .await
+            .is_err()
+        {
+            return error(request, "MetadataInvalid", "team lock audit unavailable");
+        }
     } else if !result.pending_profiles.is_empty() {
         match unlocked_pending_details(state, typed.project_id).await {
             Ok(details) => result.pending_details = details,
@@ -125,31 +133,30 @@ async fn configure_cached(
         &request.scope,
         commit_authorization(state, &project, &context.store_path, expiry, &key),
     );
-    tokio::task::spawn_blocking(move || {
-        configure_store(&request, &context.store_path, &authorization)
+    run_sync_worker(state, project, context.store_path.clone(), move |store| {
+        configure_store(store, &request, &context.store_path, &authorization)
     })
     .await
-    .map_err(|_| team_sync::SyncError::Rejected("team configuration worker stopped".into()))?
 }
 fn configure_store(
+    store: &locket_store::Store,
     request: &TeamSyncConfigureRequest,
     store_path: &std::path::Path,
     authorization: &team_sync::CommitAuthorization,
 ) -> team_sync::Result<SyncStatus> {
     check_selected_store(request.scope.store_path.as_deref(), store_path)?;
-    let store = open_sync_store(store_path)?;
     let root = store_path
         .parent()
         .ok_or_else(|| team_sync::SyncError::Rejected("local key directory unavailable".into()))?;
     team_sync::configure_folder_guarded(
-        &store,
+        store,
         &request.scope.project_id,
         &request.folder,
         root,
         request.allow_dangerous,
         Some(authorization),
     )?;
-    team_sync::status(&store, &request.scope.project_id)
+    team_sync::status(store, &request.scope.project_id)
 }
 
 fn check_selected_store(
@@ -193,21 +200,20 @@ async fn run_cached_sync(
 ) -> team_sync::Result<SyncStatus> {
     let (key, context, expiry) = cached_sync_context(state, &project).await?;
     let authorization = commit_authorization(state, &project, &context.store_path, expiry, &key);
-    tokio::task::spawn_blocking(move || {
+    run_sync_worker(state, project.clone(), context.store_path.clone(), move |store| {
         check_selected_store(selected_store.as_deref(), &context.store_path)?;
-        let mut store = open_sync_store(&context.store_path)?;
         let configured = store.connection().query_row(
             "SELECT EXISTS(SELECT 1 FROM team_sync_folders WHERE project_id=?1 AND enabled=1)",
             [&project],
             |row| row.get::<_, bool>(0),
         )?;
         if !configured {
-            return team_sync::status(&store, &project);
+            return team_sync::status(store, &project);
         }
         let now = i64::try_from(crate::server::current_unix_nanos() / 1_000_000_000)
             .map_err(|_| team_sync::SyncError::Rejected("clock unavailable".into()))?;
         let result =
-            team_sync::sync_folder_guarded(&mut store, &project, &key, now, Some(&authorization));
+            team_sync::sync_folder_guarded(store, &project, &key, now, Some(&authorization));
         let message = result.as_ref().err().map(ToString::to_string);
         if let Some(message) = message {
             store.connection().execute(
@@ -218,7 +224,48 @@ async fn run_cached_sync(
         result
     })
     .await
-    .map_err(|_| team_sync::SyncError::Rejected("team update worker stopped".into()))?
+}
+
+/// Observe persisted security state even if the worker returned an error after
+/// committing a fork marker. Never retain authorization when that check fails.
+async fn run_sync_worker(
+    state: &AgentSocketState,
+    project: String,
+    store_path: PathBuf,
+    operation: impl FnOnce(&mut locket_store::Store) -> team_sync::Result<SyncStatus> + Send + 'static,
+) -> team_sync::Result<SyncStatus> {
+    let worker_project = project.clone();
+    let worker = tokio::task::spawn_blocking(move || -> team_sync::Result<_> {
+        let mut store = open_sync_store(store_path)?;
+        let result = operation(&mut store);
+        let invalidated = store.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM team_sync_heads WHERE project_id=?1 AND state IN ('removed','fork'))",
+            [&worker_project],
+            |row| row.get::<_, bool>(0),
+        );
+        Ok((result, invalidated))
+    })
+    .await;
+    let (result, invalidated) = if let Ok(result) = worker {
+        result?
+    } else {
+        // A worker may have persisted a security transition before panicking.
+        let _ = state.lock_for_team_sync_event(&project, crate::server::current_unix_nanos()).await;
+        return Err(team_sync::SyncError::Rejected("team update worker stopped".into()));
+    };
+    let lock = if matches!(invalidated, Ok(false)) {
+        Ok(())
+    } else {
+        state
+            .lock_for_team_sync_event(&project, crate::server::current_unix_nanos())
+            .await
+            .map(|_| ())
+    };
+    // Preserve the original sync rejection after cleanup has completed.
+    let status = result?;
+    invalidated?;
+    lock?;
+    Ok(status)
 }
 
 async fn cached_sync_context(
@@ -293,9 +340,8 @@ async fn reconcile_cached(
         &request.scope,
         commit_authorization(state, &project, &context.store_path, expiry, &key),
     );
-    tokio::task::spawn_blocking(move || {
+    run_sync_worker(state, project.clone(), context.store_path.clone(), move |store| {
         check_selected_store(request.scope.store_path.as_deref(), &context.store_path)?;
-        let mut store = open_sync_store(&context.store_path)?;
         let local = store
             .get_active_local_device(&project)?
             .ok_or_else(|| team_sync::SyncError::Rejected("active local device missing".into()))?;
@@ -312,7 +358,7 @@ async fn reconcile_cached(
         match request.action {
             crate::TeamSyncAction::RenameProfile { local_profile_id, new_name } => {
                 team_sync::rename_local_profile_for_pending(
-                    &mut store,
+                    store,
                     &project,
                     &request.incoming_profile_id,
                     &local_profile_id,
@@ -326,7 +372,7 @@ async fn reconcile_cached(
             }
             crate::TeamSyncAction::PreserveOverride { local_secret_id } => {
                 team_sync::preserve_collision_as_override(
-                    &mut store,
+                    store,
                     &project,
                     &request.incoming_profile_id,
                     &local_secret_id,
@@ -344,13 +390,7 @@ async fn reconcile_cached(
             |row| row.get(0),
         )?;
         let mut status = if configured {
-            match team_sync::sync_folder_guarded(
-                &mut store,
-                &project,
-                &key,
-                now,
-                Some(&authorization),
-            ) {
+            match team_sync::sync_folder_guarded(store, &project, &key, now, Some(&authorization)) {
                 Ok(status) => status,
                 Err(failure) => {
                     let message =
@@ -359,18 +399,17 @@ async fn reconcile_cached(
                         "UPDATE team_sync_folders SET last_error=?2 WHERE project_id=?1",
                         rusqlite::params![project, message],
                     )?;
-                    team_sync::status(&store, &project)?
+                    team_sync::status(store, &project)?
                 }
             }
         } else {
-            team_sync::status(&store, &project)?
+            team_sync::status(store, &project)?
         };
         status.pending_details =
-            team_sync::pending_profile_details(&store, &project, &sealing, &identity, now)?;
+            team_sync::pending_profile_details(store, &project, &sealing, &identity, now)?;
         Ok(status)
     })
     .await
-    .map_err(|_| team_sync::SyncError::Rejected("team reconciliation worker stopped".into()))?
 }
 
 fn pending_details(
@@ -481,6 +520,210 @@ mod tests {
     use super::*;
     use crate::{GrantRecord, GrantRecordFields, UnlockEntry, UnlockMethod};
 
+    async fn cached_projects(path: &std::path::Path) -> AgentSocketState {
+        let state = AgentSocketState::locked("test");
+        let now = crate::server::current_unix_nanos();
+        for project in ["project", "other"] {
+            let mut entry = UnlockEntry::new(
+                vec![22; 32],
+                now,
+                std::time::Duration::from_secs(60),
+                UnlockMethod::Passphrase,
+            );
+            if project == "project" {
+                entry = entry.with_audit_context(crate::unlock_cache::UnlockAuditContext {
+                    store_path: path.to_owned(),
+                    profile_id: None,
+                });
+            }
+            state.unlock_cache.lock().await.insert(project.into(), entry);
+            state.grants.lock().await.insert(GrantRecord::new(GrantRecordFields {
+                grant_id: project.into(),
+                project_id: project.into(),
+                profile_id: "profile".into(),
+                action: GrantAction::TeamSync,
+                binding: GrantBinding::new(42, "start"),
+                issued_at_unix_nanos: now,
+                ttl_seconds: 60,
+                expires_at_unix_nanos: now + 60_000_000_000,
+            }));
+        }
+        state
+    }
+
+    async fn assert_project_invalidated(state: &AgentSocketState) {
+        let now = crate::server::current_unix_nanos();
+        let cache = state.unlock_cache.lock().await;
+        assert!(cache.lookup("project", now).is_none(), "unsafe project key stayed cached");
+        assert!(cache.lookup("other", now).is_some(), "unrelated project was locked");
+        drop(cache);
+        let grants = state.grants.lock().await;
+        assert!(grants.get("project").is_none(), "unsafe project grant stayed live");
+        assert!(grants.get("other").is_some(), "unrelated grant was revoked");
+        drop(grants);
+    }
+
+    fn receiver_store(path: &std::path::Path) -> team_sync::Result<locket_store::Store> {
+        let store = open_sync_store(path)?;
+        store.insert_project_if_absent("project", "project", 1)?;
+        team_sync::store_key(
+            &store,
+            "project",
+            None,
+            locket_crypto::KeyPurpose::Audit,
+            &[22; 32],
+            &[23; 32],
+            100,
+        )?;
+        Ok(store)
+    }
+
+    #[tokio::test]
+    async fn observed_team_security_state_evicts_only_affected_project()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for terminal_state in ["removed", "fork"] {
+            for via_status in [false, true] {
+                let directory = tempfile::tempdir()?;
+                let path = directory.path().join("store.db");
+                let store = receiver_store(&path)?;
+                store.connection().execute(
+                    "INSERT INTO team_sync_heads VALUES ('project',1,'digest','[]',?1,1)",
+                    [terminal_state],
+                )?;
+                let state = cached_projects(&path).await;
+                if via_status {
+                    let request = RequestEnvelope::new(
+                        "status",
+                        crate::AgentMethod::TeamSyncStatus,
+                        serde_json::json!({"project_id":"project"}),
+                    );
+                    assert!(matches!(
+                        handle_team_sync_status(&request, &state).await,
+                        ResponseEnvelope::Success(_)
+                    ));
+                } else {
+                    assert_eq!(
+                        run_cached_sync(&state, "project".into(), None).await?.state,
+                        terminal_state
+                    );
+                }
+                assert_project_invalidated(&state).await;
+                let metadata: String = store.connection().query_row(
+                    "SELECT metadata_json FROM audit_log WHERE action='LOCK'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let metadata: serde_json::Value = serde_json::from_str(&metadata)?;
+                assert_eq!(metadata["source"], "team_sync_invalidated");
+                assert_eq!(metadata["cached_keys_cleared"], 1);
+                assert_eq!(metadata["live_grants_revoked"], 1);
+                assert!(store.verify_audit_chain_read_only("project", &[23; 32])?.hmac_ok);
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Real signed fork traverses the folder worker's error path.
+    async fn observed_team_fork_error_revokes_cached_authorization()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use locket_core::team_package::{
+            DeviceIdentity, SignedStatement, TeamMember, TeamStatement,
+        };
+        use locket_platform::{LocalDevicePrivateKeyStorage, MasterKeyStore};
+        let directory = tempfile::tempdir()?;
+        let private = directory.path().join("private");
+        let folder = directory.path().join("exchange");
+        std::fs::create_dir(&private)?;
+        std::fs::create_dir(&folder)?;
+        let path = private.join("store.db");
+        let mut store = receiver_store(&path)?;
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let owner =
+            DeviceIdentity::new("owner".into(), signing.verifying_key().to_bytes(), [8; 32]);
+        let sealing = [9; 32];
+        let local = DeviceIdentity::new(
+            "receiver".into(),
+            ed25519_dalek::SigningKey::from_bytes(&[10; 32]).verifying_key().to_bytes(),
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(sealing)).to_bytes(),
+        );
+        store.insert_device(&locket_store::DeviceRecord {
+            id: local.id.clone(),
+            project_id: "project".into(),
+            member_id: None,
+            name: "receiver".into(),
+            label: "receiver".into(),
+            signing_public_key: local.signing_key.to_vec(),
+            sealing_public_key: local.sealing_key.to_vec(),
+            fingerprint: local.fingerprint.clone(),
+            safety_words: vec![],
+            local: true,
+            created_at: 1,
+            last_seen_at: None,
+            revoked_at: None,
+        })?;
+        let now = sync_now()?;
+        let mut statement = TeamStatement {
+            v: 1,
+            team_id: "team".into(),
+            project_id: "project".into(),
+            epoch: 1,
+            previous_digest: String::new(),
+            issued_at: now - 1,
+            expires_at: now + 300,
+            nonce: [4; 24],
+            publisher: owner.clone(),
+            recipient: local.clone(),
+            members: vec![
+                TeamMember {
+                    id: "owner-member".into(),
+                    name: "owner".into(),
+                    role: "owner".into(),
+                    profiles: vec![],
+                    device: owner.clone(),
+                    removed: false,
+                },
+                TeamMember {
+                    id: "receiver-member".into(),
+                    name: "receiver".into(),
+                    role: "developer".into(),
+                    profiles: vec![],
+                    device: local.clone(),
+                    removed: false,
+                },
+            ],
+            profiles: vec![],
+        };
+        let first = SignedStatement::sign(&statement, &signing)?.seal(&local.sealing_key)?;
+        team_sync::apply_package(
+            &mut store,
+            &first,
+            &[22; 32],
+            &sealing,
+            &local,
+            "project",
+            Some(&owner.fingerprint),
+            now,
+        )?;
+        let memory = std::sync::Arc::new(locket_platform::MemoryMasterKeyStore::default());
+        memory.store_master_key("project", &[22; 32])?;
+        locket_platform::WrappedLocalFileDevicePrivateKeyStorage::new(&private, "project", memory)
+            .store(&local.id, &sealing)?;
+        team_sync::configure_folder(&store, "project", &folder, &private, false)?;
+        statement.nonce = [5; 24];
+        std::fs::write(
+            folder.join("fork.lkpkg"),
+            SignedStatement::sign(&statement, &signing)?.seal(&local.sealing_key)?,
+        )?;
+        let state = cached_projects(&path).await;
+        let failure =
+            run_cached_sync(&state, "project".into(), None).await.err().ok_or("fork accepted")?;
+        assert!(failure.to_string().contains("fork or rollback detected"));
+        assert_eq!(team_sync::status(&store, "project")?.state, "fork");
+        assert_project_invalidated(&state).await;
+        Ok(())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn configure_worker_keeps_cache_responsive_and_cannot_insert_after_lock()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -528,7 +771,7 @@ mod tests {
         let worker = tokio::task::spawn_blocking(move || {
             let _ = started.send(());
             let _ = parked.blocking_recv();
-            configure_store(&request, &path, &authorize)
+            configure_store(&open_sync_store(&path)?, &request, &path, &authorize)
         });
         ready.await?;
         let mut cache =

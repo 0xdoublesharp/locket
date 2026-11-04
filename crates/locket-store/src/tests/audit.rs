@@ -18,6 +18,105 @@ use super::{
     test_secret_fingerprint, test_secret_version,
 };
 
+#[test]
+fn audit_checkpoint_detects_valid_prefix_rollback_and_empty_chain() -> Result<(), Box<dyn Error>> {
+    let project = locket_core::ProjectId::new("lk_proj_test")?;
+    for retained_rows in [0_i64, 1] {
+        let mut fixture = audit_display_fixture(None, None)?;
+        let checkpoint = fixture.store.audit_checkpoint(&project, &[42; 32])?;
+        assert_eq!(checkpoint.sequence, 2);
+        fixture
+            .store
+            .connection()
+            .execute("DELETE FROM audit_log WHERE sequence > ?1", [retained_rows])?;
+        assert!(fixture.store.verify_audit_chain_read_only(project.as_str(), &[42; 32])?.hmac_ok);
+        assert!(matches!(
+            fixture.store.verify_audit_checkpoint_and_append(&project, &[42; 32], &checkpoint, 300),
+            Err(StoreError::AuditIntegrity { .. })
+        ));
+        assert_eq!(
+            fixture.store.list_recent_audit_actions(project.as_str(), 10)?.len(),
+            usize::try_from(retained_rows)?
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn audit_checkpoint_authenticates_scope_fields_and_the_anchored_history()
+-> Result<(), Box<dyn Error>> {
+    let project = locket_core::ProjectId::new("lk_proj_test")?;
+    let mut fixture = audit_display_fixture(None, None)?;
+    let checkpoint = fixture.store.audit_checkpoint(&project, &[42; 32])?;
+    assert_eq!(
+        fixture.store.verify_audit_checkpoint_and_append(&project, &[42; 32], &checkpoint, 300)?,
+        2
+    );
+    assert_eq!(
+        fixture.store.verify_audit_checkpoint_and_append(&project, &[42; 32], &checkpoint, 400)?,
+        3
+    );
+
+    for field in ["project", "schema", "sequence", "empty", "row", "tag"] {
+        let mut altered = checkpoint.clone();
+        match field {
+            "project" => altered.project_id = locket_core::ProjectId::new("lk_proj_other")?,
+            "schema" => altered.schema_version += 1,
+            "sequence" => altered.sequence -= 1,
+            "empty" => altered.sequence = 0,
+            "row" => altered.row_hmac[0] ^= 1,
+            "tag" => altered.authentication_tag[0] ^= 1,
+            _ => return Err("unknown checkpoint test field".into()),
+        }
+        assert!(
+            matches!(
+                fixture
+                    .store
+                    .verify_audit_checkpoint_and_append(&project, &[42; 32], &altered, 500),
+                Err(StoreError::AuditIntegrity { .. })
+            ),
+            "changed {field} must fail closed"
+        );
+    }
+    assert_eq!(fixture.store.list_recent_audit_actions(project.as_str(), 10)?.len(), 4);
+    let mut other_history = audit_display_fixture(Some("OTHER_NAME"), None)?;
+    assert!(other_history.store.verify_audit_chain_read_only(project.as_str(), &[42; 32])?.hmac_ok);
+    assert!(matches!(
+        other_history.store.verify_audit_checkpoint_and_append(
+            &project,
+            &[42; 32],
+            &checkpoint,
+            500
+        ),
+        Err(StoreError::AuditIntegrity { .. })
+    ));
+    Ok(())
+}
+
+#[test]
+fn audit_checkpoint_refuses_empty_or_corrupted_history() -> Result<(), Box<dyn Error>> {
+    let project = locket_core::ProjectId::new("lk_proj_test")?;
+    let fixture = audit_display_fixture(None, None)?;
+    assert!(matches!(
+        fixture.store.audit_checkpoint(&project, &[43; 32]),
+        Err(StoreError::AuditIntegrity { .. })
+    ));
+    fixture
+        .store
+        .connection()
+        .execute("UPDATE audit_log SET hmac = zeroblob(32) WHERE sequence = 2", [])?;
+    assert!(matches!(
+        fixture.store.audit_checkpoint(&project, &[42; 32]),
+        Err(StoreError::AuditIntegrity { .. })
+    ));
+    fixture.store.connection().execute("DELETE FROM audit_log", [])?;
+    assert!(matches!(
+        fixture.store.audit_checkpoint(&project, &[42; 32]),
+        Err(StoreError::AuditIntegrity { .. })
+    ));
+    Ok(())
+}
+
 fn audit_display_fixture(
     secret_name: Option<&str>,
     command: Option<&str>,

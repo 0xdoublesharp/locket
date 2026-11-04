@@ -130,7 +130,7 @@ mod windows_impl {
         let mut token: HANDLE = null_mut();
         // SAFETY: `GetCurrentProcess` is a pseudo-handle and `token`
         // points to writable storage for the opened token handle.
-        let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
+        let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) };
         if opened == 0 {
             return Err(PlatformError::WindowsSidUnavailable(last_os_error_code()));
         }
@@ -140,17 +140,25 @@ mod windows_impl {
         // SAFETY: The first call intentionally passes a null buffer to
         // query the required size per `GetTokenInformation` contract.
         unsafe {
-            GetTokenInformation(token.0, TokenUser, null_mut(), 0, &mut needed);
+            GetTokenInformation(token.0, TokenUser, null_mut(), 0, &raw mut needed);
         }
         if needed == 0 {
             return Err(PlatformError::WindowsSidUnavailable(last_os_error_code()));
         }
 
-        let mut buffer = vec![0_u8; needed as usize];
-        // SAFETY: `buffer` has the size Windows just requested, and
+        // TOKEN_USER contains a pointer, so byte-aligned storage is insufficient.
+        let mut buffer = vec![0_usize; (needed as usize).div_ceil(size_of::<usize>())];
+        // SAFETY: `buffer` has at least the size Windows just requested, with
+        // pointer alignment suitable for TOKEN_USER and its embedded SID, and
         // `needed` points to writable storage for the returned size.
         let read = unsafe {
-            GetTokenInformation(token.0, TokenUser, buffer.as_mut_ptr().cast(), needed, &mut needed)
+            GetTokenInformation(
+                token.0,
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                needed,
+                &raw mut needed,
+            )
         };
         if read == 0 {
             return Err(PlatformError::WindowsSidUnavailable(last_os_error_code()));
@@ -162,7 +170,7 @@ mod windows_impl {
         let mut sid_text: PWSTR = null_mut();
         // SAFETY: `token_user.User.Sid` is owned by the token-info
         // buffer and valid for this call; Windows allocates `sid_text`.
-        let converted = unsafe { ConvertSidToStringSidW(token_user.User.Sid, &mut sid_text) };
+        let converted = unsafe { ConvertSidToStringSidW(token_user.User.Sid, &raw mut sid_text) };
         if converted == 0 || sid_text.is_null() {
             return Err(PlatformError::WindowsSidUnavailable(last_os_error_code()));
         }
@@ -226,7 +234,7 @@ mod windows_impl {
                 ConvertStringSecurityDescriptorToSecurityDescriptorW(
                     wide.as_ptr(),
                     SDDL_REVISION_1,
-                    &mut descriptor,
+                    &raw mut descriptor,
                     null_mut(),
                 )
             };
@@ -244,8 +252,8 @@ mod windows_impl {
             Ok(Self { descriptor, attributes })
         }
 
-        fn as_mut_ptr(&mut self) -> *mut c_void {
-            (&mut self.attributes as *mut SECURITY_ATTRIBUTES).cast::<c_void>()
+        const fn as_mut_ptr(&mut self) -> *mut c_void {
+            (&raw mut self.attributes).cast::<c_void>()
         }
     }
 

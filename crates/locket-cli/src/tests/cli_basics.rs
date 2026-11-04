@@ -2,6 +2,137 @@
 use super::*;
 
 #[test]
+fn audit_checkpoint_detects_rollback_without_overwriting_the_external_anchor()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let external = tempdir()?;
+    let context = test_context(&directory);
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--no-device", "--no-passkey"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    let mut local_only_output = Vec::new();
+    run_with_context(
+        Cli::try_parse_from(["locket", "audit", "verify"])?,
+        &context,
+        &mut local_only_output,
+    )?;
+    assert!(
+        String::from_utf8(local_only_output)?.contains("rollback detection requires --checkpoint")
+    );
+    let path = external.path().join("checkpoint.json");
+    let path_arg = path.to_str().ok_or("checkpoint path is not UTF-8")?;
+    let checkpoint_command =
+        Cli::try_parse_from(["locket", "audit", "checkpoint", "--output", path_arg]);
+    assert!(checkpoint_command.is_ok(), "audit checkpoint must be available");
+    run_with_context(checkpoint_command?, &context, &mut Vec::new())?;
+    let original = std::fs::read(&path)?;
+    let overwrite = run_with_context(
+        Cli::try_parse_from(["locket", "audit", "checkpoint", "--output", path_arg])?,
+        &context,
+        &mut Vec::new(),
+    );
+    assert!(overwrite.is_err(), "trusted checkpoint must never be overwritten");
+    assert_eq!(std::fs::read(&path)?, original);
+    run_with_context(
+        Cli::try_parse_from(["locket", "audit", "verify", "--checkpoint", path_arg])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    let store = locket_store::Store::open(directory.path().join("store.db"))?;
+    store.connection().execute("DELETE FROM audit_log", [])?;
+    let result = run_with_context(
+        Cli::try_parse_from(["locket", "audit", "verify", "--checkpoint", path_arg])?,
+        &context,
+        &mut Vec::new(),
+    );
+    assert!(
+        matches!(result, Err(ref error) if error.exit_code() == locket_core::LocketError::AuditIntegrityFailed.exit_code())
+    );
+    let remaining: i64 =
+        store.connection().query_row("SELECT COUNT(*) FROM audit_log", [], |row| row.get(0))?;
+    assert_eq!(remaining, 0, "failed anchored verification must not append an audit row");
+    Ok(())
+}
+
+#[test]
+fn audit_checkpoint_rejects_malformed_oversized_and_nonregular_inputs()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let external = tempdir()?;
+    let context = test_context(&directory);
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--no-device", "--no-passkey"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    let path = external.path().join("checkpoint.json");
+    let path_arg = path.to_str().ok_or("checkpoint path is not UTF-8")?;
+    run_with_context(
+        Cli::try_parse_from(["locket", "audit", "checkpoint", "--output", path_arg])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+    }
+    let original = std::fs::read(&path)?;
+    let mut unknown_field: serde_json::Value = serde_json::from_slice(&original)?;
+    unknown_field["unexpected"] = serde_json::json!("CHECKPOINT_INPUT_MUST_NOT_LEAK");
+    let duplicate_field =
+        String::from_utf8(original.clone())?.replacen('{', "{\"schema_version\":1,", 1);
+    for invalid in [
+        b"CHECKPOINT_INPUT_MUST_NOT_LEAK".to_vec(),
+        Vec::new(),
+        vec![b'x'; locket_core::AUDIT_CHECKPOINT_MAX_BYTES + 1],
+        serde_json::to_vec(&unknown_field)?,
+        duplicate_field.into_bytes(),
+    ] {
+        std::fs::write(&path, invalid)?;
+        let mut output = Vec::new();
+        let error = run_with_context(
+            Cli::try_parse_from(["locket", "audit", "verify", "--checkpoint", path_arg])?,
+            &context,
+            &mut output,
+        )
+        .err()
+        .ok_or("invalid checkpoint must fail")?;
+        assert_eq!(error.exit_code(), locket_core::LocketError::AuditIntegrityFailed.exit_code());
+        assert_eq!(output, [] as [u8; 0]);
+        assert!(!error.to_string().contains("CHECKPOINT_INPUT_MUST_NOT_LEAK"));
+    }
+    std::fs::remove_file(&path)?;
+    std::fs::create_dir(&path)?;
+    assert!(
+        run_with_context(
+            Cli::try_parse_from(["locket", "audit", "verify", "--checkpoint", path_arg])?,
+            &context,
+            &mut Vec::new(),
+        )
+        .is_err()
+    );
+    #[cfg(unix)]
+    {
+        std::fs::remove_dir(&path)?;
+        let target = external.path().join("anchor.json");
+        std::fs::write(&target, original)?;
+        std::os::unix::fs::symlink(&target, &path)?;
+        assert!(
+            run_with_context(
+                Cli::try_parse_from(["locket", "audit", "verify", "--checkpoint", path_arg])?,
+                &context,
+                &mut Vec::new(),
+            )
+            .is_err()
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn completion_command_generates_scripts_without_project() -> Result<(), Box<dyn std::error::Error>>
 {
     let directory = tempdir()?;

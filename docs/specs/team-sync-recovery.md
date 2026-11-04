@@ -77,6 +77,13 @@ Team invite trust ceremony:
 
 Team security rules:
 
+- When the agent observes a persisted `removed` or `fork` sync state, it clears
+  that project's cached master key and live grants before completing the sync
+  operation or status observation. This also applies when sync rejects a
+  conflicting signed package after recording a fork. Other projects remain
+  unlocked. Offline devices and secrets already delivered still require the
+  provider credential rotation described above.
+
 - Signed `team add` and manual `team publish` require typed `team share <profile names>` confirmation before granting or delivering dangerous profiles. Automatic publication separately requires the owner's explicit dangerous-profile folder consent. Recipient-side holds are not a substitute for sender consent: an encrypted package already grants cryptographic access to its recipient.
 
 - Invites are sealed to recipient device sealing public keys; invite files never contain plaintext secret values outside the age-encrypted payload. Profile secret and fingerprint keys are included as plaintext key material inside the age-sealed payload so the recipient can rewrap them into their local `keys` table; the recipient device private key is the cryptographic protection for that payload.

@@ -266,6 +266,7 @@ fn ensure_user_only_permissions(path: &Path) -> Result<(), PlatformError> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)] // Matches the fallible Unix permission helper.
 const fn ensure_user_only_permissions(_path: &Path) -> Result<(), PlatformError> {
     Ok(())
 }

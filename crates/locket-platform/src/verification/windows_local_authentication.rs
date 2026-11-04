@@ -1,4 +1,4 @@
-//! Windows Hello LocalUserVerifier backend.
+//! Windows Hello `LocalUserVerifier` backend.
 //!
 //! Mirrors the structure of [`crate::macos_local_authentication`] but
 //! uses the `Windows::Security::Credentials::UI::UserConsentVerifier`
@@ -7,7 +7,7 @@
 //!   1. Construct a `UserConsentVerifier` request with the localized
 //!      reason via `UserConsentVerifier::RequestVerificationAsync`.
 //!   2. Resolve the returned `IAsyncOperation<UserConsentVerificationResult>`
-//!      synchronously (using `.join()` from the WinRT runtime).
+//!      synchronously (using `.join()` from the `WinRT` runtime).
 //!   3. Map `UserConsentVerificationResult::Verified` to `Ok(true)`,
 //!      `DeviceBusy`/`Canceled`/`RetriesExhausted` to `Ok(false)` (user
 //!      rejected), `DeviceNotPresent`/`NotConfiguredForUser`/
@@ -103,16 +103,16 @@ fn evaluate_local_user_via_windows_hello(reason: &str) -> Result<bool, LocalAuth
     use windows::core::HSTRING;
 
     let availability = UserConsentVerifier::CheckAvailabilityAsync()
-        .map_err(map_windows_error)?
+        .map_err(|error| map_windows_error(&error))?
         .join()
-        .map_err(map_windows_error)?;
+        .map_err(|error| map_windows_error(&error))?;
     map_availability(availability)?;
 
     let message = HSTRING::from(reason);
     let result = UserConsentVerifier::RequestVerificationAsync(&message)
-        .map_err(map_windows_error)?
+        .map_err(|error| map_windows_error(&error))?
         .join()
-        .map_err(map_windows_error)?;
+        .map_err(|error| map_windows_error(&error))?;
     map_verification_result(result)
 }
 
@@ -176,7 +176,7 @@ fn map_verification_result(
 }
 
 #[cfg(target_os = "windows")]
-fn map_windows_error(error: windows::core::Error) -> LocalAuthError {
+fn map_windows_error(error: &windows::core::Error) -> LocalAuthError {
     LocalAuthError::Framework(error.to_string())
 }
 

@@ -12,12 +12,12 @@ require_fido2=0
 usage() {
   sed -n '1,120p' <<'USAGE'
 Usage:
-  scripts/validate-local-user-auth-real-host.sh [--target auto|linux-secret-service|windows-hello] [--require-fido2] [--dry-run]
+  scripts/validate-local-user-auth-real-host.sh [--target auto|linux-polkit|windows-hello] [--require-fido2] [--dry-run]
 
 Runs the LocalUserVerifier against real host OS user-presence APIs.
 
 Targets:
-  linux-secret-service  Exercises the Linux Secret Service/keyring prompt.
+  linux-polkit          Exercises fresh current-user polkit authentication.
   windows-hello         Exercises Windows Hello UserConsentVerifier.
   auto                  Selects a target from uname.
 
@@ -55,7 +55,7 @@ done
 
 detect_target() {
   case "$(uname -s)" in
-    Linux*) echo "linux-secret-service" ;;
+    Linux*) echo "linux-polkit" ;;
     MINGW*|MSYS*|CYGWIN*|Windows_NT) echo "windows-hello" ;;
     *)
       echo "unsupported"
@@ -111,17 +111,26 @@ fn main() {
 EOF
 }
 
-run_harness() {
+run_harness() (
   local harness_dir
-  harness_dir="$(mktemp -d "${TMPDIR:-/tmp}/locket-local-auth.XXXXXX")"
+  : "${TMPDIR:?Set TMPDIR to disposable storage before running the host harness}"
+  harness_dir="$(mktemp -d "${TMPDIR%/}/locket-local-auth.XXXXXX")"
   trap 'rm -rf "${harness_dir}"' EXIT
   write_harness "${harness_dir}"
-  "${cargo_bin}" run --manifest-path "${harness_dir}/Cargo.toml" --locked -j "${jobs}"
-}
+  # Preserve the workspace versions while adding only this temporary harness.
+  # The new package is absent from the workspace lock, so --locked cannot be
+  # used until Cargo records it. Offline resolution uses the installed cache.
+  cp "${repo_root}/Cargo.lock" "${harness_dir}/Cargo.lock"
+  "${cargo_bin}" run --manifest-path "${harness_dir}/Cargo.toml" --offline -j "${jobs}"
+)
 
 validate_linux_prereqs() {
-  if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
-    echo "DBUS_SESSION_BUS_ADDRESS is unset; run from an unlocked graphical Linux user session" >&2
+  if [[ ! -x /usr/bin/pkcheck || ! -f /usr/share/polkit-1/actions/app.locket.policy ]]; then
+    echo "install polkit and Locket's packaged policy before validating fresh authentication" >&2
+    exit 65
+  fi
+  if [[ ! -S /run/dbus/system_bus_socket ]]; then
+    echo "system D-Bus unavailable; run from an active Linux desktop session" >&2
     exit 65
   fi
   if [[ "${require_fido2}" == "1" ]]; then
@@ -140,7 +149,11 @@ if [[ "${target}" == "auto" ]]; then
 fi
 
 case "${target}" in
-  linux-secret-service|windows-hello)
+  linux-secret-service)
+    # Retain the old invocation as an alias; Secret Service is not a consent gate.
+    target="linux-polkit"
+    ;;
+  linux-polkit|windows-hello)
     ;;
   unsupported)
     if [[ "${dry_run}" == "1" ]]; then
@@ -169,7 +182,7 @@ require_tool "${cargo_bin}"
 cd "${repo_root}"
 
 case "${target}" in
-  linux-secret-service)
+  linux-polkit)
     validate_linux_prereqs
     run_harness
     ;;

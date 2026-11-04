@@ -614,6 +614,41 @@ impl AgentSocketState {
         outcome
     }
 
+    /// Revokes one project's cached authorization after a team security change.
+    /// Serializes with complete unlock/grant requests so in-flight issuance is
+    /// removed before returning, while other projects retain their authorization.
+    ///
+    /// # Errors
+    /// Returns an audit storage error after key and grant removal has completed.
+    pub(crate) async fn lock_for_team_sync_event(
+        &self,
+        project: &str,
+        now: i128,
+    ) -> Result<SessionLockOutcome, StoreError> {
+        let gate = self.session_gate.lock().await;
+        let entries: Vec<_> = self
+            .unlock_cache
+            .lock()
+            .await
+            .evict(project)
+            .map(|entry| (project.to_owned(), entry))
+            .into_iter()
+            .collect();
+        let cached_keys_cleared = entries.len();
+        let material = lock_audit_material(&entries);
+        drop(entries);
+        let live_grants_revoked = self.grants.lock().await.revoke_for_project(project);
+        let outcome = SessionLockOutcome { cached_keys_cleared, live_grants_revoked };
+        if outcome.changed() {
+            self.publish_status_snapshot(now).await;
+        }
+        let result =
+            append_lock_audits(SessionLockSource::TeamSyncInvalidated, now, outcome, &material);
+        drop(gate);
+        result?;
+        Ok(outcome)
+    }
+
     // Production reads wall time; unit tests inject a per-agent clock jump.
     #[allow(clippy::unused_self)]
     fn expiry_now(&self) -> i128 {
@@ -1705,6 +1740,94 @@ async fn write_response(stream: &mut UnixStream, response: &ResponseEnvelope) ->
 #[cfg(unix)]
 pub fn socket_permission_mode(path: &Path) -> Option<u32> {
     std::fs::metadata(path).ok().map(|metadata| metadata.permissions().mode() & 0o777)
+}
+
+#[cfg(test)]
+mod team_sync_lock_tests {
+    use super::*;
+    use crate::unlock_cache::{UnlockEntry, UnlockMethod};
+    use std::time::Duration;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn team_sync_lock_waits_for_inflight_unlock_then_erases_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let state = AgentSocketState::locked("test");
+        state.seed_master_key("project", &[4; 32])?;
+        let cache = state.unlock_cache.lock().await;
+        let unlocking_state = state.clone();
+        let unlocking = tokio::spawn(async move {
+            dispatch(
+                &RequestEnvelope::new(
+                    "unlock",
+                    AgentMethod::Unlock,
+                    serde_json::json!({"project_id":"project", "ttl_seconds":60}),
+                ),
+                &unlocking_state,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(state.session_gate.try_lock().is_err());
+        let locking_state = state.clone();
+        let locking = tokio::spawn(async move {
+            locking_state.lock_for_team_sync_event("project", current_unix_nanos()).await
+        });
+        tokio::task::yield_now().await;
+        drop(cache);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), unlocking).await??,
+            ResponseEnvelope::Success(_)
+        ));
+        let outcome = tokio::time::timeout(Duration::from_secs(1), locking).await???;
+        assert_eq!(outcome.cached_keys_cleared, 1);
+        assert!(state.unlock_cache.lock().await.is_empty());
+        assert!(state.session_gate.lock().await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn team_sync_lock_waits_for_prepared_grant_then_revokes_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let state = AgentSocketState::locked("test");
+        state.unlock_cache.lock().await.insert(
+            "project".into(),
+            UnlockEntry::new(
+                vec![4; 32],
+                current_unix_nanos(),
+                Duration::from_secs(60),
+                UnlockMethod::Passphrase,
+            ),
+        );
+        state.set_command_policies_for_tests(vec![serde_json::from_value(serde_json::json!({
+            "project_id":"project", "name":"dev", "command_kind":"argv", "command_preview":"test",
+            "required_secrets":[], "optional_secrets":[], "allowed_secrets":[], "confirm":false,
+            "require_user_verification":false, "require_agent":true, "allow_remote_docker":false,
+            "ttl_seconds":60, "env_mode":"minimal", "override_mode":"locket", "updated_at_unix_nanos":1
+        }))?]).await;
+        let grants = state.grants.lock().await;
+        let preparing_state = state.clone();
+        let preparing = tokio::spawn(async move {
+            dispatch(&RequestEnvelope::new("prepare", AgentMethod::PrepareExec,
+                serde_json::json!({"project_id":"project", "profile_id":"profile", "policy_name":"dev"})), &preparing_state).await
+        });
+        tokio::task::yield_now().await;
+        assert!(state.session_gate.try_lock().is_err());
+        let locking_state = state.clone();
+        let locking = tokio::spawn(async move {
+            locking_state.lock_for_team_sync_event("project", current_unix_nanos()).await
+        });
+        tokio::task::yield_now().await;
+        drop(grants);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), preparing).await??,
+            ResponseEnvelope::Success(_)
+        ));
+        let outcome = tokio::time::timeout(Duration::from_secs(1), locking).await???;
+        assert_eq!(outcome.live_grants_revoked, 1);
+        assert!(state.grants.lock().await.is_empty());
+        assert!(state.unlock_cache.lock().await.is_empty());
+        Ok(())
+    }
 }
 
 #[cfg(all(test, unix))]

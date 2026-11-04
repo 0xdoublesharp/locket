@@ -2,13 +2,23 @@
 
 use libfuzzer_sys::fuzz_target;
 use locket_core::{
-    AuditHmacInput, Timestamp, audit_hmac_v1_bytes, canonical_json, canonical_json_string,
+    AUDIT_CHECKPOINT_MAX_BYTES, AuditCheckpoint, AuditHmacInput, Timestamp,
+    audit_checkpoint_v1_bytes, audit_hmac_v1_bytes, canonical_json, canonical_json_string,
 };
 use serde_json::Value;
 
 fuzz_target!(|data: &[u8]| {
     if data.len() > 8192 {
         return;
+    }
+    if data.len() <= AUDIT_CHECKPOINT_MAX_BYTES
+        && let Ok(checkpoint) = serde_json::from_slice::<AuditCheckpoint>(data)
+    {
+        let encoded = serde_json::to_vec(&checkpoint).expect("checkpoint should serialize");
+        let decoded: AuditCheckpoint =
+            serde_json::from_slice(&encoded).expect("checkpoint should reparse");
+        assert_eq!(checkpoint, decoded);
+        let _ = audit_checkpoint_v1_bytes(&checkpoint);
     }
     let Ok(input) = std::str::from_utf8(data) else {
         return;

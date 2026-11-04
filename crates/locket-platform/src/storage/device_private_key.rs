@@ -366,6 +366,8 @@ impl DevicePrivateKeyEnvelope {
     }
 }
 
+// Keep the fallible cross-platform interface; POSIX mode checks only apply on Unix.
+#[cfg_attr(not(unix), allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps))]
 fn check_envelope_permissions(metadata: &fs::Metadata) -> Result<(), PlatformError> {
     #[cfg(unix)]
     {

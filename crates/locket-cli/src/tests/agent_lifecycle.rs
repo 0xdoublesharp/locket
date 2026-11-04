@@ -143,7 +143,11 @@ fn run_internal_agent_serve_listens_and_cleans_up_on_sigterm()
     let serve_socket = socket_path.clone();
     let serve_pid = pid_path.clone();
     let serve_thread = std::thread::spawn(move || -> Result<(), crate::CliError> {
-        let args = crate::InternalAgentServeArgs { socket: serve_socket, pid_file: serve_pid };
+        let args = crate::InternalAgentServeArgs {
+            socket: serve_socket,
+            pid_file: serve_pid,
+            require_session_monitoring: false,
+        };
         crate::commands::agent::run_internal_agent_serve(&args)
     });
 

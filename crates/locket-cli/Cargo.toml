@@ -39,6 +39,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tar = { workspace = true }
+tempfile = { workspace = true }
 time = { workspace = true }
 toml = { workspace = true }
 x25519-dalek = { workspace = true, features = ["static_secrets"] }
@@ -46,7 +47,7 @@ zeroize = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 locket-agent = { version = "0.1.1", path = "../locket-agent" }
-rustix = { workspace = true, features = ["process"] }
+rustix = { workspace = true, features = ["process", "fs"] }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]

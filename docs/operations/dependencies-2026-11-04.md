@@ -45,6 +45,32 @@ upstream constraints, not resolved by refreshing lockfiles. Track their removal
 through compatible upstream releases; a passing advisory policy does not mean
 the graph has no informational warnings.
 
+## Native session and authentication additions
+
+Native Linux session observation adds zbus 6 with only Tokio/proxy features and
+futures-util with `std`. D-Bus is required to use logind's session state and
+suspend inhibitor; the observer connects to the fixed system socket, validates
+the root-owned service's unique sender, and stops on ownership loss. This direct
+dependency does not replace the older keyring dependency graph described above.
+Both lockfiles retain registry checksums and the existing license policy.
+
+Windows enables additional `windows-sys` window, WTS, module, and graphics
+bindings. The new unsafe boundary is confined to `session/windows.rs`: a single
+thread owns the hidden window, notification registration, callback context, and
+teardown. Callback state is thread-local, never taken from message pointers;
+WTS buffers are checked and freed with the matching OS allocator. Callbacks
+carry session metadata and wait for bounded key-erasure acknowledgement.
+Windows token queries now allocate pointer-aligned storage before reading
+`TOKEN_USER`; session queries copy returned bytes into aligned local storage
+before interpreting `WTSINFOEXW`.
+Linux authentication uses a fixed polkit executable and policy rather than a
+new native FFI dependency; child environment and timeout are bounded.
+
+CLI checkpoint files reuse tempfile and rustix's `fs` feature for atomic export
+and no-follow, nonblocking reads on Unix. Checkpoint authentication uses the
+existing HMAC implementation with a separate domain and constant-time tag
+verification. No encryption format or key derivation changes are introduced.
+
 ## JavaScript tooling
 
 Desktop and extension dependencies are updated independently in their pnpm

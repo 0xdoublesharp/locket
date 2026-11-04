@@ -68,3 +68,23 @@ Behavior:
 - Exit with `AuditIntegrityFailed` when the chain is broken.
 - Record an `AUDIT_VERIFY` row only when the entire chain verifies successfully and the SQLite write succeeds in the same transaction.
 - On verification failure, report the first break location and do not attempt to append a row.
+
+### Independently retained checkpoints
+
+```bash
+locket audit checkpoint --output /independent/location/project-checkpoint.json
+locket audit verify --checkpoint /independent/location/project-checkpoint.json
+```
+
+Checkpoint export verifies the nonempty chain and authenticates its project,
+sequence, and final row HMAC with a domain-separated HMAC. It creates a new
+file (mode `0600` on Unix) and refuses to overwrite an existing output. Checkpoint
+verification authenticates the checkpoint, verifies the current chain, and
+requires the exact anchored row before appending a successful `AUDIT_VERIFY`
+row in the same transaction. Missing anchored rows, including an emptied or
+truncated chain, fail verification.
+
+Keep the newest trusted checkpoint independently of the vault and its backups.
+Restoring both the database and an older authentic checkpoint remains
+undetectable. Checkpoints are explicitly supplied to verification; creating one
+does not automatically enforce it on later secret operations.

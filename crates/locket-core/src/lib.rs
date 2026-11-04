@@ -17,9 +17,9 @@ pub use formats::{audit, bundle, dotenv, invite, pgp_word_list, update_manifest}
 pub use identity::{id, profile_name, reference_uri, secret_name};
 
 pub use audit::{
-    AUDIT_HMAC_LEN, AuditCanonicalizationError, AuditHmacInput, audit_hmac_v1_bytes, bytes,
-    canonical_json, canonical_json_bytes, canonical_json_string, field,
-    insert_convenience_metadata,
+    AUDIT_CHECKPOINT_MAX_BYTES, AUDIT_HMAC_LEN, AuditCanonicalizationError, AuditCheckpoint,
+    AuditHmacInput, audit_checkpoint_v1_bytes, audit_hmac_v1_bytes, bytes, canonical_json,
+    canonical_json_bytes, canonical_json_string, field, insert_convenience_metadata,
 };
 pub use bundle::{
     BUNDLE_MAGIC, BUNDLE_MANIFEST_ALLOWED_FIELDS, BUNDLE_MAX_MANIFEST_LEN, BUNDLE_MAX_PAYLOAD_LEN,
