@@ -49,6 +49,8 @@ Lifecycle and hardening:
 
 - The agent can start on demand, from the tray app, or at login when the user enables autostart.
 - The agent locks on explicit `locket lock`, idle timeout, process exit, system sleep, screen lock where detectable, and user-session switch where detectable.
+- macOS implements native sleep/wake and screen lock/unlock notifications. Sleep is acknowledged after key erasure and grant revocation; if this cannot finish within five seconds, the daemon exits. Losing an active observer also clears keys and grants and stops the daemon. User-session changes can be signaled with `SIGHUP`; there is no separate native switch observer. Linux and Windows currently report native session monitoring as unavailable; users must lock explicitly when leaving those sessions. `Status.session_monitoring`, `agent start`, `agent status`, and the desktop warning expose this capability.
+- An empty unlock cache has no polling timer. Inserts wake the expiry worker, which uses the earliest deadline with a 100 ms maximum wait while keys exist so forward wall-clock changes still cause prompt physical erasure and grant revocation.
 - Stale sockets or pipes are cleaned up only after verifying that no live trusted agent owns them.
 - Linux agents must call `prctl(PR_SET_DUMPABLE, 0)` and set `RLIMIT_CORE = 0` where available.
 - macOS and Windows agents must use the closest platform-supported core-dump suppression and process hardening available to a user-space app.

@@ -281,6 +281,8 @@ pub struct AgentSocketState {
     /// Compact tray/status counters that are produced by agent activity
     /// and do not contain names or values.
     status_metrics: Arc<Mutex<StatusMetrics>>,
+    /// Native session observer availability, metadata only.
+    session_monitoring: Arc<Mutex<Option<String>>>,
     /// In-memory automation-client challenges issued by `ClientHello`.
     pub automation_challenges: Arc<Mutex<BTreeMap<String, crate::auth::IssuedChallenge>>>,
     /// TTL-bound, names-only IDE env-session registry populated by
@@ -299,6 +301,14 @@ pub struct AgentSocketState {
     pub status_hub: StatusHub,
     /// In-band shutdown notification used by daemon transports.
     pub shutdown: Arc<Notify>,
+    /// Serializes native session transitions with key/grant creation. Each
+    /// block reason remains active until its matching OS resume notification.
+    session_gate: Arc<Mutex<std::collections::BTreeSet<&'static str>>>,
+    /// Counts expiry work for deterministic idle-work regression checks.
+    #[cfg(test)]
+    pub(crate) expiry_checks: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    pub(crate) test_expiry_clock_offset: Arc<std::sync::atomic::AtomicI64>,
     /// Test hook overriding the heartbeat cadence so unit tests can run
     /// with millisecond cadence rather than 30-second waits.
     #[cfg(all(test, unix))]
@@ -354,12 +364,18 @@ impl AgentSocketState {
             runtime_sessions: Arc::new(Mutex::new(Vec::new())),
             command_policies: Arc::new(Mutex::new(Vec::new())),
             status_metrics: Arc::new(Mutex::new(StatusMetrics::default())),
+            session_monitoring: Arc::new(Mutex::new(None)),
             automation_challenges: Arc::new(Mutex::new(BTreeMap::new())),
             ide_env_sessions: crate::ide_env_session::new_registry(),
             master_key_store,
             passphrase_store,
             status_hub,
             shutdown: Arc::new(Notify::new()),
+            session_gate: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+            #[cfg(test)]
+            expiry_checks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            test_expiry_clock_offset: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             #[cfg(all(test, unix))]
             test_heartbeat_interval: Arc::new(Mutex::new(None)),
             #[cfg(all(test, unix))]
@@ -386,6 +402,7 @@ impl AgentSocketState {
             runtime_sessions: Arc::new(Mutex::new(Vec::new())),
             command_policies: Arc::new(Mutex::new(Vec::new())),
             status_metrics: Arc::new(Mutex::new(StatusMetrics::default())),
+            session_monitoring: Arc::new(Mutex::new(None)),
             automation_challenges: Arc::new(Mutex::new(BTreeMap::new())),
             ide_env_sessions: crate::ide_env_session::new_registry(),
             master_key_store: Arc::new(locket_platform::MemoryMasterKeyStore::default()),
@@ -394,6 +411,9 @@ impl AgentSocketState {
             )),
             status_hub,
             shutdown: Arc::new(Notify::new()),
+            session_gate: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+            expiry_checks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            test_expiry_clock_offset: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             #[cfg(unix)]
             test_heartbeat_interval: Arc::new(Mutex::new(None)),
             #[cfg(unix)]
@@ -478,6 +498,7 @@ impl AgentSocketState {
             profile_name: None,
             live_grant_count: u32::try_from(grant_count).unwrap_or(u32::MAX),
             agent_version: self.agent_version.clone(),
+            session_monitoring: self.session_monitoring.lock().await.clone(),
             unlock_ttl_seconds: summary.max_remaining_seconds,
             running_session_count: u32::try_from(running_session_count).unwrap_or(u32::MAX),
             scan_warning_count: metrics.scan_warning_count,
@@ -485,6 +506,12 @@ impl AgentSocketState {
             recent_audit_status: metrics.recent_audit_status,
             pinned_reference_warning_count: metrics.pinned_reference_warning_count,
         }
+    }
+
+    /// Records whether the daemon is receiving native session-lock events.
+    pub async fn set_session_monitoring_status(&self, status: impl Into<String>) {
+        *self.session_monitoring.lock().await = Some(status.into());
+        self.publish_status_snapshot(current_unix_nanos()).await;
     }
 
     /// Builds project-scoped health without borrowing another project's unlock.
@@ -565,11 +592,45 @@ impl AgentSocketState {
         Ok(outcome)
     }
 
+    /// Blocks new unlocks/grants throughout a native locked or suspended session.
+    /// Resuming clears any old state before permitting new authorization.
+    ///
+    /// # Errors
+    /// Returns an audit error after key erasure and grant revocation.
+    pub async fn lock_for_native_session_event(
+        &self,
+        source: SessionLockSource,
+        session_blocked: bool,
+        now: i128,
+    ) -> Result<SessionLockOutcome, StoreError> {
+        let mut gate = self.session_gate.lock().await;
+        if session_blocked {
+            gate.insert(source.as_str());
+        } else {
+            gate.remove(source.as_str());
+        }
+        let outcome = self.lock_for_session_event(source, now).await;
+        drop(gate);
+        outcome
+    }
+
+    // Production reads wall time; unit tests inject a per-agent clock jump.
+    #[allow(clippy::unused_self)]
+    fn expiry_now(&self) -> i128 {
+        let now = current_unix_nanos();
+        #[cfg(test)]
+        let now = now
+            + i128::from(self.test_expiry_clock_offset.load(std::sync::atomic::Ordering::Relaxed));
+        now
+    }
+
     /// Evicts expired project keys and revokes grants before a subsequent unlock.
     ///
     /// # Errors
     /// Returns an audit storage error after key and grant removal has completed.
     pub async fn expire_unlocks(&self, now: i128) -> Result<usize, StoreError> {
+        #[cfg(test)]
+        self.expiry_checks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let entries = self.unlock_cache.lock().await.drain_expired(now);
         let count = entries.len();
         let material = lock_audit_material(&entries);
@@ -595,11 +656,31 @@ impl AgentSocketState {
     pub fn spawn_unlock_expiry(&self) -> tokio::task::JoinHandle<()> {
         let state = self.clone();
         tokio::spawn(async move {
-            let mut timer = tokio::time::interval(std::time::Duration::from_millis(100));
+            let changed = state.unlock_cache.lock().await.change_notification();
             loop {
-                tokio::select! { () = state.shutdown.notified() => break, _ = timer.tick() => {} }
-                let now = current_unix_nanos();
-                if state.expire_unlocks(now).await.is_ok_and(|count| count > 0) {
+                let deadline = state.unlock_cache.lock().await.next_expiry_unix_nanos();
+                let wait_for_expiry = async {
+                    if let Some(deadline) = deadline {
+                        let remaining = deadline.saturating_sub(state.expiry_now()).max(0);
+                        let nanos = u64::try_from(remaining).unwrap_or(u64::MAX);
+                        // Expiry timestamps also follow wall time. Recheck while
+                        // keys exist so clock jumps cannot delay physical erasure.
+                        let delay = std::time::Duration::from_nanos(nanos)
+                            .min(std::time::Duration::from_millis(100));
+                        tokio::time::sleep(delay).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                };
+                tokio::select! {
+                    () = state.shutdown.notified() => break,
+                    () = changed.notified() => continue,
+                    () = wait_for_expiry => {}
+                }
+                let now = state.expiry_now();
+                // Audit failures occur after keys/grants have been removed: status
+                // still needs to reflect the lock instead of retaining stale UI.
+                if !matches!(state.expire_unlocks(now).await, Ok(0)) {
                     state.publish_status_snapshot(now).await;
                 }
             }
@@ -1046,7 +1127,14 @@ async fn prepare_exec_dispatch(
     envelope: &RequestEnvelope,
     state: &AgentSocketState,
 ) -> ResponseEnvelope {
-    crate::prepare_exec::handle_prepare_exec(envelope, state, current_unix_nanos()).await
+    let session = state.session_gate.lock().await;
+    if !session.is_empty() {
+        return error_response(envelope, "UnlockRequired", "OS session is locked or suspended");
+    }
+    let response =
+        crate::prepare_exec::handle_prepare_exec(envelope, state, current_unix_nanos()).await;
+    drop(session);
+    response
 }
 
 async fn ide_env_session_dispatch(
@@ -1071,6 +1159,12 @@ const AGENT_UNLOCK_COMMAND: &str = "unlock";
 /// audit key, writes the `UNLOCK` audit row, and finally caches the
 /// unwrapped master key so subsequent RPCs can reuse it.
 async fn handle_unlock(envelope: &RequestEnvelope, state: &AgentSocketState) -> ResponseEnvelope {
+    // Hold through insertion so native locking either runs after this unlock
+    // and erases it, or rejects it for the entire locked/suspended session.
+    let session = state.session_gate.lock().await;
+    if !session.is_empty() {
+        return error_response(envelope, "UnlockRequired", "OS session is locked or suspended");
+    }
     let now = current_unix_nanos();
     if state.expire_unlocks(now).await.is_err() {
         return error_response(envelope, "CorruptDb", "failed to audit expired unlock");
@@ -1130,6 +1224,7 @@ async fn handle_unlock(envelope: &RequestEnvelope, state: &AgentSocketState) -> 
         });
     }
     state.unlock_cache.lock().await.insert(payload.project_id, entry);
+    drop(session);
     state.publish_status_snapshot(now).await;
     ResponseEnvelope::Success(SuccessEnvelope::new(envelope.id.clone(), serde_json::Value::Null))
 }
@@ -1484,6 +1579,10 @@ async fn handle_request_grant(
     envelope: &RequestEnvelope,
     state: &AgentSocketState,
 ) -> ResponseEnvelope {
+    let session = state.session_gate.lock().await;
+    if !session.is_empty() {
+        return error_response(envelope, "UnlockRequired", "OS session is locked or suspended");
+    }
     let mut payload: crate::grant::RequestGrantPayload =
         match serde_json::from_value(envelope.payload.clone()) {
             Ok(payload) => payload,
@@ -1517,6 +1616,7 @@ async fn handle_request_grant(
             }
         }
     };
+    drop(session);
     let response_payload = serde_json::json!({
         "grant_id": record.grant_id,
         "expires_at_unix_nanos": record.expires_at_unix_nanos.to_string(),
@@ -1615,6 +1715,101 @@ mod cache_status_tests {
     use super::*;
     use crate::unlock_cache::{UnlockCache, UnlockEntry, UnlockMethod};
     use tokio::sync::Mutex;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_lock_waits_for_inflight_unlock_then_erases_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let state =
+            AgentSocketState::for_tests("test", 0, Arc::new(Mutex::new(UnlockCache::default())));
+        state.seed_master_key("project", &[4; 32])?;
+        // Pause Unlock at its first cache access while it owns the session gate.
+        let cache = state.unlock_cache.lock().await;
+        let unlock_state = state.clone();
+        let unlock = tokio::spawn(async move {
+            dispatch(
+                &RequestEnvelope::new(
+                    "unlock",
+                    AgentMethod::Unlock,
+                    serde_json::json!({"project_id":"project", "ttl_seconds":60}),
+                ),
+                &unlock_state,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(state.session_gate.try_lock().is_err());
+        let lock_state = state.clone();
+        let lock = tokio::spawn(async move {
+            lock_state
+                .lock_for_native_session_event(
+                    SessionLockSource::SystemSleep,
+                    true,
+                    current_unix_nanos(),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        drop(cache);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), unlock).await??,
+            ResponseEnvelope::Success(_)
+        ));
+        tokio::time::timeout(Duration::from_secs(1), lock).await???;
+        assert!(state.unlock_cache.lock().await.is_empty());
+        assert!(!state.session_gate.lock().await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_lock_waits_for_prepared_grant_then_revokes_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let state = AgentSocketState::locked("test");
+        state.unlock_cache.lock().await.insert(
+            "project".into(),
+            UnlockEntry::new(
+                vec![4; 32],
+                current_unix_nanos(),
+                Duration::from_secs(60),
+                UnlockMethod::Passphrase,
+            ),
+        );
+        state.set_command_policies_for_tests(vec![serde_json::from_value(serde_json::json!({
+            "project_id":"project", "name":"dev", "command_kind":"argv", "command_preview":"test",
+            "required_secrets":[], "optional_secrets":[], "allowed_secrets":[], "confirm":false,
+            "require_user_verification":false, "require_agent":true, "allow_remote_docker":false,
+            "ttl_seconds":60, "env_mode":"minimal", "override_mode":"locket", "updated_at_unix_nanos":1
+        }))?]).await;
+        // Hold issuance after PrepareExec has checked the cache. Native locking
+        // must wait for the whole request, then revoke its newly created grant.
+        let grants = state.grants.lock().await;
+        let preparing_state = state.clone();
+        let preparing = tokio::spawn(async move {
+            dispatch(&RequestEnvelope::new("prepare", AgentMethod::PrepareExec,
+                serde_json::json!({"project_id":"project", "profile_id":"profile", "policy_name":"dev"})), &preparing_state).await
+        });
+        tokio::task::yield_now().await;
+        assert!(state.session_gate.try_lock().is_err());
+        let locking_state = state.clone();
+        let locking = tokio::spawn(async move {
+            locking_state
+                .lock_for_native_session_event(
+                    SessionLockSource::ScreenLock,
+                    true,
+                    current_unix_nanos(),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        drop(grants);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), preparing).await??,
+            ResponseEnvelope::Success(_)
+        ));
+        tokio::time::timeout(Duration::from_secs(1), locking).await???;
+        assert!(state.grants.lock().await.is_empty());
+        assert!(state.unlock_cache.lock().await.is_empty());
+        Ok(())
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn scoped_status_does_not_borrow_another_projects_unlock() {

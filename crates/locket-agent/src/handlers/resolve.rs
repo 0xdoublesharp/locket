@@ -476,104 +476,72 @@ fn authorize_policy_reference_context(
             LocketError::PolicyNotFound,
         ));
     };
-    // New indexes bind to their durable source. If a file save succeeds but
-    // its derived-index update fails, the previous permissions cannot survive.
-    // Legacy indexes keep compatibility until their next explicit local edit.
-    if let Some(path) =
-        policy.normalized_json.get("source_path").and_then(serde_json::Value::as_str)
-    {
-        let current = std::fs::symlink_metadata(path)
-            .ok()
-            .filter(|metadata| metadata.file_type().is_file())
-            .and_then(|_| std::fs::read_to_string(path).ok())
-            .and_then(|source| toml::from_str::<toml::Value>(&source).ok());
-        let matches = current.as_ref().is_some_and(|document| {
-            let digest_matches = policy
-                .normalized_json
-                .get("source_digest")
-                .and_then(Value::as_str)
-                .is_none_or(|expected| {
-                    locket_core::policy::policy_source_digest(document, policy_name).ok().as_deref()
-                        == Some(expected)
-                });
-            digest_matches
-                && document.get("project_id").and_then(toml::Value::as_str) == Some(project_id)
-                && document
-                    .get("commands")
-                    .and_then(|commands| commands.get(policy_name))
-                    .and_then(|command| serde_json::to_value(command).ok())
-                    .as_ref()
-                    == Some(&policy.policy_json)
-        });
-        if !matches {
-            return Err(ResolveFailure::new(
-                ERROR_ACCESS_DENIED,
-                "command configuration changed; refresh and approve the local command before resolving references",
-                LocketError::AccessDenied,
-            ));
-        }
-        let document = current.ok_or_else(reference_access_denied)?;
-        let parsed = locket_core::PolicyDocument::from_toml_str(
-            &toml::to_string(&document).map_err(|_| reference_access_denied())?,
-        )
-        .map_err(|_| reference_access_denied())?;
-        let root = Path::new(path)
-            .parent()
-            .ok_or_else(reference_access_denied)?
-            .canonicalize()
-            .map_err(|_| reference_access_denied())?;
-        let cwd = match execution {
-            Some(scope) => scope.cwd.canonicalize().map_err(|_| reference_access_denied())?,
-            None => root.clone(),
-        };
-        let relative = cwd.strip_prefix(&root).map_err(|_| reference_access_denied())?;
-        let relative = if relative.as_os_str().is_empty() { Path::new(".") } else { relative };
-        if let Some(expected) =
-            parsed.path_scope_for(&root, &cwd).and_then(|scope| scope.profile.as_ref())
-            && profile_name.is_some_and(|name| name != expected.as_str())
-        {
-            return Err(reference_access_denied());
-        }
-        let effective = parsed
-            .effective_command(policy_name, &root, &cwd)
-            .ok_or_else(reference_access_denied)?;
-        let argv = match &effective.command {
-            locket_core::CommandSpec::Argv(argv) => Some(argv.as_slice()),
-            locket_core::CommandSpec::Shell(_) => None,
-        };
-        if !parsed
-            .denied_secrets(policy_name, argv, relative, &effective.allowed_secrets)
-            .is_empty()
-            || !effective.allowed_secrets.iter().any(|name| name.as_str() == secret_name)
-        {
-            return Err(reference_access_denied());
-        }
-        return Ok(());
-    }
-    authorize_legacy_policy_reference(&policy.normalized_json, secret_name)
-}
-
-fn authorize_legacy_policy_reference(
-    normalized: &Value,
-    secret_name: &str,
-) -> Result<(), ResolveFailure> {
-    let Some(allowed_secrets) =
-        normalized.get("allowed_secrets").and_then(serde_json::Value::as_array)
-    else {
-        return Err(corrupt_db());
+    let source_path = policy.normalized_json.get("source_path").and_then(Value::as_str);
+    let source_digest = policy.normalized_json.get("source_digest").and_then(Value::as_str);
+    let (Some(path), Some(expected_digest)) = (source_path, source_digest) else {
+        return Err(ResolveFailure::new(
+            ERROR_ACCESS_DENIED,
+            "command policy needs local approval; run `locket policy refresh <name>` in the project directory",
+            LocketError::AccessDenied,
+        ));
     };
-    allowed_secrets
-        .iter()
-        .filter_map(serde_json::Value::as_str)
-        .any(|allowed| allowed == secret_name)
-        .then_some(())
-        .ok_or_else(|| {
-            ResolveFailure::new(
-                ERROR_ACCESS_DENIED,
-                "command policy does not authorize the reference",
-                LocketError::AccessDenied,
-            )
-        })
+    let current = std::fs::symlink_metadata(path)
+        .ok()
+        .filter(|metadata| metadata.file_type().is_file())
+        .and_then(|_| std::fs::read_to_string(path).ok())
+        .and_then(|source| toml::from_str::<toml::Value>(&source).ok());
+    let matches = current.as_ref().is_some_and(|document| {
+        let digest_matches =
+            locket_core::policy::policy_source_digest(document, policy_name).ok().as_deref()
+                == Some(expected_digest);
+        digest_matches
+            && document.get("project_id").and_then(toml::Value::as_str) == Some(project_id)
+            && document
+                .get("commands")
+                .and_then(|commands| commands.get(policy_name))
+                .and_then(|command| serde_json::to_value(command).ok())
+                .as_ref()
+                == Some(&policy.policy_json)
+    });
+    if !matches {
+        return Err(ResolveFailure::new(
+            ERROR_ACCESS_DENIED,
+            "command configuration changed; review locket.toml and run `locket policy refresh <name>` before resolving references",
+            LocketError::AccessDenied,
+        ));
+    }
+    let document = current.ok_or_else(reference_access_denied)?;
+    let parsed = locket_core::PolicyDocument::from_toml_value(&document)
+        .map_err(|_| reference_access_denied())?;
+    let root = Path::new(path)
+        .parent()
+        .ok_or_else(reference_access_denied)?
+        .canonicalize()
+        .map_err(|_| reference_access_denied())?;
+    let cwd = match execution {
+        Some(scope) => scope.cwd.canonicalize().map_err(|_| reference_access_denied())?,
+        None => root.clone(),
+    };
+    let relative = cwd.strip_prefix(&root).map_err(|_| reference_access_denied())?;
+    let relative = if relative.as_os_str().is_empty() { Path::new(".") } else { relative };
+    if let Some(expected) =
+        parsed.path_scope_for(&root, &cwd).and_then(|scope| scope.profile.as_ref())
+        && profile_name.is_some_and(|name| name != expected.as_str())
+    {
+        return Err(reference_access_denied());
+    }
+    let effective =
+        parsed.effective_command(policy_name, &root, &cwd).ok_or_else(reference_access_denied)?;
+    let argv = match &effective.command {
+        locket_core::CommandSpec::Argv(argv) => Some(argv.as_slice()),
+        locket_core::CommandSpec::Shell(_) => None,
+    };
+    if !parsed.denied_secrets(policy_name, argv, relative, &effective.allowed_secrets).is_empty()
+        || !effective.allowed_secrets.iter().any(|name| name.as_str() == secret_name)
+    {
+        return Err(reference_access_denied());
+    }
+    Ok(())
 }
 
 const fn reference_access_denied() -> ResolveFailure {
@@ -852,7 +820,7 @@ mod tests {
         store.initialize_schema()?;
         store.insert_project_if_absent(PROJECT_ID, "resolve-test", 1)?;
         store.insert_profile_if_absent(PROFILE_ID, PROJECT_ID, PROFILE_NAME, false, 1)?;
-        insert_policy_index(&mut store, POLICY_NAME, &[SECRET_NAME])?;
+        insert_policy_index(&mut store, directory.path(), POLICY_NAME, &[SECRET_NAME])?;
 
         let master_key = [7_u8; 32];
         let audit_key = [10_u8; 32];
@@ -1012,6 +980,81 @@ mod tests {
     }
 
     #[test]
+    fn legacy_policy_index_requires_explicit_source_refresh()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = build_fixture()?;
+        let mut store = Store::open(&fixture.store_path)?;
+        let policy = store
+            .get_command_policy_index(PROJECT_ID, POLICY_NAME)?
+            .ok_or("missing fixture policy")?;
+        for normalized in [
+            json!({"allowed_secrets":[SECRET_NAME]}),
+            json!({"allowed_secrets":[SECRET_NAME],"source_path":fixture.directory.path().join("locket.toml")}),
+        ] {
+            store.upsert_command_policy_index(
+                PROJECT_ID,
+                POLICY_NAME,
+                &policy.policy_json,
+                &normalized,
+                2,
+                None,
+            )?;
+            let result =
+                super::authorize_policy_reference(&store, PROJECT_ID, POLICY_NAME, SECRET_NAME);
+            let Err(failure) = result else {
+                return Err("unbound permissions must not authorize references".into());
+            };
+            assert_eq!(failure.error, "AccessDenied");
+            assert!(failure.message.contains("locket policy refresh"));
+        }
+        Ok(())
+    }
+
+    /// Measures the production authorization path with synthetic metadata only.
+    /// Run explicitly before/after tuning with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "manual authorization latency measurement"]
+    #[allow(clippy::print_stderr)] // Explicit metadata-only benchmark output.
+    fn policy_authorization_latency() -> Result<(), Box<dyn std::error::Error>> {
+        use std::fmt::Write as _;
+        let fixture = build_fixture()?;
+        let mut source = format!(
+            "schema_version=1\nproject_id='{PROJECT_ID}'\n[commands.{POLICY_NAME}]\nargv=['pnpm','deploy']\nrequired_secrets=['{SECRET_NAME}']\n"
+        );
+        for index in 0..32 {
+            write!(
+                source,
+                "[commands.task{index}]\nargv=['node','task{index}.js']\noptional_secrets=['TOKEN_{index}']\n[secrets.TOKEN_{index}]\nallow_commands=['task{index}']\n[paths.'apps/task{index}']\noptional_secrets=['TOKEN_{index}']\n"
+            )?;
+        }
+        install_source_policy(&fixture, &source, &[SECRET_NAME])?;
+        let store = Store::open(&fixture.store_path)?;
+        for _ in 0..10 {
+            assert!(
+                super::authorize_policy_reference(&store, PROJECT_ID, POLICY_NAME, SECRET_NAME)
+                    .is_ok()
+            );
+        }
+        let mut micros = Vec::new();
+        for _ in 0..7 {
+            let start = std::time::Instant::now();
+            for _ in 0..100 {
+                assert!(
+                    super::authorize_policy_reference(&store, PROJECT_ID, POLICY_NAME, SECRET_NAME)
+                        .is_ok()
+                );
+            }
+            micros.push(start.elapsed().as_micros() / 100);
+        }
+        micros.sort_unstable();
+        eprintln!(
+            "policy_authorization: commands=33 paths=32 acls=32 batches=7 iterations=100 median_us={}",
+            micros[3]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn source_bound_policy_index_cannot_outlive_durable_authorization()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = build_fixture()?;
@@ -1054,17 +1097,34 @@ mod tests {
 
     fn insert_policy_index(
         store: &mut Store,
+        root: &std::path::Path,
         policy_name: &str,
         allowed_secrets: &[&str],
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let source_path = root.join("locket.toml");
+        let mut source = if source_path.try_exists()? {
+            toml::from_str::<toml::Value>(&std::fs::read_to_string(&source_path)?)?
+        } else {
+            toml::Value::try_from(
+                json!({"schema_version":1,"project_id":PROJECT_ID,"commands":{}}),
+            )?
+        };
+        let raw_policy = json!({"argv":["pnpm","deploy"],"required_secrets":allowed_secrets});
+        source["commands"]
+            .as_table_mut()
+            .ok_or("missing commands")?
+            .insert(policy_name.into(), toml::Value::try_from(&raw_policy)?);
+        std::fs::write(&source_path, toml::to_string(&source)?)?;
         store.upsert_command_policy_index(
             PROJECT_ID,
             policy_name,
-            &json!({ "argv": ["pnpm", "deploy"] }),
+            &raw_policy,
             &json!({
                 "schema_version": 1,
                 "name": policy_name,
                 "allowed_secrets": allowed_secrets,
+                "source_path": source_path,
+                "source_digest": locket_core::policy::policy_source_digest(&source, policy_name)?,
             }),
             1,
             None,
@@ -1482,7 +1542,12 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = build_fixture()?;
         let mut store = Store::open(&fixture.store_path)?;
-        insert_policy_index(&mut store, "deny-database", &["OTHER_SECRET"])?;
+        insert_policy_index(
+            &mut store,
+            fixture.directory.path(),
+            "deny-database",
+            &["OTHER_SECRET"],
+        )?;
         let state = unlocked_state(&fixture).await;
         let mut request = resolve_request(&fixture);
         request.policy_name = Some("deny-database".to_owned());
@@ -1737,7 +1802,12 @@ mod tests {
     async fn handle_resolve_rejects_missing_secret() -> Result<(), Box<dyn std::error::Error>> {
         let fixture = build_fixture()?;
         let mut store = Store::open(&fixture.store_path)?;
-        insert_policy_index(&mut store, "allow-missing", &["MISSING_KEY"])?;
+        insert_policy_index(
+            &mut store,
+            fixture.directory.path(),
+            "allow-missing",
+            &["MISSING_KEY"],
+        )?;
         let state = unlocked_state(&fixture).await;
         let mut request = resolve_request(&fixture);
         request.reference = "lk://dev/MISSING_KEY".to_owned();

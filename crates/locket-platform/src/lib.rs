@@ -7,6 +7,7 @@
 mod error;
 mod hardening;
 mod ipc;
+mod session;
 mod storage;
 mod verification;
 
@@ -63,12 +64,16 @@ pub use recovery::{
     decode_recovery_state, load_recovery_envelope, load_recovery_kdf_toml, save_recovery_envelope,
     save_recovery_kdf_toml, save_recovery_state,
 };
+pub use session::{
+    NativeSessionEvent, NativeSessionNotification, SessionObserver, run_with_native_session_loop,
+};
 pub use storage::policy_file::{
     PolicyFileDocument, PolicyFileError, SECRET_FILE_IGNORE_PATTERNS, ensure_secret_file_ignores,
 };
 pub use user_verification::{
     LocalUserVerification, LocalUserVerificationMethod, LocalUserVerificationRequest,
     LocalUserVerifier, MemoryLocalUserVerifier, UnavailableLocalUserVerifier,
+    local_auth_test_overrides_enabled,
 };
 
 #[cfg(target_os = "linux")]

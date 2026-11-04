@@ -109,7 +109,16 @@ impl PolicyDocument {
         Self::from_toml_value(&value)
     }
 
-    fn from_toml_value(value: &toml::Value) -> Result<Self, PolicyParseError> {
+    /// Validates an already parsed TOML document without serializing or parsing it again.
+    ///
+    /// Applies the same schema, command, path, and secret ACL validation as
+    /// [`Self::from_toml_str`]. Source parsers must reject duplicate table definitions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyParseError`] for unsupported schema versions, unknown keys,
+    /// malformed tables, unsupported fields, or invalid normalized policy values.
+    pub fn from_toml_value(value: &toml::Value) -> Result<Self, PolicyParseError> {
         let Some(root) = value.as_table() else {
             return Err(PolicyParseError::RootMustBeTable);
         };

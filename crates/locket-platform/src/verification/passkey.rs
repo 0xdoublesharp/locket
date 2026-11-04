@@ -1,24 +1,25 @@
 //! Platform passkey/`WebAuthn` registration and PRF evaluation traits.
 //!
-//! Locket only stores public passkey metadata. The platform registrar
-//! abstracts over the OS authenticator (Touch ID / Windows Hello / FIDO2) and
-//! returns just the public credential bytes plus capability hints.
+//! Genuine WebAuthn/FIDO2 integration is currently unavailable. Existing
+//! software keyring credentials have a separate, explicit recovery path;
+//! they must never be represented as hardware-backed authenticators.
 
 use std::sync::Mutex;
 
 use data_encoding::BASE64URL_NOPAD;
 use hmac::{Hmac, KeyInit, Mac};
 use keyring_core::Entry;
-use locket_crypto::{KEY_LEN, generate_key, random_bytes};
-use sha2::{Digest, Sha256};
+use locket_crypto::KEY_LEN;
+#[cfg(test)]
+use sha2::Digest;
+use sha2::Sha256;
 use zeroize::Zeroizing;
 
 use crate::error::PlatformError;
 
 const PASSKEY_KEYRING_SERVICE: &str = "dev.0xdoublesharp.locket.passkey";
 const PASSKEY_ACCOUNT_PREFIX: &str = "prf:";
-const PASSKEY_TRANSPORT_INTERNAL: &str = "internal";
-const PASSKEY_TRANSPORT_KEYRING: &str = "platform-keyring";
+#[cfg(test)]
 const PASSKEY_PUBLIC_KEY_DOMAIN: &[u8] = b"locket-platform-passkey-public-v1";
 const PASSKEY_PRF_DOMAIN: &[u8] = b"locket-platform-passkey-prf-v1";
 
@@ -49,6 +50,13 @@ pub struct PasskeyRegistration {
 /// and must surface platform errors as [`PlatformError`] so the CLI can map
 /// them to a generic "passkey auth failed" outcome without leaking detail.
 pub trait PlatformPasskeyRegistrar {
+    /// Whether this backend can register a real platform authenticator.
+    ///
+    /// Callers can check this before requesting local user verification.
+    fn supports_registration(&self) -> bool {
+        false
+    }
+
     /// Performs a platform-authenticator registration ceremony.
     ///
     /// # Errors
@@ -82,6 +90,23 @@ pub trait PlatformPasskeyRegistrar {
         credential_id: &[u8],
         salt: &[u8],
     ) -> Result<Zeroizing<[u8; 32]>, PlatformError>;
+
+    /// Recovers the software keyring factor created by older Locket builds.
+    ///
+    /// This is not `WebAuthn`, FIDO2, or proof of user presence. Callers must
+    /// independently require fresh local user verification and label the
+    /// resulting recovery as a legacy software keyring operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::PasskeyUnsupported`] by default.
+    fn recover_legacy_keyring_prf(
+        &self,
+        _credential_id: &[u8],
+        _salt: &[u8],
+    ) -> Result<Zeroizing<[u8; 32]>, PlatformError> {
+        Err(PlatformError::PasskeyUnsupported)
+    }
 }
 
 /// Default registrar for builds where platform passkey APIs are not yet wired.
@@ -89,6 +114,10 @@ pub trait PlatformPasskeyRegistrar {
 pub struct UnavailablePlatformPasskeyRegistrar;
 
 impl PlatformPasskeyRegistrar for UnavailablePlatformPasskeyRegistrar {
+    fn supports_registration(&self) -> bool {
+        false
+    }
+
     fn register_passkey(
         &self,
         _label: &str,
@@ -106,51 +135,46 @@ impl PlatformPasskeyRegistrar for UnavailablePlatformPasskeyRegistrar {
     }
 }
 
-/// OS secure-storage backed passkey registrar.
+/// Recovery backend for legacy software keyring credentials.
 ///
-/// This backend is intentionally local: the CLI requires fresh local user
-/// verification before registration/removal, then this registrar stores a
-/// per-credential PRF seed in the platform credential store (`Keychain` on
-/// macOS, Credential Manager on Windows, Secret Service/keyring on Linux).
-/// It returns only public metadata and derives PRF output from the stored
-/// seed plus the caller-provided salt.
+/// The historical type name is retained for compatibility. New registration
+/// and `WebAuthn` PRF evaluation are unsupported. Previously stored seeds remain
+/// recoverable through the explicitly named legacy method after the caller
+/// performs fresh local verification.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct KeyringPlatformPasskeyRegistrar;
 
 impl PlatformPasskeyRegistrar for KeyringPlatformPasskeyRegistrar {
+    fn supports_registration(&self) -> bool {
+        false
+    }
+
     fn register_passkey(
         &self,
         _label: &str,
         _relying_party_id: &str,
     ) -> Result<PasskeyRegistration, PlatformError> {
-        let credential_id = random_bytes::<32>()?.to_vec();
-        let secret = generate_key()?;
-        passkey_entry(&credential_id)?
-            .set_password(&encode_passkey_secret(&secret))
-            .map_err(|_| PlatformError::PasskeyRegistrationFailed)?;
-        Ok(PasskeyRegistration {
-            credential_id,
-            public_key: public_metadata_key(&secret),
-            user_handle: random_bytes::<32>()?.to_vec(),
-            transports: vec![
-                PASSKEY_TRANSPORT_INTERNAL.to_owned(),
-                PASSKEY_TRANSPORT_KEYRING.to_owned(),
-                platform_transport_label().to_owned(),
-            ],
-            prf_capable: true,
-            backup_eligible: None,
-            backup_state: None,
-        })
+        Err(PlatformError::PasskeyUnsupported)
     }
 
     fn evaluate_prf(
         &self,
+        _credential_id: &[u8],
+        _salt: &[u8],
+    ) -> Result<Zeroizing<[u8; 32]>, PlatformError> {
+        Err(PlatformError::PasskeyUnsupported)
+    }
+
+    fn recover_legacy_keyring_prf(
+        &self,
         credential_id: &[u8],
         salt: &[u8],
     ) -> Result<Zeroizing<[u8; 32]>, PlatformError> {
-        let encoded = passkey_entry(credential_id)?
-            .get_password()
-            .map_err(|error| map_passkey_get_error(&error))?;
+        let encoded = Zeroizing::new(
+            passkey_entry(credential_id)?
+                .get_password()
+                .map_err(|error| map_passkey_get_error(&error))?,
+        );
         let secret = decode_passkey_secret(&encoded)?;
         Ok(Zeroizing::new(derive_passkey_prf(&secret, salt)?))
     }
@@ -224,6 +248,10 @@ impl MemoryPlatformPasskeyRegistrar {
 }
 
 impl PlatformPasskeyRegistrar for MemoryPlatformPasskeyRegistrar {
+    fn supports_registration(&self) -> bool {
+        !matches!(self.outcome, MemoryPlatformPasskeyOutcome::Unsupported)
+    }
+
     fn register_passkey(
         &self,
         _label: &str,
@@ -261,6 +289,14 @@ impl PlatformPasskeyRegistrar for MemoryPlatformPasskeyRegistrar {
             },
         }
     }
+
+    fn recover_legacy_keyring_prf(
+        &self,
+        credential_id: &[u8],
+        salt: &[u8],
+    ) -> Result<Zeroizing<[u8; 32]>, PlatformError> {
+        self.evaluate_prf(credential_id, salt)
+    }
 }
 
 /// Returns the default passkey registrar for this build.
@@ -278,13 +314,10 @@ pub fn passkey_account(credential_id: &[u8]) -> String {
     format!("{PASSKEY_ACCOUNT_PREFIX}{}", BASE64URL_NOPAD.encode(credential_id))
 }
 
-fn encode_passkey_secret(secret: &[u8; KEY_LEN]) -> String {
-    BASE64URL_NOPAD.encode(secret)
-}
-
 fn decode_passkey_secret(encoded: &str) -> Result<Zeroizing<[u8; KEY_LEN]>, PlatformError> {
-    let decoded =
-        BASE64URL_NOPAD.decode(encoded.as_bytes()).map_err(|_| PlatformError::PasskeyAuthFailed)?;
+    let decoded = Zeroizing::new(
+        BASE64URL_NOPAD.decode(encoded.as_bytes()).map_err(|_| PlatformError::PasskeyAuthFailed)?,
+    );
     if decoded.len() != KEY_LEN {
         return Err(PlatformError::PasskeyAuthFailed);
     }
@@ -293,6 +326,7 @@ fn decode_passkey_secret(encoded: &str) -> Result<Zeroizing<[u8; KEY_LEN]>, Plat
     Ok(secret)
 }
 
+#[cfg(test)]
 pub fn public_metadata_key(secret: &[u8; KEY_LEN]) -> Vec<u8> {
     Sha256::new().chain_update(PASSKEY_PUBLIC_KEY_DOMAIN).chain_update(secret).finalize().to_vec()
 }
@@ -315,6 +349,7 @@ const fn map_passkey_get_error(error: &keyring_core::Error) -> PlatformError {
     }
 }
 
+#[cfg(test)]
 pub const fn platform_transport_label() -> &'static str {
     #[cfg(target_os = "macos")]
     {

@@ -322,6 +322,7 @@ locket policy add dev -- pnpm dev
 locket policy allow dev DATABASE_URL
 locket policy require dev DATABASE_URL
 locket policy edit dev
+locket policy refresh dev
 locket policy delete dev
 locket policy doctor
 ```

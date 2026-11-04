@@ -5,6 +5,15 @@ use serde::{Deserialize, Serialize};
 use crate::error::PlatformError;
 use crate::platform_name;
 
+/// Whether this build includes deterministic local-authentication test overrides.
+///
+/// This diagnostic probe never invokes a native authentication prompt.
+#[doc(hidden)]
+#[must_use]
+pub const fn local_auth_test_overrides_enabled() -> bool {
+    cfg!(test)
+}
+
 /// Request metadata for a local user-verification ceremony.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalUserVerificationRequest {

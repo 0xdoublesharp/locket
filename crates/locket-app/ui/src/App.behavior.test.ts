@@ -58,6 +58,7 @@ const revealed = (value = 'fixture-plaintext'): RevealResponse => ({ value, ttl_
 
 let nativeSelection: DesktopProjectContext | null;
 let lockState: AgentStatus['lock_state'];
+let sessionMonitoring: string | undefined;
 let windowEvents: EventTarget;
 let calls: string[];
 let overrides: Map<string, (args: InvokeArgs | undefined) => unknown>;
@@ -87,6 +88,7 @@ async function nativeInvoke(command: string, args?: InvokeArgs): Promise<unknown
         scan_warning_count: 0,
         recent_audit_status: 'unknown',
         pinned_reference_warning_count: 0,
+        session_monitoring: sessionMonitoring,
       } satisfies AgentStatus;
     case 'agent_read_config':
       return {
@@ -129,6 +131,7 @@ beforeEach(() => {
   vi.resetAllMocks();
   nativeSelection = null;
   lockState = 'unlocked';
+  sessionMonitoring = 'active: macOS native notifications';
   calls = [];
   overrides = new Map();
   mounts = [];
@@ -163,6 +166,26 @@ async function connectedApp() {
 function plaintext(app: ReturnType<typeof mountApp>): string | undefined {
   return findNode(app.root, (node) => node.props['data-testid'] === 'reveal-value')?.text;
 }
+
+describe('automatic locking availability', () => {
+  it.each([undefined, 'unavailable: native observer unavailable'])(
+    'shows manual-lock guidance when monitoring is %s',
+    async (monitoring) => {
+      sessionMonitoring = monitoring;
+      const app = await connectedApp();
+      const warning = () =>
+        findNode(app.root, (node) => node.props['data-testid'] === 'session-lock-warning');
+      expect(warning()?.text).toContain('Lock the vault before leaving this device');
+      await app.state.connectProject(false, b.root);
+      await settle();
+      expect(warning()).toBeDefined();
+      sessionMonitoring = 'active: macOS native notifications';
+      await app.state.refresh();
+      await settle();
+      expect(warning()).toBeUndefined();
+    },
+  );
+});
 
 describe('reveal request lifetime in the mounted app', () => {
   it('shows a current response and keeps its TTL countdown', async () => {

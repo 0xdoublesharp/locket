@@ -223,12 +223,19 @@ fn agent_start_command(context: &RuntimeContext, output: &mut impl Write) -> Res
         None => writeln!(output, "pid: -")?,
     }
     write_agent_paths(context, output)?;
+    write_session_monitoring_status(output, report.session_monitoring.as_deref())?;
     Ok(())
 }
 
 #[cfg(not(test))]
 pub fn ensure_agent_running_for_execution(context: &RuntimeContext) -> Result<(), CliError> {
-    ensure_agent_running_with_launcher(context, &ProcessAgentDaemonLauncher).map(|_| ())
+    let report = ensure_agent_running_with_launcher(context, &ProcessAgentDaemonLauncher)?;
+    if report.started
+        && !report.session_monitoring.as_deref().is_some_and(|status| status.starts_with("active:"))
+    {
+        write_session_monitoring_status(&mut io::stderr(), report.session_monitoring.as_deref())?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -240,10 +247,11 @@ pub fn ensure_agent_running_for_execution(_context: &RuntimeContext) -> Result<(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct AgentStartupReport {
     started: bool,
     pid: Option<u32>,
+    session_monitoring: Option<String>,
 }
 
 trait AgentDaemonLauncher {
@@ -275,8 +283,12 @@ fn ensure_agent_running_with_launcher(
     // Idempotency: if a live PID owns the pid file and responds on the
     // socket, execution can proceed without spawning a second daemon.
     if let Some(pid) = read_running_pid(context)? {
-        if launcher.status_snapshot(&socket_path).is_ok() {
-            return Ok(AgentStartupReport { started: false, pid: Some(pid) });
+        if let Ok(snapshot) = launcher.status_snapshot(&socket_path) {
+            return Ok(AgentStartupReport {
+                started: false,
+                pid: Some(pid),
+                session_monitoring: session_monitoring_from_snapshot(&snapshot),
+            });
         }
         let _ignored = fs::remove_file(&pid_path);
         let _ignored = fs::remove_file(&socket_path);
@@ -286,12 +298,22 @@ fn ensure_agent_running_with_launcher(
     // answers trusted status requests, preserve the live daemon and
     // keep start idempotent instead of unlinking its socket.
     #[cfg(unix)]
-    if socket_path.exists() && launcher.status_snapshot(&socket_path).is_ok() {
-        return Ok(AgentStartupReport { started: false, pid: None });
+    if socket_path.exists()
+        && let Ok(snapshot) = launcher.status_snapshot(&socket_path)
+    {
+        return Ok(AgentStartupReport {
+            started: false,
+            pid: None,
+            session_monitoring: session_monitoring_from_snapshot(&snapshot),
+        });
     }
     #[cfg(target_os = "windows")]
-    if launcher.status_snapshot(&socket_path).is_ok() {
-        return Ok(AgentStartupReport { started: false, pid: None });
+    if let Ok(snapshot) = launcher.status_snapshot(&socket_path) {
+        return Ok(AgentStartupReport {
+            started: false,
+            pid: None,
+            session_monitoring: session_monitoring_from_snapshot(&snapshot),
+        });
     }
 
     // Best-effort cleanup of stale pid/socket files. The daemon may have
@@ -312,13 +334,21 @@ fn ensure_agent_running_with_launcher(
     );
 
     let pid = read_running_pid(context)?;
-    launcher.status_snapshot(&socket_path).map_err(|error| {
+    let snapshot = launcher.status_snapshot(&socket_path).map_err(|error| {
         typed_cli_error(
             locket_core::LocketError::AgentUnavailable,
             format!("agent did not become reachable after on-demand startup: {error}"),
         )
     })?;
-    Ok(AgentStartupReport { started: true, pid })
+    Ok(AgentStartupReport {
+        started: true,
+        pid,
+        session_monitoring: session_monitoring_from_snapshot(&snapshot),
+    })
+}
+
+fn session_monitoring_from_snapshot(snapshot: &Value) -> Option<String> {
+    snapshot.get("session_monitoring").and_then(Value::as_str).map(str::to_owned)
 }
 
 fn agent_status_command(context: &RuntimeContext, output: &mut impl Write) -> Result<(), CliError> {
@@ -566,6 +596,26 @@ fn write_agent_status_snapshot(output: &mut impl Write, snapshot: &Value) -> Res
     writeln!(output, "live_grants: {live_grants}")?;
     let version = snapshot.get("agent_version").and_then(Value::as_str).unwrap_or("unknown");
     writeln!(output, "agent_version: {version}")?;
+    write_session_monitoring_status(
+        output,
+        snapshot.get("session_monitoring").and_then(Value::as_str),
+    )?;
+    Ok(())
+}
+
+fn write_session_monitoring_status(
+    output: &mut impl Write,
+    status: Option<&str>,
+) -> io::Result<()> {
+    let status =
+        status.unwrap_or("unavailable: this agent does not report native session monitoring");
+    writeln!(output, "session_monitoring: {status}")?;
+    if !status.starts_with("active:") {
+        writeln!(
+            output,
+            "warning: automatic locking on sleep or screen lock is unavailable; use locket lock or short unlock TTLs"
+        )?;
+    }
     Ok(())
 }
 
@@ -807,6 +857,13 @@ pub fn request_status_snapshot(_socket_path: &Path) -> Result<Value, io::Error> 
 /// file and the socket so the next `agent start` is unblocked.
 #[cfg(unix)]
 pub fn run_internal_agent_serve(args: &InternalAgentServeArgs) -> Result<(), CliError> {
+    let args =
+        InternalAgentServeArgs { socket: args.socket.clone(), pid_file: args.pid_file.clone() };
+    locket_platform::run_with_native_session_loop(move || run_internal_agent_worker(&args))?
+}
+
+#[cfg(unix)]
+fn run_internal_agent_worker(args: &InternalAgentServeArgs) -> Result<(), CliError> {
     // Daemon-startup ordering invariant:
     //
     // `agent_lifecycle::run_internal_agent_serve_listens_and_cleans_up_on_sigterm`
@@ -823,7 +880,8 @@ pub fn run_internal_agent_serve(args: &InternalAgentServeArgs) -> Result<(), Cli
         let (listener, state) = bind_and_record(args)?;
         let sync_task = locket_agent::team_sync::spawn_team_sync_poll(state.clone());
         let expiry_task = state.spawn_unlock_expiry();
-        let result = serve_until_signal(listener, state).await.map_err(CliError::Io);
+        let result =
+            serve_until_signal(listener, state, &args.pid_file).await.map_err(CliError::Io);
         sync_task.abort();
         expiry_task.abort();
         result
@@ -848,7 +906,6 @@ fn bind_and_record(
         env!("CARGO_PKG_VERSION"),
     ))
     .map_err(socket_error_to_cli)?;
-    write_pid_file(&args.pid_file)?;
     let state = AgentSocketState::locked(env!("CARGO_PKG_VERSION"));
     Ok((listener, state))
 }
@@ -857,6 +914,7 @@ fn bind_and_record(
 async fn serve_until_signal(
     listener: tokio::net::UnixListener,
     state: locket_agent::AgentSocketState,
+    pid_file: &Path,
 ) -> io::Result<()> {
     use locket_agent::{SessionLockSource, handle_connection};
     use tokio::signal::unix::{SignalKind, signal};
@@ -864,8 +922,16 @@ async fn serve_until_signal(
     let mut term = signal(SignalKind::terminate())?;
     let mut intr = signal(SignalKind::interrupt())?;
     let mut hup = signal(SignalKind::hangup())?;
+    let mut observer = start_session_observer(&state).await;
+    write_pid_file(pid_file).map_err(|error| io::Error::other(error.to_string()))?;
     loop {
         tokio::select! {
+            biased;
+            event = next_native_session_event(&mut observer) => {
+                let result = handle_native_session_event(&state, event.map(|event| event.event)).await;
+                if let (Some(observer), Some(event)) = (&observer, event) { observer.acknowledge_event(event); }
+                result?;
+            }
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
                 let connection_state = state.clone();
@@ -904,7 +970,7 @@ async fn serve_until_signal(
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "windows"))]
 fn agent_signal_unix_nanos() -> i128 {
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -915,6 +981,56 @@ fn agent_signal_unix_nanos() -> i128 {
     })
 }
 
+#[cfg(any(unix, target_os = "windows"))]
+async fn handle_native_session_event(
+    state: &locket_agent::AgentSocketState,
+    event: Option<locket_platform::NativeSessionEvent>,
+) -> io::Result<()> {
+    use locket_agent::SessionLockSource;
+    use locket_platform::NativeSessionEvent;
+    let (source, blocked) = match event {
+        Some(NativeSessionEvent::SystemSleep) => (SessionLockSource::SystemSleep, true),
+        Some(NativeSessionEvent::SystemWake) => (SessionLockSource::SystemSleep, false),
+        Some(NativeSessionEvent::ScreenLock) => (SessionLockSource::ScreenLock, true),
+        Some(NativeSessionEvent::ScreenUnlock) => (SessionLockSource::ScreenLock, false),
+        None => (SessionLockSource::UserSessionSwitch, true),
+    };
+    state
+        .lock_for_native_session_event(source, blocked, agent_signal_unix_nanos())
+        .await
+        .map_err(|error| io::Error::other(format!("failed to append LOCK audit row: {error}")))?;
+    if event.is_none() {
+        return Err(io::Error::other("native session observer stopped; agent locked and stopped"));
+    }
+    Ok(())
+}
+
+#[cfg(any(unix, target_os = "windows"))]
+async fn start_session_observer(
+    state: &locket_agent::AgentSocketState,
+) -> Option<locket_platform::SessionObserver> {
+    match locket_platform::SessionObserver::start(|| std::process::exit(1)).await {
+        Ok(observer) => {
+            state.set_session_monitoring_status("active: macOS native session notifications").await;
+            Some(observer)
+        }
+        Err(error) => {
+            state.set_session_monitoring_status(format!("unavailable: {error}")).await;
+            None
+        }
+    }
+}
+
+#[cfg(any(unix, target_os = "windows"))]
+async fn next_native_session_event(
+    observer: &mut Option<locket_platform::SessionObserver>,
+) -> Option<locket_platform::NativeSessionNotification> {
+    match observer {
+        Some(observer) => observer.next_event().await,
+        None => std::future::pending().await,
+    }
+}
+
 #[cfg(target_os = "windows")]
 pub fn run_internal_agent_serve(args: &InternalAgentServeArgs) -> Result<(), CliError> {
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
@@ -923,11 +1039,18 @@ pub fn run_internal_agent_serve(args: &InternalAgentServeArgs) -> Result<(), Cli
             .map_err(|error| io::Error::other(error.to_string()))?;
         let mut listener = locket_agent::bind_named_pipe_listener(&config)?;
         let state = locket_agent::AgentSocketState::locked(env!("CARGO_PKG_VERSION"));
+        let mut observer = start_session_observer(&state).await;
         write_pid_file(&args.pid_file).map_err(|error| io::Error::other(error.to_string()))?;
         let sync_task = locket_agent::team_sync::spawn_team_sync_poll(state.clone());
         let expiry_task = state.spawn_unlock_expiry();
         loop {
             tokio::select! {
+                biased;
+                event = next_native_session_event(&mut observer) => {
+                    let result = handle_native_session_event(&state, event.map(|event| event.event)).await;
+                    if let (Some(observer), Some(event)) = (&observer, event) { observer.acknowledge_event(event); }
+                    result?;
+                }
                 connected = listener.connect() => {
                     connected?;
                     let stream = listener;
@@ -1124,6 +1247,49 @@ mod tests {
         TtyRecoveryCodeReader,
     };
 
+    #[cfg(any(unix, target_os = "windows"))]
+    #[tokio::test]
+    async fn native_session_events_clear_keys_and_revoke_grants() -> io::Result<()> {
+        use locket_agent::{
+            AgentSocketState, GrantAction, GrantBinding, GrantRecord, UnlockEntry, UnlockMethod,
+        };
+        use locket_platform::NativeSessionEvent;
+
+        for event in [
+            Some(NativeSessionEvent::SystemSleep),
+            Some(NativeSessionEvent::ScreenLock),
+            Some(NativeSessionEvent::SystemWake),
+            Some(NativeSessionEvent::ScreenUnlock),
+            None,
+        ] {
+            let state = AgentSocketState::locked("test");
+            state.unlock_cache.lock().await.insert(
+                "project".to_owned(),
+                UnlockEntry::new(
+                    vec![7; 32],
+                    0,
+                    StdDuration::from_secs(30),
+                    UnlockMethod::OsKeychain,
+                ),
+            );
+            state.grants.lock().await.insert(GrantRecord {
+                grant_id: "before-sleep".to_owned(),
+                project_id: "project".to_owned(),
+                profile_id: "profile".to_owned(),
+                action: GrantAction::RunPolicy,
+                binding: GrantBinding::new(std::process::id(), "test"),
+                issued_at_unix_nanos: 0,
+                ttl_seconds: 30,
+                expires_at_unix_nanos: i128::MAX,
+            });
+            let result = handle_native_session_event(&state, event).await;
+            assert!(state.unlock_cache.lock().await.is_empty(), "{event:?} retained keys");
+            assert!(state.grants.lock().await.is_empty(), "{event:?} retained a pre-event grant");
+            assert_eq!(result.is_err(), event.is_none(), "observer failure must stop serving");
+        }
+        Ok(())
+    }
+
     struct FakeLauncher {
         spawn_calls: Cell<usize>,
         status_ok: Cell<bool>,
@@ -1197,11 +1363,25 @@ mod tests {
         let launcher = FakeLauncher::succeeding();
 
         let first = ensure_agent_running_with_launcher(&context, &launcher)?;
-        assert_eq!(first, AgentStartupReport { started: true, pid: Some(std::process::id()) });
+        assert_eq!(
+            first,
+            AgentStartupReport {
+                started: true,
+                pid: Some(std::process::id()),
+                session_monitoring: None
+            }
+        );
         assert_eq!(launcher.spawn_calls(), 1);
 
         let second = ensure_agent_running_with_launcher(&context, &launcher)?;
-        assert_eq!(second, AgentStartupReport { started: false, pid: Some(std::process::id()) });
+        assert_eq!(
+            second,
+            AgentStartupReport {
+                started: false,
+                pid: Some(std::process::id()),
+                session_monitoring: None
+            }
+        );
         assert_eq!(launcher.spawn_calls(), 1);
         Ok(())
     }

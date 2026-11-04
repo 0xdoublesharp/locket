@@ -1411,6 +1411,143 @@ async fn expired_unlock_revokes_its_grants() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn native_session_gate_rejects_unlock_and_grants_until_resume() {
+    let state = crate::AgentSocketState::with_stores(
+        "test",
+        0,
+        std::sync::Arc::new(locket_platform::MemoryMasterKeyStore::default()),
+        std::sync::Arc::new(locket_platform::PassphraseFallbackMasterKeyStore::new(
+            std::path::PathBuf::new(),
+        )),
+    );
+    state.seed_master_key("project", &[3; 32]).unwrap();
+    let unlock = crate::RequestEnvelope::new(
+        "unlock",
+        crate::AgentMethod::Unlock,
+        serde_json::json!({"project_id":"project", "ttl_seconds":60}),
+    );
+    let grant = crate::RequestEnvelope::new(
+        "grant",
+        crate::AgentMethod::RequestGrant,
+        serde_json::json!({"project_id":"project", "profile_id":"profile", "action":"ResolveReference", "ttl_seconds":60,
+            "binding":{"pid":123,"process_start_time":"start"}}),
+    );
+    state
+        .lock_for_native_session_event(
+            crate::SessionLockSource::SystemSleep,
+            true,
+            crate::server::current_unix_nanos(),
+        )
+        .await
+        .unwrap();
+    for request in [&unlock, &grant] {
+        let response = crate::dispatch(request, &state).await;
+        assert!(
+            matches!(response, crate::ResponseEnvelope::Error(ref error) if error.error == "UnlockRequired"),
+            "{response:?}"
+        );
+    }
+    assert!(state.unlock_cache.lock().await.is_empty());
+    assert!(state.grants.lock().await.is_empty());
+    state
+        .lock_for_native_session_event(
+            crate::SessionLockSource::ScreenLock,
+            true,
+            crate::server::current_unix_nanos(),
+        )
+        .await
+        .unwrap();
+    state
+        .lock_for_native_session_event(
+            crate::SessionLockSource::SystemSleep,
+            false,
+            crate::server::current_unix_nanos(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(crate::dispatch(&unlock, &state).await, crate::ResponseEnvelope::Error(_)),
+        "waking must not clear the screen-lock gate"
+    );
+    state
+        .lock_for_native_session_event(
+            crate::SessionLockSource::ScreenLock,
+            false,
+            crate::server::current_unix_nanos(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(crate::dispatch(&unlock, &state).await, crate::ResponseEnvelope::Success(_)));
+    assert!(matches!(crate::dispatch(&grant, &state).await, crate::ResponseEnvelope::Success(_)));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn expiry_timer_rechecks_wall_clock_while_unlocked() {
+    let state = crate::AgentSocketState::locked("test");
+    state.unlock_cache.lock().await.insert(
+        "project".into(),
+        crate::UnlockEntry::new(
+            vec![7; 32],
+            crate::server::current_unix_nanos(),
+            std::time::Duration::from_secs(60),
+            crate::UnlockMethod::Passphrase,
+        ),
+    );
+    let worker = state.spawn_unlock_expiry();
+    tokio::task::yield_now().await;
+    state.test_expiry_clock_offset.store(120_000_000_000, std::sync::atomic::Ordering::Relaxed);
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    worker.abort();
+    assert!(
+        state.unlock_cache.lock().await.is_empty(),
+        "wall-clock expiry must physically erase keys promptly"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn idle_unlock_cache_does_not_poll() {
+    let state = crate::server::AgentSocketState::locked("test");
+    let worker = state.spawn_unlock_expiry();
+    tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+    worker.abort();
+    let checks = state.expiry_checks.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(checks, 0, "empty cache performed {checks} expiry scans in 350 ms");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn expiry_scheduler_wakes_for_new_earlier_deadlines() {
+    let state = crate::server::AgentSocketState::locked("test");
+    let worker = state.spawn_unlock_expiry();
+    tokio::task::yield_now().await;
+    state.unlock_cache.lock().await.insert(
+        "later".into(),
+        crate::UnlockEntry::new(
+            vec![7; 32],
+            crate::server::current_unix_nanos(),
+            std::time::Duration::from_secs(60),
+            crate::UnlockMethod::Passphrase,
+        ),
+    );
+    tokio::task::yield_now().await;
+    state.unlock_cache.lock().await.insert(
+        "earlier".into(),
+        crate::UnlockEntry::new(
+            vec![8; 32],
+            crate::server::current_unix_nanos(),
+            std::time::Duration::from_millis(20),
+            crate::UnlockMethod::Passphrase,
+        ),
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    state.shutdown.notify_waiters();
+    tokio::time::timeout(std::time::Duration::from_secs(1), worker).await.unwrap().unwrap();
+    let mut cache = state.unlock_cache.lock().await;
+    assert!(cache.evict("earlier").is_none(), "earlier deadline must be physically evicted");
+    assert!(cache.evict("later").is_some(), "later key must stay live");
+    drop(cache);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn daemon_expiry_removes_keys_without_status_requests() {
     let state = crate::server::AgentSocketState::locked("test");
     state.unlock_cache.lock().await.insert(

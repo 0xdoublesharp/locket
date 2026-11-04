@@ -151,6 +151,11 @@ locket policy require dev API_TOKEN
 locket policy doctor
 ```
 
+If doctor reports an old or changed policy approval, review `locket.toml` and run
+`locket policy refresh dev`. Type the policy name to approve the current command,
+path scopes, and secret access rules. This updates local approval without editing
+the project file.
+
 Run a saved policy or inject explicit secrets into one child process:
 
 ```bash
@@ -274,12 +279,17 @@ locket ai-safe -- <command> [args...]
 ```bash
 locket unlock [--verify-user]
 locket lock
-locket passkey register
 locket recover
 locket recovery rotate
 ```
 
 Recovery and verification flows are local-first. Keep each project's recovery code separately from its encrypted recovery files in `.locket/recovery` and back up both the recovery files and local vault. The encrypted files are excluded from Git; one project's recovery code does not recover other projects.
+
+Fresh user verification uses macOS LocalAuthentication or Windows Hello. Linux vault unlock with keyring or passphrase remains available, but actions requiring fresh verification fail closed until a supported Linux verification backend is installed in Locket. Reading an unlocked Secret Service keyring is not proof of fresh consent.
+
+New passkey registration is unavailable until a genuine WebAuthn/FIDO2 backend is integrated. Earlier `platform-keyring` credentials are software recovery factors stored in the OS keyring, not hardware passkeys. `locket passkey list` identifies them; `locket passkey unlock` preserves their recovery path and requires fresh local verification. Keep your recovery code available.
+
+The macOS agent observes sleep and screen lock and clears cached keys and grants. `locket agent status` reports whether monitoring is active. When monitoring is unavailable, lock the vault explicitly before leaving the device; TTL expiry still applies.
 
 ### Team And Sync
 

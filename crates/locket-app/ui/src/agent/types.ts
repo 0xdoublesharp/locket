@@ -16,6 +16,7 @@ export interface AgentStatus {
   scan_warning_count_known?: boolean;
   recent_audit_status: 'unknown' | 'ok' | 'warning';
   pinned_reference_warning_count: number;
+  session_monitoring?: string | null;
 }
 
 export type AgentStatusEventKind = 'status' | 'heartbeat';

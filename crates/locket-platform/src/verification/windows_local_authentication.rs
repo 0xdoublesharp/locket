@@ -27,6 +27,7 @@ use thiserror::Error;
 
 /// Environment variable consulted by tests so they can drive the wrapper
 /// deterministically without invoking Windows Hello.
+#[cfg(test)]
 const TEST_OVERRIDE_ENV: &str = "LOCKET_TEST_LOCAL_AUTH";
 
 /// Errors returned by [`evaluate_local_user`].
@@ -57,6 +58,7 @@ pub enum LocalAuthError {
 }
 
 /// Test-only override applied before any backend call.
+#[cfg(test)]
 fn test_override() -> Option<Result<bool, LocalAuthError>> {
     let value = std::env::var(TEST_OVERRIDE_ENV).ok()?;
     Some(match value.as_str() {
@@ -85,7 +87,10 @@ pub fn evaluate_local_user(reason: &str) -> Result<bool, LocalAuthError> {
         return Err(LocalAuthError::EmptyReason);
     }
 
-    if let Some(outcome) = test_override() {
+    #[cfg(test)]
+    if crate::local_auth_test_overrides_enabled()
+        && let Some(outcome) = test_override()
+    {
         return outcome;
     }
 

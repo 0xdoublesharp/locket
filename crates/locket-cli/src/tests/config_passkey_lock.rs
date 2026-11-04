@@ -461,6 +461,58 @@ fn passkey_register_is_unavailable_without_writing_metadata()
 }
 
 #[test]
+fn passkey_register_rejects_software_keyring_credentials() -> Result<(), Box<dyn std::error::Error>>
+{
+    use locket_platform::{MemoryPlatformPasskeyRegistrar, PasskeyRegistration};
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    initialize_project_and_device(&context)?;
+    let registration = PasskeyRegistration {
+        credential_id: vec![1; 32],
+        public_key: vec![2; 32],
+        user_handle: vec![3; 32],
+        transports: vec!["internal".to_owned(), "platform-keyring".to_owned()],
+        prf_capable: true,
+        backup_eligible: None,
+        backup_state: None,
+    };
+    let context = super::context_with_passkey_registrar(
+        &context,
+        Arc::new(MemoryPlatformPasskeyRegistrar::allowing(registration, [7; 32])),
+    );
+    let result = run_with_context(
+        Cli::try_parse_from(["locket", "passkey", "register", "--label", "software"])?,
+        &context,
+        &mut Vec::new(),
+    );
+    assert_error_contains(result, "software keyring");
+    let resolved = crate::resolve_project(&context.cwd)?.ok_or("project should resolve")?;
+    let store = locket_store::Store::open(directory.path().join("store.db"))?;
+    assert_eq!(
+        store.list_passkey_credentials(resolved.config.project_id.as_str(), true)?,
+        Vec::new()
+    );
+    Ok(())
+}
+
+#[test]
+fn passkey_unavailable_is_reported_before_requesting_user_verification()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    initialize_project_and_device(&context)?;
+    let context =
+        context_with_user_verifier(&context, Arc::new(MemoryLocalUserVerifier::denying()));
+    let result = run_with_context(
+        Cli::try_parse_from(["locket", "passkey", "register", "--label", "laptop"])?,
+        &context,
+        &mut Vec::new(),
+    );
+    assert_error_contains(result, "WebAuthn/FIDO2");
+    Ok(())
+}
+
+#[test]
 fn passkey_register_via_memory_registrar_writes_credential_and_audit()
 -> Result<(), Box<dyn std::error::Error>> {
     use locket_platform::{MemoryPlatformPasskeyRegistrar, PasskeyRegistration};
@@ -561,6 +613,19 @@ fn passkey_unlock_round_trips_master_key_through_prf() -> Result<(), Box<dyn std
     registered_context.key_store.delete_master_key(&project_id)?;
     assert!(registered_context.key_store.load_master_key(&project_id).is_err());
 
+    // Possession of the PRF wrap must not bypass fresh local verification.
+    let denied_context = context_with_user_verifier(
+        &registered_context,
+        Arc::new(MemoryLocalUserVerifier::denying()),
+    );
+    let denied = run_with_context(
+        Cli::try_parse_from(["locket", "passkey", "unlock"])?,
+        &denied_context,
+        &mut Vec::new(),
+    );
+    assert_error_contains(denied, "local user verification failed");
+    assert!(registered_context.key_store.load_master_key(&project_id).is_err());
+
     let mut unlock_output = Vec::new();
     run_with_context(
         Cli::try_parse_from(["locket", "passkey", "unlock"])?,
@@ -582,6 +647,60 @@ fn passkey_unlock_round_trips_master_key_through_prf() -> Result<(), Box<dyn std
     )?;
     assert!(metadata.contains("\"auth_result\":\"success\""));
     assert!(metadata.contains("\"credential_id_prefix\":\"123456789abc\""));
+    Ok(())
+}
+
+#[test]
+fn passkey_legacy_keyring_recovery_preserves_data_and_identifies_software_factor()
+-> Result<(), Box<dyn std::error::Error>> {
+    use locket_platform::{MemoryPlatformPasskeyRegistrar, PasskeyRegistration};
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    initialize_project_and_device(&context)?;
+    let registration = PasskeyRegistration {
+        credential_id: vec![9; 32],
+        public_key: vec![8; 32],
+        user_handle: vec![7; 32],
+        transports: vec!["internal".to_owned()],
+        prf_capable: true,
+        backup_eligible: None,
+        backup_state: None,
+    };
+    let context = super::context_with_passkey_registrar(
+        &context,
+        Arc::new(MemoryPlatformPasskeyRegistrar::allowing(registration, [6; 32])),
+    );
+    run_with_context(
+        Cli::try_parse_from(["locket", "passkey", "register", "--label", "legacy-laptop"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    let resolved = crate::resolve_project(&context.cwd)?.ok_or("project should resolve")?;
+    let project_id = resolved.config.project_id.as_str();
+    let store = locket_store::Store::open(directory.path().join("store.db"))?;
+    // Reproduce metadata persisted by the old software keyring registrar.
+    store.connection().execute(
+        "UPDATE passkey_credentials SET transports_json = ?1 WHERE project_id = ?2",
+        rusqlite::params![r#"["internal","platform-keyring","macos-keychain"]"#, project_id],
+    )?;
+    let master_key = *context.key_store.load_master_key(project_id)?;
+    context.key_store.delete_master_key(project_id)?;
+    let denied_context =
+        context_with_user_verifier(&context, Arc::new(MemoryLocalUserVerifier::denying()));
+    let denied = run_with_context(
+        Cli::try_parse_from(["locket", "passkey", "unlock"])?,
+        &denied_context,
+        &mut Vec::new(),
+    );
+    assert_error_contains(denied, "local user verification failed");
+    assert!(context.key_store.load_master_key(project_id).is_err());
+    let mut output = Vec::new();
+    run_with_context(Cli::try_parse_from(["locket", "passkey", "unlock"])?, &context, &mut output)?;
+    assert!(String::from_utf8(output)?.contains("legacy software keyring recovery"));
+    assert_eq!(*context.key_store.load_master_key(project_id)?, master_key);
+    let mut output = Vec::new();
+    run_with_context(Cli::try_parse_from(["locket", "passkey", "list"])?, &context, &mut output)?;
+    assert!(String::from_utf8(output)?.contains("kind=legacy-software-keyring"));
     Ok(())
 }
 

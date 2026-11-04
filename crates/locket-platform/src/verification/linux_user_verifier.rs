@@ -1,5 +1,5 @@
-//! Linux implementation of [`LocalUserVerifier`] backed by the
-//! Secret Service wrapper in [`crate::linux_local_authentication`].
+//! Linux implementation of [`LocalUserVerifier`] using the fail-closed
+//! boundary in [`crate::linux_local_authentication`].
 //!
 //! This file contains zero `unsafe`. All platform interaction is
 //! confined to `linux_local_authentication.rs`. See that module's
@@ -13,7 +13,7 @@ use crate::user_verification::{
     LocalUserVerifier,
 };
 
-/// Linux [`LocalUserVerifier`] backed by Secret Service.
+/// Linux [`LocalUserVerifier`]; unavailable without a fresh consent backend.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LinuxLocalUserVerifier;
 

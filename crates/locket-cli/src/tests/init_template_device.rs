@@ -5089,6 +5089,7 @@ fn init_recovery_code_displayed_even_when_passkey_registration_fails()
         output_text.contains("recovery_code_init: success"),
         "init must still display the recovery code when passkey registration fails: {output_text}"
     );
+    assert!(output_text.contains("WebAuthn/FIDO2 registration is unavailable"));
 
     let store = locket_store::Store::open(directory.path().join("store.db"))?;
     let project_id: String =

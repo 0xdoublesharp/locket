@@ -182,12 +182,12 @@ Recovery envelope v1:
 
 Passkey and local user-verification model:
 
-- General user-presence gates use platform APIs directly: macOS LocalAuthentication.framework, Windows Hello user-consent APIs, and Linux desktop Secret Service or configured hardware-key presence where available.
-- Hardware security keys use CTAP2/FIDO2 user-presence/user-verification flows directly for approval gates.
+- General user-presence gates use macOS LocalAuthentication.framework and Windows Hello user-consent APIs. Linux gates currently fail closed: access to an unlocked Secret Service collection does not prove fresh consent. Ordinary keyring storage and passphrase vault unlock remain supported.
+- CTAP2/FIDO2 user-presence/user-verification approval gates require a real authenticator integration; the current Linux hardware-key feature does not provide one.
 - Browser-style WebAuthn/passkey ceremonies are not the default path for local CLI/UI user presence because they add browser/RP ceremony without improving the local approval primitive.
 - WebAuthn PRF/hmac-secret is allowed only as an optional key-wrapping factor when a hardware token or platform authenticator supports it. Recovery code support remains mandatory because PRF availability and synced-passkey behavior vary by platform.
 - Local user-verification gates can protect unlock, reveal/copy, dangerous-profile switching, team invite acceptance, device registration, and recovery operations.
-- Locket stores only public metadata for authenticators and never stores passkey, authenticator, or biometric private material.
+- Genuine authenticators must keep their private material outside Locket. Legacy `platform-keyring` credentials instead use software seeds held in the OS keyring; they are explicitly identified as legacy software recovery factors.
 - Local user verification does not replace peer-credential checks for the local agent and does not bypass policy, grants, audit, or team roles.
 - Registration, removal, and authentication write audit rows when project context is available.
 
@@ -205,8 +205,8 @@ Default approval paths:
 
 - macOS: LocalAuthentication.framework.
 - Windows: Windows Hello user-consent APIs.
-- Linux: Secret Service unlock prompts or configured hardware-key presence where available.
-- Hardware keys: CTAP2/FIDO2 user-presence or user-verification flows directly.
+- Linux: unavailable until a supported fresh-verification backend is integrated; Secret Service access alone is not accepted.
+- Hardware keys: unavailable until a genuine CTAP2/FIDO2 integration is provided.
 
 Protected use cases:
 
@@ -219,7 +219,10 @@ Rules:
 
 - Local user verification never replaces recovery codes.
 - Local user verification never bypasses project/profile policy, grants, team roles, or audit logging.
-- Biometric, authenticator, and passkey private material is never stored by Locket.
+- Production binaries ignore `LOCKET_TEST_LOCAL_AUTH`; test overrides are compiled only into unit tests.
+- New passkey registration is disabled in the default backend. It must not generate software keyring seeds and describe them as WebAuthn PRF credentials.
+- Existing `platform-keyring` records remain readable through an explicitly labeled legacy recovery path after fresh local verification. Their seed derivation remains compatible; key material is zeroized after use. These credentials are not an independent hardware factor or an RP-bound WebAuthn ceremony.
+- Genuine biometric and authenticator private material must never be stored by Locket.
 - Browser-style WebAuthn/passkey ceremonies are not used for ordinary reveal/copy/unlock approvals. They may be used only for optional PRF/hmac-secret key-wrapping flows that require a WebAuthn-compatible authenticator.
 - For optional WebAuthn PRF credentials, the relying party id must be recorded in `PasskeyCredential.webauthn_relying_party_id` and must never change silently. The default RP ID for that optional path is `locket.localhost`; official signed distributions may define a controlled RP ID only as an explicit migration requiring credential re-registration.
 - Synced passkeys are not accepted as a sole recovery or trust root. If a platform exposes backup eligibility/state, Locket must display it so teams can decide whether synced credentials are acceptable as an extra approval factor under current NIST syncable-authenticator guidance.

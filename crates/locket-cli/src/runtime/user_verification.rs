@@ -1,7 +1,7 @@
 //! Shared local user-verification gates for sensitive CLI actions.
 
 use locket_core::LocketError;
-use locket_platform::{LocalUserVerificationMethod, LocalUserVerificationRequest};
+use locket_platform::{LocalUserVerificationMethod, LocalUserVerificationRequest, PlatformError};
 use serde::Serialize;
 
 use crate::commands::config::spec::{
@@ -43,10 +43,28 @@ pub fn require_user_verification(
     let verification = context
         .user_verifier
         .verify_user(&LocalUserVerificationRequest::new(action, reason))
-        .map_err(|_| {
+        .map_err(|error| {
+            let message = match error {
+                PlatformError::LocalUserVerificationUnavailable => {
+                    if cfg!(target_os = "linux") {
+                        format!(
+                            "{action}: fresh local user verification is unavailable on this Linux build; \
+                             Secret Service access cannot prove fresh consent. Ordinary vault unlock \
+                             with keyring or passphrase remains supported"
+                        )
+                    } else {
+                        format!(
+                            "{action}: local user verification is unavailable; configure the OS \
+                             authentication prompt (Touch ID/device password or Windows Hello) \
+                             and retry in an interactive desktop session"
+                        )
+                    }
+                }
+                _ => format!("{action}: local user verification failed"),
+            };
             typed_cli_error(
                 LocketError::UserVerificationFailed,
-                format!("{action}: local user verification failed"),
+                message,
             )
         })?;
     Ok(UserVerificationAudit::satisfied(verification.method))

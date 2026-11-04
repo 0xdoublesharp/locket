@@ -614,6 +614,7 @@ fn required_fields_for_action(action: &str) -> &'static [&'static str] {
 }
 
 const KNOWN_AUDIT_METADATA_FIELDS: &[&str] = &[
+    "credential_kind",
     "access_mode",
     "accepted_at",
     "action",

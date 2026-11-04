@@ -1695,6 +1695,15 @@ onUnmounted(() => {
 
     <main class="shell__main">
       <AgentUnavailableBanner v-if="error" :error="error" />
+      <p
+        v-if="connected && agentStatus && !agentStatus.session_monitoring?.startsWith('active:')"
+        role="status"
+        class="shell__notice"
+        data-testid="session-lock-warning"
+      >
+        Automatic locking on screen lock or sleep is unavailable. Lock the vault before leaving this
+        device.
+      </p>
       <p v-if="!desktopAvailable" class="shell__notice">
         Browser preview is disconnected. Open the Locket desktop app to connect projects, unlock,
         import values, and run commands.

@@ -13,6 +13,7 @@ locket policy add dev -- pnpm dev
 locket policy allow dev DATABASE_URL
 locket policy require dev DATABASE_URL
 locket policy edit dev
+locket policy refresh dev
 locket policy delete dev
 locket policy doctor
 ```
@@ -23,8 +24,10 @@ Behavior:
 - `policy allow` permits optional secret access.
 - `policy require` marks a secret as required before spawn.
 - `policy edit` opens the configured editor on the policy file or launches the UI editor.
+- `policy refresh <name>` approves the current local command, path scopes, and secret ACLs for agent reference resolution after review and typed confirmation of the policy name. It refreshes the audited SQLite index without changing `locket.toml`, and refuses a source change during confirmation.
 - `policy delete <name>` shows a metadata-only summary of affected shell hooks, tray actions, automation clients, and VS Code tasks, requires typed confirmation of the policy name, removes the saved policy, revokes live grants for that policy, and writes a `POLICY_UPDATE` audit row with deletion metadata.
 - `policy doctor` validates command existence, required secrets, profile availability, dangerous-profile confirmations, and `lk://` references. If the agent is unavailable, it warns that `lk://` reference validation was skipped, lists unvalidated references, and exits with a distinct non-zero status separate from ordinary policy validation failure.
+- `policy doctor` reports existing indexes with missing or stale source approval and prints the affected `locket policy refresh <name>` commands. It never approves or refreshes a policy implicitly. Agent availability and unlock failures include the next commands to run.
 - UI policy editing must expose argv vs shell mode clearly and warn when shell mode is selected.
 - Docker/Compose policy editing must expose `allow_remote_docker` clearly. The default is `false`; enabling it requires typed confirmation because remote Docker contexts deliver local secrets to another machine.
 - Monorepos may define path-scoped environment sets under `[paths."<project-relative-directory>"]`. The current working directory is resolved under the project root, the deepest matching path scope wins, and its `required_secrets` / `optional_secrets` are merged into the selected command policy before policy execution, external-env resolution, `env inspect`, Docker, or Compose preparation. A scope may set `profile = "<profile>"` to use that profile for executions from the matching subtree. Path keys must be project-relative and must not contain `..` or absolute roots.
@@ -65,6 +68,7 @@ Policy source of truth:
 - Project path scopes are canonical in `locket.toml` under `[paths.<relative-path>]` so subproject env boundaries are reviewable without exporting secret values.
 - Project secret ACLs are canonical in `locket.toml` under `[secrets.<SECRET_NAME>]` so per-secret command and path limits are reviewable without exporting secret values.
 - The SQLite `command_policies` table stores a normalized local index/cache used by the agent, UI, tray, VS Code, and policy doctor.
+- Agent reference resolution requires both a durable `source_path` and a matching `source_digest`; legacy allow-list-only indexes fail closed. The source is read and validated on every resolution, including current command, path, profile, and secret ACL rules. After upgrading, review `locket.toml` and use `locket policy refresh <name>` for any legacy policy reported by doctor.
 - `policy add`, `policy allow`, `policy require`, `policy edit`, and `policy delete` update `locket.toml` first, then refresh the SQLite index in the same user-visible operation.
 - If `locket.toml` and SQLite disagree, `locket.toml` wins after a successful parse; invalid TOML fails closed and leaves the prior SQLite index read-only for diagnostics only.
 

@@ -471,6 +471,16 @@ fn maybe_register_passkey(
     if no_passkey {
         return;
     }
+    if !context.passkey_registrar.supports_registration() {
+        if register_passkey {
+            let _ = writeln!(
+                output,
+                "passkey: WebAuthn/FIDO2 registration is unavailable in this build; \
+                 vault unlock with the OS keyring or passphrase remains available."
+            );
+        }
+        return;
+    }
     let should_register = if register_passkey {
         true
     } else if io::stdin().is_terminal() && io::stderr().is_terminal() {

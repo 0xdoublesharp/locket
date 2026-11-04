@@ -46,7 +46,7 @@ This spec describes the intended v1 product surface for Locket. A conforming imp
 - OS key integration, passphrase fallback, recovery code generation, and `locket recover`.
 - Project resolution, trusted roots, profiles, dangerous-profile policy, and `locket project trust-root`.
 - Project template initialization through `locket new --from-template` using bundled or local templates only.
-- Platform local user verification for unlock, dangerous actions, team/device trust, and recovery gates, plus optional passkey/PRF registration for hardware-backed key wrapping.
+- Platform local user verification for unlock, dangerous actions, team/device trust, and recovery gates. Genuine passkey/PRF registration is unavailable in the default backend; legacy software keyring recovery remains explicitly labeled and requires fresh verification.
 - Team setup, device identity, sealed invites, member/device revocation, and `locket bootstrap`.
 - Core secret lifecycle: `init`, `set`, `get`, `rm`, `purge`, `list`, `rotate`, rotation grace/deprecated-version handling, `history`, and `diff`.
 - CLI reveal/copy gates with TTY and `--force` semantics.

@@ -2,6 +2,97 @@
 use super::*;
 
 #[test]
+fn policy_doctor_reports_legacy_index_without_approving_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--name", "app", "--profile", "dev"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    run_with_context(
+        Cli::try_parse_from(["locket", "policy", "add", "dev", "--", "pnpm", "dev"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    let store = locket_store::Store::open(&context.store_path)?;
+    store.connection().execute("UPDATE command_policies SET normalized_json = '{}'", [])?;
+    let mut output = Vec::new();
+    let result = run_with_context(
+        Cli::try_parse_from(["locket", "policy", "doctor"])?,
+        &context,
+        &mut output,
+    );
+    assert_error_contains(result, "refresh");
+    let output = String::from_utf8(output)?;
+    assert!(output.contains("policy_doctor: incomplete"), "{output}");
+    assert!(output.contains("locket policy refresh dev"), "{output}");
+    let resolved = crate::require_project(&context)?;
+    assert_eq!(
+        store
+            .get_command_policy_index(resolved.config.project_id.as_str(), "dev")?
+            .ok_or("missing policy")?
+            .normalized_json,
+        json!({})
+    );
+    Ok(())
+}
+
+#[test]
+fn policy_refresh_requires_confirmation_and_rebinds_current_source()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    let mut output = Vec::new();
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--name", "app", "--profile", "dev"])?,
+        &context,
+        &mut output,
+    )?;
+    run_with_context(
+        Cli::try_parse_from(["locket", "policy", "add", "dev", "--", "pnpm", "dev"])?,
+        &context,
+        &mut output,
+    )?;
+    let store = locket_store::Store::open(&context.store_path)?;
+    store.connection().execute("UPDATE command_policies SET normalized_json = '{}'", [])?;
+    let path = directory.path().join("locket.toml");
+    let original = std::fs::read_to_string(&path)?;
+    assert_error_contains(
+        run_with_context(
+            Cli::try_parse_from(["locket", "policy", "refresh", "dev"])?,
+            &context,
+            &mut output,
+        ),
+        "confirmation did not match policy name",
+    );
+    let resolved = crate::require_project(&context)?;
+    let unapproved = store
+        .get_command_policy_index(resolved.config.project_id.as_str(), "dev")?
+        .ok_or("missing policy")?;
+    assert_eq!(unapproved.normalized_json, json!({}));
+    let approved_context = context_with_confirmation(&context, "dev\n");
+    run_with_context(
+        Cli::try_parse_from(["locket", "policy", "refresh", "dev"])?,
+        &approved_context,
+        &mut output,
+    )?;
+    let approved = store
+        .get_command_policy_index(resolved.config.project_id.as_str(), "dev")?
+        .ok_or("missing policy")?;
+    assert_eq!(approved.normalized_json["source_path"], json!(path));
+    let document: toml::Value = toml::from_str(&original)?;
+    assert_eq!(
+        approved.normalized_json["source_digest"],
+        json!(locket_core::policy::policy_source_digest(&document, "dev")?)
+    );
+    assert_eq!(std::fs::read_to_string(path)?, original);
+    assert!(String::from_utf8(output)?.contains("operation: refresh"));
+    Ok(())
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn policy_commands_update_locket_toml_without_duplicates_and_audit_metadata()
 -> Result<(), Box<dyn std::error::Error>> {

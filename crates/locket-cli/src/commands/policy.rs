@@ -45,6 +45,8 @@ pub enum PolicyCommand {
     Delete(PolicyDeleteArgs),
     /// Edit a command policy in the configured editor.
     Edit(PolicyEditArgs),
+    /// Review and approve the current policy source for agent reference access.
+    Refresh(PolicyEditArgs),
     /// Validate policy metadata in locket.toml.
     Doctor,
 }
@@ -91,6 +93,7 @@ pub fn command(
         PolicyCommand::Require(args) => require(context, output, args),
         PolicyCommand::Delete(args) => delete(context, output, args),
         PolicyCommand::Edit(args) => edit(context, output, &args),
+        PolicyCommand::Refresh(args) => refresh(context, output, &args),
         PolicyCommand::Doctor => doctor(context, output),
     }
 }
@@ -224,8 +227,7 @@ fn edit(
     }
     edit_result?;
     let updated_document = read_locket_toml(&path)?;
-    let policy_text = toml::to_string_pretty(&*updated_document)?;
-    let policy_document = PolicyDocument::from_toml_str(&policy_text)
+    let policy_document = PolicyDocument::from_toml_value(&updated_document)
         .map_err(|error| metadata_invalid_error(error.to_string()))?;
     write_policy_index_update_if_available(
         context,
@@ -239,12 +241,66 @@ fn edit(
     write_policy_update(output, &args.name, "edit")
 }
 
+fn refresh(
+    context: &RuntimeContext,
+    output: &mut impl Write,
+    args: &PolicyEditArgs,
+) -> Result<(), CliError> {
+    validate_policy_name(&args.name)?;
+    let resolved = require_project(context)?;
+    crate::ensure_trusted_project_root(&open_store(context)?, &resolved)?;
+    let path = resolved.root.join(LOCKET_TOML);
+    let source = read_locket_toml(&path)?;
+    let parsed = PolicyDocument::from_toml_value(&source)
+        .map_err(|error| metadata_invalid_error(error.to_string()))?;
+    let policy = parsed.commands.get(&args.name).ok_or_else(|| {
+        policy_not_found_error(format!("command policy not found: {}", args.name))
+    })?;
+    writeln!(output, "policy_refresh: {}", args.name)?;
+    writeln!(output, "review_source: {}", path.display())?;
+    writeln!(
+        output,
+        "allowed_secret_names: {}",
+        policy.allowed_secrets.iter().map(ToString::to_string).collect::<Vec<_>>().join(" ")
+    )?;
+    writeln!(
+        output,
+        "path_scopes: {}",
+        parsed.path_scopes.keys().cloned().collect::<Vec<_>>().join(" ")
+    )?;
+    writeln!(output, "review the command, path scopes, and secret ACLs in this file")?;
+    writeln!(output, "type '{}' to approve the current policy source", args.name)?;
+    let confirmation = context.confirmation_reader.read_confirmation("policy refresh")?;
+    if confirmation.trim_end_matches(['\r', '\n']) != args.name {
+        return Err(confirmation_failed_error("confirmation did not match policy name"));
+    }
+    let current = read_locket_toml(&path)?;
+    if *current != *source {
+        return Err(metadata_invalid_error(
+            "command configuration changed during approval; retry policy refresh",
+        ));
+    }
+    write_policy_index_update_if_available(
+        context,
+        resolved.config.project_id.as_str(),
+        &source,
+        &parsed,
+        &args.name,
+        "refresh",
+    )?;
+    pump_policies_to_agent(context, resolved.config.project_id.as_str(), &parsed);
+    write_policy_update(output, &args.name, "refresh")
+}
+
 fn doctor(context: &RuntimeContext, output: &mut impl Write) -> Result<(), CliError> {
     let resolved = require_project(context)?;
     let path = resolved.root.join(LOCKET_TOML);
     let policy_text = fs::read_to_string(&path)?;
-    let document = PolicyDocument::from_toml_str(&policy_text)
+    let raw: toml::Value = toml::from_str(&policy_text)
+        .map_err(|_| metadata_invalid_error("invalid project configuration"))?;
+    let document = PolicyDocument::from_toml_value(&raw)
         .map_err(|error| metadata_invalid_error(error.to_string()))?;
+    let refreshes = policy_indexes_needing_refresh(context, &resolved, &raw, &document)?;
 
     let has_lk_references = policy_text.contains("lk://");
     let validation = if document.commands.is_empty() {
@@ -253,17 +309,75 @@ fn doctor(context: &RuntimeContext, output: &mut impl Write) -> Result<(), CliEr
         validate_policies_via_agent(context, &resolved, &document)
     };
 
-    let header_status =
-        if validation.has_failures() || (validation.fatal_error.is_some() && has_lk_references) {
-            "incomplete"
-        } else {
-            "ok"
-        };
+    let header_status = if !refreshes.is_empty()
+        || validation.has_failures()
+        || (validation.fatal_error.is_some() && has_lk_references)
+    {
+        "incomplete"
+    } else {
+        "ok"
+    };
     writeln!(output, "policy_doctor: {header_status}")?;
     writeln!(output, "policies: {}", document.commands.len())?;
     writeln!(output, "metadata_only: yes")?;
     writeln!(output, "minimal_env_allowlist: {}", locket_exec::DEFAULT_SAFE_ALLOWLIST.join(" "))?;
-    let scan_policy = read_scan_policy(&path)?;
+    write_doctor_scanner_warnings(output, &path)?;
+    for policy in document.commands.values().filter(|policy| !policy.override_explicit()) {
+        writeln!(
+            output,
+            "warning: policy {} uses implicit override=locket; set override explicitly",
+            policy.name
+        )?;
+    }
+
+    for report in &validation.reports {
+        write_policy_doctor_report(output, report)?;
+    }
+    for name in &refreshes {
+        writeln!(output, "warning: policy {name} needs local approval of its current source")?;
+        writeln!(output, "next_step: review locket.toml, then run `locket policy refresh {name}`")?;
+    }
+
+    write_doctor_audit_if_available(context, &resolved, &validation)?;
+
+    if matches!(validation.fatal_error.as_ref(), Some(FatalDoctorError::AgentUnavailable)) {
+        writeln!(
+            output,
+            "next_step: run `locket agent start`, `locket unlock`, then `locket policy doctor`"
+        )?;
+        if has_lk_references {
+            writeln!(output, "warning: lk:// validation skipped because agent is unavailable")?;
+            writeln!(output, "unvalidated_lk_references: present")?;
+            return Err(typed_cli_error(
+                LocketError::AgentUnavailable,
+                "AgentUnavailable: policy doctor could not validate lk:// references",
+            ));
+        }
+        // No agent and no lk:// references → keep the legacy "ok"
+        // outcome so projects that have not yet started the agent can
+        // still run `policy doctor` for the scanner checks.
+        if refreshes.is_empty() {
+            return Ok(());
+        }
+    }
+    if matches!(validation.fatal_error.as_ref(), Some(FatalDoctorError::UnlockRequired)) {
+        writeln!(output, "next_step: run `locket unlock`, then `locket policy doctor`")?;
+    }
+    if !refreshes.is_empty() {
+        return Err(typed_cli_error(
+            LocketError::PolicyValidationIncomplete,
+            "policy indexes need approval; review locket.toml and run the listed policy refresh commands",
+        ));
+    }
+
+    if let Some(error) = validation.exit_error {
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn write_doctor_scanner_warnings(output: &mut impl Write, path: &Path) -> Result<(), CliError> {
+    let scan_policy = read_scan_policy(path)?;
     let entropy_rule = scan_policy.entropy_rule;
     if entropy_rule != EntropyRule::default() {
         writeln!(
@@ -283,39 +397,39 @@ fn doctor(context: &RuntimeContext, output: &mut impl Write) -> Result<(), CliEr
             scan_policy.env_file_severity().as_str()
         )?;
     }
-    for policy in document.commands.values().filter(|policy| !policy.override_explicit()) {
-        writeln!(
-            output,
-            "warning: policy {} uses implicit override=locket; set override explicitly",
-            policy.name
-        )?;
-    }
-
-    for report in &validation.reports {
-        write_policy_doctor_report(output, report)?;
-    }
-
-    write_doctor_audit_if_available(context, &resolved, &validation)?;
-
-    if matches!(validation.fatal_error.as_ref(), Some(FatalDoctorError::AgentUnavailable)) {
-        if has_lk_references {
-            writeln!(output, "warning: lk:// validation skipped because agent is unavailable")?;
-            writeln!(output, "unvalidated_lk_references: present")?;
-            return Err(typed_cli_error(
-                LocketError::AgentUnavailable,
-                "AgentUnavailable: policy doctor could not validate lk:// references",
-            ));
-        }
-        // No agent and no lk:// references → keep the legacy "ok"
-        // outcome so projects that have not yet started the agent can
-        // still run `policy doctor` for the scanner checks.
-        return Ok(());
-    }
-
-    if let Some(error) = validation.exit_error {
-        return Err(error);
-    }
     Ok(())
+}
+
+fn policy_indexes_needing_refresh(
+    context: &RuntimeContext,
+    resolved: &ResolvedProject,
+    source: &toml::Value,
+    parsed: &PolicyDocument,
+) -> Result<Vec<String>, CliError> {
+    let store = open_store(context)?;
+    let mut names = Vec::new();
+    for name in parsed.commands.keys() {
+        if let Some(index) =
+            store.get_command_policy_index(resolved.config.project_id.as_str(), name)?
+            && !policy_index_matches_source(&index, resolved, source, name)?
+        {
+            names.push(name.clone());
+        }
+    }
+    Ok(names)
+}
+
+fn policy_index_matches_source(
+    index: &locket_store::CommandPolicyIndexRecord,
+    resolved: &ResolvedProject,
+    source: &toml::Value,
+    name: &str,
+) -> Result<bool, CliError> {
+    let digest = locket_core::policy::policy_source_digest(source, name)?;
+    Ok(index.normalized_json.get("source_path") == Some(&json!(resolved.root.join(LOCKET_TOML)))
+        && index.normalized_json.get("source_digest").and_then(serde_json::Value::as_str)
+            == Some(&digest)
+        && index.policy_json == policy_json(source, name)?)
 }
 
 /// Outcome of an agent-driven validation pass over the project's
@@ -851,7 +965,7 @@ fn apply_edited_policy(path: &Path, edit_path: &Path, name: &str) -> Result<(), 
         .map_err(|error| invalid_policy_error(format!("invalid edited policy TOML: {error}")))?;
     ensure_policy_exists(&edited, name)?;
     let content = toml::to_string_pretty(&edited)?;
-    PolicyDocument::from_toml_str(&content)
+    PolicyDocument::from_toml_value(&edited)
         .map_err(|error| invalid_policy_error(format!("invalid edited policy: {error}")))?;
     fs::write(path, content)?;
     Ok(())
@@ -1300,17 +1414,14 @@ pub fn refresh_command_policy_for_run(
     name: &str,
 ) -> Result<(), CliError> {
     let document = read_locket_toml(&resolved.root.join(LOCKET_TOML))?;
-    let parsed = PolicyDocument::from_toml_str(&toml::to_string_pretty(&*document)?)
+    let parsed = PolicyDocument::from_toml_value(&document)
         .map_err(|error| metadata_invalid_error(error.to_string()))?;
-    let digest = locket_core::policy::policy_source_digest(&document, name)?;
     let store = open_store(context)?;
     crate::ensure_trusted_project_root(&store, resolved)?;
-    if store.get_command_policy_index(resolved.config.project_id.as_str(), name)?.is_some_and(
-        |index| {
-            index.normalized_json.get("source_digest").and_then(serde_json::Value::as_str)
-                == Some(&digest)
-        },
-    ) {
+    if let Some(index) =
+        store.get_command_policy_index(resolved.config.project_id.as_str(), name)?
+        && policy_index_matches_source(&index, resolved, &document, name)?
+    {
         return Ok(());
     }
     write_policy_index_update_if_available(

@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -118,12 +119,14 @@ impl UnlockEntry {
 #[derive(Debug, Default)]
 pub struct UnlockCache {
     entries: BTreeMap<String, UnlockEntry>,
+    changed: Arc<tokio::sync::Notify>,
 }
 
 impl UnlockCache {
     /// Inserts or replaces an unlock entry for a project.
     pub fn insert(&mut self, project_id: String, entry: UnlockEntry) {
         self.entries.insert(project_id, entry);
+        self.changed.notify_one();
     }
 
     /// Returns the live entry for `project_id`, or `None` if absent or
@@ -137,7 +140,11 @@ impl UnlockCache {
 
     /// Removes one project's entry and returns it, if present.
     pub fn evict(&mut self, project_id: &str) -> Option<UnlockEntry> {
-        self.entries.remove(project_id)
+        let entry = self.entries.remove(project_id);
+        if entry.is_some() {
+            self.changed.notify_one();
+        }
+        entry
     }
 
     /// Removes every entry whose TTL has elapsed by `now_unix_nanos`.
@@ -149,13 +156,21 @@ impl UnlockCache {
 
     /// Removes expired keys, retaining their audit context until the caller records the lock.
     pub(crate) fn drain_expired(&mut self, now_unix_nanos: i128) -> Vec<(String, UnlockEntry)> {
-        self.entries.extract_if(.., |_, entry| entry.is_expired(now_unix_nanos)).collect()
+        let entries: Vec<_> =
+            self.entries.extract_if(.., |_, entry| entry.is_expired(now_unix_nanos)).collect();
+        if !entries.is_empty() {
+            self.changed.notify_one();
+        }
+        entries
     }
 
     /// Clears every entry (`Lock` for all projects).
     pub fn clear(&mut self) -> Vec<String> {
         let ids: Vec<String> = self.entries.keys().cloned().collect();
         self.entries.clear();
+        if !ids.is_empty() {
+            self.changed.notify_one();
+        }
         ids
     }
 
@@ -163,7 +178,21 @@ impl UnlockCache {
     /// removed entries for audit emission.
     pub fn drain(&mut self) -> Vec<(String, UnlockEntry)> {
         let entries = std::mem::take(&mut self.entries);
+        if !entries.is_empty() {
+            self.changed.notify_one();
+        }
         entries.into_iter().collect()
+    }
+
+    /// Wakes the single expiry worker when cache contents change. Notifications
+    /// retain a permit so inserts between calculating and waiting cannot be lost.
+    pub(crate) fn change_notification(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.changed)
+    }
+
+    /// Earliest deadline; only recalculated on a mutation or expiry.
+    pub(crate) fn next_expiry_unix_nanos(&self) -> Option<i128> {
+        self.entries.values().map(UnlockEntry::expires_at_unix_nanos).min()
     }
 
     /// Returns true when no live entries are held.

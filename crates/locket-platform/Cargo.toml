@@ -51,6 +51,7 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
 zeroize = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
@@ -78,6 +79,10 @@ version = "1"
 apple-native-keyring-store = { version = "1", features = ["keychain"] }
 block2 = { version = "0.6", default-features = false, features = ["alloc"] }
 objc2 = { version = "0.6", default-features = false, features = ["std"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = [
+  "std", "CFDictionary", "CFNotificationCenter", "CFRunLoop", "CFString",
+] }
+objc2-io-kit = { version = "0.3", default-features = false, features = ["std", "libc", "pwr_mgt"] }
 objc2-foundation = { version = "0.3", default-features = false, features = [
   "alloc",
   "NSError",
@@ -92,3 +97,8 @@ objc2-local-authentication = { version = "0.3", default-features = false, featur
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[[test]]
+name = "native_session_observer"
+path = "tests/native_session_observer.rs"
+harness = false
