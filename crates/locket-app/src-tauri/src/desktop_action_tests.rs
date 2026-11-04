@@ -1,10 +1,11 @@
 use super::*;
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::time::Duration;
 use std::{
     error::Error,
     fs,
     path::{Path, PathBuf},
-    time::Duration,
 };
 
 struct Fixture {

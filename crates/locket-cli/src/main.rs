@@ -52,10 +52,13 @@ pub(crate) use commands::exec::docker::{
 };
 #[cfg(test)]
 pub(crate) use commands::exec::run::{
-    ComposeConfigCommand, expand_runner_command_for_tests, ide_env_source_context_for_tests,
-    prepare_agent_policy_access_for_tests, resolve_external_env_ide_with_session_id,
-    resolve_policy_external_env, resolve_policy_external_env_with_compose_config_command,
-    runner_policy_name_for_tests,
+    ComposeConfigCommand, expand_runner_command_for_tests, resolve_policy_external_env,
+    resolve_policy_external_env_with_compose_config_command, runner_policy_name_for_tests,
+};
+#[cfg(all(test, unix))]
+pub(crate) use commands::exec::run::{
+    ide_env_source_context_for_tests, prepare_agent_policy_access_for_tests,
+    resolve_external_env_ide_with_session_id,
 };
 pub(crate) use commands::project::install_hooks::git_dir_for_worktree;
 pub(crate) use commands::scan::context::privacy_redact_names_enabled;

@@ -1,7 +1,7 @@
 //! Atomic, comment-preserving writes of project command metadata.
 
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, Write};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 
@@ -87,14 +87,9 @@ impl PolicyFileDocument {
     }
 
     fn replace_source(&self, rendered: &str) -> Result<(), PolicyFileError> {
-        let original = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        let mut original = OpenOptions::new().read(true).write(true).open(&self.path)?;
         original.lock()?;
-        if !fs::symlink_metadata(&self.path)?.file_type().is_file() {
-            return Err(PolicyFileError::NotRegularFile);
-        }
-        if fs::read_to_string(&self.path)? != self.source {
-            return Err(PolicyFileError::ConcurrentModification);
-        }
+        self.check_locked_source(&mut original)?;
         if rendered == self.source {
             return Ok(());
         }
@@ -110,14 +105,50 @@ impl PolicyFileDocument {
         temporary.as_file().sync_all()?;
         // Recheck after preparing the replacement so a detected concurrent editor
         // cannot be overwritten by a stale snapshot.
-        if fs::read_to_string(&self.path)? != self.source {
-            return Err(PolicyFileError::ConcurrentModification);
-        }
+        self.check_locked_source(&mut original)?;
         temporary.persist(&self.path).map_err(|error| error.error)?;
         #[cfg(unix)]
         std::fs::File::open(parent)?.sync_all()?;
         Ok(())
     }
+
+    fn check_locked_source(&self, original: &mut File) -> Result<(), PolicyFileError> {
+        if !fs::symlink_metadata(&self.path)?.file_type().is_file() {
+            return Err(PolicyFileError::NotRegularFile);
+        }
+        let current = File::open(&self.path)?;
+        if !same_file(original, &current)? {
+            return Err(PolicyFileError::ConcurrentModification);
+        }
+        // Windows byte-range locks are mandatory even for another handle in
+        // this process. Read through the handle that owns the lock. The file
+        // identity check above also catches atomic pathname replacement.
+        original.rewind()?;
+        let mut source = String::new();
+        original.read_to_string(&mut source)?;
+        if source != self.source {
+            return Err(PolicyFileError::ConcurrentModification);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn same_file(left: &File, right: &File) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let left = left.metadata()?;
+    let right = right.metadata()?;
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+#[cfg(windows)]
+fn same_file(left: &File, right: &File) -> std::io::Result<bool> {
+    super::windows_file_identity::same_file(left, right)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file(_left: &File, _right: &File) -> std::io::Result<bool> {
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "file identity is unavailable"))
 }
 
 impl Deref for PolicyFileDocument {
@@ -181,6 +212,26 @@ mod tests {
         fs::write(&path, &external)?;
         assert!(matches!(document.save(), Err(PolicyFileError::ConcurrentModification)));
         assert_eq!(fs::read_to_string(path)?, external);
+        Ok(())
+    }
+
+    #[test]
+    fn policy_lock_rejects_a_replaced_file_with_identical_contents()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("locket.toml");
+        fs::write(&path, SOURCE)?;
+        let document = PolicyFileDocument::read(&path)?;
+        let mut locked = OpenOptions::new().read(true).write(true).open(&path)?;
+        locked.lock()?;
+        let mut replacement = tempfile::NamedTempFile::new_in(directory.path())?;
+        replacement.write_all(SOURCE.as_bytes())?;
+        replacement.persist(&path)?;
+        assert!(matches!(
+            document.check_locked_source(&mut locked),
+            Err(PolicyFileError::ConcurrentModification)
+        ));
+        assert_eq!(fs::read_to_string(&path)?, SOURCE);
         Ok(())
     }
 }

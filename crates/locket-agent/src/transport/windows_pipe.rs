@@ -8,13 +8,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use tokio::net::windows::named_pipe::{
-    ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
-};
+use tokio::net::windows::named_pipe::{NamedPipeClient, NamedPipeServer, ServerOptions};
 use tokio::time::sleep;
 
 /// Windows error code returned when all pipe instances are busy.
 const ERROR_PIPE_BUSY: i32 = 231;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Configuration for the Windows agent named pipe.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -99,21 +98,35 @@ fn named_pipe_server_options(first_instance: bool) -> ServerOptions {
 }
 
 /// Opens a client connection to the agent pipe, retrying while all
-/// server instances are busy.
+/// server instances are busy. Verifies the connected object's owner and the
+/// kernel-reported server's user before returning a handle capable of RPC I/O.
+/// Connection retries stop after two seconds; subsequent RPCs are unaffected.
 ///
 /// # Errors
 ///
-/// Returns the first non-busy OS error from Tokio's named-pipe client.
+/// Returns identity failures, the first non-busy OS error, or `TimedOut` when
+/// no connection can be established within the retry deadline.
 pub async fn connect_named_pipe_client(pipe_name: &Path) -> io::Result<NamedPipeClient> {
-    loop {
-        match ClientOptions::new().open(pipe_name.as_os_str()) {
-            Ok(client) => return Ok(client),
-            Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
-                sleep(Duration::from_millis(25)).await;
+    connect_named_pipe_client_with_timeout(pipe_name, CONNECT_TIMEOUT).await
+}
+
+async fn connect_named_pipe_client_with_timeout(
+    pipe_name: &Path,
+    timeout: Duration,
+) -> io::Result<NamedPipeClient> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            match locket_platform::open_verified_agent_pipe_client(pipe_name.as_os_str()) {
+                Ok(client) => return Ok(client),
+                Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                    sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
         }
-    }
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "agent pipe connection timed out"))?
 }
 
 /// Handles one connected named-pipe client with the shared unary
@@ -166,5 +179,36 @@ mod tests {
     #[test]
     fn busy_error_code_matches_windows_pipe_busy() {
         assert_eq!(ERROR_PIPE_BUSY, 231);
+    }
+
+    #[tokio::test]
+    async fn busy_pipe_connection_has_a_deadline() -> Result<(), Box<dyn std::error::Error>> {
+        use std::io;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::Duration;
+
+        static NEXT_PIPE: AtomicU64 = AtomicU64::new(0);
+        let path = PathBuf::from(format!(
+            r"\\.\pipe\locket-busy-test-{}-{}",
+            std::process::id(),
+            NEXT_PIPE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let config = AgentPipeConfig::current_user(path.clone())?;
+        let server = super::bind_named_pipe_listener(&config)?;
+        let _client = super::connect_named_pipe_client(&path).await?;
+        server.connect().await?;
+        assert!(
+            locket_platform::open_verified_agent_pipe_client(path.as_os_str())
+                .is_err_and(|error| error.raw_os_error() == Some(ERROR_PIPE_BUSY))
+        );
+
+        // The outer bound makes a regression fail promptly instead of hanging CI.
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            super::connect_named_pipe_client_with_timeout(&path, Duration::from_millis(40)),
+        )
+        .await?;
+        assert!(result.is_err_and(|error| error.kind() == io::ErrorKind::TimedOut));
+        Ok(())
     }
 }

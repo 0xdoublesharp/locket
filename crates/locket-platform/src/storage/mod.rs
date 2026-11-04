@@ -10,3 +10,6 @@ pub mod policy_file;
 
 #[cfg(windows)]
 pub mod windows_directory;
+
+#[cfg(windows)]
+mod windows_file_identity;

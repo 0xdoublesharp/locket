@@ -63,6 +63,10 @@ carry session metadata and wait for bounded key-erasure acknowledgement.
 Windows token queries now allocate pointer-aligned storage before reading
 `TOKEN_USER`; session queries copy returned bytes into aligned local storage
 before interpreting `WTSINFOEXW`.
+Named-pipe clients verify the connected object's owner and the server process's
+token user before sending RPC data. The descriptor explicitly sets the owner,
+and clients request identification-only access so a server cannot impersonate
+them. These checks reuse the isolated `ipc/agent_pipe.rs` native boundary.
 Temporary env-file creation on Windows uses an isolated filesystem boundary in
 `locket-platform`. It creates a protected inheritable ACL for the current SID
 before writing, verifies the resulting descriptor, and rejects parent paths
@@ -70,6 +74,10 @@ that another unprivileged account could replace. Descriptor/ACL pointers remain
 owned by Windows allocations through each synchronous call and are freed with
 the matching allocator. `locket-exec` reuses this boundary through a Windows-only
 dependency rather than adding unsafe code to its execution logic.
+`storage/windows_file_identity.rs` uses the existing Windows filesystem binding
+to query 128-bit file identifiers without reading a byte range through a second
+handle. Policy updates read through the handle owning their mandatory Windows
+lock and verify that the pathname still refers to that file before replacement.
 Linux authentication uses a fixed polkit executable and policy rather than a
 new native FFI dependency; child environment and timeout are bounded.
 

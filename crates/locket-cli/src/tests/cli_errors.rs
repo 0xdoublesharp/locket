@@ -530,7 +530,7 @@ fn exec_passthrough_preserves_child_exit_code() -> Result<(), Box<dyn std::error
             "--secret",
             "DATABASE_URL",
             "--",
-            "/bin/sh",
+            test_shell(),
             "-c",
             "exit 7",
         ])?,

@@ -1,3 +1,4 @@
+#![allow(clippy::literal_string_with_formatting_args)]
 #[allow(unused_imports)]
 use super::*;
 
@@ -22,7 +23,7 @@ fn exec_enforces_secret_acl_before_spawning() -> Result<(), Box<dyn std::error::
         .open(directory.path().join("locket.toml"))?
         .write_all(b"\n[secrets.DATABASE_URL]\nallow_commands=['dev']\n")?;
     let result = run_with_context(
-        Cli::try_parse_from(["locket", "exec", "--secret", "DATABASE_URL", "--", "/usr/bin/true"])?,
+        Cli::try_parse_from(["locket", "exec", "--secret", "DATABASE_URL", "--", test_true()])?,
         &context,
         &mut Vec::new(),
     );
@@ -53,7 +54,7 @@ fn exec_all_force_injects_active_profile_secrets_and_writes_audit()
             "--all",
             "--force",
             "--",
-            "/bin/sh",
+            test_shell(),
             "-c",
             "test \"$DATABASE_URL\" = \"postgres://localhost/app\" \
              && test \"$API_KEY\" = \"tok-v1\"",
@@ -72,7 +73,7 @@ fn exec_all_force_injects_active_profile_secrets_and_writes_audit()
     )?;
     assert!(metadata.contains("\"action\":\"EXEC\""));
     assert!(metadata.contains("\"all_mode\":true"));
-    assert!(metadata.contains("\"argv_program\":\"/bin/sh\""));
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&metadata)?["argv_program"], test_shell());
     assert!(metadata.contains("\"arg_count\":3"));
     assert!(metadata.contains("\"API_KEY\""));
     assert!(metadata.contains("\"DATABASE_URL\""));
@@ -100,14 +101,14 @@ fn exec_all_requires_typed_confirmation_when_not_forced() -> Result<(), Box<dyn 
         test_context_with_key_store_and_confirmation(&directory, Arc::clone(&key_store), "wrong\n");
     let mut output = Vec::new();
     let result = run_with_context(
-        Cli::try_parse_from(["locket", "exec", "--all", "--", "/bin/sh", "-c", "true"])?,
+        Cli::try_parse_from(["locket", "exec", "--all", "--", test_shell(), "-c", "true"])?,
         &bad_context,
         &mut output,
     );
     assert_error_contains(result, "confirmation did not match exec --all scope");
     let output = String::from_utf8(output)?;
     assert!(output.contains("exec_profile: dev"));
-    assert!(output.contains("exec_argv_program: /bin/sh"));
+    assert!(output.contains(&format!("exec_argv_program: {}", test_shell())));
     assert!(output.contains("exec_secret_count: 1"));
     assert!(output.contains("exec_secret_names: DATABASE_URL"));
     assert!(output.contains("metadata_only: yes"));
@@ -119,7 +120,7 @@ fn exec_all_requires_typed_confirmation_when_not_forced() -> Result<(), Box<dyn 
     );
     let mut good_output = Vec::new();
     run_with_context(
-        Cli::try_parse_from(["locket", "exec", "--all", "--", "/bin/sh", "-c", "true"])?,
+        Cli::try_parse_from(["locket", "exec", "--all", "--", test_shell(), "-c", "true"])?,
         &good_context,
         &mut good_output,
     )?;
@@ -137,7 +138,7 @@ fn exec_without_secrets_or_all_errors() -> Result<(), Box<dyn std::error::Error>
     )?;
     let mut output = Vec::new();
     let result = run_with_context(
-        Cli::try_parse_from(["locket", "exec", "--", "/bin/sh", "-c", "true"])?,
+        Cli::try_parse_from(["locket", "exec", "--", test_shell(), "-c", "true"])?,
         &context,
         &mut output,
     );
@@ -154,7 +155,7 @@ fn exec_all_and_secret_flags_are_mutually_exclusive() {
         "--secret",
         "DATABASE_URL",
         "--",
-        "/bin/sh",
+        test_shell(),
         "-c",
         "true",
     ]);
@@ -186,7 +187,7 @@ fn exec_injects_secret_into_child_scope() -> Result<(), Box<dyn std::error::Erro
             "--secret",
             "DATABASE_URL",
             "--",
-            "/bin/sh",
+            test_shell(),
             "-c",
             "test \"$DATABASE_URL\" = \"machine-db-value\"",
         ])?,
@@ -228,7 +229,7 @@ fn exec_injects_secret_into_child_scope() -> Result<(), Box<dyn std::error::Erro
     assert_eq!(metadata["all_mode"], false);
     assert_eq!(metadata["secret_names"], json!(["DATABASE_URL"]));
     assert_eq!(metadata["secret_sources"]["DATABASE_URL"], "machine-local");
-    assert_eq!(metadata["argv_program"], "/bin/sh");
+    assert_eq!(metadata["argv_program"], test_shell());
     assert_eq!(metadata["arg_count"], 3);
     assert_eq!(metadata["command"], "exec");
     assert!(!metadata.to_string().contains("machine-db-value"));
@@ -258,7 +259,7 @@ fn exec_secret_requires_unlocked_vault_before_spawn() -> Result<(), Box<dyn std:
             "--secret",
             "DATABASE_URL",
             "--",
-            "/bin/sh",
+            test_shell(),
             "-c",
             "touch spawned-locked",
         ])?,
@@ -294,14 +295,14 @@ fn run_policy_injects_required_and_optional_secrets_without_printing_values()
         .append(true)
         .open(directory.path().join("locket.toml"))?
         .write_all(
-            br#"
+            (r#"
 [commands.env_check]
 argv = ["/bin/sh", "-c", "printf 'DATABASE_URL=%s\nOPENAI_API_KEY=%s\n' \"${DATABASE_URL:+present}\" \"${OPENAI_API_KEY:+present}\" > env-presence.txt"]
 required_secrets = ["DATABASE_URL"]
 optional_secrets = ["OPENAI_API_KEY"]
 env_mode = "strict"
 inherit_env = ["PATH"]
-"#,
+"#.replace("/bin/sh", test_shell()).replace("/usr/bin/true", test_true())).as_bytes(),
         )?;
 
     let mut inspect_output = Vec::new();
@@ -370,14 +371,17 @@ fn run_policy_audit_records_selected_source_by_precedence_without_values()
         .append(true)
         .open(directory.path().join("locket.toml"))?
         .write_all(
-            br#"
+            (r#"
 [commands.env_check]
 argv = ["/bin/sh", "-c", "test \"$DATABASE_URL\" = \"machine-precedence-value\""]
 required_secrets = ["DATABASE_URL"]
 env_mode = "strict"
 inherit_env = ["PATH"]
 ttl = "30s"
-"#,
+"#
+            .replace("/bin/sh", test_shell())
+            .replace("/usr/bin/true", test_true()))
+            .as_bytes(),
         )?;
 
     run_with_context(
@@ -439,12 +443,15 @@ fn run_warns_when_implicit_locket_override_replaces_parent_name_without_values()
         .append(true)
         .open(directory.path().join("locket.toml"))?
         .write_all(
-            br#"
+            (r#"
 [commands.env_check]
 argv = ["/bin/sh", "-c", "test \"$HOME\" = \"locket-home\""]
 required_secrets = ["HOME"]
 env_mode = "minimal"
-"#,
+"#
+            .replace("/bin/sh", test_shell())
+            .replace("/usr/bin/true", test_true()))
+            .as_bytes(),
         )?;
 
     let mut output = Vec::new();
@@ -472,12 +479,15 @@ fn run_policy_audit_records_child_exit_code_on_failure() -> Result<(), Box<dyn s
         .append(true)
         .open(directory.path().join("locket.toml"))?
         .write_all(
-            br#"
+            (r#"
 [commands.fail_command]
 argv = ["/bin/sh", "-c", "exit 17"]
 env_mode = "strict"
 inherit_env = ["PATH"]
-"#,
+"#
+            .replace("/bin/sh", test_shell())
+            .replace("/usr/bin/true", test_true()))
+            .as_bytes(),
         )?;
 
     let mut output = Vec::new();
@@ -508,7 +518,7 @@ inherit_env = ["PATH"]
 fn parent_external_env_source_reinjects_only_allowed_names()
 -> Result<(), Box<dyn std::error::Error>> {
     let document = locket_core::PolicyDocument::from_toml_str(
-        r#"
+        &(r#"
 schema_version = 1
 
 [commands.env_check]
@@ -517,7 +527,9 @@ required_secrets = ["PARENT_ALLOWED"]
 optional_secrets = ["PARENT_OPTIONAL"]
 external_env_sources = ["parent"]
 env_mode = "strict"
-"#,
+"#
+        .replace("/bin/sh", test_shell())
+        .replace("/usr/bin/true", test_true())),
     )?;
     let policy = document.commands.get("env_check").ok_or("missing policy")?;
     let parent_env = [
@@ -540,7 +552,7 @@ env_mode = "strict"
     assert!(!external_env.contains_key("PARENT_DENIED"));
 
     let request = locket_exec::ExecutionRequest {
-        argv: vec!["/bin/sh".to_owned(), "-c".to_owned(), "true".to_owned()],
+        argv: vec![test_shell().to_owned(), "-c".to_owned(), "true".to_owned()],
         parent_env,
         inherit_env: policy.inherit_env.clone(),
         external_env,
@@ -562,7 +574,7 @@ env_mode = "strict"
 fn file_external_env_source_loads_only_policy_allowed_names()
 -> Result<(), Box<dyn std::error::Error>> {
     let document = locket_core::PolicyDocument::from_toml_str(
-        r#"
+        &(r#"
 schema_version = 1
 
 [commands.env_check]
@@ -571,7 +583,9 @@ required_secrets = ["DATABASE_URL"]
 optional_secrets = ["LOG_LEVEL"]
 external_env_sources = [{ file = ".env.local" }]
 env_mode = "strict"
-"#,
+"#
+        .replace("/bin/sh", test_shell())
+        .replace("/usr/bin/true", test_true())),
     )?;
     let policy = document.commands.get("env_check").ok_or("missing policy")?;
     let project_root = tempdir()?;
@@ -610,14 +624,17 @@ fn env_inspect_reports_external_layers_without_values() -> Result<(), Box<dyn st
         .append(true)
         .open(directory.path().join("locket.toml"))?
         .write_all(
-            br#"
+            (r#"
 [commands.env_check]
 argv = ["/bin/sh", "-c", "true"]
 required_secrets = ["DATABASE_URL"]
 optional_secrets = ["LOG_LEVEL"]
 external_env_sources = [{ file = ".env.local" }]
 env_mode = "strict"
-"#,
+"#
+            .replace("/bin/sh", test_shell())
+            .replace("/usr/bin/true", test_true()))
+            .as_bytes(),
         )?;
 
     let mut output = Vec::new();
@@ -655,7 +672,7 @@ fn path_scoped_env_sets_extend_policy_from_matching_subdirectory()
         .append(true)
         .open(directory.path().join("locket.toml"))?
         .write_all(
-            br#"
+            (r#"
 [commands.dev]
 argv = ["/bin/sh", "-c", "true"]
 required_secrets = ["BASE_URL"]
@@ -664,7 +681,10 @@ optional_secrets = ["BASE_OPT"]
 [paths."apps/api"]
 required_secrets = ["DATABASE_URL"]
 optional_secrets = ["STRIPE_SECRET_KEY"]
-"#,
+"#
+            .replace("/bin/sh", test_shell())
+            .replace("/usr/bin/true", test_true()))
+            .as_bytes(),
         )?;
 
     let api_context = RuntimeContext { cwd: api_dir, ..context.clone() };
@@ -675,7 +695,8 @@ optional_secrets = ["STRIPE_SECRET_KEY"]
         &mut api_output,
     )?;
     let api_output = String::from_utf8(api_output)?;
-    assert!(api_output.contains("path_scope=apps/api"), "{api_output}");
+    let scope_line = format!("path_scope={}", Path::new("apps").join("api").display());
+    assert!(api_output.contains(&scope_line), "{api_output}");
     assert!(api_output.contains("secret BASE_URL kind=required"), "{api_output}");
     assert!(api_output.contains("secret DATABASE_URL kind=required"), "{api_output}");
     assert!(api_output.contains("secret STRIPE_SECRET_KEY kind=optional"), "{api_output}");
@@ -687,7 +708,7 @@ optional_secrets = ["STRIPE_SECRET_KEY"]
         &mut root_output,
     )?;
     let root_output = String::from_utf8(root_output)?;
-    assert!(!root_output.contains("path_scope=apps/api"), "{root_output}");
+    assert!(!root_output.contains(&scope_line), "{root_output}");
     assert!(!root_output.contains("DATABASE_URL"), "{root_output}");
     Ok(())
 }
@@ -878,7 +899,7 @@ allow_paths = ["apps/api/**"]
 #[test]
 fn file_external_env_source_rejects_absolute_path() -> Result<(), Box<dyn std::error::Error>> {
     let document = locket_core::PolicyDocument::from_toml_str(
-        r#"
+        &(r#"
 schema_version = 1
 
 [commands.env_check]
@@ -886,7 +907,9 @@ argv = ["/bin/sh", "-c", "true"]
 required_secrets = ["DATABASE_URL"]
 external_env_sources = [{ file = "/etc/passwd" }]
 env_mode = "strict"
-"#,
+"#
+        .replace("/bin/sh", test_shell())
+        .replace("/usr/bin/true", test_true())),
     )?;
     let policy = document.commands.get("env_check").ok_or("missing policy")?;
     let project_root = tempdir()?;
@@ -907,7 +930,7 @@ env_mode = "strict"
 fn file_external_env_source_rejects_paths_outside_project_root()
 -> Result<(), Box<dyn std::error::Error>> {
     let document = locket_core::PolicyDocument::from_toml_str(
-        r#"
+        &(r#"
 schema_version = 1
 
 [commands.env_check]
@@ -915,7 +938,9 @@ argv = ["/bin/sh", "-c", "true"]
 required_secrets = ["DATABASE_URL"]
 external_env_sources = [{ file = "../escape.env" }]
 env_mode = "strict"
-"#,
+"#
+        .replace("/bin/sh", test_shell())
+        .replace("/usr/bin/true", test_true())),
     )?;
     let policy = document.commands.get("env_check").ok_or("missing policy")?;
     let outside = tempdir()?;
@@ -942,7 +967,7 @@ env_mode = "strict"
 fn file_external_env_source_rejects_symlink_resolving_outside_root()
 -> Result<(), Box<dyn std::error::Error>> {
     let document = locket_core::PolicyDocument::from_toml_str(
-        r#"
+        &(r#"
 schema_version = 1
 
 [commands.env_check]
@@ -950,7 +975,9 @@ argv = ["/bin/sh", "-c", "true"]
 required_secrets = ["DATABASE_URL"]
 external_env_sources = [{ file = "linked.env" }]
 env_mode = "strict"
-"#,
+"#
+        .replace("/bin/sh", test_shell())
+        .replace("/usr/bin/true", test_true())),
     )?;
     let policy = document.commands.get("env_check").ok_or("missing policy")?;
 
@@ -983,7 +1010,7 @@ env_mode = "strict"
 fn file_external_env_source_accepts_symlink_resolving_inside_root()
 -> Result<(), Box<dyn std::error::Error>> {
     let document = locket_core::PolicyDocument::from_toml_str(
-        r#"
+        &(r#"
 schema_version = 1
 
 [commands.env_check]
@@ -991,7 +1018,9 @@ argv = ["/bin/sh", "-c", "true"]
 required_secrets = ["DATABASE_URL"]
 external_env_sources = [{ file = "linked.env" }]
 env_mode = "strict"
-"#,
+"#
+        .replace("/bin/sh", test_shell())
+        .replace("/usr/bin/true", test_true())),
     )?;
     let policy = document.commands.get("env_check").ok_or("missing policy")?;
 
@@ -1017,7 +1046,7 @@ env_mode = "strict"
 fn compose_external_env_source_uses_process_stub_without_docker()
 -> Result<(), Box<dyn std::error::Error>> {
     let document = locket_core::PolicyDocument::from_toml_str(
-        r#"
+        &(r#"
 schema_version = 1
 
 [commands.env_check]
@@ -1026,7 +1055,9 @@ required_secrets = ["DATABASE_URL"]
 optional_secrets = ["API_KEY", "LOG_LEVEL", "PORT"]
 external_env_sources = ["compose"]
 env_mode = "strict"
-"#,
+"#
+        .replace("/bin/sh", test_shell())
+        .replace("/usr/bin/true", test_true())),
     )?;
     let policy = document.commands.get("env_check").ok_or("missing policy")?;
     let project_root = tempdir()?;
@@ -1034,7 +1065,7 @@ env_mode = "strict"
         "-c",
         r#"printf '%s' '{"environment":{"LOG_LEVEL":"debug","PORT":5432,"NOT_ALLOWED":"denied"},"services":{"web":{"environment":{"DATABASE_URL":"from-compose"}},"worker":{"environment":["API_KEY=from-compose-array","IGNORED=denied"]}}}'"#,
     ];
-    let command = crate::ComposeConfigCommand::new(Path::new("/bin/sh"), &args);
+    let command = crate::ComposeConfigCommand::new(Path::new(test_shell()), &args);
 
     let external_env = crate::resolve_policy_external_env_with_compose_config_command(
         policy,
@@ -1058,7 +1089,7 @@ env_mode = "strict"
 fn compose_external_env_source_reports_command_failure_without_values()
 -> Result<(), Box<dyn std::error::Error>> {
     let document = locket_core::PolicyDocument::from_toml_str(
-        r#"
+        &(r#"
 schema_version = 1
 
 [commands.env_check]
@@ -1066,12 +1097,14 @@ argv = ["/bin/sh", "-c", "true"]
 required_secrets = ["DATABASE_URL"]
 external_env_sources = ["compose"]
 env_mode = "strict"
-"#,
+"#
+        .replace("/bin/sh", test_shell())
+        .replace("/usr/bin/true", test_true())),
     )?;
     let policy = document.commands.get("env_check").ok_or("missing policy")?;
     let project_root = tempdir()?;
     let args = ["-c", "printf '%s' 'from-compose' >&2; exit 19"];
-    let command = crate::ComposeConfigCommand::new(Path::new("/bin/sh"), &args);
+    let command = crate::ComposeConfigCommand::new(Path::new(test_shell()), &args);
 
     let result = crate::resolve_policy_external_env_with_compose_config_command(
         policy,
@@ -1095,7 +1128,7 @@ env_mode = "strict"
 fn compose_external_env_source_reports_missing_command_with_typed_error()
 -> Result<(), Box<dyn std::error::Error>> {
     let document = locket_core::PolicyDocument::from_toml_str(
-        r#"
+        &(r#"
 schema_version = 1
 
 [commands.env_check]
@@ -1103,7 +1136,9 @@ argv = ["/bin/sh", "-c", "true"]
 required_secrets = ["DATABASE_URL"]
 external_env_sources = ["compose"]
 env_mode = "strict"
-"#,
+"#
+        .replace("/bin/sh", test_shell())
+        .replace("/usr/bin/true", test_true())),
     )?;
     let policy = document.commands.get("env_check").ok_or("missing policy")?;
     let project_root = tempdir()?;
@@ -1129,7 +1164,7 @@ env_mode = "strict"
 #[test]
 fn compose_external_env_source_rejects_invalid_json() -> Result<(), Box<dyn std::error::Error>> {
     let document = locket_core::PolicyDocument::from_toml_str(
-        r#"
+        &(r#"
 schema_version = 1
 
 [commands.env_check]
@@ -1137,12 +1172,14 @@ argv = ["/bin/sh", "-c", "true"]
 required_secrets = ["DATABASE_URL"]
 external_env_sources = ["compose"]
 env_mode = "strict"
-"#,
+"#
+        .replace("/bin/sh", test_shell())
+        .replace("/usr/bin/true", test_true())),
     )?;
     let policy = document.commands.get("env_check").ok_or("missing policy")?;
     let project_root = tempdir()?;
     let args = ["-c", "printf '%s' 'not json'"];
-    let command = crate::ComposeConfigCommand::new(Path::new("/bin/sh"), &args);
+    let command = crate::ComposeConfigCommand::new(Path::new(test_shell()), &args);
 
     let result = crate::resolve_policy_external_env_with_compose_config_command(
         policy,
@@ -1168,7 +1205,7 @@ fn ide_external_env_source_without_agent_context_returns_typed_error()
     // IdeEnvSessionUnavailable so the operator is told to switch to
     // `locket run`.
     let document = locket_core::PolicyDocument::from_toml_str(
-        r#"
+        &(r#"
 schema_version = 1
 
 [commands.env_check]
@@ -1176,7 +1213,9 @@ argv = ["/bin/sh", "-c", "true"]
 required_secrets = ["DATABASE_URL"]
 external_env_sources = ["ide"]
 env_mode = "strict"
-"#,
+"#
+        .replace("/bin/sh", test_shell())
+        .replace("/usr/bin/true", test_true())),
     )?;
     let policy = document.commands.get("env_check").ok_or("missing policy")?;
     let project_root = tempdir()?;
@@ -1419,14 +1458,17 @@ fn context_reports_metadata_only_summaries_without_values() -> Result<(), Box<dy
         .append(true)
         .open(directory.path().join("locket.toml"))?
         .write_all(
-            br#"
+            (r#"
 [commands.env_check]
 argv = ["/bin/sh", "-c", "true"]
 required_secrets = ["DATABASE_URL"]
 optional_secrets = ["MISSING_ONLY", "OPENAI_API_KEY"]
 confirm = true
 require_user_verification = true
-"#,
+"#
+            .replace("/bin/sh", test_shell())
+            .replace("/usr/bin/true", test_true()))
+            .as_bytes(),
         )?;
 
     let locked_context = test_context_with_key_store(
@@ -1480,11 +1522,14 @@ fn context_redacts_names_from_flag_or_privacy_config() -> Result<(), Box<dyn std
         .append(true)
         .open(directory.path().join("locket.toml"))?
         .write_all(
-            br#"
+            (r#"
 [commands.env_check]
 argv = ["/bin/sh", "-c", "true"]
 required_secrets = ["DATABASE_URL"]
-"#,
+"#
+            .replace("/bin/sh", test_shell())
+            .replace("/usr/bin/true", test_true()))
+            .as_bytes(),
         )?;
 
     let mut flag_output = Vec::new();
@@ -1537,13 +1582,16 @@ fn run_policy_confirm_gate_rejects_wrong_confirmation() -> Result<(), Box<dyn st
         .append(true)
         .open(directory.path().join("locket.toml"))?
         .write_all(
-            br#"
+            (r#"
 [commands.deploy]
 argv = ["/bin/sh", "-c", "true"]
 confirm = true
 env_mode = "strict"
 inherit_env = ["PATH"]
-"#,
+"#
+            .replace("/bin/sh", test_shell())
+            .replace("/usr/bin/true", test_true()))
+            .as_bytes(),
         )?;
 
     let bad_context =
@@ -1583,13 +1631,16 @@ fn run_policy_confirm_gate_accepts_typed_confirmation() -> Result<(), Box<dyn st
         .append(true)
         .open(directory.path().join("locket.toml"))?
         .write_all(
-            br#"
+            (r#"
 [commands.deploy]
 argv = ["/bin/sh", "-c", "true"]
 confirm = true
 env_mode = "strict"
 inherit_env = ["PATH"]
-"#,
+"#
+            .replace("/bin/sh", test_shell())
+            .replace("/usr/bin/true", test_true()))
+            .as_bytes(),
         )?;
 
     let good_context = test_context_with_key_store_and_confirmation(
@@ -1634,13 +1685,16 @@ fn run_policy_user_verification_gate_rejects_when_unsatisfied()
         .append(true)
         .open(directory.path().join("locket.toml"))?
         .write_all(
-            br#"
+            (r#"
 [commands.sensitive]
 argv = ["/bin/sh", "-c", "true"]
 require_user_verification = true
 env_mode = "strict"
 inherit_env = ["PATH"]
-"#,
+"#
+            .replace("/bin/sh", test_shell())
+            .replace("/usr/bin/true", test_true()))
+            .as_bytes(),
         )?;
 
     let cases: [(&str, Arc<dyn LocalUserVerifier + Send + Sync>); 3] = [
@@ -1686,13 +1740,16 @@ fn run_policy_user_verification_gate_records_method_on_success()
         .append(true)
         .open(directory.path().join("locket.toml"))?
         .write_all(
-            br#"
+            (r#"
 [commands.sensitive]
 argv = ["/bin/sh", "-c", "true"]
 require_user_verification = true
 env_mode = "strict"
 inherit_env = ["PATH"]
-"#,
+"#
+            .replace("/bin/sh", test_shell())
+            .replace("/usr/bin/true", test_true()))
+            .as_bytes(),
         )?;
 
     run_with_context(
@@ -1730,12 +1787,15 @@ fn run_policy_user_verification_metadata_is_unsatisfied_when_not_required()
         .append(true)
         .open(directory.path().join("locket.toml"))?
         .write_all(
-            br#"
+            (r#"
 [commands.unprotected]
 argv = ["/bin/sh", "-c", "true"]
 env_mode = "strict"
 inherit_env = ["PATH"]
-"#,
+"#
+            .replace("/bin/sh", test_shell())
+            .replace("/usr/bin/true", test_true()))
+            .as_bytes(),
         )?;
 
     run_with_context(
@@ -1825,12 +1885,15 @@ fn run_argv_policy_audit_records_command_type_argv() -> Result<(), Box<dyn std::
         .append(true)
         .open(directory.path().join("locket.toml"))?
         .write_all(
-            br#"
+            (r#"
 [commands.argv_check]
 argv = ["/bin/sh", "-c", "true"]
 env_mode = "strict"
 inherit_env = ["PATH"]
-"#,
+"#
+            .replace("/bin/sh", test_shell())
+            .replace("/usr/bin/true", test_true()))
+            .as_bytes(),
         )?;
 
     run_with_context(
@@ -1917,9 +1980,9 @@ fn exec_preserves_non_ascii_utf8_secret_bytes_through_injection()
             "--secret",
             "UNICODE_SECRET",
             "--",
-            "/bin/sh",
+            test_shell(),
             "-c",
-            &format!("printf '%s' \"$UNICODE_SECRET\" > {}", out_path.display()),
+            "printf '%s' \"$UNICODE_SECRET\" > secret_bytes.bin",
         ])?,
         &context,
         &mut Vec::new(),
@@ -1954,8 +2017,8 @@ fn run_preserves_non_ascii_utf8_secret_bytes_through_injection()
         .open(directory.path().join("locket.toml"))?
         .write_all(
             format!(
-                "\n[commands.check_unicode]\nargv = [\"/bin/sh\", \"-c\", \"printf '%s' \\\"$UNICODE_SECRET\\\" > {path}\"]\nrequired_secrets = [\"UNICODE_SECRET\"]\n",
-                path = out_path.display()
+                "\n[commands.check_unicode]\nargv = [\"{shell}\", \"-c\", \"printf '%s' \\\"$UNICODE_SECRET\\\" > secret_bytes.bin\"]\nrequired_secrets = [\"UNICODE_SECRET\"]\n",
+                shell = test_shell()
             )
             .as_bytes(),
         )?;
@@ -2557,14 +2620,16 @@ fn generic_run_reuses_saved_exact_argv_and_policy_authorization()
     )?;
     let config = directory.path().join("locket.toml");
     let mut text = std::fs::read_to_string(&config)?;
-    text.push_str("\n[commands.dev]\nargv = [\"/bin/sh\", \"-c\", \"test \\\"$API_KEY\\\" = fixture-value\"]\nrequired_secrets = [\"API_KEY\"]\n");
+    text.push_str("\n[commands.dev]\nargv = [\"");
+    text.push_str(test_shell());
+    text.push_str("\", \"-c\", \"test \\\"$API_KEY\\\" = fixture-value\"]\nrequired_secrets = [\"API_KEY\"]\n");
     std::fs::write(&config, text)?;
     run_with_context(
         Cli::try_parse_from([
             "locket",
             "run",
             "--",
-            "/bin/sh",
+            test_shell(),
             "-c",
             "test \"$API_KEY\" = fixture-value",
         ])?,
@@ -2606,7 +2671,7 @@ fn generic_run_new_argv_requires_approval_and_persists_only_chosen_profile_names
     )?;
     let before = std::fs::read_to_string(directory.path().join("locket.toml"))?;
     let error = run_with_context(
-        Cli::try_parse_from(["locket", "run", "--", "/usr/bin/true"])?,
+        Cli::try_parse_from(["locket", "run", "--", test_true()])?,
         &context,
         &mut Vec::new(),
     )
@@ -2618,7 +2683,7 @@ fn generic_run_new_argv_requires_approval_and_persists_only_chosen_profile_names
         test_context_with_key_store_and_confirmation(&directory, key_store, "approve dev");
     let mut output = Vec::new();
     run_with_context(
-        Cli::try_parse_from(["locket", "run", "--", "/usr/bin/true"])?,
+        Cli::try_parse_from(["locket", "run", "--", test_true()])?,
         &approved,
         &mut output,
     )?;
@@ -2634,7 +2699,7 @@ fn generic_run_new_argv_requires_approval_and_persists_only_chosen_profile_names
     );
     assert_eq!(
         document.commands["dev"].command,
-        locket_core::CommandSpec::Argv(vec!["/usr/bin/true".to_owned()])
+        locket_core::CommandSpec::Argv(vec![test_true().to_owned()])
     );
     let store = crate::open_store(&approved)?;
     assert!(store.get_command_policy_index(resolved.config.project_id.as_str(), "dev")?.is_some());

@@ -1419,12 +1419,15 @@ mod tests {
                 fs::create_dir_all(parent)?;
             }
             fs::write(pid_file, format!("{}\n", std::process::id()))?;
+            #[cfg(unix)]
             fs::write(socket, b"")?;
+            #[cfg(not(unix))]
+            let _ = socket;
             Ok(())
         }
 
         fn status_snapshot(&self, _socket: &Path) -> Result<Value, io::Error> {
-            if self.status_ok.get() {
+            if self.spawn_calls.get() > 0 && self.status_ok.get() {
                 Ok(json!({ "lock_state": "locked", "agent_version": "test" }))
             } else {
                 Err(io::Error::other("unreachable"))

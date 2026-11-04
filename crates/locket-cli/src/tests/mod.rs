@@ -19,6 +19,53 @@ pub(super) use tempfile::{tempdir, tempdir_in};
 
 pub(super) use super::{Cli, RuntimeContext, run_with_context};
 
+// These fixtures intentionally exercise POSIX scripts on each host. Windows
+// uses the shell and coreutils shipped with Git for Windows, which the git
+// integration tests also require; the production shell selection is unchanged.
+#[cfg(unix)]
+const fn test_shell() -> &'static str {
+    "/bin/sh"
+}
+
+#[cfg(unix)]
+const fn test_true() -> &'static str {
+    "/usr/bin/true"
+}
+
+#[cfg(windows)]
+fn test_shell() -> &'static str {
+    static SHELL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SHELL.get_or_init(|| git_fixture_program("sh.exe")).as_str()
+}
+
+#[cfg(windows)]
+fn test_true() -> &'static str {
+    static TRUE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TRUE.get_or_init(|| git_fixture_program("true.exe")).as_str()
+}
+
+#[cfg(windows)]
+#[allow(clippy::panic)]
+fn git_fixture_program(name: &str) -> String {
+    let mut directories: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    if let Some(program_files) = std::env::var_os("ProgramFiles") {
+        let git = PathBuf::from(program_files).join("Git");
+        directories.push(git.join("bin"));
+        directories.push(git.join("usr").join("bin"));
+    }
+    for directory in directories {
+        let program = directory.join(name);
+        if program.is_file() && program.is_absolute() {
+            // Forward slashes are accepted by Windows and remain valid inside
+            // TOML basic strings and POSIX fixture scripts.
+            return program.to_string_lossy().replace('\\', "/");
+        }
+    }
+    panic!("Windows integration tests require Git for Windows {name}");
+}
+
 #[derive(Debug)]
 struct StaticPassphraseReader {
     passphrase: String,

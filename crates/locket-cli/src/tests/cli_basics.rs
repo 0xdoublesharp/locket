@@ -83,7 +83,7 @@ fn audit_checkpoint_rejects_malformed_oversized_and_nonregular_inputs()
     let mut unknown_field: serde_json::Value = serde_json::from_slice(&original)?;
     unknown_field["unexpected"] = serde_json::json!("CHECKPOINT_INPUT_MUST_NOT_LEAK");
     let duplicate_field =
-        String::from_utf8(original.clone())?.replacen('{', "{\"schema_version\":1,", 1);
+        std::str::from_utf8(&original)?.replacen('{', "{\"schema_version\":1,", 1);
     for invalid in [
         b"CHECKPOINT_INPUT_MUST_NOT_LEAK".to_vec(),
         Vec::new(),

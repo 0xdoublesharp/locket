@@ -692,7 +692,10 @@ fn doctor_reports_locked_safe_diagnostics_and_exit_codes() -> Result<(), Box<dyn
     assert!(doctor_output.contains("pass trusted_roots"));
     assert!(doctor_output.contains("pass schema_migration_backups"));
     assert!(doctor_output.contains("skip audit_hmac_verification"));
+    #[cfg(not(windows))]
     assert!(doctor_output.contains("skip agent_socket_path_spec"));
+    #[cfg(windows)]
+    assert!(doctor_output.contains("pass agent_socket_path_spec"));
     // The hardening check must surface every shipped mitigation. Tests
     // run as a child of cargo, so both helpers have been called at
     // process startup; the line is
@@ -838,7 +841,10 @@ fn open_store_backs_up_legacy_store_and_doctor_reports_latest_backup()
     let doctor_output = String::from_utf8(doctor_output)?;
     assert!(doctor_output.contains("pass schema_migration_backups"));
     assert!(doctor_output.contains("backup_skipped=0"));
-    assert!(doctor_output.contains("latest_backup=pre-migration-backups/"));
+    assert!(
+        doctor_output
+            .contains(&format!("latest_backup=pre-migration-backups{}", std::path::MAIN_SEPARATOR))
+    );
     assert!(!doctor_output.contains(directory.path().to_string_lossy().as_ref()));
     Ok(())
 }

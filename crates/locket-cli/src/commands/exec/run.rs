@@ -19,7 +19,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::commands::agent::ensure_agent_running_for_execution;
-#[cfg(all(unix, not(test)))]
+#[cfg(all(any(unix, windows), not(test)))]
 use crate::commands::agent::request_agent_once;
 use crate::commands::config::spec::{config_get_value, read_user_config};
 use crate::runtime::RuntimeContext;
@@ -797,7 +797,7 @@ pub(crate) fn resolve_external_env_ide_with_session_id(
 /// tests can drive `resolve_external_env_ide_with_session_id` against a
 /// real in-process agent without going through the full `locket run`
 /// pipeline.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) const fn ide_env_source_context_for_tests<'a>(
     context: &'a RuntimeContext,
@@ -811,7 +811,7 @@ pub(crate) const fn ide_env_source_context_for_tests<'a>(
 
 /// Test-only helper that drives the same agent unlock and grant
 /// sequence the production `prepare_policy_execution` path uses.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) fn prepare_agent_policy_access_for_tests(
     context: &RuntimeContext,
@@ -1256,21 +1256,36 @@ where
     serde_json::from_value(response).map_err(CliError::from)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn agent_invoke_value(
     context: &RuntimeContext,
     method: locket_agent::AgentMethod,
     payload: serde_json::Value,
     operation: &'static str,
 ) -> Result<serde_json::Value, CliError> {
+    agent_invoke_endpoint_value(&crate::agent_socket_path(context), method, payload, operation)
+}
+
+#[cfg(any(unix, windows))]
+fn agent_invoke_endpoint_value(
+    socket_path: &Path,
+    method: locket_agent::AgentMethod,
+    payload: serde_json::Value,
+    operation: &'static str,
+) -> Result<serde_json::Value, CliError> {
     use locket_agent::{DEFAULT_MAX_MESSAGE_SIZE, RequestEnvelope, ResponseEnvelope, encode_frame};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[cfg(unix)]
     use tokio::net::UnixStream;
 
-    let socket_path = crate::agent_socket_path(context);
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     runtime.block_on(async move {
-        let mut stream = UnixStream::connect(&socket_path)
+        #[cfg(unix)]
+        let mut stream = UnixStream::connect(socket_path)
+            .await
+            .map_err(|error| agent_unavailable(operation, &error))?;
+        #[cfg(windows)]
+        let mut stream = locket_agent::connect_named_pipe_client(socket_path)
             .await
             .map_err(|error| agent_unavailable(operation, &error))?;
         let request = RequestEnvelope::new(format!("run-{operation}"), method, payload);
@@ -1305,7 +1320,7 @@ fn agent_invoke_value(
     })
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn agent_invoke_value(
     _context: &RuntimeContext,
     _method: locket_agent::AgentMethod,
@@ -1375,6 +1390,89 @@ mod framing_tests {
 fn agent_error_to_cli(error: &locket_agent::ErrorEnvelope) -> CliError {
     let kind = LocketError::from_code_name(&error.error).unwrap_or(LocketError::AgentUnavailable);
     typed_cli_error(kind, format!("{}: {}", error.error, error.message))
+}
+
+#[cfg(all(test, windows))]
+mod windows_agent_tests {
+    use std::io;
+    use std::path::PathBuf;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use locket_agent::{
+        AgentMethod, AgentPipeConfig, DEFAULT_MAX_MESSAGE_SIZE, ErrorEnvelope, ResponseEnvelope,
+        SuccessEnvelope, bind_named_pipe_listener, encode_frame,
+    };
+    use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn invoke_with_response(
+        response: &ResponseEnvelope,
+    ) -> Result<Result<serde_json::Value, crate::CliError>, Box<dyn std::error::Error>> {
+        let endpoint = PathBuf::from(format!(
+            r"\\.\pipe\locket-cli-run-test-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+        ));
+        let config = AgentPipeConfig::current_user(endpoint.clone())?;
+        let frame = encode_frame(response, DEFAULT_MAX_MESSAGE_SIZE)?;
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || -> io::Result<()> {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+            runtime.block_on(async move {
+                let mut stream = bind_named_pipe_listener(&config)?;
+                ready_tx.send(()).map_err(io::Error::other)?;
+                tokio::time::timeout(Duration::from_secs(5), async move {
+                    stream.connect().await?;
+                    let size = stream.read_u32_le().await?;
+                    let mut request = vec![0; usize::try_from(size).map_err(io::Error::other)?];
+                    stream.read_exact(&mut request).await?;
+                    let request: locket_agent::RequestEnvelope =
+                        serde_json::from_slice(&request).map_err(io::Error::other)?;
+                    assert_eq!(request.kind, AgentMethod::Status.as_str());
+                    stream.write_all(&frame).await?;
+                    stream.flush().await?;
+                    // Keep the server alive until the client consumed its reply.
+                    let _closed = stream.read(&mut [0; 1]).await;
+                    Ok::<_, io::Error>(())
+                })
+                .await
+                .map_err(io::Error::other)?
+            })
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5))?;
+        let result = super::agent_invoke_endpoint_value(
+            &endpoint,
+            AgentMethod::Status,
+            json!({}),
+            "windows test",
+        );
+        server.join().map_err(|_| io::Error::other("named-pipe fixture panicked"))??;
+        Ok(result)
+    }
+
+    #[test]
+    fn windows_agent_rpc_preserves_success_and_typed_denial()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let success = ResponseEnvelope::Success(SuccessEnvelope::new(
+            "run-windows test",
+            json!({"lock_state": "locked"}),
+        ));
+        assert_eq!(invoke_with_response(&success)??, json!({"lock_state": "locked"}));
+        let denied = ResponseEnvelope::Error(ErrorEnvelope::new(
+            "run-windows test",
+            "UserVerificationFailed",
+            "verification required",
+            false,
+        ));
+        assert!(matches!(
+            invoke_with_response(&denied)?,
+            Err(crate::CliError::Typed {
+                kind: locket_core::LocketError::UserVerificationFailed,
+                ..
+            })
+        ));
+        Ok(())
+    }
 }
 
 fn policy_argv(policy: &CommandPolicy) -> Vec<String> {
@@ -1484,7 +1582,7 @@ fn request_run_policy_grant(
     )
 }
 
-#[cfg(all(unix, not(test)))]
+#[cfg(all(any(unix, windows), not(test)))]
 fn request_run_policy_grant_with_binding(
     context: &RuntimeContext,
     project_id: &str,
@@ -1521,7 +1619,7 @@ fn request_run_policy_grant_with_binding(
     })
 }
 
-#[cfg(all(not(unix), not(test)))]
+#[cfg(all(not(any(unix, windows)), not(test)))]
 fn request_run_policy_grant_with_binding(
     _context: &RuntimeContext,
     _project_id: &str,
@@ -1563,7 +1661,7 @@ fn revoke_run_policy_grant(context: &RuntimeContext, grant: Option<&RunPolicyGra
     revoke_run_policy_grant_id(context, &grant.grant_id);
 }
 
-#[cfg(all(unix, not(test)))]
+#[cfg(all(any(unix, windows), not(test)))]
 fn revoke_run_policy_grant_id(context: &RuntimeContext, grant_id: &str) {
     let _ignored = request_agent_once(
         context,
@@ -1572,7 +1670,7 @@ fn revoke_run_policy_grant_id(context: &RuntimeContext, grant_id: &str) {
     );
 }
 
-#[cfg(any(not(unix), test))]
+#[cfg(any(not(any(unix, windows)), test))]
 const fn revoke_run_policy_grant_id(_context: &RuntimeContext, _grant_id: &str) {}
 
 fn runtime_session_retention(

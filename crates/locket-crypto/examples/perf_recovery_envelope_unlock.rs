@@ -207,6 +207,7 @@ fn write_report(config: &Config, samples: &[f64], p95_ms: f64) -> Result<(), Box
     }
 
     let mut report = File::create(&config.report_path)?;
+    #[cfg(unix)]
     set_user_only_permissions(&report)?;
 
     writeln!(report, "# Recovery Envelope Unlock Performance")?;
@@ -260,18 +261,11 @@ fn write_report(config: &Config, samples: &[f64], p95_ms: f64) -> Result<(), Box
     Ok(())
 }
 
+#[cfg(unix)]
 fn set_user_only_permissions(file: &File) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        let mut permissions = file.metadata()?.permissions();
-        permissions.set_mode(0o600);
-        file.set_permissions(permissions)?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = file;
-    }
-    Ok(())
+    let mut permissions = file.metadata()?.permissions();
+    permissions.set_mode(0o600);
+    file.set_permissions(permissions)
 }
 
 fn command_output<const N: usize>(command: &str, args: [&str; N]) -> String {

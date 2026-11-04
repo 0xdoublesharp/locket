@@ -242,7 +242,9 @@ optional_secrets = ["STRIPE_SECRET_KEY"]
         );
         assert_eq!(
             result,
-            Err(PolicyParseError::DuplicatePathScope { path: "apps/api".to_owned() })
+            Err(PolicyParseError::DuplicatePathScope {
+                path: std::path::Path::new("apps").join("api").to_string_lossy().into_owned(),
+            })
         );
     }
 

@@ -33,7 +33,7 @@ fn e2e_policy_run_golden_path_required_and_optional_secrets()
             "add",
             "deploy",
             "--",
-            "/bin/sh",
+            test_shell(),
             "-c",
             "printf 'DB=%s\\nAPI=%s\\n' \"${DATABASE_URL:+present}\" \"${API_KEY:+present}\" > run-presence.txt",
         ])?,
@@ -146,11 +146,14 @@ fn e2e_policy_run_missing_required_secret_exits_invalid_policy()
         .append(true)
         .open(directory.path().join("locket.toml"))?
         .write_all(
-            br#"
+            (r#"
 [commands.deploy]
 argv = ["/usr/bin/true"]
 required_secrets = ["MISSING_SECRET"]
-"#,
+"#
+            .replace("/bin/sh", test_shell())
+            .replace("/usr/bin/true", test_true()))
+            .as_bytes(),
         )?;
 
     let result = run_with_context(
@@ -212,12 +215,15 @@ fn e2e_policy_run_external_env_source_failure_emits_denial_audit()
         .append(true)
         .open(directory.path().join("locket.toml"))?
         .write_all(
-            br#"
+            (r#"
 [commands.deploy]
 argv = ["/usr/bin/true"]
 external_env_sources = [{ file = "../escape.env" }]
 env_mode = "strict"
-"#,
+"#
+            .replace("/bin/sh", test_shell())
+            .replace("/usr/bin/true", test_true()))
+            .as_bytes(),
         )?;
 
     let result = run_with_context(
@@ -270,11 +276,14 @@ fn e2e_policy_run_invalid_lk_reference_emits_denial_audit() -> Result<(), Box<dy
         .append(true)
         .open(directory.path().join("locket.toml"))?
         .write_all(
-            br#"
+            (r#"
 [commands.deploy]
 argv = ["/usr/bin/true", "lk://"]
 env_mode = "strict"
-"#,
+"#
+            .replace("/bin/sh", test_shell())
+            .replace("/usr/bin/true", test_true()))
+            .as_bytes(),
         )?;
 
     std::fs::set_permissions(
@@ -331,11 +340,14 @@ fn e2e_policy_run_require_agent_exits_agent_unavailable_before_spawn()
         .append(true)
         .open(directory.path().join("locket.toml"))?
         .write_all(
-            br#"
+            (r#"
 [commands.agent_only]
 argv = ["/bin/sh", "-c", "touch should-not-spawn"]
 require_agent = true
-"#,
+"#
+            .replace("/bin/sh", test_shell())
+            .replace("/usr/bin/true", test_true()))
+            .as_bytes(),
         )?;
 
     let result = run_with_context(
@@ -382,7 +394,7 @@ fn e2e_policy_run_require_agent_resolves_required_secret_via_agent()
             "add",
             "deploy",
             "--",
-            "/bin/sh",
+            test_shell(),
             "-c",
             "printf 'DB=%s\\n' \"${DATABASE_URL:+present}\" > agent-run-presence.txt",
         ])?,
@@ -438,11 +450,14 @@ fn e2e_policy_run_confirm_gate_rejects_wrong_confirmation() -> Result<(), Box<dy
         .append(true)
         .open(directory.path().join("locket.toml"))?
         .write_all(
-            br#"
+            (r#"
 [commands.sensitive]
 argv = ["/usr/bin/true"]
 confirm = true
-"#,
+"#
+            .replace("/bin/sh", test_shell())
+            .replace("/usr/bin/true", test_true()))
+            .as_bytes(),
         )?;
 
     let result = run_with_context(
@@ -478,11 +493,14 @@ fn e2e_policy_run_confirm_gate_accepts_correct_confirmation()
         .append(true)
         .open(directory.path().join("locket.toml"))?
         .write_all(
-            br#"
+            (r#"
 [commands.sensitive]
 argv = ["/usr/bin/true"]
 confirm = true
-"#,
+"#
+            .replace("/bin/sh", test_shell())
+            .replace("/usr/bin/true", test_true()))
+            .as_bytes(),
         )?;
 
     let mut output = Vec::new();
@@ -509,11 +527,14 @@ fn e2e_policy_run_user_verification_gate_fails_when_verifier_denies()
         .append(true)
         .open(directory.path().join("locket.toml"))?
         .write_all(
-            br#"
+            (r#"
 [commands.protected]
 argv = ["/usr/bin/true"]
 require_user_verification = true
-"#,
+"#
+            .replace("/bin/sh", test_shell())
+            .replace("/usr/bin/true", test_true()))
+            .as_bytes(),
         )?;
 
     let denying_context =
@@ -558,13 +579,16 @@ fn e2e_policy_run_records_external_env_names_in_audit_metadata()
         .append(true)
         .open(directory.path().join("locket.toml"))?
         .write_all(
-            br#"
+            (r#"
 [commands.deploy]
 argv = ["/usr/bin/true"]
 optional_secrets = ["DATABASE_URL"]
 external_env_sources = [{ file = ".env.local" }]
 env_mode = "strict"
-"#,
+"#
+            .replace("/bin/sh", test_shell())
+            .replace("/usr/bin/true", test_true()))
+            .as_bytes(),
         )?;
 
     run_with_context(Cli::try_parse_from(["locket", "run", "deploy"])?, &context, &mut Vec::new())?;
@@ -606,12 +630,12 @@ fn e2e_policy_run_env_mode_merge_inherits_parent_and_overlays_secrets()
         .append(true)
         .open(directory.path().join("locket.toml"))?
         .write_all(
-            br#"
+            (r#"
 [commands.merge_check]
 argv = ["/bin/sh", "-c", "printf 'PATH=%s\nDB=%s\n' \"${PATH:+present}\" \"${DATABASE_URL:+present}\" > merge-presence.txt"]
 required_secrets = ["DATABASE_URL"]
 env_mode = "merge"
-"#,
+"#.replace("/bin/sh", test_shell()).replace("/usr/bin/true", test_true())).as_bytes(),
         )?;
 
     run_with_context(
@@ -665,12 +689,12 @@ fn e2e_policy_run_env_mode_passthrough_preserves_parent_environment()
         .append(true)
         .open(directory.path().join("locket.toml"))?
         .write_all(
-            br#"
+            (r#"
 [commands.passthrough_check]
 argv = ["/bin/sh", "-c", "printf 'PATH=%s\nAPI=%s\n' \"${PATH:+present}\" \"${API_KEY:+present}\" > passthrough-presence.txt"]
 optional_secrets = ["API_KEY"]
 env_mode = "passthrough"
-"#,
+"#.replace("/bin/sh", test_shell()).replace("/usr/bin/true", test_true())).as_bytes(),
         )?;
 
     run_with_context(

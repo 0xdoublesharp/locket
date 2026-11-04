@@ -341,9 +341,9 @@ fn tool_is_present(program: &str) -> bool {
             }
             let pathext = std::env::var_os("PATHEXT")
                 .unwrap_or_else(|| std::ffi::OsString::from(".COM;.EXE;.BAT;.CMD"));
-            return pathext.to_string_lossy().split(';').any(|extension| {
+            pathext.to_string_lossy().split(';').any(|extension| {
                 !extension.is_empty() && dir.join(format!("{program}{extension}")).is_file()
-            });
+            })
         }
         #[cfg(not(windows))]
         {

@@ -34,6 +34,11 @@ use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS
 
 struct Descriptor(NonNull<c_void>);
 
+// Windows Modules Installer is a privileged host service and the normal owner
+// of the system-volume root. Do not trust the broader service-SID namespace.
+const TRUSTED_INSTALLER_SID: &str =
+    "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+
 impl Descriptor {
     fn from_sddl(sddl: &str) -> io::Result<Self> {
         let wide: Vec<_> = sddl.encode_utf16().chain(Some(0)).collect();
@@ -82,7 +87,8 @@ impl Drop for Descriptor {
 /// Existing paths are rejected. The resulting owner and ACL are read back
 /// before returning, so filesystems that cannot enforce the ACL fail closed.
 /// The absolute parent path must have no reparse points or untrusted accounts
-/// able to replace its components. The current user, SYSTEM, and administrators
+/// able to replace its components. The current user, SYSTEM, administrators,
+/// and the exact Windows Modules Installer service SID
 /// are trusted; callers should use their canonical per-user temporary directory.
 ///
 /// # Errors
@@ -224,15 +230,23 @@ fn verify_parent_chain(path: &Path, current_user: *mut c_void) -> io::Result<()>
             "private directory requires an absolute normalized path",
         ));
     }
+    let installer_descriptor = Descriptor::from_sddl(&format!("O:{TRUSTED_INSTALLER_SID}"))?;
+    let trusted_installer = installer_descriptor.owner()?;
     let parent = path.parent().ok_or_else(invalid_acl)?;
     for (depth, ancestor) in parent.ancestors().enumerate() {
         let metadata = std::fs::symlink_metadata(ancestor)?;
-        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(invalid_acl());
+        if !metadata.is_dir() {
+            return Err(parent_error(ancestor, "component is not a directory"));
+        }
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(parent_error(ancestor, "component is a reparse point"));
         }
         let (_descriptor, owner, dacl) = read_security(&wide_path(ancestor)?)?;
-        if !trusted_sid(owner, current_user) {
-            return Err(invalid_acl());
+        if !trusted_sid(owner, current_user, trusted_installer) {
+            return Err(parent_error(
+                ancestor,
+                "owner is not the current user, SYSTEM, Administrators, or Windows Modules Installer",
+            ));
         }
         // Adding a new sibling under an ancestor cannot replace an existing
         // component. Delete-child, ACL/owner changes and attribute writes can.
@@ -252,21 +266,39 @@ fn verify_parent_chain(path: &Path, current_user: *mut c_void) -> io::Result<()>
         for index in 0..u32::from(count) {
             if let Some((ace, sid)) = read_allow_ace(dacl, index)?
                 && ace.Mask & unsafe_rights != 0
-                && !trusted_sid(sid, current_user)
+                && !trusted_sid(sid, current_user, trusted_installer)
             {
-                return Err(invalid_acl());
+                return Err(parent_error(
+                    ancestor,
+                    &format!(
+                        "untrusted access rule {index} grants replacement/control rights (mask={:#010x}, unsafe_mask={unsafe_rights:#010x})",
+                        ace.Mask
+                    ),
+                ));
             }
         }
     }
     Ok(())
 }
 
-fn trusted_sid(sid: *mut c_void, current_user: *mut c_void) -> bool {
-    // SAFETY: both pointers borrow validated, live OS security descriptors.
+fn parent_error(path: &Path, reason: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!("unsafe temporary-directory ancestor {}: {reason}", path.display()),
+    )
+}
+
+fn trusted_sid(
+    sid: *mut c_void,
+    current_user: *mut c_void,
+    trusted_installer: *mut c_void,
+) -> bool {
+    // SAFETY: all pointers borrow validated, live OS security descriptors.
     unsafe {
         EqualSid(sid, current_user) != 0
             || IsWellKnownSid(sid, WinLocalSystemSid) != 0
             || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
+            || EqualSid(sid, trusted_installer) != 0
     }
 }
 
@@ -284,4 +316,21 @@ fn invalid_acl() -> io::Error {
         io::ErrorKind::PermissionDenied,
         "filesystem did not enforce a private owner-only directory ACL",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trusts_only_the_exact_privileged_installer_service_sid() -> io::Result<()> {
+        let current = Descriptor::from_sddl("O:S-1-5-21-1-2-3-1000")?;
+        let installer = Descriptor::from_sddl(&format!("O:{TRUSTED_INSTALLER_SID}"))?;
+        assert!(trusted_sid(installer.owner()?, current.owner()?, installer.owner()?));
+        for sid in ["S-1-5-19", "S-1-5-20", "S-1-1-0", "S-1-5-80-1-2-3-4-5"] {
+            let other = Descriptor::from_sddl(&format!("O:{sid}"))?;
+            assert!(!trusted_sid(other.owner()?, current.owner()?, installer.owner()?));
+        }
+        Ok(())
+    }
 }

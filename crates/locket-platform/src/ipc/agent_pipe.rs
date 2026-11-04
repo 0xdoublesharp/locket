@@ -29,7 +29,7 @@ pub fn agent_pipe_name_for_sid(sid: &str) -> Result<String, PlatformError> {
 
 /// Returns the protected DACL SDDL used when creating the agent pipe.
 ///
-/// The descriptor grants generic-all to the current user's SID and
+/// The descriptor sets the owner and grants generic-all to the current user's SID and
 /// marks the DACL protected (`D:P`) so inherited ACEs are not added by
 /// the object manager.
 ///
@@ -38,7 +38,7 @@ pub fn agent_pipe_name_for_sid(sid: &str) -> Result<String, PlatformError> {
 /// Returns [`PlatformError::InvalidWindowsSid`] when `sid` is empty or malformed.
 pub fn agent_pipe_dacl_sddl_for_sid(sid: &str) -> Result<String, PlatformError> {
     let sid = validate_sid_fragment(sid)?;
-    Ok(format!("D:P(A;;GA;;;{sid})"))
+    Ok(format!("O:{sid}D:P(A;;GA;;;{sid})"))
 }
 
 fn validate_sid_fragment(sid: &str) -> Result<Cow<'_, str>, PlatformError> {
@@ -91,24 +91,44 @@ pub fn create_agent_pipe_server_with_sddl(
     windows_impl::create_agent_pipe_server_with_sddl(options, pipe_name, sddl)
 }
 
+/// Opens a local pipe only after verifying its object owner and server user.
+///
+/// The connected handle is checked before any protocol data is sent. The pipe
+/// object's owner binds the check even if its original server PID was recycled.
+/// The client permits identification only, never server impersonation.
+///
+/// # Errors
+/// Rejects non-local endpoints, identity mismatches and unavailable identity data.
+#[cfg(target_os = "windows")]
+pub fn open_verified_agent_pipe_client(
+    pipe_name: &std::ffi::OsStr,
+) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    windows_impl::open_verified_agent_pipe_client(pipe_name)
+}
+
 #[cfg(target_os = "windows")]
 mod windows_impl {
     #![allow(unsafe_code)]
 
     use std::ffi::{OsStr, c_void};
     use std::io;
+    use std::os::windows::io::AsRawHandle;
     use std::ptr::{NonNull, null_mut};
 
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, HLOCAL, LocalFree};
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-        SDDL_REVISION_1,
+        GetSecurityInfo, SDDL_REVISION_1, SE_KERNEL_OBJECT,
     };
     use windows_sys::Win32::Security::{
-        GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
-        TokenUser,
+        GetTokenInformation, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+        TOKEN_QUERY, TOKEN_USER, TokenUser,
     };
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows_sys::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION;
+    use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
     use windows_sys::core::PWSTR;
 
     use crate::PlatformError;
@@ -118,7 +138,7 @@ mod windows_impl {
     impl Drop for Handle {
         fn drop(&mut self) {
             if !self.0.is_null() {
-                // SAFETY: `self.0` is a live handle returned by `OpenProcessToken`.
+                // SAFETY: `self.0` is a live owned process or token handle.
                 unsafe {
                     CloseHandle(self.0);
                 }
@@ -127,10 +147,14 @@ mod windows_impl {
     }
 
     pub(super) fn current_user_sid_string() -> Result<String, PlatformError> {
+        // SAFETY: GetCurrentProcess returns the current process pseudo-handle.
+        process_user_sid_string(unsafe { GetCurrentProcess() })
+    }
+
+    fn process_user_sid_string(process: HANDLE) -> Result<String, PlatformError> {
         let mut token: HANDLE = null_mut();
-        // SAFETY: `GetCurrentProcess` is a pseudo-handle and `token`
-        // points to writable storage for the opened token handle.
-        let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) };
+        // SAFETY: callers supply a live process handle; token is writable.
+        let opened = unsafe { OpenProcessToken(process, TOKEN_QUERY, &raw mut token) };
         if opened == 0 {
             return Err(PlatformError::WindowsSidUnavailable(last_os_error_code()));
         }
@@ -167,21 +191,118 @@ mod windows_impl {
         // SAFETY: `buffer` contains a TOKEN_USER structure written by
         // `GetTokenInformation(TokenUser, ...)`.
         let token_user = unsafe { &*(buffer.as_ptr().cast::<TOKEN_USER>()) };
+        sid_string(token_user.User.Sid)
+    }
+
+    fn sid_string(sid: *mut c_void) -> Result<String, PlatformError> {
         let mut sid_text: PWSTR = null_mut();
-        // SAFETY: `token_user.User.Sid` is owned by the token-info
-        // buffer and valid for this call; Windows allocates `sid_text`.
-        let converted = unsafe { ConvertSidToStringSidW(token_user.User.Sid, &raw mut sid_text) };
+        // SAFETY: callers supply an OS-owned SID alive for this call.
+        let converted = unsafe { ConvertSidToStringSidW(sid, &raw mut sid_text) };
         if converted == 0 || sid_text.is_null() {
             return Err(PlatformError::WindowsSidUnavailable(last_os_error_code()));
         }
 
-        let text = wide_ptr_to_string(sid_text)?;
+        let text = wide_ptr_to_string(sid_text);
         // SAFETY: `sid_text` was allocated by `ConvertSidToStringSidW`
         // and must be released with `LocalFree`.
         unsafe {
             LocalFree(sid_text.cast::<core::ffi::c_void>() as HLOCAL);
         }
-        Ok(text)
+        text
+    }
+
+    pub(super) fn open_verified_agent_pipe_client(
+        pipe_name: &OsStr,
+    ) -> io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+        validate_local_pipe_name(pipe_name)?;
+        let expected_sid = current_user_sid_string().map_err(io::Error::other)?;
+        let client = tokio::net::windows::named_pipe::ClientOptions::new()
+            .security_qos_flags(SECURITY_IDENTIFICATION)
+            .open(pipe_name)?;
+        verify_pipe_server_identity(&client, &expected_sid)?;
+        Ok(client)
+    }
+
+    fn validate_local_pipe_name(name: &OsStr) -> io::Result<()> {
+        const PREFIX: &str = r"\\.\pipe\";
+        let Some(name) = name.to_str() else {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid local pipe name"));
+        };
+        if !name.get(..PREFIX.len()).is_some_and(|prefix| prefix.eq_ignore_ascii_case(PREFIX))
+            || name.len() == PREFIX.len()
+            || name[PREFIX.len()..].contains(['\\', '/', '\0'])
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "expected a local named pipe"));
+        }
+        Ok(())
+    }
+
+    fn verify_pipe_server_identity(
+        client: &tokio::net::windows::named_pipe::NamedPipeClient,
+        expected_sid: &str,
+    ) -> io::Result<()> {
+        let pipe = client.as_raw_handle();
+        let owner_sid = pipe_owner_sid(pipe)?;
+        if owner_sid != expected_sid {
+            return Err(identity_denied());
+        }
+        let mut pid = 0;
+        // SAFETY: the connected client owns a live pipe handle; pid is writable.
+        if unsafe { GetNamedPipeServerProcessId(pipe, &raw mut pid) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the kernel provided this PID; request only token-query access.
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if process.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let process = Handle(process);
+        require_process_user(process.0, expected_sid)
+    }
+
+    fn require_process_user(process: HANDLE, expected_sid: &str) -> io::Result<()> {
+        let server_sid = process_user_sid_string(process).map_err(io::Error::other)?;
+        if server_sid != expected_sid {
+            return Err(identity_denied());
+        }
+        Ok(())
+    }
+
+    fn pipe_owner_sid(pipe: HANDLE) -> io::Result<String> {
+        let mut owner = null_mut();
+        let mut descriptor = null_mut();
+        // SAFETY: pipe is a connected live handle with GENERIC_READ/READ_CONTROL.
+        // Returned owner borrows the LocalAlloc descriptor until it is freed.
+        let status = unsafe {
+            GetSecurityInfo(
+                pipe,
+                SE_KERNEL_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &raw mut owner,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                &raw mut descriptor,
+            )
+        };
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(i32::try_from(status).unwrap_or(i32::MAX)));
+        }
+        let result = if owner.is_null() || descriptor.is_null() {
+            Err(identity_denied())
+        } else {
+            sid_string(owner).map_err(io::Error::other)
+        };
+        // SAFETY: GetSecurityInfo returns a LocalAlloc descriptor (or null).
+        unsafe { LocalFree(descriptor) };
+        result
+    }
+
+    fn identity_denied() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "agent pipe server is not owned by this user",
+        )
     }
 
     fn wide_ptr_to_string(ptr: *const u16) -> Result<String, PlatformError> {
@@ -266,6 +387,67 @@ mod windows_impl {
             }
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn pipe_client_rejects_remote_and_non_pipe_paths_before_opening() {
+            for path in [
+                r"\\remote\pipe\locket-agent",
+                r"\\localhost\pipe\locket-agent",
+                r"\\?\pipe\locket-agent",
+                r"C:\locket-agent",
+                r"\\.\pipe\",
+                r"\\.\pipe\nested\locket-agent",
+                "\\\\.\\pipe\\locket\0ignored",
+            ] {
+                assert!(
+                    open_verified_agent_pipe_client(OsStr::new(path))
+                        .is_err_and(|error| error.kind() == io::ErrorKind::InvalidInput)
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn pipe_client_checks_real_object_owner_and_server_token()
+        -> Result<(), Box<dyn std::error::Error>> {
+            use std::sync::atomic::{AtomicU64, Ordering};
+
+            static NEXT_PIPE: AtomicU64 = AtomicU64::new(0);
+            let name = format!(
+                r"\\.\pipe\locket-owner-test-{}-{}",
+                std::process::id(),
+                NEXT_PIPE.fetch_add(1, Ordering::Relaxed)
+            );
+            let sid = current_user_sid_string()?;
+            let sddl = crate::agent_pipe_dacl_sddl_for_sid(&sid)?;
+            let mut options = tokio::net::windows::named_pipe::ServerOptions::new();
+            options.first_pipe_instance(true).reject_remote_clients(true);
+            let server = create_agent_pipe_server_with_sddl(&options, OsStr::new(&name), &sddl)?;
+            let client = open_verified_agent_pipe_client(OsStr::new(&name))?;
+            server.connect().await?;
+            assert_eq!(pipe_owner_sid(client.as_raw_handle())?, sid);
+            assert!(
+                verify_pipe_server_identity(&client, "S-1-0-0")
+                    .is_err_and(|error| error.kind() == io::ErrorKind::PermissionDenied)
+            );
+            // Check the process-token branch independently of the owner branch.
+            // SAFETY: the current-process pseudo-handle is valid and not owned.
+            let process = unsafe { GetCurrentProcess() };
+            assert!(
+                require_process_user(process, "S-1-0-0")
+                    .is_err_and(|error| error.kind() == io::ErrorKind::PermissionDenied)
+            );
+            assert!(
+                server
+                    .try_read(&mut [0; 1])
+                    .is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock)
+            );
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -284,7 +466,10 @@ mod tests {
     #[test]
     fn agent_pipe_dacl_sddl_is_current_user_only_and_protected()
     -> Result<(), Box<dyn std::error::Error>> {
-        assert_eq!(agent_pipe_dacl_sddl_for_sid("S-1-5-21-1000")?, "D:P(A;;GA;;;S-1-5-21-1000)");
+        assert_eq!(
+            agent_pipe_dacl_sddl_for_sid("S-1-5-21-1000")?,
+            "O:S-1-5-21-1000D:P(A;;GA;;;S-1-5-21-1000)"
+        );
         Ok(())
     }
 

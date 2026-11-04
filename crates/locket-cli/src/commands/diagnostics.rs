@@ -819,7 +819,7 @@ fn check_agent_socket_path_matches_spec(context: &RuntimeContext) -> DiagnosticC
             Ok(dacl) => dacl,
             Err(error) => return DiagnosticCheck::fail(NAME, false, error.to_string()),
         };
-        if actual_socket != PathBuf::from(&pipe_name) {
+        if actual_socket != Path::new(&pipe_name) {
             return DiagnosticCheck::fail(
                 NAME,
                 false,
@@ -830,7 +830,7 @@ fn check_agent_socket_path_matches_spec(context: &RuntimeContext) -> DiagnosticC
                 ),
             );
         }
-        return DiagnosticCheck::pass(NAME, format!("windows named pipe path ok dacl_sddl={dacl}"));
+        DiagnosticCheck::pass(NAME, format!("windows named pipe path ok dacl_sddl={dacl}"))
     }
 
     #[cfg(not(target_os = "windows"))]

@@ -1235,7 +1235,7 @@ pub fn pump_policies_to_agent(
     project_id: &str,
     policy_document: &PolicyDocument,
 ) {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let snapshots = build_snapshots(project_id, policy_document);
         let payload = json!({
@@ -1244,7 +1244,7 @@ pub fn pump_policies_to_agent(
             "store_path": context.store_path,
             "audit_profile_id": serde_json::Value::Null,
         });
-        if let Err(error) = pump_policies_unix(context, payload)
+        if let Err(error) = pump_policies_endpoint(context, payload)
             && std::env::var_os("LOCKET_DEBUG").is_some()
         {
             let mut stderr = io::stderr();
@@ -1254,7 +1254,7 @@ pub fn pump_policies_to_agent(
             );
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (context, project_id, policy_document);
     }
@@ -1274,8 +1274,8 @@ fn build_snapshots(
         .collect()
 }
 
-#[cfg(unix)]
-fn pump_policies_unix(
+#[cfg(any(unix, windows))]
+fn pump_policies_endpoint(
     context: &RuntimeContext,
     payload: serde_json::Value,
 ) -> Result<(), io::Error> {
@@ -1283,9 +1283,11 @@ fn pump_policies_unix(
         AgentMethod, DEFAULT_MAX_MESSAGE_SIZE, RequestEnvelope, ResponseEnvelope, encode_frame,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[cfg(unix)]
     use tokio::net::UnixStream;
 
     let socket_path = crate::agent_socket_path(context);
+    #[cfg(unix)]
     if !socket_path.exists() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -1295,7 +1297,10 @@ fn pump_policies_unix(
 
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     runtime.block_on(async move {
+        #[cfg(unix)]
         let mut stream = UnixStream::connect(&socket_path).await?;
+        #[cfg(windows)]
+        let mut stream = locket_agent::connect_named_pipe_client(&socket_path).await?;
         let request = RequestEnvelope::new(
             "cli-pump-policies",
             AgentMethod::RegisterCommandPolicies,
@@ -1342,7 +1347,7 @@ mod framing_tests {
 
     fn rejects_frame(kind: &str) {
         let result = with_open_peer(vec![invalid_frame(kind)], |context| {
-            super::pump_policies_unix(context, json!({}))
+            super::pump_policies_endpoint(context, json!({}))
         });
         let Err(error) = result else {
             panic!("permanent frame error expected");
@@ -1370,7 +1375,7 @@ mod framing_tests {
     #[test]
     fn policy_reader_accepts_fragmented_frame_while_peer_stays_open() {
         let result = with_open_peer(fragmented_success(), |context| {
-            super::pump_policies_unix(context, json!({}))
+            super::pump_policies_endpoint(context, json!({}))
         });
         assert!(result.is_ok());
     }

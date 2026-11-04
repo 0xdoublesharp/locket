@@ -104,7 +104,9 @@ profiles = ["dev"]
 
 [commands.smoke]
 argv = ["/bin/sh", "-c", "printf smoke-ok > smoke-ran.txt"]
-"#,
+"#
+        .replace("/bin/sh", test_shell())
+        .replace("/usr/bin/true", test_true()),
     )?;
     let mut output = Vec::new();
     run_with_context(
@@ -4279,7 +4281,7 @@ fn solo_project_without_team_allows_all_owner_operations() -> Result<(), Box<dyn
             "--secret",
             "DATABASE_URL",
             "--",
-            "/bin/sh",
+            test_shell(),
             "-c",
             "test \"$DATABASE_URL\" = \"postgres://localhost/app\"",
         ])?,

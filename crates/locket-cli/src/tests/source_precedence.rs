@@ -608,7 +608,7 @@ fn exec_injects_highest_precedence_source_value_and_records_source_in_audit()
             "--secret",
             "DB_URL",
             "--",
-            "/bin/sh",
+            test_shell(),
             "-c",
             "test \"$DB_URL\" = \"machine-db-url\"",
         ])?,

@@ -54,7 +54,7 @@ fn ai_safe_multiline_transcript_never_contains_known_value_lines()
             "--output",
             "transcript.log",
             "--",
-            "/bin/sh",
+            test_shell(),
             "-c",
             "printf 'quiet apple\nquiet pear\n'; printf 'quiet apple\nquiet pear\n' >&2",
         ])?,
@@ -92,7 +92,7 @@ fn ai_safe_redacts_child_output_and_transcript() -> Result<(), Box<dyn std::erro
             "--output",
             "transcript.log",
             "--",
-            "/bin/sh",
+            test_shell(),
             "-c",
             "printf 'db=postgres://localhost/app\n'; printf 'err=postgres://localhost/app\n' >&2",
         ])?,
@@ -276,7 +276,14 @@ fn ai_safe_fails_closed_when_locked_unless_pattern_only() -> Result<(), Box<dyn 
 
     let mut default_output = Vec::new();
     let default_result = run_with_context(
-        Cli::try_parse_from(["locket", "ai-safe", "--", "/bin/sh", "-c", "touch spawned-default"])?,
+        Cli::try_parse_from([
+            "locket",
+            "ai-safe",
+            "--",
+            test_shell(),
+            "-c",
+            "touch spawned-default",
+        ])?,
         &context,
         &mut default_output,
     );
@@ -301,7 +308,7 @@ fn ai_safe_fails_closed_when_locked_unless_pattern_only() -> Result<(), Box<dyn 
             "ai-safe",
             "--pattern-only",
             "--",
-            "/bin/sh",
+            test_shell(),
             "-c",
             "printf 'token=sk_test_sampleTokenValue123\n'; touch spawned-pattern",
         ])?,
@@ -321,7 +328,7 @@ fn ai_safe_without_project_uses_project_not_found() -> Result<(), Box<dyn std::e
     let context = test_context(&directory);
 
     let result = run_with_context(
-        Cli::try_parse_from(["locket", "ai-safe", "--", "/bin/sh", "-c", "true"])?,
+        Cli::try_parse_from(["locket", "ai-safe", "--", test_shell(), "-c", "true"])?,
         &context,
         &mut Vec::new(),
     );
@@ -362,7 +369,7 @@ fn ai_safe_uses_privacy_config_aliases_but_audits_exact_names()
             "locket",
             "ai-safe",
             "--",
-            "/bin/sh",
+            test_shell(),
             "-c",
             "printf 'db=postgres://localhost/app\n'",
         ])?,
@@ -412,7 +419,7 @@ fn ai_safe_transcript_force_repairs_permissions_and_child_exit_is_forwarded()
             "--output",
             "transcript.log",
             "--",
-            "/bin/sh",
+            test_shell(),
             "-c",
             "true",
         ])?,
@@ -431,7 +438,7 @@ fn ai_safe_transcript_force_repairs_permissions_and_child_exit_is_forwarded()
             "--output",
             "transcript.log",
             "--",
-            "/bin/sh",
+            test_shell(),
             "-c",
             "printf 'token=sk_test_sampleTokenValue123'; exit 7",
         ])?,
@@ -479,7 +486,7 @@ fn ai_safe_redacts_non_ascii_utf8_secret_bytes_without_normalization()
             "locket",
             "ai-safe",
             "--",
-            "/bin/sh",
+            test_shell(),
             "-c",
             &format!("printf 'val=%s\\n' '{secret_value}'"),
         ])?,
