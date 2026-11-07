@@ -10,7 +10,7 @@ Last reviewed: 2026-06-26.
 
 Release builds should use current stable foundations, not legacy defaults:
 
-- Rust 2024 edition with the repository-pinned toolchain in `rust-toolchain.toml` (`1.99.0`). The pre-1.0 minimum supported Rust version is 1.99.
+- Rust 2024 edition with the repository-pinned toolchain in `rust-toolchain.toml` (`1.99.1`). The pre-1.0 minimum supported Rust version is 1.99.
 - Tauri v2 for the desktop app and tray surface; start from the latest stable v2 minor at scaffolding time (`2.10.x` at this review), not legacy v1 or beta/RC APIs. Reference: [Tauri v2 releases](https://tauri.app/release/tauri/v2.10.1/).
 - SLSA v1.2-style provenance expectations for release artifacts. Reference: [SLSA v1.2 build requirements](https://slsa.dev/spec/v1.2/build-requirements).
 - OWASP secrets-management guidance for lifecycle, rotation, audit, redaction, and CI boundaries. Reference: [OWASP Secrets Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html).
