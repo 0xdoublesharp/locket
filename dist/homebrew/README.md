@@ -25,7 +25,7 @@ the signed source-tarball URL and SHA-256 recorded by the release ceremony:
 ```sh
 scripts/render-homebrew-formula.sh \
   --version 0.1.0 \
-  --url https://github.com/doublesharp/locket/releases/download/v0.1.0/locket-0.1.0-src.tar.gz \
+  --url https://github.com/0xdoublesharp/locket/releases/download/v0.1.0/locket-0.1.0-src.tar.gz \
   --sha256 <64 lowercase hex>
 ```
 
@@ -44,7 +44,7 @@ The release operator checklist makes the final tap update deterministic:
 ```sh
 scripts/release-operator-runbook.sh \
   --task homebrew-tap-publish-operator \
-  --signed-source-url https://github.com/doublesharp/locket/releases/download/v0.1.0/locket-0.1.0-src.tar.gz \
+  --signed-source-url https://github.com/0xdoublesharp/locket/releases/download/v0.1.0/locket-0.1.0-src.tar.gz \
   --signed-source-sha256 <64 lowercase hex>
 ```
 
@@ -62,7 +62,7 @@ Once `release-key-offline` ships, the formula will live at:
 
 ## Release-tag to formula update flow
 
-1. Cut a signed release tag in `doublesharp/locket` (for example, `v0.1.0`).
+1. Cut a signed release tag in `0xdoublesharp/locket` (for example, `v0.1.0`).
    This step depends on the offline release key ceremony and signed source
    tarball production.
 2. The release pipeline publishes a signed source tarball as a GitHub
