@@ -161,7 +161,7 @@ heading() {
 
 source_url_or_placeholder() {
   [[ -n "${signed_source_url}" ]] && printf '%s' "${signed_source_url}" && return
-  printf 'https://github.com/doublesharp/locket/releases/download/%s/locket-%s-src.tar.gz' "${release_tag}" "${version}"
+  printf 'https://github.com/0xdoublesharp/locket/releases/download/%s/locket-%s-src.tar.gz' "${release_tag}" "${version}"
 }
 
 source_sha_or_placeholder() {

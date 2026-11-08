@@ -9,7 +9,7 @@
       "platform": "macos-linux",
       "format": "homebrew-formula",
       "builder": "scripts/render-homebrew-formula.sh --version <version> --url <signed-source-url> --sha256 <sha256>",
-      "dry_run": "scripts/render-homebrew-formula.sh --version 0.1.0 --url https://github.com/doublesharp/locket/releases/download/v0.1.0/locket-0.1.0-src.tar.gz --sha256 <64 lowercase hex>",
+      "dry_run": "scripts/render-homebrew-formula.sh --version 0.1.0 --url https://github.com/0xdoublesharp/locket/releases/download/v0.1.0/locket-0.1.0-src.tar.gz --sha256 <64 lowercase hex>",
       "unsigned_inputs": [
         "dist/homebrew/locket.rb.in"
       ],

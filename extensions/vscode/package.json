@@ -8,7 +8,7 @@
   "publisher": "locket",
   "repository": {
     "type": "git",
-    "url": "https://github.com/doublesharp/locket.git",
+    "url": "https://github.com/0xdoublesharp/locket.git",
     "directory": "extensions/vscode"
   },
   "engines": {
