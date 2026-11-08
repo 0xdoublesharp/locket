@@ -28,7 +28,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, ubuntu-24.04, windows-2022]
+        os: [macos-26, ubuntu-24.04, windows-2025]
     runs-on: ${{ matrix.os }}
     env:
       CARGO_INCREMENTAL: '0'
@@ -150,7 +150,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, ubuntu-24.04, windows-2022]
+        os: [macos-26, ubuntu-24.04, windows-2025]
     runs-on: ${{ matrix.os }}
     env:
       PYTHONDONTWRITEBYTECODE: '1'
