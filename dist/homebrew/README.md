@@ -25,7 +25,7 @@ the signed source-tarball URL and SHA-256 recorded by the release ceremony:
 ```sh
 scripts/render-homebrew-formula.sh \
   --version 0.1.0 \
-  --url https://github.com/doublesharp/locket/releases/download/v0.1.0/locket-0.1.0-src.tar.gz \
+  --url https://github.com/0xdoublesharp/locket/releases/download/v0.1.0/locket-0.1.0-src.tar.gz \
   --sha256 <64 lowercase hex>
 ```
 
@@ -44,25 +44,25 @@ The release operator checklist makes the final tap update deterministic:
 ```sh
 scripts/release-operator-runbook.sh \
   --task homebrew-tap-publish-operator \
-  --signed-source-url https://github.com/doublesharp/locket/releases/download/v0.1.0/locket-0.1.0-src.tar.gz \
+  --signed-source-url https://github.com/0xdoublesharp/locket/releases/download/v0.1.0/locket-0.1.0-src.tar.gz \
   --signed-source-sha256 <64 lowercase hex>
 ```
 
 The command is dry-run by default. On the credentialed release host, set
-`LOCKET_HOMEBREW_TAP_DIR` to a checkout of `doublesharp/homebrew-locket` and
+`LOCKET_HOMEBREW_TAP_DIR` to a checkout of `0xdoublesharp/homebrew-locket` and
 add `--execute --confirm publish-v0.1.0`.
 
 ## Intended tap path
 
 Once `release-key-offline` ships, the formula will live at:
 
-- Tap repository: `doublesharp/homebrew-locket`
+- Tap repository: `0xdoublesharp/homebrew-locket`
 - Formula path: `Formula/locket.rb`
-- User install command: `brew tap doublesharp/locket && brew install locket`
+- User install command: `brew tap 0xdoublesharp/locket && brew install locket`
 
 ## Release-tag to formula update flow
 
-1. Cut a signed release tag in `doublesharp/locket` (for example, `v0.1.0`).
+1. Cut a signed release tag in `0xdoublesharp/locket` (for example, `v0.1.0`).
    This step depends on the offline release key ceremony and signed source
    tarball production.
 2. The release pipeline publishes a signed source tarball as a GitHub
@@ -70,7 +70,7 @@ Once `release-key-offline` ships, the formula will live at:
 3. A formula-update job copies `dist/homebrew/locket.rb` from the source
    tree, renders `dist/homebrew/locket.rb.in` with the version, `sha256`,
    and signed source-tarball URL, and opens a pull request against the
-   `doublesharp/homebrew-locket` tap repository.
+   `0xdoublesharp/homebrew-locket` tap repository.
 4. The tap PR runs `brew audit --strict --new-formula` and the formula's
    `test do` block in CI before merging.
 5. Users `brew upgrade locket` after the tap PR merges; no client-side

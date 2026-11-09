@@ -82,7 +82,7 @@ for (const dir of fs.readdirSync("crates")) {
 
 skip_or_check ruby ruby -c dist/homebrew/locket.rb
 skip_or_check ruby ruby -c dist/homebrew/locket.rb.in
-check scripts/render-homebrew-formula.sh --version 0.1.0 --url https://github.com/doublesharp/locket/releases/download/v0.1.0/locket-0.1.0-src.tar.gz --sha256 1111111111111111111111111111111111111111111111111111111111111111 --out "${LOCKET_BUILD_ROOT:-${CARGO_TARGET_DIR:-target}}/package/homebrew/locket.rb"
+check scripts/render-homebrew-formula.sh --version 0.1.0 --url https://github.com/0xdoublesharp/locket/releases/download/v0.1.0/locket-0.1.0-src.tar.gz --sha256 1111111111111111111111111111111111111111111111111111111111111111 --out "${LOCKET_BUILD_ROOT:-${CARGO_TARGET_DIR:-target}}/package/homebrew/locket.rb"
 skip_or_check plutil plutil -lint dist/installers/macos/entitlements.plist
 skip_or_check xmllint xmllint --noout dist/installers/macos/distribution.xml
 skip_or_check actionlint actionlint .github/workflows/ci.yml .github/workflows/release.yml .github/workflows/fuzz-nightly.yml .github/workflows/package-validation.yml

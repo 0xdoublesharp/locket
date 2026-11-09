@@ -33,7 +33,7 @@ if (args.require_build_l3) {
   const builder = builderId(statement) ?? "";
   const hosted = /^https:\/\/github\.com\/actions\/runner\//.test(builder)
     || /^https:\/\/github\.com\/Attestations\/GitHubHostedActions@/.test(builder)
-    || /^https:\/\/github\.com\/doublesharp\/locket\/\.github\/workflows\//.test(builder);
+    || /^https:\/\/github\.com\/0xdoublesharp\/locket\/\.github\/workflows\//.test(builder);
   checkTruth("Build L3 hosted-runner target", hosted, "builder identity is a hosted CI builder, not a local workstation");
 }
 

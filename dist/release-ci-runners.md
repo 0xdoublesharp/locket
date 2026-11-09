@@ -117,7 +117,7 @@ Every release artifact carries an SLSA v1.2 build-provenance attestation
 generated via `actions/attest-build-provenance@v2`. The attestation is then
 validated by `scripts/slsa-provenance-policy.pl` against:
 
-- The expected source repository (`doublesharp/locket`).
+- The expected source repository (`0xdoublesharp/locket`).
 - The expected workflow ref (`.github/workflows/release.yml@refs/tags/v*`).
 - The expected builder identity (GitHub-hosted Actions runner or the pinned
   isolated self-hosted builder).

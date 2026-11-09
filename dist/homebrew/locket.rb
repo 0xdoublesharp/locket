@@ -10,12 +10,12 @@
 # to formula update flow.
 class Locket < Formula
   desc "Local-first secrets control plane for development environments"
-  homepage "https://github.com/doublesharp/locket"
+  homepage "https://github.com/0xdoublesharp/locket"
   # TODO(release-key-offline): replace with the signed release-tarball URL
   # produced by the offline signing ceremony. The pattern below mirrors the
   # GitHub source-tarball convention and will become a release-asset URL once
   # the signed tarball pipeline lands.
-  url "https://github.com/doublesharp/locket/archive/refs/tags/v#{version}.tar.gz"
+  url "https://github.com/0xdoublesharp/locket/archive/refs/tags/v#{version}.tar.gz"
   # TODO(release-key-offline): replace with actual release-tarball SHA256
   # from offline signing ceremony.
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
