@@ -62,7 +62,8 @@ jobs:
             libxdo-dev
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        id: cargo-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
@@ -72,6 +73,24 @@ jobs:
           restore-keys: |
             cargo-ci-${{ runner.os }}-
 
+      - name: Install Cargo Steward v0.2.0
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          installer="$RUNNER_TEMP/install-cargo-steward.sh"
+          curl --fail --silent --show-error --location --retry 3 https://raw.githubusercontent.com/0xdoublesharp/cargo-steward/v0.2.0/scripts/install.sh -o "$installer"
+          sh "$installer" --release 0.2.0 --repo 0xdoublesharp/cargo-steward --no-setup
+          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
+          if [[ -n "${RUSTC_WRAPPER:-}" && "$RUSTC_WRAPPER" != cargo-steward ]]; then
+            printf 'CARGO_STEWARD_INNER=%s\n' "$RUSTC_WRAPPER" >> "$GITHUB_ENV"
+          fi
+          echo "RUSTC_WRAPPER=cargo-steward" >> "$GITHUB_ENV"
+      - name: Track Cargo build cache
+        if: runner.os != 'Windows'
+        uses: 0xdoublesharp/cargo-steward@v0.2.0
+        with:
+          mode: start
+          target-dir: ${{ github.workspace }}/target
       - name: Fetch locked dependencies for offline quality checks
         run: cargo fetch --locked
 
@@ -109,6 +128,24 @@ jobs:
             target/quality/**
             supply-chain-exceptions.json
           if-no-files-found: ignore
+      - name: Trim Cargo build cache
+        if: runner.os != 'Windows'
+        uses: 0xdoublesharp/cargo-steward@v0.2.0
+        with:
+          mode: trim
+          target-dir: ${{ github.workspace }}/target
+          budget: 4GiB
+          keep-workspace: true
+          keep-incremental: true
+      - name: Save trimmed Cargo cache
+        if: success() && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   desktop-ui:
     name: desktop UI checks
