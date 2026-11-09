@@ -92,6 +92,20 @@ jobs:
             ${{ runner.temp }}/locket/cargo
             ${{ runner.temp }}/locket/build/tools
           key: unsigned-${{ matrix.os }}-tauri-2.10.1-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - name: Configure Cargo Steward wrapper
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          if [[ -n "${RUSTC_WRAPPER:-}" && "$RUSTC_WRAPPER" != cargo-steward ]]; then
+            printf 'CARGO_STEWARD_INNER=%s\n' "$RUSTC_WRAPPER" >> "$GITHUB_ENV"
+          fi
+          echo "RUSTC_WRAPPER=cargo-steward" >> "$GITHUB_ENV"
+      - name: Track Cargo build cache
+        if: runner.os != 'Windows'
+        uses: 0xdoublesharp/cargo-steward@v0.2.2
+        with:
+          mode: start
+          target-dir: ${{ runner.temp }}/locket/cargo
       - name: Linux native dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev
@@ -121,6 +135,14 @@ jobs:
           TAURI_CONFIG="$(cat "$LOCKET_BUILD_ROOT/package/installers/stage/tauri-bundle.json")"
           export TAURI_CONFIG
           cargo test -p locket-desktop --release --all-targets --locked
+      - name: Trim Cargo build cache
+        if: runner.os != 'Windows'
+        uses: 0xdoublesharp/cargo-steward@v0.2.2
+        with:
+          mode: trim
+          target-dir: ${{ runner.temp }}/locket/cargo
+          budget: 4GiB
+          keep-workspace: true
       - name: Preserve unsigned build cache
         if: always() && !cancelled() && steps.unsigned-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4

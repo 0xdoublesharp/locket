@@ -30,7 +30,8 @@ jobs:
         run: rustup toolchain install nightly --profile minimal
 
       - name: Cache cargo and fuzz state
-        uses: actions/cache@v4
+        id: cargo-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
@@ -41,6 +42,27 @@ jobs:
           restore-keys: |
             fuzz-nightly-${{ runner.os }}-
 
+      - name: Configure Cargo Steward wrapper
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          if [[ -n "${RUSTC_WRAPPER:-}" && "$RUSTC_WRAPPER" != cargo-steward ]]; then
+            printf 'CARGO_STEWARD_INNER=%s\n' "$RUSTC_WRAPPER" >> "$GITHUB_ENV"
+          fi
+          echo "RUSTC_WRAPPER=cargo-steward" >> "$GITHUB_ENV"
+      - name: Track Cargo build cache
+        if: runner.os != 'Windows'
+        uses: 0xdoublesharp/cargo-steward@v0.2.2
+        with:
+          mode: start
+          target-dir: ${{ github.workspace }}/target
+      - name: Track Cargo build cache (fuzz)
+        if: runner.os != 'Windows'
+        uses: 0xdoublesharp/cargo-steward@v0.2.2
+        with:
+          mode: start
+          working-directory: fuzz
+          target-dir: ${{ github.workspace }}/fuzz/target
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
 
@@ -57,3 +79,32 @@ jobs:
             fuzz/corpus/**
           if-no-files-found: ignore
           retention-days: 14
+      - name: Trim Cargo build cache
+        if: runner.os != 'Windows'
+        uses: 0xdoublesharp/cargo-steward@v0.2.2
+        with:
+          mode: trim
+          target-dir: ${{ github.workspace }}/target
+          budget: 4GiB
+          keep-workspace: true
+          keep-incremental: true
+      - name: Trim Cargo build cache (fuzz)
+        if: runner.os != 'Windows'
+        uses: 0xdoublesharp/cargo-steward@v0.2.2
+        with:
+          mode: trim
+          working-directory: fuzz
+          target-dir: ${{ github.workspace }}/fuzz/target
+          budget: 4GiB
+          keep-workspace: true
+          keep-incremental: true
+      - name: Save trimmed Cargo cache
+        if: success() && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            fuzz/target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}

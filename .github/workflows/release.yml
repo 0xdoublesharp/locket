@@ -50,7 +50,8 @@ jobs:
         run: rustup show
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        id: cargo-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
@@ -60,6 +61,20 @@ jobs:
           restore-keys: |
             cargo-release-${{ runner.os }}-
 
+      - name: Configure Cargo Steward wrapper
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          if [[ -n "${RUSTC_WRAPPER:-}" && "$RUSTC_WRAPPER" != cargo-steward ]]; then
+            printf 'CARGO_STEWARD_INNER=%s\n' "$RUSTC_WRAPPER" >> "$GITHUB_ENV"
+          fi
+          echo "RUSTC_WRAPPER=cargo-steward" >> "$GITHUB_ENV"
+      - name: Track Cargo build cache
+        if: runner.os != 'Windows'
+        uses: 0xdoublesharp/cargo-steward@v0.2.2
+        with:
+          mode: start
+          target-dir: ${{ github.workspace }}/target
       - name: Install release audit tools
         run: |
           cargo install cargo-auditable --locked
@@ -124,6 +139,23 @@ jobs:
             target/quality/**
             supply-chain-exceptions.json
           if-no-files-found: error
+      - name: Trim Cargo build cache
+        if: runner.os != 'Windows'
+        uses: 0xdoublesharp/cargo-steward@v0.2.2
+        with:
+          mode: trim
+          target-dir: ${{ github.workspace }}/target
+          budget: 4GiB
+          keep-workspace: true
+      - name: Save trimmed Cargo cache
+        if: success() && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   validate-packages:
     needs: build
