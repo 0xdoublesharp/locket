@@ -1391,7 +1391,15 @@ pub async fn dispatch_with_peer(
         Ok(AgentMethod::ResolveReference) => {
             crate::resolve::handle_resolve(envelope, state, current_unix_nanos()).await
         }
-        Ok(AgentMethod::PrepareExec) => prepare_exec_dispatch(envelope, state, observed_pid).await,
+        Ok(AgentMethod::PrepareExec) => {
+            prepare_exec_dispatch(
+                envelope,
+                state,
+                observed_pid,
+                envelope.payload.get("auth").is_some(),
+            )
+            .await
+        }
         Ok(AgentMethod::ListSecrets) => handle_list_secrets(envelope, state).await,
         Ok(AgentMethod::ListProjects) => crate::discovery::handle_list_projects(envelope, state),
         Ok(AgentMethod::DiscoverSecrets) => {
@@ -1442,16 +1450,18 @@ async fn prepare_exec_dispatch(
     envelope: &RequestEnvelope,
     state: &AgentSocketState,
     observed_pid: Option<u32>,
+    authenticated_automation: bool,
 ) -> ResponseEnvelope {
     let session = state.session_gate.lock().await;
     if !session.is_empty() {
         return error_response(envelope, "UnlockRequired", "OS session is locked or suspended");
     }
-    let response = crate::prepare_exec::handle_prepare_exec(
+    let response = crate::prepare_exec::handle_prepare_exec_with_auth(
         envelope,
         state,
         current_unix_nanos(),
         observed_pid,
+        authenticated_automation,
     )
     .await;
     drop(session);
@@ -2054,6 +2064,16 @@ async fn handle_request_grant(
             "grant binding does not match the connecting process",
         );
     }
+    if let (Some(policy_name), Some(scope)) =
+        (payload.policy_name.as_deref(), payload.binding.execution.as_ref())
+        && policy_name != scope.policy_name
+    {
+        return error_response(
+            envelope,
+            "AccessDenied",
+            "grant policy name does not match execution scope",
+        );
+    }
     let verification_actions = secret_grant_verification_actions(payload.action);
     if verification_actions.is_some()
         && state
@@ -2093,8 +2113,15 @@ async fn handle_request_grant(
         payload.ttl_seconds = policy_ttl_seconds;
     }
     let grant_audit = if let Some(actions) = verification_actions {
-        match authorize_secret_grant(envelope, state, &payload, actions, authenticated_automation)
-            .await
+        match authorize_secret_grant(
+            envelope,
+            state,
+            &payload,
+            actions,
+            authenticated_automation,
+            current_unix_nanos(),
+        )
+        .await
         {
             Ok(audit) => audit,
             Err(response) => return response,
@@ -2208,7 +2235,7 @@ async fn authorize_run_policy_grant(
     Ok(ttl)
 }
 
-struct GrantVerificationAudit {
+pub struct GrantVerificationAudit {
     store: Store,
     key: Zeroizing<KeyBytes>,
     verification: UserVerificationAudit,
@@ -2230,27 +2257,29 @@ const fn secret_grant_verification_actions(
         | GrantAction::ImportDotenv
         | GrantAction::SetSecret
         | GrantAction::ApplyPolicy => Some(&["reveal", "copy"]),
-        GrantAction::TeamSync | GrantAction::ResolveReference | GrantAction::ScanKnownValues => {
-            Some(&[])
-        }
+        GrantAction::TeamSync
+        | GrantAction::PrepareExec
+        | GrantAction::ResolveReference
+        | GrantAction::ScanKnownValues => Some(&[]),
         _ => None,
     }
 }
 
 #[allow(clippy::too_many_lines)]
-async fn authorize_secret_grant(
+pub async fn authorize_secret_grant(
     envelope: &RequestEnvelope,
     state: &AgentSocketState,
     payload: &crate::grant::RequestGrantPayload,
     verification_actions: &[&str],
     authenticated_automation: bool,
+    now_unix_nanos: i128,
 ) -> Result<Option<GrantVerificationAudit>, ResponseEnvelope> {
     use crate::GrantAction;
 
     let locked = || unlock_required_for_grant(envelope);
     let (store, master) = {
         let cache = state.unlock_cache.lock().await;
-        let entry = cache.lookup(&payload.project_id, current_unix_nanos()).ok_or_else(locked)?;
+        let entry = cache.lookup(&payload.project_id, now_unix_nanos).ok_or_else(locked)?;
         let path = envelope
             .payload
             .get("store_path")
@@ -2293,14 +2322,18 @@ async fn authorize_secret_grant(
         }
     }
 
-    if verification_actions.is_empty() || authenticated_automation {
+    if authenticated_automation {
         return Ok(None);
     }
-    let required = state
-        .verification_required(store.as_ref(), &payload.project_id, verification_actions)
-        .map_err(|()| {
-            error_response(envelope, "AccessDenied", "could not read grant verification policy")
-        })?;
+    let required = if verification_actions.is_empty() {
+        state.enforce_daemon_user_verification
+    } else {
+        state
+            .verification_required(store.as_ref(), &payload.project_id, verification_actions)
+            .map_err(|()| {
+                error_response(envelope, "AccessDenied", "could not read grant verification policy")
+            })?
+    };
     if !required {
         return Ok(None);
     }
@@ -2321,7 +2354,7 @@ async fn authorize_secret_grant(
     Ok(Some(GrantVerificationAudit { store, key, verification }))
 }
 
-fn append_grant_verification_audit(
+pub fn append_grant_verification_audit(
     audit: &mut GrantVerificationAudit,
     record: &crate::grant::GrantRecord,
     now: i128,

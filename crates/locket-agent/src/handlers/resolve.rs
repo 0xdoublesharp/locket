@@ -142,11 +142,12 @@ pub async fn handle_resolve(
         // `ResolveReference` grant: `PrepareExec` is the umbrella the
         // trusted CLI execution path acquires up front, and reissuing a
         // narrower grant for each `lk://` resolution is redundant.
-        grants.validate_any(
+        grants.validate_any_for_policy(
             grant_id,
             project_id,
             profile_id,
             &[GrantAction::ResolveReference, GrantAction::PrepareExec],
+            policy_name,
             now_unix_nanos,
             typed.binding.as_ref(),
         )
@@ -1835,6 +1836,7 @@ mod tests {
             policy_name: POLICY_NAME.to_owned(),
             profile_id: PROFILE_ID.to_owned(),
             project_id: PROJECT_ID.to_owned(),
+            confirm_dangerous: false,
             binding: Some(GrantBinding::new(std::process::id(), "0")),
         };
         let prepare_envelope = RequestEnvelope::new(

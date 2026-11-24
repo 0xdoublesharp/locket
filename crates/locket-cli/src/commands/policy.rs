@@ -556,6 +556,7 @@ fn validate_one_policy(
         policy_name: policy.name.clone(),
         profile_id: profile.id.clone(),
         project_id: resolved.config.project_id.to_string(),
+        confirm_dangerous: false,
         binding: Some(binding.clone()),
     };
     let prepare = match agent_invoke::<_, locket_agent::PrepareExecResponse>(

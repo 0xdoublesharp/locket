@@ -2071,6 +2071,163 @@ async fn daemon_verification_gates_unlock_grants_and_client_registration()
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn daemon_verification_gates_resolve_and_prepare_exec_and_binds_policy()
+-> Result<(), Box<dyn std::error::Error>> {
+    use locket_platform::MemoryLocalUserVerifier;
+    use std::sync::Arc;
+
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("store.db");
+    let mut store = locket_store::Store::open(&path)?;
+    store.initialize_schema()?;
+    store.insert_project_if_absent("p", "fixture", 1)?;
+    store.insert_profile_if_absent("dev", "p", "dev", false, 1)?;
+    store.insert_profile_if_absent("prod", "p", "prod", true, 1)?;
+    insert_wrapped_audit_key(&store, "p", &[42; 32], &[11; 32])?;
+
+    let rejected = crate::AgentSocketState::locked("test")
+        .with_canonical_store_path(path.clone())
+        .with_daemon_user_verification(true)
+        .with_user_verifier(Arc::new(MemoryLocalUserVerifier::denying()));
+    let approved =
+        rejected.clone().with_user_verifier(Arc::new(MemoryLocalUserVerifier::allowing()));
+    approved.seed_master_key("p", &[42; 32])?;
+    let policy_snapshot = |name: &str| crate::CommandPolicySnapshot {
+        project_id: "p".to_owned(),
+        name: name.to_owned(),
+        command_kind: "argv".to_owned(),
+        command_preview: name.to_owned(),
+        required_secrets: vec!["API_KEY".to_owned()],
+        optional_secrets: Vec::new(),
+        allowed_secrets: vec!["API_KEY".to_owned()],
+        confirm: false,
+        require_user_verification: false,
+        require_agent: true,
+        allow_remote_docker: false,
+        ttl_seconds: 60,
+        env_mode: "minimal".to_owned(),
+        override_mode: "locket".to_owned(),
+        updated_at_unix_nanos: 1,
+    };
+    approved
+        .set_command_policies_for_tests(vec![
+            policy_snapshot("policy-a"),
+            policy_snapshot("policy-b"),
+        ])
+        .await;
+
+    let binding = locket_platform::current_process_binding()?;
+    let peer =
+        crate::PeerIdentity { uid: approved.daemon_uid, pid: Some(binding.pid), connection_id: 91 };
+    let unlock = RequestEnvelope::new(
+        "unlock",
+        AgentMethod::Unlock,
+        json!({"project_id": "p", "ttl_seconds": 120}),
+    );
+    assert!(matches!(
+        crate::dispatch_with_peer(&unlock, &approved, Some(peer)).await,
+        ResponseEnvelope::Success(_)
+    ));
+
+    let grant_req = |action: &str, policy: Option<&str>| {
+        let mut payload = json!({
+            "project_id": "p",
+            "profile_id": "dev",
+            "action": action,
+            "ttl_seconds": 30,
+            "confirm_dangerous": false,
+            "binding": {"pid": binding.pid, "process_start_time": binding.process_start_time},
+        });
+        if let Some(policy) = policy
+            && let Some(map) = payload.as_object_mut()
+        {
+            map.insert("policy_name".to_owned(), json!(policy));
+        }
+        RequestEnvelope::new("grant", AgentMethod::RequestGrant, payload)
+    };
+    for (action, policy) in [
+        ("ResolveReference", Some("policy-a")),
+        ("PrepareExec", Some("policy-a")),
+        ("ScanKnownValues", None),
+        ("TeamSync", None),
+    ] {
+        let response =
+            crate::dispatch_with_peer(&grant_req(action, policy), &rejected, Some(peer)).await;
+        assert!(
+            matches!(&response, ResponseEnvelope::Error(error) if error.error == "UserVerificationFailed"),
+            "{action} must require daemon verification: {response:?}"
+        );
+    }
+
+    let prepare_req = |profile: &str, policy: &str, confirm_dangerous: bool| {
+        RequestEnvelope::new(
+            "prepare",
+            AgentMethod::PrepareExec,
+            json!({
+                "project_id": "p",
+                "profile_id": profile,
+                "policy_name": policy,
+                "confirm_dangerous": confirm_dangerous,
+                "binding": {"pid": binding.pid, "process_start_time": binding.process_start_time},
+            }),
+        )
+    };
+    let denied_prepare =
+        crate::dispatch_with_peer(&prepare_req("dev", "policy-a", false), &rejected, Some(peer))
+            .await;
+    assert!(
+        matches!(&denied_prepare, ResponseEnvelope::Error(error) if error.error == "UserVerificationFailed"),
+        "PrepareExec must require daemon verification: {denied_prepare:?}"
+    );
+    let unconfirmed_prod =
+        crate::dispatch_with_peer(&prepare_req("prod", "policy-a", false), &approved, Some(peer))
+            .await;
+    assert!(
+        matches!(&unconfirmed_prod, ResponseEnvelope::Error(error) if error.error == "ConfirmationFailed"),
+        "PrepareExec on dangerous profile must require confirmation: {unconfirmed_prod:?}"
+    );
+
+    let ResponseEnvelope::Success(prepared) =
+        crate::dispatch_with_peer(&prepare_req("dev", "policy-a", false), &approved, Some(peer))
+            .await
+    else {
+        return Err("approved PrepareExec should succeed".into());
+    };
+    let grant_id = prepared.payload()["grant_id"].as_str().ok_or("missing grant_id")?.to_owned();
+
+    // Using the policy-a PrepareExec grant to resolve under policy-b must fail closed.
+    let cross_policy = RequestEnvelope::new(
+        "resolve-cross",
+        AgentMethod::ResolveReference,
+        json!({
+            "reference": "lk://dev/API_KEY",
+            "project_id": "p",
+            "profile_id": "dev",
+            "policy_name": "policy-b",
+            "store_path": path,
+            "grant_id": grant_id,
+            "binding": {"pid": binding.pid, "process_start_time": binding.process_start_time},
+        }),
+    );
+    let ResponseEnvelope::Error(cross_err) =
+        crate::dispatch_with_peer(&cross_policy, &approved, Some(peer)).await
+    else {
+        return Err("cross-policy ResolveReference must fail".into());
+    };
+    assert_eq!(cross_err.error, "GrantRequired");
+
+    // Approved dangerous PrepareExec succeeds and records verified AGENT_GRANT audit row.
+    assert!(matches!(
+        crate::dispatch_with_peer(&prepare_req("prod", "policy-a", true), &approved, Some(peer))
+            .await,
+        ResponseEnvelope::Success(_)
+    ));
+    assert!(store.verify_audit_chain_read_only("p", &[11; 32])?.hmac_ok);
+    Ok(())
+}
+
+#[tokio::test]
 async fn stored_unlock_verification_policy_is_enforced_without_daemon_default()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
@@ -4169,6 +4326,7 @@ async fn register_command_policies_replaces_project_snapshot_and_runs_prepare_ex
     let mut store = locket_store::Store::open(&store_path)?;
     store.initialize_schema()?;
     store.insert_project_if_absent("p-pump", "pump project", 1)?;
+    store.insert_profile_if_absent("prof-1", "p-pump", "dev", false, 1)?;
     insert_snapshot_fixture_audit_key(&store, "p-pump")?;
     drop(store);
 

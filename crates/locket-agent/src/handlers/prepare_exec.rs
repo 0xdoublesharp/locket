@@ -71,6 +71,9 @@ pub struct PrepareExecRequest {
     pub profile_id: String,
     /// Project id whose policy registry should be consulted.
     pub project_id: String,
+    /// Explicit confirmation to prepare execution against a dangerous profile.
+    #[serde(default)]
+    pub confirm_dangerous: bool,
     /// Caller's process binding for the issued grant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding: Option<GrantBinding>,
@@ -97,11 +100,23 @@ pub struct PrepareExecResponse {
 /// the agent is unlocked, issues a live grant for
 /// [`GrantAction::PrepareExec`], and returns the policy's allowed env
 /// names, command kind, grant TTL, and live grant id.
+#[cfg(test)]
 pub async fn handle_prepare_exec(
     request: &RequestEnvelope,
     state: &crate::server::AgentSocketState,
     now_unix_nanos: i128,
     observed_pid: Option<u32>,
+) -> ResponseEnvelope {
+    handle_prepare_exec_with_auth(request, state, now_unix_nanos, observed_pid, false).await
+}
+
+#[allow(clippy::too_many_lines)]
+pub async fn handle_prepare_exec_with_auth(
+    request: &RequestEnvelope,
+    state: &crate::server::AgentSocketState,
+    now_unix_nanos: i128,
+    observed_pid: Option<u32>,
+    authenticated_automation: bool,
 ) -> ResponseEnvelope {
     let Ok(typed) = serde_json::from_value::<PrepareExecRequest>(request.payload.clone()) else {
         return protocol_error(request, "invalid PrepareExec payload");
@@ -164,7 +179,7 @@ pub async fn handle_prepare_exec(
         profile_id: typed.profile_id.clone(),
         policy_name: Some(policy.name.clone()),
         action: GrantAction::PrepareExec,
-        confirm_dangerous: false,
+        confirm_dangerous: typed.confirm_dangerous,
         ttl_seconds,
         binding,
     };
@@ -176,21 +191,57 @@ pub async fn handle_prepare_exec(
             LocketError::AccessDenied,
         );
     }
+    let grant_audit = match crate::server::authorize_secret_grant(
+        request,
+        state,
+        &grant_payload,
+        &[],
+        authenticated_automation,
+        now_unix_nanos,
+    )
+    .await
+    {
+        Ok(audit) => audit,
+        Err(response) => return response,
+    };
     let ttl_seconds = grant_payload.ttl_seconds;
     let ttl_nanos = i128::from(ttl_seconds).saturating_mul(1_000_000_000);
-    let issued = {
+    let cache = state.unlock_cache.lock().await;
+    let issue_now =
+        if grant_audit.is_some() { crate::server::current_unix_nanos() } else { now_unix_nanos };
+    if cache.lookup(project_id, issue_now).is_none() {
+        return typed_error(
+            request,
+            ERROR_UNLOCK_REQUIRED,
+            UNLOCK_REQUIRED_MESSAGE,
+            LocketError::UnlockRequired,
+        );
+    }
+    let grant_id = {
         let mut grants = state.grants.lock().await;
-        grants.issue_with_peer(
+        if let Ok(record) = grants.issue_with_peer(
             grant_payload,
-            now_unix_nanos,
-            now_unix_nanos.saturating_add(ttl_nanos),
+            issue_now,
+            issue_now.saturating_add(ttl_nanos),
             observed_pid,
             None,
-        )
-    };
-    let grant_id = match issued {
-        Ok(record) => record.grant_id,
-        Err(_) => {
+        ) {
+            if let Some(mut audit) = grant_audit
+                && crate::server::append_grant_verification_audit(&mut audit, &record, issue_now)
+                    .is_err()
+            {
+                let _ = grants.revoke(&record.grant_id);
+                drop(grants);
+                return crate::server::error_response(
+                    request,
+                    "AuditIntegrityFailed",
+                    "could not audit grant approval",
+                );
+            }
+            drop(grants);
+            record.grant_id
+        } else {
+            drop(grants);
             return typed_error(
                 request,
                 ERROR_PROTOCOL,
@@ -199,6 +250,7 @@ pub async fn handle_prepare_exec(
             );
         }
     };
+    drop(cache);
 
     let response = PrepareExecResponse {
         allowed_env_names,
@@ -319,6 +371,7 @@ mod tests {
             policy_name: "deploy-staging".to_owned(),
             profile_id: "profile-staging".to_owned(),
             project_id: PROJECT_ID.to_owned(),
+            confirm_dangerous: false,
             binding: Some(GrantBinding::new(123, "start")),
         };
 

@@ -95,6 +95,9 @@ pub struct GrantRecord {
     pub profile_id: String,
     /// Authorized action.
     pub action: GrantAction,
+    /// Optional command policy name the grant is bound to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_name: Option<String>,
     /// Process identity required to use the grant.
     pub binding: GrantBinding,
     /// Kernel-observed PID of the process that requested this grant, when available.
@@ -141,6 +144,7 @@ impl GrantRecord {
             project_id: fields.project_id,
             profile_id: fields.profile_id,
             action: fields.action,
+            policy_name: None,
             binding: fields.binding,
             observed_peer_pid: None,
             observed_connection_id: None,
@@ -340,6 +344,41 @@ impl GrantTable {
         }
     }
 
+    /// Validate a live grant where any of `actions` is acceptable and, if
+    /// the grant is bound to a specific command policy, require `policy_name`
+    /// to match that policy.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn validate_any_for_policy(
+        &self,
+        grant_id: &str,
+        project_id: &str,
+        profile_id: &str,
+        actions: &[GrantAction],
+        policy_name: &str,
+        now_unix_nanos: i128,
+        current_binding: Option<&GrantBinding>,
+    ) -> GrantValidation {
+        let validation = self.validate_any(
+            grant_id,
+            project_id,
+            profile_id,
+            actions,
+            now_unix_nanos,
+            current_binding,
+        );
+        if !matches!(validation, GrantValidation::Valid) {
+            return validation;
+        }
+        if let Some(grant) = self.grants.get(grant_id)
+            && let Some(bound_policy) = grant.policy_name.as_deref()
+            && bound_policy != policy_name
+        {
+            return GrantValidation::ProcessMismatch;
+        }
+        GrantValidation::Valid
+    }
+
     /// Returns the grant record for a given id without mutating the table.
     #[must_use]
     pub fn get(&self, grant_id: &str) -> Option<&GrantRecord> {
@@ -380,6 +419,9 @@ impl GrantTable {
             ttl_seconds: payload.ttl_seconds,
             expires_at_unix_nanos,
         });
+        record.policy_name = payload
+            .policy_name
+            .or_else(|| record.binding.execution.as_ref().map(|scope| scope.policy_name.clone()));
         record.observed_peer_pid = observed_peer_pid;
         record.observed_connection_id = observed_connection_id;
         self.insert(record.clone());
