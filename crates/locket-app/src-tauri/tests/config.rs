@@ -264,6 +264,26 @@ fn desktop_scan_action_is_registered_and_allowed() {
 }
 
 #[test]
+fn native_companion_commands_are_registered_and_allowed() {
+    let registered = handler_command_names(&read_text("src/lib.rs"));
+    let allowed =
+        toml_string_array(&read_text("permissions/desktop-commands.toml"), "commands.allow");
+    for command in [
+        "agent_discover_secrets",
+        "agent_list_projects",
+        "desktop_copy_text_plain",
+        "desktop_get_launch_at_login",
+        "desktop_mcp_config_snippet",
+        "desktop_pick_directory",
+        "desktop_pick_file",
+        "desktop_set_launch_at_login",
+    ] {
+        assert!(registered.contains(command), "{command} must be registered");
+        assert!(allowed.iter().any(|name| name == command), "{command} must be allowed");
+    }
+}
+
+#[test]
 fn desktop_command_permission_matches_registered_handlers() {
     let source = read_text("src/lib.rs");
     let registered = handler_command_names(&source);

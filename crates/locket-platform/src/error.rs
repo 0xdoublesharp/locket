@@ -30,6 +30,10 @@ pub enum PlatformError {
     /// Local user verification was rejected or failed.
     #[error("local user verification failed")]
     LocalUserVerificationFailed,
+    /// The macOS pasteboard could not be opened or written.
+    #[cfg(target_os = "macos")]
+    #[error("macOS pasteboard operation failed")]
+    PasteboardUnavailable,
     /// Platform passkey/WebAuthn integration is not available in this build or platform.
     #[error("platform passkey unsupported")]
     PasskeyUnsupported,

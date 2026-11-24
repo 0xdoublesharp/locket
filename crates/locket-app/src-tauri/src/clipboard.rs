@@ -110,12 +110,14 @@ impl ClipboardSession {
     }
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 trait ClipboardBackend {
     fn write(&mut self, value: &str) -> Result<(), ClipboardError>;
     fn read(&mut self) -> Result<String, ClipboardError>;
     fn clear(&mut self) -> Result<(), ClipboardError>;
 }
 
+#[cfg(not(target_os = "macos"))]
 impl ClipboardBackend for arboard::Clipboard {
     fn write(&mut self, value: &str) -> Result<(), ClipboardError> {
         self.set_text(value.to_owned()).map_err(|error| ClipboardError::Backend(error.to_string()))
@@ -131,20 +133,72 @@ impl ClipboardBackend for arboard::Clipboard {
 }
 
 /// Copy on a native worker and acknowledge only after the write succeeds.
-/// The worker retains selection ownership until the TTL expires, then clears
-/// only if the clipboard still contains this value.
+/// At expiry, macOS checks pasteboard ownership. Elsewhere the worker retains
+/// the selection and checks whether it still holds the value.
 pub(crate) async fn copy_with_ttl(value: String, ttl: Duration) -> Result<(), ClipboardError> {
     let value = Zeroizing::new(value);
     let (ready, written) = oneshot::channel();
     std::thread::Builder::new()
         .name("locket-clipboard".into())
         .spawn(move || {
+            #[cfg(target_os = "macos")]
+            copy_concealed_on_worker(value, ttl, ready);
+            #[cfg(not(target_os = "macos"))]
             copy_on_worker(value, ttl, ready, ClipboardSession::new, std::thread::sleep);
         })
         .map_err(|error| ClipboardError::Backend(error.to_string()))?;
     written.await.map_err(|_| ClipboardError::Backend("clipboard worker stopped".into()))?
 }
 
+#[cfg(target_os = "macos")]
+fn copy_concealed_on_worker(
+    value: Zeroizing<String>,
+    ttl: Duration,
+    ready: oneshot::Sender<Result<(), ClipboardError>>,
+) {
+    let change_count = locket_platform::write_concealed_secret(&value);
+    drop(value);
+    match change_count {
+        Ok(change_count) => {
+            if ready.send(Ok(())).is_ok() {
+                std::thread::sleep(ttl);
+            }
+            let _ = locket_platform::clear_if_unchanged(change_count);
+        }
+        Err(error) => {
+            let _ = ready.send(Err(ClipboardError::Backend(error.to_string())));
+        }
+    }
+}
+
+pub(crate) fn copy_plain_text(text: String) -> Result<(), ClipboardError> {
+    #[cfg(target_os = "macos")]
+    {
+        locket_platform::write_plain_text(&text)
+            .map_err(|error| ClipboardError::Backend(error.to_string()))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // The X11 selection remains available while this process has an owner.
+        static CLIPBOARD: std::sync::Mutex<Option<arboard::Clipboard>> =
+            std::sync::Mutex::new(None);
+        let mut clipboard =
+            CLIPBOARD.lock().map_err(|error| ClipboardError::Backend(error.to_string()))?;
+        let clipboard = match clipboard.as_mut() {
+            Some(owner) => owner,
+            None => clipboard.insert(ClipboardSession::new()?),
+        };
+        clipboard.set_text(text).map_err(|error| ClipboardError::Backend(error.to_string()))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        ClipboardSession::new()?
+            .set_text(text)
+            .map_err(|error| ClipboardError::Backend(error.to_string()))
+    }
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
 fn copy_on_worker<B: ClipboardBackend>(
     value: Zeroizing<String>,
     ttl: Duration,

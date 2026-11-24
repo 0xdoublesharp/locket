@@ -8,6 +8,59 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[test]
+fn picker_passes_untrusted_text_as_arguments_for_all_modes() {
+    let title = "-e \"do shell script\"\nnext line";
+    let name = "literal \"quotes\".env";
+    let args = picker_arguments(PickerMode::Save, Some(title), Some(name));
+    assert_eq!(&args[..5], ["-s", "he", "-e", PICK_PATH_SCRIPT, "--"]);
+    assert_eq!(&args[5..], ["save", title, name]);
+    assert!(!PICK_PATH_SCRIPT.contains(title));
+    assert!(!PICK_PATH_SCRIPT.contains(name));
+    assert_eq!(
+        &picker_arguments(PickerMode::Directory, None, Some(name))[5..],
+        ["directory", "Choose a folder", ""],
+    );
+    assert_eq!(&picker_arguments(PickerMode::File, None, None)[5..], ["file", "Choose a file", ""]);
+}
+
+#[test]
+fn picker_preserves_path_and_recognizes_only_the_cancel_error() -> Result<(), String> {
+    assert_eq!(
+        parse_picker_output(true, b"/Users/example/ a\n b \n", b"")?.as_deref(),
+        Some("/Users/example/ a\n b "),
+    );
+    assert_eq!(parse_picker_output(false, b"", b"0:17: user canceled. (-128)\n")?, None);
+    assert!(parse_picker_output(false, b"", b"(-1728)\n").is_err());
+    assert!(parse_picker_output(true, b"relative/path\n", b"").is_err());
+    assert!(parse_picker_output(true, b"/invalid\xff\n", b"").is_err());
+    Ok(())
+}
+
+#[test]
+fn mcp_snippet_preserves_command_and_arguments() -> Result<(), Box<dyn Error>> {
+    let snippet = mcp_config_snippet("/Applications/Locket \"Dev\".app/locket".into())?;
+    let parsed: serde_json::Value = serde_json::from_str(&snippet.json)?;
+    assert_eq!(
+        parsed,
+        serde_json::json!({
+            "mcpServers": {"locket": {"command": snippet.command, "args": snippet.args}}
+        })
+    );
+    assert_eq!(snippet.args, ["mcp"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn plain_copy_rejects_empty_and_over_limit_text_before_opening_the_clipboard() {
+    for text in [String::new(), "é".repeat(PLAIN_CLIPBOARD_MAX_BYTES / 2 + 1)] {
+        assert_eq!(
+            desktop_copy_text_plain(text).await.err().as_deref(),
+            Some("Clipboard text must be between 1 byte and 16 KiB."),
+        );
+    }
+}
+
 struct Fixture {
     directory: tempfile::TempDir,
     root: PathBuf,

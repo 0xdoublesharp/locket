@@ -1,4 +1,6 @@
 pub mod automation_client_key;
+#[cfg(target_os = "macos")]
+pub mod clipboard;
 pub mod device_private_key;
 pub mod fs_helpers;
 pub mod locked_vault_audit;

@@ -42,8 +42,9 @@ const MENU_RUN_POLICY: &str = "tray-run-policy";
 const MENU_START_SCAN: &str = "tray-start-scan";
 const MENU_REVEAL_SECRET: &str = "tray-reveal-secret";
 const MENU_COPY_SECRET: &str = "tray-copy-secret";
+const MENU_QUIT_APP: &str = "tray-quit-app";
 
-/// Metadata-only tray menu actions exposed to the webview.
+/// Actions available from the tray menu.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TrayMenuAction {
@@ -66,6 +67,8 @@ pub enum TrayMenuAction {
     /// `agent_copy_secret`. Only enabled when the vault is unlocked and
     /// a secret is selected.
     CopySecret,
+    /// Quit the desktop companion.
+    QuitApp,
 }
 
 impl TrayMenuAction {
@@ -81,6 +84,7 @@ impl TrayMenuAction {
             Self::StartScan => MENU_START_SCAN,
             Self::RevealSecret => MENU_REVEAL_SECRET,
             Self::CopySecret => MENU_COPY_SECRET,
+            Self::QuitApp => MENU_QUIT_APP,
         }
     }
 
@@ -97,6 +101,7 @@ impl TrayMenuAction {
             Self::StartScan => "Scan in terminal",
             Self::RevealSecret => "Reveal selected secret",
             Self::CopySecret => "Copy selected secret",
+            Self::QuitApp => "Quit Locket",
         }
     }
 
@@ -121,6 +126,7 @@ pub const fn tray_menu_actions() -> &'static [TrayMenuAction] {
         TrayMenuAction::StartScan,
         TrayMenuAction::RevealSecret,
         TrayMenuAction::CopySecret,
+        TrayMenuAction::QuitApp,
     ]
 }
 
@@ -234,7 +240,7 @@ pub const fn tray_menu_action_view(action: TrayMenuAction) -> Option<&'static st
         TrayMenuAction::OpenApp | TrayMenuAction::UnlockVault | TrayMenuAction::SwitchProfile => {
             Some("dashboard")
         }
-        TrayMenuAction::LockVault => None,
+        TrayMenuAction::LockVault | TrayMenuAction::QuitApp => None,
         TrayMenuAction::RunPolicy => Some("policies"),
         TrayMenuAction::StartScan => Some("scan"),
         // Reveal/copy stay anchored to the secrets surface so the user
@@ -265,6 +271,8 @@ pub enum TrayMenuSideEffect {
     RevealSelectedSecret,
     /// Trigger `agent_copy_secret` for the currently selected secret.
     CopySelectedSecret,
+    /// Cancel status subscriptions and exit the companion.
+    QuitApp,
 }
 
 /// Pure mapping from a tray menu action to its side-effect category.
@@ -279,6 +287,7 @@ pub const fn tray_menu_action_side_effect(action: TrayMenuAction) -> TrayMenuSid
         TrayMenuAction::StartScan => TrayMenuSideEffect::StartScan,
         TrayMenuAction::RevealSecret => TrayMenuSideEffect::RevealSelectedSecret,
         TrayMenuAction::CopySecret => TrayMenuSideEffect::CopySelectedSecret,
+        TrayMenuAction::QuitApp => TrayMenuSideEffect::QuitApp,
     }
 }
 
@@ -630,7 +639,7 @@ pub fn build_tray_menu_with<R: Runtime>(
         builder = builder.item(&item);
     }
 
-    builder.build()
+    builder.separator().text(MENU_QUIT_APP, TrayMenuAction::QuitApp.label()).build()
 }
 
 /// Backwards-compatible wrapper used by `setup_tray` and tests that
@@ -662,13 +671,15 @@ fn handle_tray_menu_event<R: Runtime>(app: &AppHandle<R>, event: &MenuEvent) {
     let Some(action) = tray_menu_action_for_id(event.id().as_ref()) else {
         return;
     };
-    // Every action that maps to a focused view also reveals the main
-    // window; lock-vault is the only headless action and stays in the
-    // menu bar.
+    // Actions routed to a webview surface reveal the main window.
     if tray_menu_action_view(action).is_some() {
         show_main_window(app);
     }
     match tray_menu_action_side_effect(action) {
+        TrayMenuSideEffect::QuitApp => {
+            crate::cancel_status_subscription();
+            app.exit(0);
+        }
         TrayMenuSideEffect::LockVault => {
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
@@ -687,9 +698,10 @@ fn handle_tray_menu_event<R: Runtime>(app: &AppHandle<R>, event: &MenuEvent) {
     }
 }
 
-fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
+pub(crate) fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
+        let _ = window.unminimize();
         let _ = window.set_focus();
     }
 }
@@ -697,9 +709,9 @@ fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
 fn start_tray_status_subscription<R: Runtime>(app: AppHandle<R>) {
     tauri::async_runtime::spawn(async move {
         let path = crate::agent_client::resolve_socket_path();
-        let cancel = crate::agent_client::CancelToken::new();
+        let cancel = crate::status_subscription_cancel_token();
         let mut last_delay: Option<std::time::Duration> = None;
-        loop {
+        while !cancel.is_cancelled() {
             let (sender, mut receiver) = tokio::sync::mpsc::channel::<StatusEvent>(16);
             let updater_app = app.clone();
             let updater = tauri::async_runtime::spawn(async move {
@@ -723,7 +735,11 @@ fn start_tray_status_subscription<R: Runtime>(app: AppHandle<R>) {
             // recovers automatically once the agent restarts.
             let delay = crate::agent_client::next_reconnect_delay(last_delay);
             last_delay = Some(delay);
-            tokio::time::sleep(delay).await;
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => break,
+                () = tokio::time::sleep(delay) => {}
+            }
         }
     });
 }
@@ -885,6 +901,7 @@ mod tests {
             (TrayMenuAction::StartScan, Some("scan")),
             (TrayMenuAction::RevealSecret, Some("secrets")),
             (TrayMenuAction::CopySecret, Some("secrets")),
+            (TrayMenuAction::QuitApp, None),
         ];
         for (action, expected) in pairs {
             assert_eq!(tray_menu_action_view(action), expected, "{action:?}");
@@ -902,6 +919,7 @@ mod tests {
             (TrayMenuAction::StartScan, TrayMenuSideEffect::StartScan),
             (TrayMenuAction::RevealSecret, TrayMenuSideEffect::RevealSelectedSecret),
             (TrayMenuAction::CopySecret, TrayMenuSideEffect::CopySelectedSecret),
+            (TrayMenuAction::QuitApp, TrayMenuSideEffect::QuitApp),
         ];
         for (action, expected) in pairs {
             assert_eq!(tray_menu_action_side_effect(action), expected, "{action:?}");
@@ -909,11 +927,11 @@ mod tests {
     }
 
     #[test]
-    fn lock_vault_is_the_only_headless_tray_action() {
+    fn lock_and_quit_do_not_focus_a_webview_surface() {
         for action in tray_menu_actions() {
             let view = tray_menu_action_view(*action);
-            if *action == TrayMenuAction::LockVault {
-                assert!(view.is_none(), "lock-vault must stay in the menu bar");
+            if matches!(action, TrayMenuAction::LockVault | TrayMenuAction::QuitApp) {
+                assert!(view.is_none(), "{action:?} must stay in the menu bar");
             } else {
                 assert!(view.is_some(), "{action:?} must focus a webview surface");
             }
@@ -933,8 +951,11 @@ mod tests {
                 TrayMenuAction::StartScan,
                 TrayMenuAction::RevealSecret,
                 TrayMenuAction::CopySecret,
+                TrayMenuAction::QuitApp,
             ]
         );
+        assert_eq!(TrayMenuAction::QuitApp.id(), "tray-quit-app");
+        assert_eq!(TrayMenuAction::QuitApp.label(), "Quit Locket");
         for action in tray_menu_actions() {
             assert_eq!(tray_menu_action_for_id(action.id()), Some(*action));
             assert!(!action.label().is_empty());

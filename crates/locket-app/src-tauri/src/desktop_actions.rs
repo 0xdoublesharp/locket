@@ -17,6 +17,7 @@ use std::{
 };
 
 const CHILD_TIMEOUT: Duration = Duration::from_secs(30);
+const PLAIN_CLIPBOARD_MAX_BYTES: usize = 16 * 1024;
 static RESOURCE_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 static SELECTED_PROJECT: std::sync::Mutex<Option<DesktopProjectContext>> =
     std::sync::Mutex::new(None);
@@ -305,6 +306,201 @@ fn resolve_cli() -> Result<PathBuf, String> {
     let cli = find_cli_from(&candidates, search_path.as_deref())?;
     verify_cli_version(&cli, Duration::from_secs(2))?;
     Ok(cli)
+}
+
+#[derive(Serialize)]
+pub(crate) struct DesktopMcpConfigSnippet {
+    command: String,
+    args: Vec<String>,
+    json: String,
+}
+
+fn mcp_config_snippet(command: String) -> Result<DesktopMcpConfigSnippet, String> {
+    let args = vec!["mcp".into()];
+    let config =
+        serde_json::json!({ "mcpServers": { "locket": { "command": command, "args": args } } });
+    let json = serde_json::to_string_pretty(&config)
+        .map_err(|_| "Cannot encode the Locket MCP configuration.".to_owned())?;
+    Ok(DesktopMcpConfigSnippet { command, args, json })
+}
+
+#[tauri::command]
+pub(crate) async fn desktop_mcp_config_snippet() -> Result<DesktopMcpConfigSnippet, String> {
+    blocking(|| {
+        let command = resolve_cli()
+            .ok()
+            .and_then(|path| path.into_os_string().into_string().ok())
+            .unwrap_or_else(|| "locket".to_owned());
+        mcp_config_snippet(command)
+    })
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn desktop_copy_text_plain(text: String) -> Result<(), String> {
+    if text.is_empty() || text.len() > PLAIN_CLIPBOARD_MAX_BYTES {
+        return Err("Clipboard text must be between 1 byte and 16 KiB.".into());
+    }
+    blocking(move || super::clipboard::copy_plain_text(text).map_err(|error| error.to_string()))
+        .await
+}
+
+#[tauri::command]
+pub(crate) async fn desktop_get_launch_at_login() -> Result<bool, String> {
+    #[cfg(target_os = "macos")]
+    {
+        blocking(|| {
+            super::launch_agent::LaunchAgent::current()?
+                .enabled()
+                .map_err(|error| format!("Cannot read launch at login setting: {error}"))
+        })
+        .await
+    }
+    #[cfg(not(target_os = "macos"))]
+    Ok(false)
+}
+
+#[tauri::command]
+pub(crate) async fn desktop_set_launch_at_login(enabled: bool) -> Result<bool, String> {
+    #[cfg(target_os = "macos")]
+    {
+        // Serialize callers so the returned state describes this change.
+        static SETTINGS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        blocking(move || {
+            let _guard = SETTINGS.lock().map_err(|_| "Launch at login setting is unavailable.")?;
+            let agent = super::launch_agent::LaunchAgent::current()?;
+            if enabled {
+                let executable = std::env::current_exe()
+                    .map_err(|error| format!("Cannot locate the Locket executable: {error}"))?;
+                agent
+                    .enable(&executable)
+                    .map_err(|error| format!("Cannot enable launch at login: {error}"))?;
+            } else {
+                agent
+                    .disable()
+                    .map_err(|error| format!("Cannot disable launch at login: {error}"))?;
+            }
+            Ok(enabled)
+        })
+        .await
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = enabled;
+        Err("Launch at login is available on macOS.".into())
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+const PICK_PATH_SCRIPT: &str = r#"on run argv
+    set pickerMode to item 1 of argv
+    set pickerPrompt to item 2 of argv
+    if pickerMode is "directory" then
+        set selectedPath to choose folder with prompt pickerPrompt
+    else if pickerMode is "save" then
+        set defaultName to item 3 of argv
+        if defaultName is "" then
+            set selectedPath to choose file name with prompt pickerPrompt
+        else
+            set selectedPath to choose file name with prompt pickerPrompt default name defaultName
+        end if
+    else
+        set selectedPath to choose file with prompt pickerPrompt
+    end if
+    return POSIX path of selectedPath
+end run"#;
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy)]
+enum PickerMode {
+    Directory,
+    File,
+    Save,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn picker_arguments<'a>(
+    mode: PickerMode,
+    title: Option<&'a str>,
+    default_name: Option<&'a str>,
+) -> [&'a str; 8] {
+    let (mode, prompt, default_name) = match mode {
+        PickerMode::Directory => ("directory", "Choose a folder", ""),
+        PickerMode::File => ("file", "Choose a file", ""),
+        PickerMode::Save => ("save", "Save a file", default_name.unwrap_or_default()),
+    };
+    ["-s", "he", "-e", PICK_PATH_SCRIPT, "--", mode, title.unwrap_or(prompt), default_name]
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_picker_output(
+    success: bool,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<Option<String>, String> {
+    if !success {
+        if String::from_utf8_lossy(stderr).trim_end().ends_with("(-128)") {
+            return Ok(None);
+        }
+        return Err("Could not open the macOS picker.".into());
+    }
+    // osascript appends a single newline to human-readable results. Preserve
+    // whitespace and any embedded newlines in the selected filename.
+    std::str::from_utf8(stdout)
+        .ok()
+        .and_then(|output| output.strip_suffix('\n'))
+        .filter(|path| path.starts_with('/') && !path.contains('\0'))
+        .map(|path| Some(path.to_owned()))
+        .ok_or_else(|| "The macOS picker returned an invalid path.".into())
+}
+
+#[cfg(target_os = "macos")]
+async fn pick_path(
+    mode: PickerMode,
+    title: Option<String>,
+    default_name: Option<String>,
+) -> Result<Option<String>, String> {
+    blocking(move || {
+        let output = Command::new("/usr/bin/osascript")
+            .args(picker_arguments(mode, title.as_deref(), default_name.as_deref()))
+            .output()
+            .map_err(|_| "Could not start the macOS picker.".to_owned())?;
+        parse_picker_output(output.status.success(), &output.stdout, &output.stderr)
+    })
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn desktop_pick_directory(
+    title: Option<String>,
+) -> Result<Option<String>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        pick_path(PickerMode::Directory, title, None).await
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = title;
+        Err("The native folder picker is available on macOS.".into())
+    }
+}
+
+#[tauri::command]
+pub(crate) async fn desktop_pick_file(
+    title: Option<String>,
+    save: Option<bool>,
+    default_name: Option<String>,
+) -> Result<Option<String>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let mode = if save == Some(true) { PickerMode::Save } else { PickerMode::File };
+        pick_path(mode, title, default_name).await
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (title, save, default_name);
+        Err("The native file picker is available on macOS.".into())
+    }
 }
 
 fn execute_cli(executable: &Path, plan: &CliPlan, timeout: Duration) -> Result<(), String> {

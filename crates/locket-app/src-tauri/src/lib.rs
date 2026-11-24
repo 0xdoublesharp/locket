@@ -23,6 +23,10 @@ use tempfile as _;
 mod agent_client;
 mod clipboard;
 mod desktop_actions;
+#[cfg(any(target_os = "macos", test))]
+mod launch_agent;
+#[cfg(unix)]
+mod macos_lifecycle;
 mod tray;
 
 pub use agent_client::{
@@ -63,6 +67,44 @@ impl DesktopListSecretsRequest {
             redact_names: self.redact_names,
         })
     }
+}
+
+#[derive(Deserialize)]
+struct DesktopDiscoverSecretsRequest {
+    store_path: Option<PathBuf>,
+    #[serde(flatten)]
+    filters: locket_agent::DiscoveryFilters,
+}
+
+impl DesktopDiscoverSecretsRequest {
+    fn into_agent_request(self) -> Result<locket_agent::DiscoverSecretsRequest, AgentClientError> {
+        Ok(locket_agent::DiscoverSecretsRequest {
+            store_path: resolve_discovery_store_path(self.store_path)?,
+            filters: self.filters,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct DesktopListProjectsRequest {
+    store_path: Option<PathBuf>,
+    #[serde(default)]
+    redact_names: bool,
+}
+
+impl DesktopListProjectsRequest {
+    fn into_agent_request(self) -> Result<locket_agent::ListProjectsRequest, AgentClientError> {
+        Ok(locket_agent::ListProjectsRequest {
+            store_path: resolve_discovery_store_path(self.store_path)?,
+            redact_names: self.redact_names,
+        })
+    }
+}
+
+fn resolve_discovery_store_path(path: Option<PathBuf>) -> Result<String, AgentClientError> {
+    resolve_path(path, default_store_path)?.into_os_string().into_string().map_err(|_| {
+        AgentClientError::Protocol { reason: "Locket store path must be valid Unicode".into() }
+    })
 }
 
 #[derive(Deserialize)]
@@ -356,10 +398,6 @@ enum UnlockSource {
         #[serde(deserialize_with = "deserialize_secret")]
         passphrase: Zeroizing<String>,
     },
-    Recovery {
-        #[serde(deserialize_with = "deserialize_secret")]
-        recovery: Zeroizing<String>,
-    },
     OsKeychain,
 }
 
@@ -399,27 +437,18 @@ struct AgentUnlockPayload<'a> {
 }
 
 impl DesktopUnlockRequest {
-    fn agent_payload(&self) -> Result<AgentUnlockPayload<'_>, AgentClientError> {
+    fn agent_payload(&self) -> AgentUnlockPayload<'_> {
         let passphrase = match &self.source {
             UnlockSource::Passphrase { passphrase } => Some(passphrase.as_str()),
             UnlockSource::OsKeychain => None,
-            UnlockSource::Recovery { recovery } => {
-                return Err(AgentClientError::Protocol {
-                    reason: if recovery.trim().is_empty() {
-                        "recovery code is required".to_owned()
-                    } else {
-                        "unsupported unlock source".to_owned()
-                    },
-                });
-            }
         };
-        Ok(AgentUnlockPayload {
+        AgentUnlockPayload {
             project_id: &self.project_id,
             ttl_seconds: self.ttl_seconds,
             passphrase,
             method: passphrase.map(|_| "passphrase"),
             audit: self.audit.as_ref(),
-        })
+        }
     }
 }
 
@@ -430,7 +459,7 @@ impl DesktopUnlockRequest {
 /// unwrapped key.
 #[tauri::command]
 async fn agent_unlock(request: DesktopUnlockRequest) -> Result<(), AgentClientError> {
-    let payload = request.agent_payload()?;
+    let payload = request.agent_payload();
     let path = agent_client::resolve_socket_path();
     agent_client::invoke_method(&path, locket_agent::AgentMethod::Unlock, &payload).await
 }
@@ -732,6 +761,24 @@ async fn agent_list_secrets(
     agent_client::invoke_method(&path, locket_agent::AgentMethod::ListSecrets, &request).await
 }
 
+#[tauri::command]
+async fn agent_discover_secrets(
+    request: DesktopDiscoverSecretsRequest,
+) -> Result<serde_json::Value, AgentClientError> {
+    let path = agent_client::resolve_socket_path();
+    let request = request.into_agent_request()?;
+    agent_client::invoke_method(&path, locket_agent::AgentMethod::DiscoverSecrets, &request).await
+}
+
+#[tauri::command]
+async fn agent_list_projects(
+    request: DesktopListProjectsRequest,
+) -> Result<serde_json::Value, AgentClientError> {
+    let path = agent_client::resolve_socket_path();
+    let request = request.into_agent_request()?;
+    agent_client::invoke_method(&path, locket_agent::AgentMethod::ListProjects, &request).await
+}
+
 /// Webview input for the agent's `SetSecret` RPC.
 #[derive(Deserialize)]
 struct DesktopSetSecretRequest {
@@ -1026,6 +1073,15 @@ async fn tray_set_privacy_context(
 /// application.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() -> tauri::Result<()> {
+    #[cfg(unix)]
+    let mut instance = {
+        let directories = project_dirs().map_err(std::io::Error::other)?;
+        let Some(owner) = macos_lifecycle::DesktopInstance::acquire(directories.data_dir())? else {
+            return Ok(());
+        };
+        Some(owner)
+    };
+
     // keyring-core 1.0 requires registering a credential store before any
     // Entry can resolve. A failure here surfaces later as the same error
     // from whichever agent command first touches the keychain.
@@ -1046,6 +1102,12 @@ pub fn run() -> tauri::Result<()> {
             desktop_actions::desktop_team_sync_now,
             desktop_actions::desktop_team_sync_rename_profile,
             desktop_actions::desktop_team_sync_preserve_override,
+            desktop_actions::desktop_get_launch_at_login,
+            desktop_actions::desktop_set_launch_at_login,
+            desktop_actions::desktop_pick_directory,
+            desktop_actions::desktop_pick_file,
+            desktop_actions::desktop_copy_text_plain,
+            desktop_actions::desktop_mcp_config_snippet,
             agent_status,
             agent_subscribe_status,
             agent_lock,
@@ -1066,6 +1128,8 @@ pub fn run() -> tauri::Result<()> {
             agent_register_command_policies,
             agent_list_device_members,
             agent_list_secrets,
+            agent_discover_secrets,
+            agent_list_projects,
             agent_set_secret,
             agent_rotate_secret,
             agent_read_config,
@@ -1078,6 +1142,17 @@ pub fn run() -> tauri::Result<()> {
             tray_set_selection,
             tray_set_privacy_context,
         ])
+        .on_window_event(|window, event| {
+            #[cfg(target_os = "macos")]
+            if window.label() == "main"
+                && let tauri::WindowEvent::CloseRequested { api, .. } = event
+            {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (window, event);
+        })
         .setup(|app| {
             if let Ok(path) = app.path().resource_dir() {
                 desktop_actions::set_resource_root(path);
@@ -1092,9 +1167,27 @@ pub fn run() -> tauri::Result<()> {
             Ok(())
         })
         .build(tauri::generate_context!())?;
-    app.run(|_app, event| {
+
+    #[cfg(unix)]
+    if let Some(owner) = &mut instance {
+        let handle = app.handle().clone();
+        owner.start(move || {
+            let handle_for_show = handle.clone();
+            handle.run_on_main_thread(move || tray::show_main_window(&handle_for_show)).is_ok()
+        })?;
+    }
+
+    app.run(move |_app, event| {
         if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
             cancel_status_subscription();
+        }
+        #[cfg(target_os = "macos")]
+        if matches!(event, RunEvent::Reopen { has_visible_windows: false, .. }) {
+            tray::show_main_window(_app);
+        }
+        #[cfg(unix)]
+        if matches!(event, RunEvent::Exit) {
+            drop(instance.take());
         }
     });
     Ok(())
@@ -1190,7 +1283,7 @@ mod tests {
             "source": {"kind": "passphrase", "passphrase": "secret"},
             "audit": {"store_path": "/vault/store.db", "profile_id": "lk_prof_test"}
         }))?;
-        let payload = serde_json::to_value(request.agent_payload()?)?;
+        let payload = serde_json::to_value(request.agent_payload())?;
         assert_eq!(payload["project_id"], "lk_proj_test");
         assert_eq!(payload["ttl_seconds"], 900);
         assert_eq!(payload["method"], "passphrase");
@@ -1204,7 +1297,7 @@ mod tests {
             source: UnlockSource::OsKeychain,
             audit: None,
         };
-        let payload = serde_json::to_value(request.agent_payload()?)?;
+        let payload = serde_json::to_value(request.agent_payload())?;
         assert!(payload.get("passphrase").is_none());
         assert!(payload.get("method").is_none());
         assert!(payload.get("audit").is_none());
@@ -1213,19 +1306,40 @@ mod tests {
     }
 
     #[test]
-    fn unlock_request_rejects_recovery_source_until_wired() -> Result<(), Box<dyn Error>> {
-        for (recovery, expected) in
-            [("code", "unsupported unlock source"), (" ", "recovery code is required")]
-        {
-            let request: DesktopUnlockRequest = serde_json::from_value(serde_json::json!({
+    fn unlock_request_rejects_unknown_sources_during_deserialization() {
+        for kind in ["recovery", "future-source"] {
+            let request = serde_json::from_value::<DesktopUnlockRequest>(serde_json::json!({
                 "project_id": "lk_proj_test",
                 "ttl_seconds": 60,
-                "source": {"kind": "recovery", "recovery": recovery},
-            }))?;
-            assert!(
-                matches!(request.agent_payload(), Err(AgentClientError::Protocol { reason }) if reason == expected)
-            );
+                "source": {"kind": kind},
+            }));
+            assert!(matches!(request, Err(error) if error.to_string().contains("unknown variant")));
         }
+    }
+
+    #[test]
+    fn discovery_preserves_filters_and_uses_the_default_store_when_omitted()
+    -> Result<(), Box<dyn Error>> {
+        let discover: super::DesktopDiscoverSecretsRequest =
+            serde_json::from_value(serde_json::json!({
+                "store_path": "/vault/store.db",
+                "project": "locket",
+                "query": "token",
+                "limit": 3,
+                "redact_names": true,
+            }))?;
+        let payload = serde_json::to_value(discover.into_agent_request()?)?;
+        assert_eq!(payload["store_path"], "/vault/store.db");
+        assert_eq!(payload["project"], "locket");
+        assert_eq!(payload["query"], "token");
+        assert_eq!(payload["limit"], 3);
+        assert_eq!(payload["redact_names"], true);
+
+        let list: super::DesktopListProjectsRequest =
+            serde_json::from_value(serde_json::json!({}))?;
+        let list = list.into_agent_request()?;
+        assert_eq!(PathBuf::from(list.store_path), super::default_store_path()?);
+        assert!(!list.redact_names);
         Ok(())
     }
 
