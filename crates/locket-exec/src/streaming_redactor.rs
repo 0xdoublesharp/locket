@@ -85,10 +85,15 @@ pub struct RedactionPatterns {
 
 impl RedactionPatterns {
     pub(super) fn new(config: StreamingRedactorConfig) -> Arc<Self> {
+        let replacement = if config.replacement.is_empty() {
+            "[REDACTED:locket]".into()
+        } else {
+            config.replacement
+        };
         let mut patterns = Self {
             by_first_byte: std::array::from_fn(|_| Vec::new()),
             max_len: 0,
-            replacement: Zeroizing::new(config.replacement),
+            replacement: Zeroizing::new(replacement),
             label_replacements: config.label_replacements,
             generic: config.redact_generic_patterns,
         };

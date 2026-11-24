@@ -169,3 +169,14 @@ fn drains_both_child_streams_through_independent_redactors() -> io::Result<()> {
     assert_eq!(stderr_stats, stdout_stats);
     Ok(())
 }
+
+#[test]
+fn empty_replacement_falls_back_to_nonempty_marker() -> io::Result<()> {
+    let mut cfg = config(&[("TOKEN", "SECRET")]);
+    cfg.replacement = String::new();
+    let (output, stats) = redact(&[b"SEC", b"SECRET", b"RET"], cfg)?;
+    assert_eq!(output, b"SEC[REDACTED:locket]RET");
+    assert!(!output.windows(b"SECRET".len()).any(|window| window == b"SECRET"));
+    assert_eq!(stats.redaction_count, 1);
+    Ok(())
+}
