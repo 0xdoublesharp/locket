@@ -14,9 +14,9 @@ it('filters actions, selects by arrow keys, executes with Enter, and closes with
     'onUpdate:open': onOpen,
     onExecute,
     actions: [
-      { id: 'settings', label: 'Settings', detail: 'View' },
-      { id: 'jump', label: 'DATABASE_URL', detail: 'Variable details' },
-      { id: 'copy', label: 'Copy lk://dev/DATABASE_URL', detail: 'Variable reference' },
+      { id: 'settings', label: 'Settings', group: 'Views', badge: 'View' },
+      { id: 'jump', label: 'DATABASE_URL', group: 'Variables', badge: 'Variable' },
+      { id: 'copy', label: 'Copy lk://dev/DATABASE_URL', group: 'Variables', badge: 'Reference' },
     ],
   });
   try {
@@ -34,6 +34,9 @@ it('filters actions, selects by arrow keys, executes with Enter, and closes with
     view.state.query = 'database variable';
     await settle();
     expect(findNode(view.root, (node) => node.text === 'Settings')).toBeUndefined();
+    expect(findNode(view.root, (node) => node.props.id === 'palette-group-Variables')?.text).toBe(
+      'Variables',
+    );
     const input = view.state.searchInput as unknown as EventTarget;
     onKey({ key: 'ArrowDown', preventDefault, target: input });
     await settle();

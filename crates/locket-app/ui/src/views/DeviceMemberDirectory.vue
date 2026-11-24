@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { formatTime } from '../utils/formatTime';
 import { computed, ref } from 'vue';
 
 import type { DeviceMemberRow } from '../types/views';
@@ -84,7 +85,12 @@ function refreshRows(): void {
       <h2 id="device-member-directory-heading">Devices &amp; members</h2>
       <div class="view__actions">
         <span v-if="loading" class="view__muted" role="status">Loading</span>
-        <span v-else-if="lastRefreshedAt" class="view__muted">Updated</span>
+        <span v-else-if="lastRefreshedAt" class="view__muted"
+          >Updated
+          <time :datetime="lastRefreshedAt" :title="lastRefreshedAt">{{
+            formatTime(lastRefreshedAt)
+          }}</time></span
+        >
         <button type="button" class="view__button" @click="refreshRows">Refresh</button>
       </div>
     </header>
@@ -154,10 +160,14 @@ function refreshRows(): void {
             <span :class="['badge', `badge--status-${row.status}`]">{{ row.status }}</span>
           </td>
           <td>
-            <time :datetime="row.createdAt">{{ row.createdAt }}</time>
+            <time :datetime="row.createdAt" :title="row.createdAt">{{
+              formatTime(row.createdAt)
+            }}</time>
           </td>
           <td>
-            <time v-if="row.lastSeenAt" :datetime="row.lastSeenAt">{{ row.lastSeenAt }}</time>
+            <time v-if="row.lastSeenAt" :datetime="row.lastSeenAt" :title="row.lastSeenAt">{{
+              formatTime(row.lastSeenAt)
+            }}</time>
             <span v-else class="view__muted">—</span>
           </td>
         </tr>
@@ -185,7 +195,6 @@ function refreshRows(): void {
   margin: 0;
   font-size: 1rem;
   letter-spacing: 0.04em;
-  text-transform: uppercase;
 }
 
 .view__actions {
@@ -229,7 +238,6 @@ function refreshRows(): void {
 .view__label {
   font-size: 0.75rem;
   color: var(--text-secondary);
-  text-transform: uppercase;
   letter-spacing: 0.04em;
 }
 
@@ -274,7 +282,6 @@ function refreshRows(): void {
   font-weight: 600;
   color: var(--text-secondary);
   font-size: 0.75rem;
-  text-transform: uppercase;
   letter-spacing: 0.04em;
 }
 

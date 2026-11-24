@@ -1,93 +1,99 @@
 <script setup lang="ts">
 import { computed } from 'vue';
-
 import type { AgentClientError } from '../agent/types';
+import AppIcon from './AppIcon.vue';
 
-interface Props {
+const props = defineProps<{
   error: AgentClientError;
-}
+  heading?: string;
+  retrying?: boolean;
+}>();
+const emit = defineEmits<{ retry: [] }>();
 
-const props = defineProps<Props>();
-
-const heading = computed<string>(() => {
-  switch (props.error.kind) {
-    case 'unavailable':
-      return 'Agent unavailable';
-    case 'protocol':
-      return 'Agent communication error';
-    case 'rejected':
-      return 'Agent rejected request';
-    default:
-      return 'Agent error';
+const unavailable = computed(
+  () =>
+    props.error.kind === 'unavailable' ||
+    (props.error.kind === 'rejected' && props.error.code === 'AgentUnavailable'),
+);
+const title = computed(
+  () => props.heading ?? (unavailable.value ? 'Locket agent unavailable' : 'Locket agent error'),
+);
+const code = computed(() =>
+  props.error.kind === 'rejected'
+    ? props.error.code
+    : unavailable.value
+      ? 'AgentUnavailable'
+      : undefined,
+);
+const guidance = computed(() => {
+  if (unavailable.value) return 'Check that the Locket agent is running, then retry.';
+  if (props.error.kind === 'rejected') {
+    return props.error.next_action || props.error.display_reason || 'Retry the request.';
   }
-});
-
-const detail = computed<string>(() => {
-  switch (props.error.kind) {
-    case 'unavailable':
-      return props.error.display_reason;
-    case 'protocol':
-      return props.error.reason;
-    case 'rejected':
-      return props.error.display_reason || `${props.error.code}: ${props.error.message}`;
-    default:
-      return '';
-  }
-});
-
-const nextAction = computed<string>(() => {
-  switch (props.error.kind) {
-    case 'unavailable':
-      return props.error.next_action;
-    case 'protocol':
-      return 'Restart the agent. If the problem persists, file an issue.';
-    case 'rejected':
-      return props.error.next_action;
-    default:
-      return '';
-  }
+  if (props.error.kind === 'protocol') return props.error.reason;
+  return props.error.next_action;
 });
 </script>
 
 <template>
-  <section class="agent-banner" role="alert" aria-live="polite" :aria-label="heading">
-    <h2 class="agent-banner__heading">
-      {{ heading }}
-    </h2>
-    <p v-if="detail" class="agent-banner__detail">
-      {{ detail }}
-    </p>
-    <p v-if="nextAction" class="agent-banner__action">
-      {{ nextAction }}
-    </p>
+  <section class="agent-banner" role="alert" :aria-label="title">
+    <AppIcon name="alert" :size="21" />
+    <div class="agent-banner__body">
+      <h2>{{ title }}</h2>
+      <p>{{ guidance }}</p>
+      <code v-if="code">{{ code }}</code>
+    </div>
+    <button
+      class="companion-button companion-button--primary icon-label"
+      type="button"
+      :disabled="retrying"
+      @click="emit('retry')"
+    >
+      <AppIcon name="refresh" />
+      {{ retrying ? 'Retrying…' : 'Retry' }}
+    </button>
   </section>
 </template>
 
-<style>
+<style scoped>
 .agent-banner {
-  background: var(--warn-soft);
-  border: 1px solid var(--warn);
-  color: var(--accent);
-  padding: 1rem 1.25rem;
-  border-radius: 0.5rem;
-  max-width: 420px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: start;
+  gap: 0.65rem 0.85rem;
+  padding: 0.9rem 1rem;
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, var(--border-subtle));
+  border-radius: var(--radius-md);
+  background: var(--danger-soft);
+  color: var(--danger);
 }
-
-.agent-banner__heading {
-  margin: 0 0 0.25rem;
-  font-size: 0.9rem;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
+.agent-banner > .app-icon {
+  margin-top: 0.1rem;
 }
-
-.agent-banner__detail,
-.agent-banner__action {
-  margin: 0.25rem 0 0;
-  font-size: 0.875rem;
+.agent-banner__body {
+  flex: 1 1 12rem;
+  min-width: 0;
+}
+.agent-banner h2 {
+  margin: 0;
+  font-size: 0.95rem;
+}
+.agent-banner p {
+  margin: 0.25rem 0 0.45rem;
   color: var(--text-primary);
+  font-size: 0.875rem;
+  overflow-wrap: anywhere;
 }
-
-.agent-banner__action {
-  color: var(--text-secondary);
+.agent-banner code {
+  display: inline-block;
+  max-width: 100%;
+  padding: 0.125rem 0.35rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  font-size: 0.7rem;
+  overflow-wrap: anywhere;
+}
+.agent-banner button {
+  margin-left: auto;
 }
 </style>

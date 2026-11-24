@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { formatTime } from '../utils/formatTime';
 // Desktop view for metadata-only team invite history and validated
 // invite forms. Secret values and wrapped keys never pass through the
 // webview; invite mutations remain available through the CLI.
@@ -160,7 +161,9 @@ function statusBadge(status: TeamInviteRow['status']): string {
       <h2 id="team-invite-heading">Team sharing</h2>
       <div class="view__actions">
         <span v-if="lastRefreshedAt" class="view__muted">
-          <time :datetime="lastRefreshedAt">{{ lastRefreshedAt }}</time>
+          <time :datetime="lastRefreshedAt" :title="lastRefreshedAt">{{
+            formatTime(lastRefreshedAt)
+          }}</time>
         </span>
         <button type="button" class="view__button" :disabled="loading" @click="refresh">
           Refresh
@@ -240,10 +243,14 @@ function statusBadge(status: TeamInviteRow['status']): string {
                 <span v-else class="view__muted">—</span>
               </td>
               <td>
-                <time :datetime="row.createdAt">{{ row.createdAt }}</time>
+                <time :datetime="row.createdAt" :title="row.createdAt">{{
+                  formatTime(row.createdAt)
+                }}</time>
               </td>
               <td>
-                <time v-if="row.expiresAt" :datetime="row.expiresAt">{{ row.expiresAt }}</time>
+                <time v-if="row.expiresAt" :datetime="row.expiresAt" :title="row.expiresAt">{{
+                  formatTime(row.expiresAt, 'timestamp')
+                }}</time>
                 <span v-else class="view__muted">—</span>
               </td>
             </tr>
@@ -480,7 +487,6 @@ function statusBadge(status: TeamInviteRow['status']): string {
   margin: 0;
   font-size: 1rem;
   letter-spacing: 0.04em;
-  text-transform: uppercase;
 }
 .view__actions {
   display: inline-flex;
@@ -501,7 +507,6 @@ function statusBadge(status: TeamInviteRow['status']): string {
   margin: 0;
   font-size: 0.85rem;
   letter-spacing: 0.04em;
-  text-transform: uppercase;
   color: var(--text-secondary);
 }
 .view__field {
@@ -609,7 +614,6 @@ function statusBadge(status: TeamInviteRow['status']): string {
   font-size: 0.75rem;
   font-weight: 600;
   letter-spacing: 0.04em;
-  text-transform: uppercase;
 }
 .view__search input {
   box-sizing: border-box;
@@ -638,7 +642,6 @@ function statusBadge(status: TeamInviteRow['status']): string {
   font-weight: 600;
   color: var(--text-secondary);
   font-size: 0.75rem;
-  text-transform: uppercase;
   letter-spacing: 0.04em;
 }
 .badge {

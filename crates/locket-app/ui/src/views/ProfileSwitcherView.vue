@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { formatTime } from '../utils/formatTime';
 import { computed, ref } from 'vue';
 
 import {
@@ -96,7 +97,10 @@ function onSubmit(): void {
     <header class="view__header">
       <h2 id="profile-switcher-heading">Environments</h2>
       <span v-if="props.lastSwitchedAt" class="view__caption">
-        Last switch: <time :datetime="props.lastSwitchedAt">{{ props.lastSwitchedAt }}</time>
+        Last switch:
+        <time :datetime="props.lastSwitchedAt" :title="props.lastSwitchedAt">{{
+          formatTime(props.lastSwitchedAt)
+        }}</time>
       </span>
     </header>
 
@@ -201,7 +205,6 @@ function onSubmit(): void {
   margin: 0;
   font-size: 1rem;
   letter-spacing: 0.04em;
-  text-transform: uppercase;
 }
 .view__caption {
   color: var(--text-secondary);
@@ -261,7 +264,6 @@ function onSubmit(): void {
   margin: 0 0 0.5rem;
   font-size: 0.9rem;
   color: var(--text-secondary);
-  text-transform: uppercase;
   letter-spacing: 0.04em;
 }
 .switcher-form__field {

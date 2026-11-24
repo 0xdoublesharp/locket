@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { formatTime } from '../utils/formatTime';
 import { computed } from 'vue';
 
 import type { RuntimeSessionRow } from '../types/views';
@@ -68,7 +69,9 @@ function refresh(): void {
       <h2 id="execution-monitor-heading">Runtime sessions</h2>
       <div class="view__actions">
         <span v-if="lastRefreshedAt" class="view__muted">
-          <time :datetime="lastRefreshedAt">{{ lastRefreshedAt }}</time>
+          <time :datetime="lastRefreshedAt" :title="lastRefreshedAt">{{
+            formatTime(lastRefreshedAt)
+          }}</time>
         </span>
         <button type="button" class="view__button" :disabled="loading" @click="refresh">
           Refresh
@@ -111,14 +114,20 @@ function refresh(): void {
           <td>
             <span class="view__muted">
               pid {{ row.pid }} ·
-              <time :datetime="row.processStartTime">{{ row.processStartTime }}</time>
+              <time :datetime="row.processStartTime" :title="row.processStartTime">{{
+                formatTime(row.processStartTime, 'timestamp')
+              }}</time>
             </span>
           </td>
           <td>
-            <time :datetime="row.startedAt">{{ row.startedAt }}</time>
+            <time :datetime="row.startedAt" :title="row.startedAt">{{
+              formatTime(row.startedAt, 'timestamp')
+            }}</time>
           </td>
           <td>
-            <time v-if="row.endedAt" :datetime="row.endedAt">{{ row.endedAt }}</time>
+            <time v-if="row.endedAt" :datetime="row.endedAt" :title="row.endedAt">{{
+              formatTime(row.endedAt, 'timestamp')
+            }}</time>
             <span v-else class="view__muted">—</span>
           </td>
           <td>
@@ -159,7 +168,6 @@ function refresh(): void {
   margin: 0;
   font-size: 1rem;
   letter-spacing: 0.04em;
-  text-transform: uppercase;
 }
 
 .view__empty {
@@ -218,7 +226,6 @@ function refresh(): void {
   font-weight: 600;
   color: var(--text-secondary);
   font-size: 0.75rem;
-  text-transform: uppercase;
   letter-spacing: 0.04em;
 }
 

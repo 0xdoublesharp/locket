@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue';
+import AppIcon from '../components/AppIcon.vue';
+import { formatTime } from '../utils/formatTime';
 import VariableReadinessPanel from '../components/VariableReadinessPanel.vue';
 import type {
   AuditLogRow,
@@ -61,18 +63,26 @@ const failedRuns = computed(
         <h2 id="project-dashboard-heading">Project</h2>
         <p class="dashboard__context">{{ projectLabel }} / {{ profileLabel }}</p>
       </div>
-      <button type="button" class="dashboard__refresh" :disabled="loading" @click="emit('refresh')">
+      <button
+        type="button"
+        class="companion-button icon-label"
+        :disabled="loading"
+        @click="emit('refresh')"
+      >
+        <AppIcon name="refresh" />
         {{ loading ? 'Refreshing…' : 'Refresh' }}
       </button>
     </header>
-    <section class="dashboard__start" aria-labelledby="dashboard-start-heading">
+    <slot name="connection" />
+    <section
+      v-if="startActions.length"
+      class="dashboard__start"
+      aria-labelledby="dashboard-start-heading"
+    >
       <div class="dashboard__section-head">
         <h3 id="dashboard-start-heading">Start here</h3>
-        <span>{{
-          setupComplete ? 'Setup complete' : startActions.length ? 'Next step' : 'Setup complete'
-        }}</span>
       </div>
-      <ol v-if="startActions.length" class="dashboard__start-list">
+      <ol class="dashboard__start-list">
         <li v-for="action in startActions" :key="action.id">
           <div>
             <strong>{{ action.title }}</strong>
@@ -87,10 +97,8 @@ const failedRuns = computed(
           </button>
         </li>
       </ol>
-      <p v-else class="dashboard__start-empty">
-        Your project has variables, commands, and a recorded run. Sharing is optional.
-      </p>
     </section>
+    <p v-else class="dashboard__setup-complete"><AppIcon name="check" /> Setup complete</p>
     <VariableReadinessPanel
       :project-id="projectId"
       :profile-id="profileId"
@@ -108,7 +116,7 @@ const failedRuns = computed(
       <dl class="dashboard__facts">
         <div>
           <dt>Agent</dt>
-          <dd>{{ connected ? settings.agentVersion : 'Disconnected' }}</dd>
+          <dd>{{ connected ? settings.agentVersion : 'Offline' }}</dd>
         </div>
         <div>
           <dt>Environment</dt>
@@ -141,11 +149,19 @@ const failedRuns = computed(
       <h3 id="dashboard-health-heading">Checks for this project</h3>
       <p>
         Audit: {{ audit.label
-        }}<span v-if="auditLastRefreshed"> · Last checked {{ auditLastRefreshed }}</span>
+        }}<span v-if="auditLastRefreshed">
+          · Last checked
+          <time :datetime="auditLastRefreshed" :title="auditLastRefreshed">{{
+            formatTime(auditLastRefreshed)
+          }}</time></span
+        >
       </p>
       <p v-if="auditError" role="alert">{{ auditError }} Retry from Activity.</p>
       <p>
-        Scan: {{ scan.label }}<span v-if="lastScanAt"> · Last checked {{ lastScanAt }}</span
+        Scan: {{ scan.label
+        }}<span v-if="lastScanAt">
+          · Last checked
+          <time :datetime="lastScanAt" :title="lastScanAt">{{ formatTime(lastScanAt) }}</time></span
         >. Scans check this project's files and available known values.
       </p>
       <p v-if="scanError" role="alert">{{ scanError }} Retry the scan.</p>
@@ -161,7 +177,6 @@ const failedRuns = computed(
   gap: 1rem;
 }
 
-.dashboard__header,
 .dashboard__status,
 .dashboard__search,
 .dashboard__start,
@@ -175,17 +190,31 @@ const failedRuns = computed(
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 1rem;
+  gap: 0.75rem;
+  min-width: 0;
 }
 
-.dashboard__header h2,
+.dashboard__header h2 {
+  margin: 0;
+  font-size: var(--font-page-title);
+  letter-spacing: -0.025em;
+}
+
+.dashboard__setup-complete {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin: 0;
+  color: var(--success);
+  font-size: 0.8125rem;
+}
+
 .dashboard__section-head h3,
 .dashboard__search h3,
 .dashboard__health h3 {
   margin: 0;
   font-size: 1rem;
   letter-spacing: 0.04em;
-  text-transform: uppercase;
 }
 
 .dashboard__context {
@@ -194,30 +223,19 @@ const failedRuns = computed(
   display: flex;
   gap: 0.4rem;
   min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .dashboard__context span {
   overflow-wrap: anywhere;
 }
 
-.dashboard__refresh,
 .dashboard__metric,
 .dashboard__start-action {
   border: 1px solid var(--border-subtle);
   background: var(--bg-subtle);
   color: var(--text-primary);
   cursor: pointer;
-}
-
-.dashboard__refresh {
-  border-radius: 0.375rem;
-  min-height: 2.25rem;
-  padding: 0 0.875rem;
-}
-
-.dashboard__refresh:disabled {
-  color: var(--text-muted);
-  cursor: default;
 }
 
 .dashboard__section-head {
@@ -256,8 +274,7 @@ const failedRuns = computed(
   padding: 0.875rem;
 }
 
-.dashboard__start-list p,
-.dashboard__start-empty {
+.dashboard__start-list p {
   color: var(--text-secondary);
   font-size: 0.85rem;
   margin: 0.25rem 0 0;
@@ -364,14 +381,6 @@ const failedRuns = computed(
 
 .dashboard__metric:hover,
 .dashboard__metric:focus-visible,
-.dashboard__refresh:hover,
-.dashboard__refresh:focus-visible,
-.dashboard__start-action:hover,
-.dashboard__start-action:focus-visible {
-  border-color: var(--accent);
-  outline: none;
-}
-
 .dashboard__metric strong {
   font-size: 2rem;
 }

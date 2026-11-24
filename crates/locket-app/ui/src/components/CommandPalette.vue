@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
-import type { PaletteAction } from '../types/views';
+import type { PaletteAction, PaletteGroup } from '../types/views';
+import { shortenProjectPath } from '../utils/projectPath';
+import AppIcon from './AppIcon.vue';
 
 const props = defineProps<{
   open: boolean;
@@ -16,13 +18,24 @@ const dialog = ref<HTMLDialogElement | null>(null);
 const searchInput = ref<HTMLInputElement | null>(null);
 const query = ref('');
 const activeIndex = ref(0);
-const results = computed(() => {
+const groupOrder: PaletteGroup[] = ['Actions', 'Views', 'Projects', 'Variables'];
+const groupedResults = computed(() => {
   const terms = query.value.trim().toLocaleLowerCase().split(/\s+/);
-  return props.actions.filter((action) => {
-    const text = [action.label, action.detail, action.keywords].join(' ').toLocaleLowerCase();
-    return terms.every((term) => text.includes(term));
-  });
+  const groups = new Map(groupOrder.map((group) => [group, [] as PaletteAction[]]));
+  for (const action of props.actions) {
+    const text = [action.label, action.detail, action.keywords, action.badge, action.group]
+      .join(' ')
+      .toLocaleLowerCase();
+    if (terms.every((term) => text.includes(term)))
+      groups.get(action.group ?? 'Actions')?.push(action);
+  }
+  let index = 0;
+  return Array.from(groups, ([group, actions]) => ({
+    group,
+    items: actions.map((action) => ({ action, index: index++ })),
+  })).filter(({ items }) => items.length);
 });
+const results = computed(() => groupedResults.value.flatMap(({ items }) => items));
 
 watch(
   query,
@@ -86,7 +99,7 @@ function onKeys(event: KeyboardEvent): void {
   if (event.key === 'Enter' && event.target === searchInput.value) {
     event.preventDefault();
     const current = results.value[activeIndex.value];
-    if (current) run(current.id);
+    if (current) run(current.action.id);
     return;
   }
   const length = results.value.length;
@@ -112,39 +125,67 @@ function onKeys(event: KeyboardEvent): void {
   >
     <header class="palette__header">
       <h2 id="palette-title">Quick actions</h2>
-      <button class="companion-button" type="button" @click="emit('update:open', false)">
-        Close
+      <button
+        class="companion-button icon-label"
+        type="button"
+        aria-label="Close"
+        @click="emit('update:open', false)"
+      >
+        <AppIcon name="x" />
       </button>
     </header>
-    <input
-      ref="searchInput"
-      v-model="query"
-      class="palette__search"
-      type="text"
-      role="combobox"
-      aria-label="Search quick actions"
-      aria-controls="palette-results"
-      :aria-expanded="open"
-      :aria-activedescendant="results.length ? `palette-result-${activeIndex}` : undefined"
-      placeholder="Search projects, views, or variables"
-      autocomplete="off"
-      spellcheck="false"
-    />
-    <ul id="palette-results" class="palette__results" role="listbox" aria-label="Quick actions">
-      <li
-        v-for="(action, index) in results"
-        :id="`palette-result-${index}`"
-        :key="action.id"
-        role="option"
-        :aria-selected="index === activeIndex"
-        @pointerenter="activeIndex = index"
-        @click="run(action.id)"
+    <div class="palette__field">
+      <AppIcon name="search" :size="20" />
+      <input
+        ref="searchInput"
+        v-model="query"
+        class="palette__search"
+        type="text"
+        role="combobox"
+        aria-label="Search quick actions"
+        aria-controls="palette-results"
+        :aria-expanded="open"
+        :aria-activedescendant="results.length ? `palette-result-${activeIndex}` : undefined"
+        placeholder="Search projects, views, or variables"
+        autocomplete="off"
+        spellcheck="false"
+      />
+    </div>
+    <div id="palette-results" class="palette__results" role="listbox" aria-label="Quick actions">
+      <div
+        v-for="{ group, items } in groupedResults"
+        :key="group"
+        role="group"
+        :aria-labelledby="`palette-group-${group}`"
       >
-        <span>{{ action.label }}</span>
-        <small v-if="action.detail">{{ action.detail }}</small>
-      </li>
-    </ul>
-    <p v-if="results.length === 0" class="palette__empty" role="status">No matching actions.</p>
+        <h3 :id="`palette-group-${group}`">{{ group }}</h3>
+        <div
+          v-for="{ action, index } in items"
+          :id="`palette-result-${index}`"
+          :key="action.id"
+          class="palette__result"
+          role="option"
+          :aria-selected="index === activeIndex"
+          @pointerenter="activeIndex = index"
+          @click="run(action.id)"
+        >
+          <AppIcon :name="action.icon ?? 'compass'" />
+          <div>
+            <span :title="action.label">{{ action.label }}</span>
+            <small v-if="action.detail" :title="action.detail">
+              {{ group === 'Projects' ? shortenProjectPath(action.detail) : action.detail }}
+            </small>
+          </div>
+          <span class="palette__badge">{{ action.badge ?? 'Action' }}</span>
+        </div>
+      </div>
+      <p v-if="results.length === 0" class="palette__empty" role="status">No matching actions.</p>
+    </div>
+    <footer class="palette__footer">
+      <span><kbd>↑↓</kbd> Navigate</span>
+      <span><kbd>↵</kbd> Select</span>
+      <span><kbd>Esc</kbd> Close</span>
+    </footer>
   </dialog>
 </template>
 
@@ -178,40 +219,89 @@ function onKeys(event: KeyboardEvent): void {
   margin: 0;
   font-size: 1rem;
 }
+.palette__field {
+  position: relative;
+  color: var(--text-secondary);
+}
+.palette__field > .app-icon {
+  position: absolute;
+  left: 0.65rem;
+  top: 50%;
+  transform: translateY(-50%);
+  pointer-events: none;
+}
 .palette__search {
   box-sizing: border-box;
   width: 100%;
-  padding: 0.65rem;
+  padding: 0.65rem 0.65rem 0.65rem 2.35rem;
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
   background: var(--bg-app);
   color: var(--text-primary);
   font: inherit;
+  font-size: 0.875rem;
 }
 .palette__results {
-  max-height: min(46vh, 24rem);
+  max-height: min(49vh, 27rem);
   overflow: auto;
-  margin: 0.5rem 0 0;
-  padding: 0.125rem;
-  list-style: none;
+  margin-top: 0.45rem;
+  padding: 0.1rem;
 }
-.palette__results li {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 0.3rem 0.7rem;
-  padding: 0.6rem;
+.palette__results h3 {
+  margin: 0.6rem 0.45rem 0.3rem;
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  font-weight: 650;
+}
+.palette__result {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.55rem;
+  min-height: 2.125rem;
+  padding: 0.3rem 0.45rem;
   border-radius: var(--radius-sm);
+  font-size: 0.875rem;
   cursor: pointer;
-  overflow-wrap: anywhere;
 }
-.palette__results li[aria-selected='true'] {
+.palette__result[aria-selected='true'] {
   color: var(--accent);
   background: var(--accent-soft);
 }
-.palette__results small,
-.palette__empty {
+.palette__result div > *,
+.palette__badge {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.palette__badge {
+  padding: 0.125rem 0.35rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
   color: var(--text-secondary);
+  font-size: 0.68rem;
+}
+.palette__results small,
+.palette__empty,
+.palette__footer {
+  color: var(--text-secondary);
+}
+.palette__results small {
+  margin-top: 0.15rem;
+  font: 0.72rem var(--font-mono);
+}
+.palette__footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 0.9rem;
+  padding-top: 0.6rem;
+  margin-top: 0.5rem;
+  border-top: 1px solid var(--border-subtle);
+  font-size: 0.75rem;
+}
+.palette__footer kbd {
+  color: var(--text-primary);
 }
 </style>

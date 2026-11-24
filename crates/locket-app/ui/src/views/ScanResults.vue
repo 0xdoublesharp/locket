@@ -69,7 +69,6 @@ function onScan(): void {
   margin: 0;
   font-size: 1rem;
   letter-spacing: 0.04em;
-  text-transform: uppercase;
 }
 
 .view__action {

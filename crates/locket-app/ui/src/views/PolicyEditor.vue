@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { formatTime } from '../utils/formatTime';
 import { computed, ref, watch } from 'vue';
 import VariableReadinessPanel from '../components/VariableReadinessPanel.vue';
 
@@ -252,7 +253,9 @@ function startDelete(): void {
               <span v-else class="view__muted">none</span>
             </td>
             <td>
-              <time :datetime="row.updatedAt">{{ row.updatedAt }}</time>
+              <time :datetime="row.updatedAt" :title="row.updatedAt">{{
+                formatTime(row.updatedAt)
+              }}</time>
             </td>
           </tr>
         </tbody>
@@ -372,7 +375,6 @@ function startDelete(): void {
   margin: 0;
   font-size: 1rem;
   letter-spacing: 0.04em;
-  text-transform: uppercase;
 }
 
 .view__actions {
@@ -393,7 +395,6 @@ function startDelete(): void {
   font-size: 0.75rem;
   font-weight: 600;
   letter-spacing: 0.04em;
-  text-transform: uppercase;
 }
 
 .view__search input {
@@ -489,7 +490,6 @@ function startDelete(): void {
   font-size: 0.75rem;
   font-weight: 600;
   letter-spacing: 0.04em;
-  text-transform: uppercase;
   color: var(--text-secondary);
 }
 
@@ -571,7 +571,6 @@ function startDelete(): void {
 .policy-detail h4 {
   font-size: 0.75rem;
   letter-spacing: 0.04em;
-  text-transform: uppercase;
   color: var(--text-secondary);
 }
 

@@ -132,7 +132,39 @@ export interface SettingsState {
   agentVersion: string;
 }
 
+export type AppIconName =
+  | 'brand-lock'
+  | 'lock'
+  | 'unlock'
+  | 'folder'
+  | 'key'
+  | 'terminal'
+  | 'activity'
+  | 'users'
+  | 'settings'
+  | 'search'
+  | 'copy'
+  | 'link'
+  | 'eye'
+  | 'fingerprint'
+  | 'refresh'
+  | 'alert'
+  | 'check'
+  | 'plus'
+  | 'cloud'
+  | 'user'
+  | 'laptop'
+  | 'compass'
+  | 'chevron-down'
+  | 'x'
+  | 'more';
+
+export type PaletteGroup = 'Actions' | 'Views' | 'Projects' | 'Variables';
+
 export interface PaletteAction {
+  group?: PaletteGroup;
+  icon?: AppIconName;
+  badge?: string;
   id: string;
   label: string;
   detail?: string;

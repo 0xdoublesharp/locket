@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import AppIcon from './AppIcon.vue';
 import { computed, onBeforeUnmount, ref, watch } from 'vue';
 import { desktopVariableReadiness } from '../agent/client';
 import type { VariableReadinessResponse } from '../agent/types';
@@ -82,7 +83,14 @@ onBeforeUnmount(() => {
   <section class="readiness" aria-label="Configuration checks" data-testid="variable-readiness">
     <header>
       <h3>Configuration checks</h3>
-      <button type="button" :disabled="loading || !projectId" @click="refresh">Refresh</button>
+      <button
+        class="companion-button icon-label"
+        type="button"
+        :disabled="loading || !projectId"
+        @click="refresh"
+      >
+        <AppIcon name="refresh" /> Refresh
+      </button>
     </header>
     <p v-if="!projectId">Open a project to check its required variables.</p>
     <p v-else-if="loading" role="status">Checking variable names and sources…</p>
@@ -102,8 +110,14 @@ onBeforeUnmount(() => {
         <ul v-else>
           <li v-for="(row, rowIndex) in policy.rows" :key="rowIndex">
             <div class="readiness__row">
-              <strong>{{ row.name }}</strong
-              ><span>{{ row.requirement }} · {{ row.classification }} · {{ row.state }}</span>
+              <strong>{{ row.name }}</strong>
+              <span class="readiness__metadata">
+                {{ row.requirement }} · {{ row.classification }}
+                <span class="readiness__state" :data-state="row.state">
+                  <AppIcon :name="row.state === 'ready' ? 'check' : 'alert'" :size="14" />
+                  {{ row.state }}
+                </span>
+              </span>
             </div>
             <p>{{ row.source }}</p>
             <p v-for="(guidance, index) in row.guidance" :key="index">{{ guidance }}</p>
@@ -136,18 +150,6 @@ h4 {
   margin: 0;
   font-size: 1rem;
 }
-button {
-  background: transparent;
-  border: 1px solid var(--text-muted);
-  border-radius: 0.375rem;
-  color: inherit;
-  padding: 0.4rem 0.75rem;
-  cursor: pointer;
-}
-button:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
 p {
   margin: 0.4rem 0;
   overflow-wrap: anywhere;
@@ -157,18 +159,48 @@ ul {
   padding: 0;
   margin: 0.5rem 0;
   display: grid;
-  gap: 0.75rem;
+  gap: 0.35rem;
 }
 li {
   border-top: 1px solid var(--border-subtle);
-  padding-top: 0.5rem;
+  padding-top: 0.35rem;
 }
 .readiness__row span,
 .readiness__context {
   color: var(--text-secondary);
   font-size: 0.85rem;
 }
-.readiness__warning {
+.readiness__row strong {
+  font: 650 0.8125rem var(--font-mono);
+  overflow-wrap: anywhere;
+}
+.readiness__metadata,
+.readiness__state {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+.readiness__state {
+  padding: 0.125rem 0.4rem;
+  border-radius: var(--radius-sm);
+  color: var(--warn);
+  background: var(--warn-soft);
+  text-transform: capitalize;
+}
+.readiness__state[data-state='ready'] {
+  color: var(--success);
+  background: var(--success-soft);
+}
+.readiness__state[data-state='missing'] {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+.readiness li p {
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+}
+.readiness li .readiness__warning {
   color: var(--accent);
 }
 .readiness__policy {

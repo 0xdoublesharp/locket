@@ -369,10 +369,12 @@ export function createMockRuntime(params: URLSearchParams) {
   return async (command: string, args: Record<string, unknown>): Promise<unknown> => {
     if (command === routeCommands[startView]) {
       if (scenario === 'loading') return noResponse;
-      if (showFailure) {
-        // Keep the selected error state stable across metadata refreshes.
-        fail('AgentUnavailable', 'Could not load this view.', 'Retry the request.');
-      }
+    }
+    // Variables exercise a metadata failure after a successful status response.
+    // Other error routes simulate a disconnected agent from startup.
+    const failureCommand = startView === 'secrets' ? 'agent_list_secrets' : 'agent_status';
+    if (showFailure && command === failureCommand) {
+      fail('AgentUnavailable', 'The Locket agent is offline.', 'Start the agent, then retry.');
     }
     const request = (args.request ?? {}) as Record<string, unknown>;
     const redact = request.redact_names === true || request.privacy_redact_names === true;

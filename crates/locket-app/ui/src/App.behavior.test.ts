@@ -175,7 +175,11 @@ describe('automatic locking availability', () => {
       const app = await connectedApp();
       const warning = () =>
         findNode(app.root, (node) => node.props['data-testid'] === 'session-lock-warning');
-      expect(warning()?.text).toContain('Lock the vault before leaving this device');
+      expect(
+        warning()?.children.some((node) =>
+          node.text.includes('Lock the vault before leaving this device'),
+        ),
+      ).toBe(true);
       await app.state.connectProject(false, b.root);
       await settle();
       expect(warning()).toBeDefined();
@@ -185,6 +189,42 @@ describe('automatic locking availability', () => {
       expect(warning()).toBeUndefined();
     },
   );
+});
+
+it('shows a retriable variables error and marks the agent offline until recovery', async () => {
+  const app = await connectedApp();
+  overrides.set('agent_list_secrets', () => {
+    throw {
+      kind: 'rejected',
+      code: 'AgentUnavailable',
+      message: 'Offline',
+      display_reason: 'Offline',
+      next_action: 'Retry the request.',
+      retryable: true,
+    };
+  });
+  app.state.selectView('secrets');
+  const clickButton = (label: string) => {
+    const textNode = findNode(app.root, (node) => node.text.trim() === label);
+    const button = textNode?.tag === 'button' ? textNode : textNode?.parent;
+    expect(button?.tag).toBe('button');
+    (button?.props.onClick as () => void)();
+  };
+  await settle();
+  clickButton('Refresh');
+  await settle();
+
+  const status = () => findNode(app.root, (node) => node.props['aria-label'] === 'Agent status');
+  expect(status()?.props['data-connected']).toBe('false');
+  expect(findNode(status()!, (node) => node.text.trim() === 'Offline')).toBeDefined();
+  expect(findNode(app.root, (node) => node.text === "Can't load variables")).toBeDefined();
+  expect(findNode(app.root, (node) => node.text === 'AgentUnavailable')).toBeDefined();
+
+  overrides.delete('agent_list_secrets');
+  clickButton('Retry');
+  await settle();
+  expect(status()?.props['data-connected']).toBe('true');
+  expect(findNode(app.root, (node) => node.text === "Can't load variables")).toBeUndefined();
 });
 
 describe('reveal request lifetime in the mounted app', () => {

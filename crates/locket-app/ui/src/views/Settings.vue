@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import AppIcon from '../components/AppIcon.vue';
 import { onMounted, ref, watch } from 'vue';
 
 import {
@@ -113,151 +114,188 @@ async function copyMcp(): Promise<void> {
       </p>
     </header>
 
-    <section class="settings__card" aria-labelledby="settings-privacy">
-      <h3 id="settings-privacy">Privacy</h3>
-      <label class="settings__switch">
-        <input
-          type="checkbox"
-          :checked="state.privacyRedactNames"
-          :disabled="loading || (projectConnected && !canEditVault)"
-          @change="toggle($event, (checked) => ({ privacy_redact_names: checked }))"
-        />
-        <span>Redact names with local aliases</span>
-      </label>
-      <p>Uses aliases in project, variable, and activity views and the menu bar.</p>
-    </section>
-
-    <section class="settings__card" aria-labelledby="settings-session">
-      <h3 id="settings-session">Vault session</h3>
-      <p>Set how long an unlock stays valid.</p>
-      <div class="settings__actions" aria-label="Session length presets">
-        <button
-          v-for="preset in presets"
-          :key="preset"
-          type="button"
-          :aria-pressed="(state.unlockTtl ?? '15m') === preset"
-          :disabled="loading || !canEditVault"
-          @click="saveDuration(preset)"
-        >
-          {{ preset }}
-        </button>
-      </div>
-      <form
-        class="settings__actions settings__duration-form"
-        @submit.prevent="saveDuration(duration)"
-      >
-        <label class="settings__duration">
-          Custom duration
-          <input
-            v-model="duration"
-            type="text"
-            placeholder="45m"
-            autocomplete="off"
-            :disabled="loading || !canEditVault"
-            :aria-invalid="durationError ? 'true' : undefined"
-            aria-describedby="settings-duration-error"
-            @input="durationError = ''"
-          />
-        </label>
-        <button type="submit" :disabled="loading || !canEditVault || !duration.trim()">
-          Save duration
-        </button>
-      </form>
-      <p id="settings-duration-error" class="settings__error" role="status">{{ durationError }}</p>
-      <p v-if="!canEditVault && !loading && !errorMessage">
-        {{
-          projectConnected
-            ? 'Unlock this project to edit vault settings.'
-            : 'Connect a project to edit vault settings.'
-        }}
-      </p>
-    </section>
-
-    <section class="settings__card" aria-labelledby="settings-verification">
-      <h3 id="settings-verification">Touch ID &amp; user verification</h3>
-      <p>Require system verification for individual actions.</p>
-      <label v-for="option in verificationOptions" :key="option.key" class="settings__switch">
-        <input
-          type="checkbox"
-          :checked="state.verification?.[option.key] ?? false"
-          :disabled="loading || !canEditVault"
-          @change="
-            toggle($event, (checked) => ({
-              user_verification_required_for: { [option.key]: checked },
-            }))
-          "
-        />
-        <span>{{ option.label }}</span>
-      </label>
-    </section>
-
-    <section class="settings__card" aria-labelledby="settings-environment">
-      <div class="settings__actions">
-        <h3 id="settings-environment">Environment safety</h3>
-        <span v-if="state.dangerousProfileFlag" class="settings__warning">Dangerous</span>
-      </div>
-      <label class="settings__switch">
-        <input
-          type="checkbox"
-          :checked="state.dangerousProfileFlag"
-          :disabled="loading || !canEditVault || !state.dangerousProfile"
-          @change="toggle($event, (checked) => ({ dangerous_profile: checked }))"
-        />
-        <span>
-          Mark
-          <strong>{{ state.dangerousProfile?.profile_label ?? 'the active environment' }}</strong>
-          as dangerous
-        </span>
-      </label>
-      <p>Dangerous environments require confirmation for sensitive actions.</p>
-    </section>
-
     <p v-if="loading || saveMessage || errorMessage" class="settings__feedback" role="status">
       <span v-if="loading">Syncing settings…</span>
       <span v-else-if="errorMessage" class="settings__error">{{ errorMessage }}</span>
       <span v-else>{{ saveMessage }}</span>
     </p>
 
-    <section class="settings__card" aria-labelledby="settings-companion">
-      <h3 id="settings-companion">macOS companion</h3>
-      <label class="settings__switch">
-        <input
-          type="checkbox"
-          :checked="launchAtLogin ?? false"
-          :disabled="launchAtLogin === null || launchBusy"
-          @change="toggleLaunch"
-        />
-        <span>Launch at login</span>
-      </label>
-      <p v-if="!desktop">Available in the macOS desktop app.</p>
-      <p v-else-if="launchMessage" role="status">{{ launchMessage }}</p>
-    </section>
-
-    <section class="settings__card" aria-labelledby="settings-mcp">
-      <h3 id="settings-mcp">AI agents &amp; MCP</h3>
-      <p>
-        Paste this JSON into your MCP client settings. Locket MCP never exposes plaintext reveals.
-      </p>
-      <pre>{{ mcpJson }}</pre>
-      <div class="settings__actions">
-        <button type="button" :disabled="!desktop" @click="copyMcp">Copy MCP JSON</button>
-        <p v-if="mcpMessage" role="status">{{ mcpMessage }}</p>
+    <div class="settings__columns">
+      <div class="settings__stack">
+        <section class="settings__card" aria-labelledby="settings-privacy">
+          <h3 id="settings-privacy">Privacy</h3>
+          <label class="settings__switch">
+            <input
+              type="checkbox"
+              :checked="state.privacyRedactNames"
+              :disabled="loading || (projectConnected && !canEditVault)"
+              @change="toggle($event, (checked) => ({ privacy_redact_names: checked }))"
+            />
+            <span>Redact names with local aliases</span>
+          </label>
+          <p>Uses aliases in project, variable, and activity views and the menu bar.</p>
+        </section>
+        <section class="settings__card" aria-labelledby="settings-session">
+          <h3 id="settings-session">Vault session</h3>
+          <p>Set how long an unlock stays valid.</p>
+          <div class="settings__actions" aria-label="Session length presets">
+            <button
+              v-for="preset in presets"
+              :key="preset"
+              type="button"
+              :aria-pressed="(state.unlockTtl ?? '15m') === preset"
+              :disabled="loading || !canEditVault"
+              @click="saveDuration(preset)"
+            >
+              {{ preset }}
+            </button>
+          </div>
+          <form
+            class="settings__actions settings__duration-form"
+            @submit.prevent="saveDuration(duration)"
+          >
+            <label class="settings__duration">
+              Custom duration
+              <input
+                v-model="duration"
+                type="text"
+                placeholder="45m"
+                autocomplete="off"
+                :disabled="loading || !canEditVault"
+                :aria-invalid="durationError ? 'true' : undefined"
+                aria-describedby="settings-duration-error"
+                @input="durationError = ''"
+              />
+            </label>
+            <button type="submit" :disabled="loading || !canEditVault || !duration.trim()">
+              Save duration
+            </button>
+          </form>
+          <p id="settings-duration-error" class="settings__error" role="status">
+            {{ durationError }}
+          </p>
+          <p v-if="!canEditVault && !loading && !errorMessage">
+            {{
+              projectConnected
+                ? 'Unlock this project to edit vault settings.'
+                : 'Connect a project to edit vault settings.'
+            }}
+          </p>
+        </section>
+        <section class="settings__card" aria-labelledby="settings-environment">
+          <div class="settings__actions">
+            <h3 id="settings-environment">Environment safety</h3>
+            <span v-if="state.dangerousProfileFlag" class="settings__warning">Dangerous</span>
+          </div>
+          <label class="settings__switch">
+            <input
+              type="checkbox"
+              :checked="state.dangerousProfileFlag"
+              :disabled="loading || !canEditVault || !state.dangerousProfile"
+              @change="toggle($event, (checked) => ({ dangerous_profile: checked }))"
+            />
+            <span>
+              Mark
+              <strong>{{
+                state.dangerousProfile?.profile_label ?? 'the active environment'
+              }}</strong>
+              as dangerous
+            </span>
+          </label>
+          <p>Dangerous environments require confirmation for sensitive actions.</p>
+        </section>
       </div>
-    </section>
+      <div class="settings__stack">
+        <section class="settings__card" aria-labelledby="settings-verification">
+          <h3 id="settings-verification">
+            <AppIcon name="fingerprint" :size="20" /> Touch ID &amp; user verification
+          </h3>
+          <p>Require system verification for individual actions.</p>
+          <label v-for="option in verificationOptions" :key="option.key" class="settings__switch">
+            <input
+              type="checkbox"
+              :checked="state.verification?.[option.key] ?? false"
+              :disabled="loading || !canEditVault"
+              @change="
+                toggle($event, (checked) => ({
+                  user_verification_required_for: { [option.key]: checked },
+                }))
+              "
+            />
+            <span>{{ option.label }}</span>
+          </label>
+        </section>
+        <section class="settings__card" aria-labelledby="settings-companion">
+          <h3 id="settings-companion">macOS companion</h3>
+          <label class="settings__switch">
+            <input
+              type="checkbox"
+              :checked="launchAtLogin ?? false"
+              :disabled="launchAtLogin === null || launchBusy"
+              @change="toggleLaunch"
+            />
+            <span>Launch at login</span>
+          </label>
+          <p v-if="!desktop">Available in the macOS desktop app.</p>
+          <p v-else-if="launchMessage" role="status">{{ launchMessage }}</p>
+        </section>
+        <section class="settings__card" aria-labelledby="settings-mcp">
+          <header class="settings__card-header">
+            <h3 id="settings-mcp">AI agents &amp; MCP</h3>
+            <button
+              class="icon-label"
+              type="button"
+              aria-label="Copy MCP JSON"
+              :disabled="!desktop"
+              @click="copyMcp"
+            >
+              <AppIcon name="copy" />
+              Copy
+            </button>
+          </header>
+          <p>
+            Paste this JSON into your MCP client settings. Locket MCP never exposes plaintext
+            reveals.
+          </p>
+          <pre>{{ mcpJson }}</pre>
+          <p v-if="mcpMessage" role="status">{{ mcpMessage }}</p>
+        </section>
+      </div>
+    </div>
   </section>
 </template>
 
 <style scoped>
-.settings {
+.settings,
+.settings__stack {
+  display: grid;
+  align-content: start;
+  min-width: 0;
+  gap: 0.75rem;
+}
+
+.settings__columns {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   align-items: start;
-  gap: 0.875rem;
+  gap: 0.75rem;
 }
 
-.settings header,
-.settings__feedback {
-  grid-column: 1 / -1;
+.settings h2 {
+  font-size: var(--font-page-title);
+  letter-spacing: -0.025em;
+}
+
+.settings__card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.settings h3 .app-icon {
+  margin-inline-end: 0.2rem;
+  color: var(--info);
 }
 
 .settings h2,
@@ -312,6 +350,14 @@ async function copyMcp(): Promise<void> {
 
 .settings__duration input {
   width: 9rem;
+  box-sizing: border-box;
+  padding: 0.35rem 0.6rem;
+  min-height: 2.125rem;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font: inherit;
 }
 
 .settings__duration-form {
@@ -360,8 +406,8 @@ async function copyMcp(): Promise<void> {
   font: 0.8125rem/1.5 var(--font-mono);
 }
 
-@media (max-width: 850px) {
-  .settings {
+@media (max-width: 767px) {
+  .settings__columns {
     grid-template-columns: minmax(0, 1fr);
   }
 }

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onScopeDispose, ref, watch } from 'vue';
 import { desktopCopyTextPlain } from '../agent/client';
+import AppIcon from './AppIcon.vue';
 import { createRequestLifetime } from '../utils/requestLifetime';
 
 const props = defineProps<{ reference: string | null }>();
@@ -39,7 +40,15 @@ async function copyReference(): Promise<void> {
 
 <template>
   <span v-if="reference" class="copy-reference">
-    <button class="companion-button" type="button" @click.stop="copyReference">Copy lk://</button>
+    <button
+      class="companion-button companion-button--reference icon-label"
+      type="button"
+      :title="message || 'Copy variable reference'"
+      @click.stop="copyReference"
+    >
+      <AppIcon :name="copiedReference ? 'check' : failedReference ? 'alert' : 'link'" />
+      Copy lk://
+    </button>
     <span v-if="message" role="status">{{ message }}</span>
   </span>
 </template>
@@ -52,7 +61,12 @@ async function copyReference(): Promise<void> {
   gap: 0.35rem;
 }
 .copy-reference span {
-  font-size: 0.75rem;
-  overflow-wrap: anywhere;
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 </style>

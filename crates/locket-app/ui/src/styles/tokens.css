@@ -93,3 +93,38 @@
   color: var(--accent);
   background: var(--accent-soft);
 }
+
+:root {
+  --font-page-title: clamp(1.25rem, 2vw, 1.625rem);
+}
+
+.icon-label {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+}
+
+.companion-button--primary,
+.companion-button--primary:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--accent-fg);
+  font-weight: 650;
+}
+
+.companion-button--primary:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+.companion-button--reference {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.companion-button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}

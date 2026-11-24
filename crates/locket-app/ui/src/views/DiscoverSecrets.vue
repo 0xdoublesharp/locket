@@ -2,6 +2,7 @@
 import { computed, onScopeDispose, ref, watch } from 'vue';
 import { actionError, discoverSecrets } from '../agent/client';
 import type { DiscoveredSecretWire } from '../agent/types';
+import AppIcon from '../components/AppIcon.vue';
 import CopyReference from '../components/CopyReference.vue';
 import { createRequestLifetime } from '../utils/requestLifetime';
 
@@ -74,7 +75,9 @@ function canOpenProject(row: DiscoveredSecretWire): boolean {
       <label>Search <input v-model="query" type="search" placeholder="Name or keyword" /></label>
       <label>Tag <input v-model="tag" type="text" placeholder="Any tag" /></label>
       <label>Owner <input v-model="owner" type="text" placeholder="Any owner" /></label>
-      <button class="companion-button" type="submit">Search all projects</button>
+      <button class="companion-button companion-button--primary icon-label" type="submit">
+        <AppIcon name="search" /> Search all projects
+      </button>
     </form>
     <p v-else>Turn off name redaction in Settings to search by name, tag, or owner.</p>
 
@@ -108,11 +111,11 @@ function canOpenProject(row: DiscoveredSecretWire): boolean {
             <CopyReference :reference="privacyMode ? null : row.reference" />
             <button
               v-if="canOpenProject(row)"
-              class="companion-button"
+              class="companion-button icon-label"
               type="button"
               @click="emit('openProject', row)"
             >
-              Open project
+              <AppIcon name="folder" /> Open project
             </button>
             <small v-else-if="!privacyMode">No local folder</small>
           </div>
@@ -131,6 +134,10 @@ function canOpenProject(row: DiscoveredSecretWire): boolean {
 .discovery p {
   margin: 0;
 }
+.discovery h2 {
+  font-size: var(--font-page-title);
+  letter-spacing: -0.025em;
+}
 .discovery p,
 .discovery small {
   color: var(--text-secondary);
@@ -138,16 +145,21 @@ function canOpenProject(row: DiscoveredSecretWire): boolean {
 .discovery header p {
   margin-top: 0.35rem;
 }
-.discovery__filters,
+.discovery__filters {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) repeat(2, minmax(0, 1fr)) auto;
+  align-items: end;
+  gap: 0.5rem;
+}
 .discovery__actions {
   display: flex;
   flex-wrap: wrap;
-  align-items: end;
+  align-items: center;
   gap: 0.5rem;
 }
 .discovery__filters label {
   display: grid;
-  flex: 1 1 8rem;
+  min-width: 0;
   gap: 0.25rem;
   font-size: 0.875rem;
 }
@@ -197,5 +209,17 @@ function canOpenProject(row: DiscoveredSecretWire): boolean {
   border-radius: var(--radius-sm);
   background: var(--warn-soft);
   color: var(--warn);
+}
+@media (max-width: 600px) {
+  .discovery__filters {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .discovery__filters > :first-child,
+  .discovery__filters > button {
+    grid-column: 1 / -1;
+  }
+  .discovery__filters > button {
+    justify-self: start;
+  }
 }
 </style>

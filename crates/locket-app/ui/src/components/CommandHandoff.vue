@@ -66,7 +66,6 @@ async function copyCommand(): Promise<void> {
   font-size: 0.75rem;
   font-weight: 600;
   letter-spacing: 0.04em;
-  text-transform: uppercase;
 }
 .handoff__command {
   box-sizing: border-box;

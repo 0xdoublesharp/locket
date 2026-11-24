@@ -1,0 +1,28 @@
+const day = 24 * 60 * 60 * 1000;
+const shortDate = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' });
+const fullDate = new Intl.DateTimeFormat(undefined, {
+  month: 'short',
+  day: 'numeric',
+  year: 'numeric',
+});
+
+const localDateTime = new Intl.DateTimeFormat(undefined, {
+  dateStyle: 'medium',
+  timeStyle: 'medium',
+});
+
+export function formatTime(iso: string, precision: 'compact' | 'timestamp' = 'compact'): string {
+  const date = new Date(iso);
+  if (!Number.isFinite(date.getTime())) return 'Unknown date';
+
+  if (precision === 'timestamp') return localDateTime.format(date);
+
+  const now = Date.now();
+  const elapsed = now - date.getTime();
+  if (elapsed >= -5000 && elapsed < 60000) return 'just now';
+  if (elapsed >= 60000 && elapsed < 3600000) return `${Math.floor(elapsed / 60000)}m ago`;
+  if (elapsed >= 3600000 && elapsed < day) return `${Math.floor(elapsed / 3600000)}h ago`;
+  if (elapsed >= day && elapsed < 7 * day) return `${Math.floor(elapsed / day)}d ago`;
+
+  return (date.getFullYear() === new Date(now).getFullYear() ? shortDate : fullDate).format(date);
+}

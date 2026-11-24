@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { formatTime } from '../utils/formatTime';
 import { computed, ref } from 'vue';
 
 import type { VersionHistoryRow } from '../types/views';
@@ -66,7 +67,9 @@ function refresh(): void {
       <h2 id="secret-version-history-heading">Version history — {{ secretLabel }}</h2>
       <div class="view__actions">
         <span v-if="lastRefreshedAt" class="view__muted">
-          <time :datetime="lastRefreshedAt">{{ lastRefreshedAt }}</time>
+          <time :datetime="lastRefreshedAt" :title="lastRefreshedAt">{{
+            formatTime(lastRefreshedAt)
+          }}</time>
         </span>
         <button type="button" class="view__button" :disabled="loading" @click="refresh">
           Refresh
@@ -110,13 +113,15 @@ function refresh(): void {
               </span>
             </td>
             <td>
-              <time v-if="row.deprecatedAt" :datetime="row.deprecatedAt">
-                {{ row.deprecatedAt }}
+              <time v-if="row.deprecatedAt" :datetime="row.deprecatedAt" :title="row.deprecatedAt">
+                {{ formatTime(row.deprecatedAt) }}
               </time>
               <span v-else class="view__muted">—</span>
             </td>
             <td>
-              <time v-if="row.graceUntil" :datetime="row.graceUntil">{{ row.graceUntil }}</time>
+              <time v-if="row.graceUntil" :datetime="row.graceUntil" :title="row.graceUntil">{{
+                formatTime(row.graceUntil, 'timestamp')
+              }}</time>
               <span v-else class="view__muted">—</span>
             </td>
             <td>
@@ -186,7 +191,6 @@ function refresh(): void {
   margin: 0;
   font-size: 1rem;
   letter-spacing: 0.04em;
-  text-transform: uppercase;
 }
 
 .view__actions {
@@ -241,7 +245,6 @@ function refresh(): void {
   font-weight: 600;
   color: var(--text-secondary);
   font-size: 0.75rem;
-  text-transform: uppercase;
   letter-spacing: 0.04em;
 }
 

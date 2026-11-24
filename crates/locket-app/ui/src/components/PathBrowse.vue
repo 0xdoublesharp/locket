@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref } from 'vue';
+import AppIcon from './AppIcon.vue';
 import { desktopActionsAvailable, desktopPickDirectory, desktopPickFile } from '../agent/client';
 
 const props = defineProps<{
@@ -34,12 +35,13 @@ async function browse(): Promise<void> {
 
 <template>
   <button
-    class="companion-button"
+    class="companion-button icon-label"
     type="button"
     :aria-label="title"
     :disabled="disabled || pending || !desktopActionsAvailable()"
     @click="browse"
   >
+    <AppIcon name="folder" />
     Browse…
   </button>
   <small v-if="error" role="status">Could not open the picker. Enter a path manually.</small>

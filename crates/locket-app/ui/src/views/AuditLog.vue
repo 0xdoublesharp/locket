@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { formatTime } from '../utils/formatTime';
 import { computed, ref } from 'vue';
 
 import { auditHealth } from '../dashboard/health';
@@ -142,7 +143,10 @@ function onVerify(): void {
 
     <p v-if="loading" role="status">Loading audit…</p>
     <p v-if="errorMessage" role="alert">{{ errorMessage }} Retry verification.</p>
-    <p v-if="lastCheckedAt">Project audit last checked {{ lastCheckedAt }}</p>
+    <p v-if="lastCheckedAt">
+      Project audit last checked
+      <time :datetime="lastCheckedAt" :title="lastCheckedAt">{{ formatTime(lastCheckedAt) }}</time>
+    </p>
     <p class="view__muted">{{ auditHealth(chainOk).label }}</p>
     <p v-if="isEmpty && !loading" class="view__empty">No audit rows.</p>
 
@@ -166,7 +170,9 @@ function onVerify(): void {
             <span class="view__muted">{{ row.sequence }}</span>
           </td>
           <td>
-            <time :datetime="row.timestamp">{{ row.timestamp }}</time>
+            <time :datetime="row.timestamp" :title="row.timestamp">{{
+              formatTime(row.timestamp, 'timestamp')
+            }}</time>
           </td>
           <td>
             <span class="view__name">{{ row.action }}</span>
@@ -211,7 +217,6 @@ function onVerify(): void {
   margin: 0;
   font-size: 1rem;
   letter-spacing: 0.04em;
-  text-transform: uppercase;
 }
 
 .view__actions {
@@ -232,7 +237,6 @@ function onVerify(): void {
   font-size: 0.75rem;
   font-weight: 600;
   letter-spacing: 0.04em;
-  text-transform: uppercase;
 }
 
 .view__search input {
@@ -320,7 +324,6 @@ function onVerify(): void {
   font-weight: 600;
   color: var(--text-secondary);
   font-size: 0.75rem;
-  text-transform: uppercase;
   letter-spacing: 0.04em;
 }
 

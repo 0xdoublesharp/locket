@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { formatTime } from '../utils/formatTime';
 // Desktop view for gated secret set/rotate, CLI-directed delete, and
 // TTL-bound reveal. Plaintext enters the webview only for an active form
 // submission or reveal modal and is cleared when the flow completes.
@@ -231,10 +232,12 @@ function errorLabel(error: AgentClientError): string {
 <template>
   <section class="view" aria-labelledby="secret-editor-heading">
     <header class="view__header">
-      <h2 id="secret-editor-heading">Secret editor</h2>
+      <h2 id="secret-editor-heading">Variable editor</h2>
       <div class="view__actions">
         <span v-if="lastRefreshedAt" class="view__muted">
-          <time :datetime="lastRefreshedAt">{{ lastRefreshedAt }}</time>
+          <time :datetime="lastRefreshedAt" :title="lastRefreshedAt">{{
+            formatTime(lastRefreshedAt)
+          }}</time>
         </span>
         <button type="button" class="view__button" :disabled="loading" @click="refresh">
           Refresh
@@ -250,7 +253,7 @@ function errorLabel(error: AgentClientError): string {
 
     <section aria-labelledby="secret-editor-list-heading" class="view__panel">
       <h3 id="secret-editor-list-heading" class="view__panel-heading">
-        Secrets in active environment
+        Variables in this environment
       </h3>
       <label class="view__search">
         <span class="view__search-label">Search secrets</span>
@@ -309,7 +312,7 @@ function errorLabel(error: AgentClientError): string {
     </section>
 
     <section aria-labelledby="secret-editor-set-heading" class="view__panel">
-      <h3 id="secret-editor-set-heading" class="view__panel-heading">Set secret</h3>
+      <h3 id="secret-editor-set-heading" class="view__panel-heading" tabindex="-1">Set variable</h3>
       <form @submit.prevent="onSet">
         <label class="view__field">
           <span>Name (KEY_FORMAT)</span>
@@ -499,7 +502,6 @@ function errorLabel(error: AgentClientError): string {
   margin: 0;
   font-size: 1rem;
   letter-spacing: 0.04em;
-  text-transform: uppercase;
 }
 .view__actions {
   display: inline-flex;
@@ -520,7 +522,6 @@ function errorLabel(error: AgentClientError): string {
   margin: 0;
   font-size: 0.85rem;
   letter-spacing: 0.04em;
-  text-transform: uppercase;
   color: var(--text-secondary);
 }
 .view__field {
@@ -612,7 +613,6 @@ function errorLabel(error: AgentClientError): string {
   font-size: 0.75rem;
   font-weight: 600;
   letter-spacing: 0.04em;
-  text-transform: uppercase;
 }
 .view__search input {
   box-sizing: border-box;
@@ -641,7 +641,6 @@ function errorLabel(error: AgentClientError): string {
   font-weight: 600;
   color: var(--text-secondary);
   font-size: 0.75rem;
-  text-transform: uppercase;
   letter-spacing: 0.04em;
 }
 </style>
