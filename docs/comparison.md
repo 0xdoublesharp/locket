@@ -11,7 +11,7 @@ Locket is being built for developers who want development variables encrypted on
 | Does routine execution require a hosted service? | No. Local keys, project configuration, and values must be available. |
 | How are teammates updated? | One owner publishes signed, device-encrypted updates through an existing shared folder. Unlocked agents deliver and apply verified updates. Real provider behavior still needs acceptance testing. |
 | What is shared by default? | Current shared values. Personal/machine values and history require opt-in. |
-| Are imported commands trusted? | Approve command access locally. Signed team updates never install command approvals or project configuration; legacy version 1 bundles do not authenticate their issuer. |
+| Are imported commands trusted? | Approve command access locally. Signed team updates never install command approvals or project configuration; manual sealed bundles do not authenticate their issuer. |
 | How does a fresh machine join? | Prepare device keys, compare full fingerprints independently with the owner, then join an owner-signed package. Owner handover and trust-fork recovery remain unsupported. |
 | What works in the desktop? | Project connection, unlock, env import, durable command editing, readiness checks, terminal launch and explicit team conflict controls. Import/edit use the unlocked agent, including passphrase-only vaults. |
 | Is this a production secret-management service? | No. Use infrastructure designed for your production and CI requirements. |

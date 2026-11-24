@@ -168,7 +168,7 @@ Recovery code model:
 
 Recovery envelope v1:
 
-- `recovery/envelope.bin` files contain the ASCII magic `LOCKET-RECOVERY-STATE-V1` followed by a NUL byte, a `u32` little-endian TOML byte length, that many bytes of KDF TOML, then the recovery envelope described below. Both parts are replaced through one synced temporary file and atomic rename. Embedded KDF metadata is authoritative; a remaining legacy `kdf.toml` is ignored by readers. Legacy raw envelopes plus `kdf.toml` remain readable.
+- `recovery/envelope.bin` files contain the ASCII magic `LOCKET-RECOVERY-STATE-V1` followed by a NUL byte, a `u32` little-endian TOML byte length, that many bytes of KDF TOML, then the recovery envelope described below. Both parts are replaced through one synced temporary file and atomic rename. Readers reject an `envelope.bin` without this header.
 - The inner recovery envelope is a versioned binary container. All integers are little-endian and all strings are UTF-8 length-prefixed.
 - Header: magic bytes `LOCKET-RECOVERY\0`, `u16 schema_version = 1`, `field("kdf_profile_id", id)`, `i128 created_at_unix_nanos_utc`, `u32 entry_count`.
 - Entry: `field("entry_kind", kind)`, `field("entry_id", id)`, `u16 algorithm_id`, `u16 nonce_len = 24`, `nonce`, `u32 ciphertext_len`, `ciphertext`.
