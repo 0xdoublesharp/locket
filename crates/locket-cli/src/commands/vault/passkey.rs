@@ -208,8 +208,7 @@ fn map_platform_passkey_error(error: &PlatformError) -> CliError {
         PlatformError::PasskeyUnsupported => unimplemented_in_build_error(
             "external FIDO2 passkeys require a macOS or Linux terminal and trusted libfido2 1.17+ \
              tools (fido2-token, fido2-cred, fido2-assert); install libfido2 and run Locket from \
-             a terminal. Desktop and Windows ceremonies are not supported. Existing legacy \
-             software keyring credentials remain recoverable with `locket passkey unlock`",
+             a terminal. Desktop and Windows ceremonies are not supported.",
         ),
         PlatformError::PasskeyNotFound => invalid_reference_error("passkey credential not found"),
         _ => user_verification_failed_error(

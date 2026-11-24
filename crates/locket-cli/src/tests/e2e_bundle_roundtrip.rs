@@ -584,8 +584,8 @@ fn deleted_vs_active_arm() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Legacy parity contract for an invite without a sealed payload:
-/// metadata-only `team accept` followed by `import-bundle` must converge
+/// Parity contract for an invite whose sealed payload imports nothing:
+/// `team accept` followed by `import-bundle` must converge
 /// with direct `import-bundle`.
 ///
 /// This test pins that contract by comparing two arms over the same

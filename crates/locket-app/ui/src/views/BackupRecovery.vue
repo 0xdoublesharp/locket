@@ -177,7 +177,7 @@ function rotateAction(): void {
         </header>
 
         <p>
-          Imported commands require explicit local approval before running. Legacy v1 bundles do not
+          Imported commands require explicit local approval before running. Sealed bundles do not
           authenticate their issuer.
         </p>
         <label class="view__field">
