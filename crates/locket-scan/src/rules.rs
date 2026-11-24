@@ -70,7 +70,7 @@ fn is_documented_public_id(token: &str) -> bool {
         || token.starts_with("lk_prof_")
         || token.starts_with("lk_sec_")
         || token.starts_with("lk_key_")
-        || token.starts_with("lkdev1_")
+        || token.starts_with("lkdev2_")
 }
 
 /// Computes Shannon entropy in bits per character.

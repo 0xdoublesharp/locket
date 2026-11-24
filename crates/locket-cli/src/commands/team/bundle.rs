@@ -1699,15 +1699,7 @@ fn try_decrypt_bundle_for_local_device(
     let Some(device) = store.get_active_local_device(project_id)? else {
         return Ok(None);
     };
-    if !bundle
-        .manifest
-        .recipient_fingerprints
-        .iter()
-        .map(|fp| store.device_matches_bundle_recipient(&device, fp))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .any(|matches| matches)
-    {
+    if !bundle.manifest.recipient_fingerprints.contains(&device.fingerprint) {
         return Ok(None);
     }
     // Fingerprint match: from here on a failure must surface as

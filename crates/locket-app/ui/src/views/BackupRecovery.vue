@@ -111,7 +111,7 @@ function rotateAction(): void {
             rows="3"
             spellcheck="false"
             autocomplete="off"
-            placeholder="lkdev1_..."
+            placeholder="lkdev2_..."
           />
         </label>
 

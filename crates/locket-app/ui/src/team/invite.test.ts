@@ -79,12 +79,12 @@ describe('desktop notice copy', () => {
       teamInviteIssueCliCommand({
         ...defaultIssueForm(),
         recipientLabel: 'Alice Smith',
-        deviceDescriptor: 'lkdev1_abcdef0123456789abcdef',
+        deviceDescriptor: 'lkdev2_abcdef0123456789abcdef',
         role: 'developer',
         profiles: 'dev, qa',
       }),
     ).toBe(
-      "locket team invite 'Alice Smith' --device lkdev1_abcdef0123456789abcdef --profile dev --profile qa --role developer",
+      "locket team invite 'Alice Smith' --device lkdev2_abcdef0123456789abcdef --profile dev --profile qa --role developer",
     );
     expect(
       teamInviteAcceptCliCommand('-----BEGIN LOCKET TEAM INVITE-----\nabc123\n-----END-----'),
@@ -102,7 +102,7 @@ describe('desktop notice copy', () => {
       teamInviteIssueCliCommand({
         ...defaultIssueForm(),
         recipientLabel: "$(touch '/tmp/pwned')",
-        deviceDescriptor: 'lkdev1_abcdef0123456789abcdef',
+        deviceDescriptor: 'lkdev2_abcdef0123456789abcdef',
         role: 'developer',
         profiles: 'dev',
       }),
@@ -115,7 +115,7 @@ describe('desktop notice copy', () => {
       {
         ...defaultIssueForm(),
         recipientLabel: 'Alice Smith',
-        deviceDescriptor: 'lkdev1_abcdef0123456789abcdef',
+        deviceDescriptor: 'lkdev2_abcdef0123456789abcdef',
         role: 'developer',
         profiles: 'dev',
         expiresAt: '2026-06-28T12:00:00.000Z',
@@ -142,11 +142,11 @@ describe('desktop notice copy', () => {
   });
 
   it('builds an agent invite request command from a local device descriptor', () => {
-    expect(agentInviteRequestCliCommand(' lkdev1_abcdef0123456789abcdef ')).toBe(
-      'locket agent invite request --device lkdev1_abcdef0123456789abcdef',
+    expect(agentInviteRequestCliCommand(' lkdev2_abcdef0123456789abcdef ')).toBe(
+      'locket agent invite request --device lkdev2_abcdef0123456789abcdef',
     );
-    expect(agentInviteRequestCliCommand("lkdev1_abc'quoted value")).toBe(
-      "locket agent invite request --device 'lkdev1_abc'\\''quoted value'",
+    expect(agentInviteRequestCliCommand("lkdev2_abc'quoted value")).toBe(
+      "locket agent invite request --device 'lkdev2_abc'\\''quoted value'",
     );
   });
 
@@ -156,7 +156,7 @@ describe('desktop notice copy', () => {
       {
         ...defaultIssueForm(),
         recipientLabel: "Build Agent 'West'",
-        deviceDescriptor: 'lkdev1_abcdef0123456789abcdef',
+        deviceDescriptor: 'lkdev2_abcdef0123456789abcdef',
         role: 'maintainer',
         profiles: 'dev, qa-prod',
         expiresAt: '2026-06-26T14:00:00.000Z',
@@ -165,7 +165,7 @@ describe('desktop notice copy', () => {
     );
 
     expect(command).toBe(
-      "locket agent invite create 'Build Agent '\\''West'\\''' --device lkdev1_abcdef0123456789abcdef --profile dev --profile qa-prod --role maintainer --expires-in 2h",
+      "locket agent invite create 'Build Agent '\\''West'\\''' --device lkdev2_abcdef0123456789abcdef --profile dev --profile qa-prod --role maintainer --expires-in 2h",
     );
   });
 
@@ -190,7 +190,7 @@ describe('validateIssueForm', () => {
     const result = validateIssueForm({
       ...defaultIssueForm(),
       recipientLabel: 'alice',
-      deviceDescriptor: 'lkdev1_abcdef0123456789abcdef',
+      deviceDescriptor: 'lkdev2_abcdef0123456789abcdef',
       role: 'developer',
       profiles: 'dev, qa',
       dangerousProfiles: 'prod',
@@ -208,14 +208,14 @@ describe('validateIssueForm', () => {
       profiles: 'dev',
     });
     expect(result.valid).toBe(false);
-    expect(result.errors.deviceDescriptor).toMatch(/lkdev1_/);
+    expect(result.errors.deviceDescriptor).toMatch(/lkdev2_/);
   });
 
   it('flags dangerous profile inclusion', () => {
     const result = validateIssueForm({
       ...defaultIssueForm(),
       recipientLabel: 'alice',
-      deviceDescriptor: 'lkdev1_abcdef0123456789abcdef',
+      deviceDescriptor: 'lkdev2_abcdef0123456789abcdef',
       profiles: 'dev, prod',
       dangerousProfiles: 'prod',
     });
@@ -230,7 +230,7 @@ describe('validateIssueForm', () => {
     const result = validateIssueForm({
       ...defaultIssueForm(),
       recipientLabel: 'alice',
-      deviceDescriptor: 'lkdev1_abcdef0123456789abcdef',
+      deviceDescriptor: 'lkdev2_abcdef0123456789abcdef',
       profiles: 'dev',
       expiresAt: new Date(Date.now() - 86_400_000).toISOString(),
     });
@@ -244,7 +244,7 @@ describe('issueFormToPayload', () => {
     const payload = issueFormToPayload({
       ...defaultIssueForm(),
       recipientLabel: 'bob',
-      deviceDescriptor: 'lkdev1_abcdef0123456789abcdef',
+      deviceDescriptor: 'lkdev2_abcdef0123456789abcdef',
       profiles: 'dev, prod, qa',
       dangerousProfiles: 'prod',
       role: 'maintainer',

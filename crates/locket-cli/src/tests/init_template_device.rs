@@ -2891,7 +2891,7 @@ fn team_invite_rejects_bad_descriptor_without_file_or_audit()
             "invite",
             "Teammate",
             "--device",
-            "lkdev1_not-base64",
+            "lkdev2_not-base64",
             "--profile",
             "dev",
             "--role",
@@ -5310,8 +5310,7 @@ fn team_join_request_supports_passphrase_only_private_key_envelopes()
     let store = locket_store::Store::open(receiver.path().join("store.db"))?;
     let device =
         store.get_active_local_device(config.project_id.as_str())?.ok_or("device missing")?;
-    let signing =
-        crate::commands::team::device::load_device_signing_key(&context, &store, &device)?;
+    let signing = crate::commands::team::device::load_device_signing_key(&context, &device)?;
     assert_eq!(signing.verifying_key().as_bytes().as_slice(), device.signing_public_key);
     Ok(())
 }

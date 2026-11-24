@@ -32,7 +32,6 @@ fn local_owner(store: &Store, project: &str) -> Result<(String, DeviceIdentity)>
     let local =
         store.get_active_local_device(project)?.ok_or_else(|| reject("local device missing"))?;
     if identity(&local)? != owner
-        || !store.device_signing_is_v2(&local.id)?
         || store
             .get_active_team_member_by_device(&team, &local.id)?
             .is_none_or(|m| m.role != "owner")
@@ -53,7 +52,6 @@ pub fn initialize_owner(
     let local =
         store.get_active_local_device(project)?.ok_or_else(|| reject("local device missing"))?;
     if identity(&local)? != *owner
-        || !store.device_signing_is_v2(&local.id)?
         || store
             .get_active_team_member_by_device(&team.id, &local.id)?
             .is_none_or(|m| m.role != "owner")
@@ -112,7 +110,6 @@ pub fn add_recipient(
         if store.find_device(project, &recipient.id)?.is_none() {
             store.insert_device(&device_row(project, recipient, name, false, now)?)?;
         }
-        store.mark_device_signing_v2(&recipient.id)?;
         if store.get_team_member_by_device(&team, &recipient.id)?.is_some() {
             return Err(reject("recipient already has membership"));
         }

@@ -27,7 +27,6 @@ fn local(
     let local = store
         .get_active_local_device(project)?
         .ok_or_else(|| metadata_invalid_error("run `locket team join --request` first"))?;
-    device::require_v2_signing(store, &local)?;
     Ok(local)
 }
 
@@ -260,7 +259,7 @@ pub fn publish(context: &RuntimeContext, output: &mut impl Write) -> Result<(), 
     ensure_trusted_project_root(&store, &resolved)?;
     let local = local(&store, project)?;
     let (master, _) = load_master_key(context, project)?;
-    let signer = device::load_device_signing_key(context, &store, &local)?;
+    let signer = device::load_device_signing_key(context, &local)?;
     team_sync::initialize_owner(
         &mut store,
         project,
@@ -485,7 +484,7 @@ pub fn remove_authenticated(
 ) -> Result<(), CliError> {
     let local = local(store, project)?;
     let (master, _) = load_master_key(context, project)?;
-    let signer = device::load_device_signing_key(context, store, &local)?;
+    let signer = device::load_device_signing_key(context, &local)?;
     let rotate =
         team_sync::remove_member(store, project, member, &master, now()?).map_err(failure)?;
     writeln!(output, "Membership revoked and affected profile encryption keys rotated locally.")?;

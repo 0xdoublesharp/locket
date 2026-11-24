@@ -62,7 +62,7 @@ Teams can [join a fresh machine and receive signed encrypted updates](docs/team-
 
 Manual version 1 export/import remains available. These older bundles encrypt for recipients but do **not** authenticate the issuer. Imported command proposals never grant local execution permission. Exports default to current shared values; personal overrides and history require explicit opt-in. Read [package validation](docs/distribution-validation.md) before preparing installers; unsigned local artifacts do not establish signing or notarization.
 
-For an older local signing identity, run `locket device rotate-signing` before enabling signed team delivery, then refresh your recovery backup. This preserves the sealing key needed to open earlier bundles. Once a team owner is pinned, identity replacement is refused; authenticated owner handover is not supported yet.
+Once a team owner is pinned, identity replacement is refused; authenticated owner handover is not supported yet.
 
 Scanners and redaction help prepare output before sharing it. They do not isolate code or intercept an AI application's outbound requests. Programs receiving a variable can read and transmit it. Original `.env` files stay plaintext until you explicitly remove them; keep a verified recovery path before doing so.
 

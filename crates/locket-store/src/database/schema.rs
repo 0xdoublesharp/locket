@@ -625,15 +625,6 @@ CREATE TABLE IF NOT EXISTS team_sync_publications (
  project_id TEXT PRIMARY KEY, members_json TEXT NOT NULL, keys_json TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS device_signing_versions (
-  device_id TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
-  version INTEGER NOT NULL CHECK(version = 2)
-);
-CREATE TABLE IF NOT EXISTS device_fingerprint_aliases (
-  device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
-  fingerprint TEXT NOT NULL,
-  PRIMARY KEY(device_id, fingerprint)
-);
 CREATE TABLE IF NOT EXISTS schema_migrations (
   version INTEGER PRIMARY KEY CHECK (version >= 1 AND version <= 4294967295),
   applied_at INTEGER NOT NULL

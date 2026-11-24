@@ -603,7 +603,7 @@ fn recovery_rotate_carries_device_keys_and_recover_restores_device_envelope()
     )?;
 
     assert_eq!(storage.load(&device.id)?.as_slice(), original_device_key.as_slice());
-    let signer = crate::commands::team::device::load_device_signing_key(&context, &store, &device)?;
+    let signer = crate::commands::team::device::load_device_signing_key(&context, &device)?;
     assert_eq!(signer.verifying_key().as_bytes().as_slice(), device.signing_public_key);
     let recover_output = String::from_utf8(recover_output)?;
     assert!(recover_output.contains("recovered: device_private_keys=1"));
@@ -910,73 +910,6 @@ fn init_and_rotate_do_not_emit_ansi_clear_when_stdout_is_not_a_terminal()
         !rotate_output.contains(&0x1b),
         "rotate output must not contain ANSI escape when stdout is not a terminal"
     );
-    Ok(())
-}
-
-#[test]
-fn legacy_recovery_rotates_disclosed_signing_seed_and_preserves_sealing_key()
--> Result<(), Box<dyn std::error::Error>> {
-    let directory = tempdir()?;
-    let context = test_context(&directory);
-    run_with_context(
-        Cli::try_parse_from(["locket", "init", "--name", "app"])?,
-        &context,
-        &mut Vec::new(),
-    )?;
-    let resolved = crate::require_project(&context)?;
-    let (project_id, master) = test_project_id_and_master_key(&context)?;
-    let (kdf, mut envelope, code) = setup_recovery_envelope(&context, &project_id, &master)?;
-    let root =
-        locket_crypto::derive_recovery_key_v1(&code, &kdf.decode_salt()?, kdf.to_crypto_params())?;
-    let store = crate::open_store(&context)?;
-    let device =
-        store.get_active_local_device(&project_id)?.ok_or("active local device missing")?;
-    let storage =
-        crate::commands::team::device::build_device_private_key_storage(&context, &project_id)?;
-    let sealing = storage.load(&device.id)?;
-    let leaked = [29_u8; 32];
-    let sealing_public: [u8; 32] = device.sealing_public_key.as_slice().try_into()?;
-    let fingerprint = crate::device_fingerprint_hex(&leaked, &sealing_public);
-    store
-        .connection()
-        .execute("DELETE FROM device_signing_versions WHERE device_id = ?1", [&device.id])?;
-    store.connection().execute(
-        "UPDATE devices SET signing_public_key = ?1, fingerprint = ?2 WHERE id = ?3",
-        rusqlite::params![leaked.as_slice(), fingerprint, device.id],
-    )?;
-    for (kind, bytes) in [
-        ("device_signing_private_key", leaked.as_slice()),
-        ("device_sealing_private_key", sealing.as_slice()),
-    ] {
-        envelope.entries.push(crate::seal_recovery_envelope_entry(
-            &root,
-            &kdf.kdf_profile_id,
-            kind,
-            &device.id,
-            bytes,
-        )?);
-    }
-    context.key_store.delete_master_key(&project_id)?;
-    storage.delete(&device.id)?;
-    crate::restore_from_recovery_code(
-        &context,
-        &mut Vec::new(),
-        &resolved,
-        &kdf,
-        &envelope,
-        &code,
-        false,
-    )?;
-    let recovered =
-        store.get_active_local_device(&project_id)?.ok_or("active local device missing")?;
-    assert!(store.device_signing_is_v2(&device.id)?);
-    assert_ne!(
-        recovered.signing_public_key,
-        ed25519_dalek::SigningKey::from_bytes(&leaked).verifying_key().as_bytes()
-    );
-    assert_eq!(*storage.load(&device.id)?, *sealing);
-    assert!(store.device_matches_bundle_recipient(&recovered, &fingerprint)?);
-    crate::commands::team::device::load_device_signing_key(&context, &store, &recovered)?;
     Ok(())
 }
 

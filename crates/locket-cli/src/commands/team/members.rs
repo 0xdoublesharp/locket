@@ -236,7 +236,7 @@ fn team_invite_command(
         &profiles,
         &recipient.sealing_public_key,
     )?;
-    let signing_key = device::load_device_signing_key(context, &store, &issuer.local_device)?;
+    let signing_key = device::load_device_signing_key(context, &issuer.local_device)?;
     let built_invite = build_signed_invite(
         &signing_key,
         project_id,

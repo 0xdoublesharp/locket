@@ -1113,8 +1113,6 @@ struct PasskeyRegisterArgs {
 enum DeviceCommand {
     /// Initialize or rotate the local device descriptor.
     Init(DeviceInitArgs),
-    /// Migrate legacy signing material while preserving bundle decryption keys.
-    RotateSigning,
     /// Print the active local device descriptor.
     Pubkey,
     /// Add a trusted device descriptor.

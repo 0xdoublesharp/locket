@@ -783,16 +783,7 @@ fn decrypt_local_bundle(
         .ok_or_else(|| {
             ("BundleVerificationFailed", "local device is not initialized".to_owned())
         })?;
-    if !bundle
-        .manifest
-        .recipient_fingerprints
-        .iter()
-        .map(|fp| store.device_matches_bundle_recipient(&device, fp))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| ("CorruptDb", error.to_string()))?
-        .into_iter()
-        .any(|matches| matches)
-    {
+    if !bundle.manifest.recipient_fingerprints.contains(&device.fingerprint) {
         return Err((
             "BundleVerificationFailed",
             "bundle is not addressed to this device".to_owned(),
@@ -1989,22 +1980,15 @@ fn bundle_recipient(value: &str) -> BackupResult<BundleRecipientV1> {
 }
 
 fn decode_device_descriptor(value: &str) -> BackupResult<DeviceDescriptorV1> {
-    let (encoded, version) = if let Some(encoded) = value.strip_prefix("lkdev2_") {
-        (encoded, 2)
-    } else if let Some(encoded) = value.strip_prefix("lkdev1_") {
-        (encoded, 1)
-    } else {
-        return Err((
-            "MetadataInvalid",
-            "device descriptor must start with lkdev2_ or legacy lkdev1_".to_owned(),
-        ));
+    let Some(encoded) = value.strip_prefix("lkdev2_") else {
+        return Err(("MetadataInvalid", "device descriptor must start with lkdev2_".to_owned()));
     };
     let bytes = BASE64URL_NOPAD
         .decode(encoded.as_bytes())
         .map_err(|_| ("MetadataInvalid", "device descriptor is not valid base64url".to_owned()))?;
     let descriptor: DeviceDescriptorV1 = serde_json::from_slice(&bytes)
         .map_err(|error| ("MetadataInvalid", format!("device descriptor is invalid: {error}")))?;
-    if descriptor.v != version {
+    if descriptor.v != 2 {
         return Err(("MetadataInvalid", "descriptor version mismatch".to_owned()));
     }
     Ok(descriptor)
@@ -3171,7 +3155,7 @@ ttl = "30s"
         let signing = [3_u8; 32];
         let sealing = [4_u8; 32];
         let descriptor = DeviceDescriptorV1 {
-            v: 1,
+            v: 2,
             device_id: "lk_dev_export".to_owned(),
             label: "export".to_owned(),
             signing_public_key_ed25519: BASE64URL_NOPAD.encode(&signing),
@@ -3180,6 +3164,6 @@ ttl = "30s"
             safety_words: Vec::new(),
         };
         serde_json::to_vec(&descriptor)
-            .map(|bytes| format!("lkdev1_{}", BASE64URL_NOPAD.encode(&bytes)))
+            .map(|bytes| format!("lkdev2_{}", BASE64URL_NOPAD.encode(&bytes)))
     }
 }
