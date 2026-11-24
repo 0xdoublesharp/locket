@@ -81,8 +81,17 @@ export interface RevealResponse {
 export type CopyRequest = RevealRequest;
 export type CopyResponse = RevealResponse;
 
+export interface ScanInput {
+  path: string;
+  text: string;
+}
+
 export interface ScanRequest {
-  paths: string[];
+  inputs: ScanInput[];
+  project_id: string;
+  profile_id: string;
+  store_path: string;
+  grant_id: string;
   require_known: boolean;
 }
 

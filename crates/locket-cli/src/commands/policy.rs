@@ -555,7 +555,7 @@ fn validate_one_policy(
     let prepare_request = locket_agent::PrepareExecRequest {
         policy_name: policy.name.clone(),
         profile_id: profile.id.clone(),
-        project_id: Some(resolved.config.project_id.to_string()),
+        project_id: resolved.config.project_id.to_string(),
         binding: Some(binding.clone()),
     };
     let prepare = match agent_invoke::<_, locket_agent::PrepareExecResponse>(
@@ -583,39 +583,9 @@ fn validate_one_policy(
     let mut references_ok = 0_usize;
 
     let needs_grant = !references.is_empty();
-    let resolve_grant = if needs_grant {
-        if let Some(reused) = reuse_prepare_exec_grant_for_resolve(&prepare.grant_id) {
-            // The agent surfaced the live PrepareExec grant id, so we
-            // skip the redundant `RequestGrant(ResolveReference)` and
-            // pass the umbrella grant straight through to the
-            // `ResolveReference` calls below.
-            Some(reused)
-        } else {
-            // TODO(prepare-exec-grant-fallback-removal): drop this
-            // legacy branch once a release has shipped where every
-            // running agent populates `PrepareExecResponse::grant_id`.
-            // The fallback exists so a newer CLI keeps working against
-            // an older agent that returns an empty `grant_id` field.
-            match agent_invoke::<_, locket_agent::GrantIdPayload>(
-                context,
-                locket_agent::AgentMethod::RequestGrant,
-                &locket_agent::RequestGrantPayload {
-                    project_id: resolved.config.project_id.to_string(),
-                    profile_id: profile.id.clone(),
-                    policy_name: Some(policy.name.clone()),
-                    action: locket_agent::GrantAction::ResolveReference,
-                    ttl_seconds: policy.ttl.as_secs(),
-                    binding: binding.clone(),
-                },
-                "request resolve grant for doctor",
-            ) {
-                Ok(response) => Some(response),
-                Err(error) => return record_fatal_or_failed(validation, policy, &error),
-            }
-        }
-    } else {
-        None
-    };
+    // Reference resolution reuses the live PrepareExec grant.
+    let resolve_grant =
+        needs_grant.then(|| locket_agent::GrantIdPayload { grant_id: prepare.grant_id.clone() });
 
     classify_references(
         context,
@@ -721,19 +691,6 @@ fn classify_references(
         } else {
             references_failed.push(reference.clone());
         }
-    }
-}
-
-/// Decides whether `policy doctor` can reuse the live `PrepareExec`
-/// grant for the follow-up `ResolveReference` calls. Returns
-/// `Some(GrantIdPayload)` when the agent surfaced a non-empty
-/// `grant_id` (the post-shipping path), and `None` when the field is
-/// empty (legacy fallback that re-issues a `RequestGrant` round-trip).
-fn reuse_prepare_exec_grant_for_resolve(grant_id: &str) -> Option<locket_agent::GrantIdPayload> {
-    if grant_id.is_empty() {
-        None
-    } else {
-        Some(locket_agent::GrantIdPayload { grant_id: grant_id.to_owned() })
     }
 }
 
@@ -1342,36 +1299,6 @@ mod framing_tests {
             super::pump_policies_endpoint(context, json!({}))
         });
         assert!(result.is_ok());
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::reuse_prepare_exec_grant_for_resolve;
-
-    #[test]
-    fn reuse_prepare_exec_grant_skips_request_grant_when_grant_id_present() {
-        // After the prepare-exec-grant-return slice ships, the doctor
-        // path receives the live PrepareExec grant on the response and
-        // must not issue a separate `RequestGrant(ResolveReference)`.
-        // The helper returns `Some(...)` so the caller takes the reuse
-        // branch, dropping the second RPC entirely.
-        let reused =
-            reuse_prepare_exec_grant_for_resolve("lk_grant_0123456789abcdef0123456789abcdef");
-        assert_eq!(
-            reused.as_ref().map(|payload| payload.grant_id.as_str()),
-            Some("lk_grant_0123456789abcdef0123456789abcdef")
-        );
-    }
-
-    #[test]
-    fn reuse_prepare_exec_grant_falls_back_when_grant_id_is_empty() {
-        // Older agents return an empty `grant_id`; the doctor must
-        // fall back to the legacy `RequestGrant(ResolveReference)`
-        // round-trip, which is signalled by the helper returning
-        // `None`. This branch is removed once the
-        // `prepare-exec-grant-fallback-removal` TODO is closed.
-        assert!(reuse_prepare_exec_grant_for_resolve("").is_none());
     }
 }
 

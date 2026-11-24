@@ -492,3 +492,26 @@ mod source_precedence;
 mod variable_contract;
 
 mod team_pending_cli;
+
+/// Builds a valid sealed invite payload that imports nothing.
+pub(crate) fn empty_sealed_invite_payload(
+    recipient_sealing_public_key: &[u8],
+) -> Result<locket_core::SealedInvitePayloadV1, Box<dyn std::error::Error>> {
+    let recipient: [u8; 32] =
+        recipient_sealing_public_key.try_into().map_err(|_| "recipient key length")?;
+    let plaintext = serde_json::to_vec(&serde_json::json!({
+        "v": 1,
+        "profiles": [],
+        "profile_keys": [],
+        "command_policies": [],
+    }))?;
+    let ciphertext =
+        locket_core::encrypt_bundle_payload_for_age_recipients(&plaintext, &[recipient])?;
+    Ok(locket_core::SealedInvitePayloadV1 {
+        v: 1,
+        ciphertext_b64: data_encoding::BASE64URL_NOPAD.encode(&ciphertext),
+        recipient_sealing_public_key_b64: data_encoding::BASE64URL_NOPAD.encode(&recipient),
+        aad_schema_version: locket_crypto::AAD_SCHEMA_V1,
+        plaintext_counts: locket_core::SealedInvitePlaintextCounts::default(),
+    })
+}

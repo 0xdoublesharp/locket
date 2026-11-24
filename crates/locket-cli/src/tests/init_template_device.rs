@@ -2624,7 +2624,7 @@ fn team_invite_creates_signed_file_pending_row_and_audit() -> Result<(), Box<dyn
     assert_eq!(invite.payload.role, locket_core::TeamRole::Developer);
     assert_eq!(invite.payload.profiles, vec!["dev".to_owned()]);
     assert_ne!(invite.signature, "");
-    let sealed_payload = invite.payload.sealed_payload.as_ref().ok_or("sealed payload")?;
+    let sealed_payload = &invite.payload.sealed_payload;
     assert_eq!(sealed_payload.v, 1);
     assert_eq!(sealed_payload.plaintext_counts.profile_key_count, 2);
     assert_eq!(
@@ -3054,7 +3054,7 @@ fn team_accept_verifies_invite_displays_trust_summary_and_records_audit()
         profiles: vec!["dev".to_owned()],
         expires_at,
         nonce: data_encoding::BASE64URL_NOPAD.encode(&[7; 24]),
-        sealed_payload: Some({
+        sealed_payload: {
             let recipient_key: [u8; 32] = local_device
                 .sealing_public_key
                 .as_slice()
@@ -3116,7 +3116,7 @@ fn team_accept_verifies_invite_displays_trust_summary_and_records_audit()
                     secret_metadata_count: 0,
                 },
             }
-        }),
+        },
     };
     let signed = locket_core::SignedInvite::sign(&issuer_signing, payload)?;
     let invite_path = directory.path().join("accept.locket-invite");
@@ -3592,7 +3592,7 @@ fn team_accept_invite_fixture(
         profiles: vec!["dev".to_owned()],
         expires_at,
         nonce: data_encoding::BASE64URL_NOPAD.encode(&[7; 24]),
-        sealed_payload: None,
+        sealed_payload: super::empty_sealed_invite_payload(&local_device.sealing_public_key)?,
     };
     let mut signed = locket_core::SignedInvite::sign(&issuer_signing, payload)?;
     if let Some(signature) = signature_override {

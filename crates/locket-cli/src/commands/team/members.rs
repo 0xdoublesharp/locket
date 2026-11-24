@@ -405,12 +405,10 @@ fn team_accept_command(
     })?;
 
     writeln!(output, "team_accept: accepted")?;
-    if invite.payload.sealed_payload.is_some() {
-        writeln!(output, "sealed_payload: applied")?;
-        writeln!(output, "applied_profiles: {}", applied.profile_count)?;
-        writeln!(output, "applied_profile_keys: {}", applied.profile_key_count)?;
-        writeln!(output, "applied_command_policies: {}", applied.command_policy_count)?;
-    }
+    writeln!(output, "sealed_payload: applied")?;
+    writeln!(output, "applied_profiles: {}", applied.profile_count)?;
+    writeln!(output, "applied_profile_keys: {}", applied.profile_key_count)?;
+    writeln!(output, "applied_command_policies: {}", applied.command_policy_count)?;
     writeln!(output, "metadata_only: yes")?;
     Ok(())
 }
@@ -617,9 +615,7 @@ fn apply_invite_sealed_payload(
     local_device: &DeviceRecord,
     invite: &SignedInvite,
 ) -> Result<InviteApplyCounts, CliError> {
-    let Some(sealed) = &invite.payload.sealed_payload else {
-        return Ok(InviteApplyCounts::default());
-    };
+    let sealed = &invite.payload.sealed_payload;
     validate_invite_sealed_payload(sealed, invite)?;
     let storage = device::build_device_private_key_storage(context, project_id)?;
     let private_key = storage.load(&local_device.id)?;
@@ -814,12 +810,10 @@ fn accept_invite_with_audit(
         "accepted_at": accepted_at,
         "user_verification": user_verification,
     });
-    if invite.payload.sealed_payload.is_some() {
-        metadata["sealed_payload_applied"] = json!(true);
-        metadata["applied_profile_count"] = json!(applied.profile_count);
-        metadata["applied_profile_key_count"] = json!(applied.profile_key_count);
-        metadata["applied_command_policy_count"] = json!(applied.command_policy_count);
-    }
+    metadata["sealed_payload_applied"] = json!(true);
+    metadata["applied_profile_count"] = json!(applied.profile_count);
+    metadata["applied_profile_key_count"] = json!(applied.profile_key_count);
+    metadata["applied_command_policy_count"] = json!(applied.command_policy_count);
     let audit = AuditWrite {
         project_id,
         profile_id: None,
@@ -1438,7 +1432,7 @@ fn build_signed_invite(
         profiles: profiles.to_vec(),
         expires_at: expires_at / NANOS_PER_SECOND,
         nonce: BASE64URL_NOPAD.encode(&nonce),
-        sealed_payload: Some(sealed_payload),
+        sealed_payload,
     };
     let signed_invite = SignedInvite::sign(signing_key, payload)
         .map_err(|error| metadata_invalid_error(format!("invite signing failed: {error}")))?;

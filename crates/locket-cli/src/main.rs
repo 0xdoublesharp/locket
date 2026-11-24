@@ -1283,7 +1283,7 @@ pub(crate) enum TeamRoleArg {
     Owner,
     Maintainer,
     Developer,
-    #[value(name = "read-only", alias = "read_only")]
+    #[value(name = "read-only")]
     ReadOnly,
 }
 

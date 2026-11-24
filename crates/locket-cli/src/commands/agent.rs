@@ -716,8 +716,7 @@ fn request_agent_shutdown_or_signal(_socket_path: &Path, pid: u32) -> Result<(),
 
 #[cfg(target_os = "windows")]
 fn terminate_windows_agent(pid: u32) -> Result<(), CliError> {
-    // Compatibility fallback for older daemons that predate the
-    // in-band Shutdown RPC.
+    // Fallback for a daemon that does not answer the Shutdown RPC.
     locket_platform::terminate_windows_process(pid).map_err(CliError::from)
 }
 
