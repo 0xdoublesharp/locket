@@ -1,0 +1,6 @@
+name = "locket-proofs"
+defaultTargets = ["LocketProofs"]
+enableArtifactCache = false
+
+[[lean_lib]]
+name = "LocketProofs"
