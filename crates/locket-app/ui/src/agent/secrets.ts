@@ -22,7 +22,9 @@ export function secretRow(row: SecretWireRow): SecretRowMeta {
     name: row.name,
     source: sourceLabel(row.source),
     required: row.required,
-    optional: false,
+    optional: row.optional ?? false,
+    ownerLabel: row.owner,
+    tags: row.tags,
     createdAt: nanosToIso(row.created_at),
     rotatedAt:
       typeof row.last_rotated_at === 'number' ? nanosToIso(row.last_rotated_at) : undefined,

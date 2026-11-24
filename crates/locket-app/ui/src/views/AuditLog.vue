@@ -192,8 +192,8 @@ function onVerify(): void {
 
 <style scoped>
 .view {
-  background: #0f1115;
-  color: #e6e8ec;
+  background: var(--bg-surface);
+  color: var(--text-primary);
   padding: 1rem;
   border-radius: 0.5rem;
 }
@@ -228,7 +228,7 @@ function onVerify(): void {
 }
 
 .view__search-label {
-  color: #9aa3b2;
+  color: var(--text-secondary);
   font-size: 0.75rem;
   font-weight: 600;
   letter-spacing: 0.04em;
@@ -239,28 +239,28 @@ function onVerify(): void {
   box-sizing: border-box;
   width: 100%;
   min-height: 2rem;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border: 1px solid var(--border-strong);
   border-radius: 0.375rem;
-  background: rgba(255, 255, 255, 0.05);
-  color: #e6e8ec;
+  background: var(--bg-subtle);
+  color: var(--text-primary);
   font: inherit;
   padding: 0.375rem 0.625rem;
 }
 
 .view__search input:focus {
-  border-color: #f8d77a;
-  outline: 2px solid rgba(248, 215, 122, 0.24);
+  border-color: var(--accent);
+  outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
 
 .view__search input::placeholder {
-  color: #667085;
+  color: var(--text-muted);
 }
 
 .view__action {
-  background: rgba(255, 255, 255, 0.04);
-  color: #e6e8ec;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: var(--bg-subtle);
+  color: var(--text-primary);
+  border: 1px solid var(--border-subtle);
   border-radius: 0.375rem;
   padding: 0.25rem 0.75rem;
   font-size: 0.8125rem;
@@ -268,11 +268,11 @@ function onVerify(): void {
 }
 
 .view__action:hover {
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--bg-subtle);
 }
 
 .view__action:focus-visible {
-  outline: 2px solid #f8d77a;
+  outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 
@@ -281,25 +281,25 @@ function onVerify(): void {
   padding: 0.5rem 0.75rem;
   border-radius: 0.5rem;
   font-size: 0.8125rem;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--border-subtle);
 }
 
 .view__chain--ok {
-  background: rgba(170, 230, 200, 0.08);
-  border-color: rgba(170, 230, 200, 0.28);
-  color: #b8e6c8;
+  background: var(--success-soft);
+  border-color: var(--border-strong);
+  color: var(--success);
 }
 
 .view__chain--broken {
-  background: rgba(240, 138, 138, 0.1);
-  border-color: rgba(240, 138, 138, 0.32);
-  color: #f4b3b3;
+  background: var(--danger-soft);
+  border-color: var(--danger);
+  color: var(--danger);
 }
 
 .view__empty {
   margin: 0;
   font-size: 0.875rem;
-  color: #9aa3b2;
+  color: var(--text-secondary);
 }
 
 .view__table {
@@ -312,13 +312,13 @@ function onVerify(): void {
 .view__table td {
   text-align: left;
   padding: 0.5rem 0.75rem;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  border-bottom: 1px solid var(--border-subtle);
   vertical-align: top;
 }
 
 .view__table th {
   font-weight: 600;
-  color: #9aa3b2;
+  color: var(--text-secondary);
   font-size: 0.75rem;
   text-transform: uppercase;
   letter-spacing: 0.04em;
@@ -329,7 +329,7 @@ function onVerify(): void {
 }
 
 .view__muted {
-  color: #9aa3b2;
+  color: var(--text-secondary);
 }
 
 .badge {
@@ -338,32 +338,32 @@ function onVerify(): void {
   border-radius: 0.375rem;
   font-size: 0.75rem;
   letter-spacing: 0.02em;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(255, 255, 255, 0.04);
-  color: #e6e8ec;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-subtle);
+  color: var(--text-primary);
 }
 
 .badge--status-ok {
-  background: rgba(170, 230, 200, 0.1);
-  border-color: rgba(170, 230, 200, 0.28);
-  color: #b8e6c8;
+  background: var(--success-soft);
+  border-color: var(--border-strong);
+  color: var(--success);
 }
 
 .badge--status-denied {
-  background: rgba(248, 215, 122, 0.12);
-  border-color: rgba(248, 215, 122, 0.32);
-  color: #f8d77a;
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 .badge--status-failed {
-  background: rgba(240, 138, 138, 0.12);
-  border-color: rgba(240, 138, 138, 0.32);
-  color: #f4b3b3;
+  background: var(--danger-soft);
+  border-color: var(--danger);
+  color: var(--danger);
 }
 
 .badge--warning {
-  background: rgba(248, 215, 122, 0.12);
-  border-color: rgba(248, 215, 122, 0.32);
-  color: #f8d77a;
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
 }
 </style>

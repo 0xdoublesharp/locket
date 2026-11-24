@@ -155,7 +155,7 @@ const failedRuns = computed(
 </template>
 <style scoped>
 .dashboard {
-  color: #e6e8ec;
+  color: var(--text-primary);
   display: flex;
   flex-direction: column;
   gap: 1rem;
@@ -166,7 +166,7 @@ const failedRuns = computed(
 .dashboard__search,
 .dashboard__start,
 .dashboard__health {
-  background: #0f1115;
+  background: var(--bg-surface);
   border-radius: 0.5rem;
   padding: 1rem;
 }
@@ -190,7 +190,7 @@ const failedRuns = computed(
 
 .dashboard__context {
   margin: 0.35rem 0 0;
-  color: #9aa3b2;
+  color: var(--text-secondary);
   display: flex;
   gap: 0.4rem;
   min-width: 0;
@@ -203,9 +203,9 @@ const failedRuns = computed(
 .dashboard__refresh,
 .dashboard__metric,
 .dashboard__start-action {
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  background: rgba(255, 255, 255, 0.04);
-  color: #e6e8ec;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-subtle);
+  color: var(--text-primary);
   cursor: pointer;
 }
 
@@ -216,7 +216,7 @@ const failedRuns = computed(
 }
 
 .dashboard__refresh:disabled {
-  color: #6f7785;
+  color: var(--text-muted);
   cursor: default;
 }
 
@@ -228,7 +228,7 @@ const failedRuns = computed(
 }
 
 .dashboard__section-head span {
-  color: #9aa3b2;
+  color: var(--text-secondary);
   font-size: 0.78rem;
 }
 
@@ -247,7 +247,7 @@ const failedRuns = computed(
 
 .dashboard__start-list li {
   align-items: center;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--border-subtle);
   border-radius: 0.5rem;
   display: grid;
   gap: 1rem;
@@ -258,7 +258,7 @@ const failedRuns = computed(
 
 .dashboard__start-list p,
 .dashboard__start-empty {
-  color: #9aa3b2;
+  color: var(--text-secondary);
   font-size: 0.85rem;
   margin: 0.25rem 0 0;
 }
@@ -268,19 +268,19 @@ const failedRuns = computed(
 }
 
 .dashboard__start-title--ok {
-  color: #78d69d;
+  color: var(--success);
 }
 
 .dashboard__start-title--warn {
-  color: #f8d77a;
+  color: var(--accent);
 }
 
 .dashboard__start-title--critical {
-  color: #ff8a8a;
+  color: var(--danger);
 }
 
 .dashboard__start-title--neutral {
-  color: #e6e8ec;
+  color: var(--text-primary);
 }
 
 .dashboard__start-action {
@@ -302,14 +302,14 @@ const failedRuns = computed(
   display: flex;
   flex-direction: column;
   gap: 0.25rem;
-  background: rgba(255, 255, 255, 0.04);
+  background: var(--bg-subtle);
 }
 
 .dashboard__lock-label,
 .dashboard__facts dt,
 .dashboard__metric span,
 .dashboard__health li span {
-  color: #9aa3b2;
+  color: var(--text-secondary);
   font-size: 0.78rem;
 }
 
@@ -318,16 +318,16 @@ const failedRuns = computed(
 }
 
 .dashboard__status--ok {
-  color: #78d69d;
+  color: var(--success);
 }
 
 .dashboard__status--locked,
 .dashboard__status--pending {
-  color: #f8d77a;
+  color: var(--accent);
 }
 
 .dashboard__status--error {
-  color: #ff8a8a;
+  color: var(--danger);
 }
 
 .dashboard__facts {
@@ -368,7 +368,7 @@ const failedRuns = computed(
 .dashboard__refresh:focus-visible,
 .dashboard__start-action:hover,
 .dashboard__start-action:focus-visible {
-  border-color: rgba(248, 215, 122, 0.55);
+  border-color: var(--accent);
   outline: none;
 }
 
@@ -396,18 +396,18 @@ const failedRuns = computed(
 }
 
 .dashboard__scope {
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border: 1px solid var(--border-subtle);
   border-radius: 0.375rem;
-  background: rgba(255, 255, 255, 0.04);
-  color: #e6e8ec;
+  background: var(--bg-subtle);
+  color: var(--text-primary);
   cursor: pointer;
   min-height: 2rem;
   padding: 0 0.7rem;
 }
 
 .dashboard__scope--active {
-  border-color: rgba(248, 215, 122, 0.65);
-  color: #f8d77a;
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 .dashboard__search-box {
@@ -419,23 +419,23 @@ const failedRuns = computed(
 .dashboard__search-box span,
 .dashboard__search-results li span,
 .dashboard__search-results li em {
-  color: #9aa3b2;
+  color: var(--text-secondary);
   font-size: 0.78rem;
   font-style: normal;
 }
 
 .dashboard__search-box input {
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border: 1px solid var(--border-subtle);
   border-radius: 0.375rem;
-  background: rgba(255, 255, 255, 0.04);
-  color: #e6e8ec;
+  background: var(--bg-subtle);
+  color: var(--text-primary);
   min-height: 2.5rem;
   padding: 0 0.75rem;
 }
 
 .dashboard__search-box input:focus,
 .dashboard__scope:focus-visible {
-  border-color: rgba(248, 215, 122, 0.65);
+  border-color: var(--accent);
   outline: none;
 }
 
@@ -449,7 +449,7 @@ const failedRuns = computed(
 }
 
 .dashboard__search-results li {
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--border-subtle);
   border-radius: 0.5rem;
   display: grid;
   gap: 0.25rem;
@@ -485,15 +485,15 @@ const failedRuns = computed(
 }
 
 .dashboard__health-ok {
-  color: #78d69d;
+  color: var(--success);
 }
 
 .dashboard__health-warn {
-  color: #f8d77a;
+  color: var(--accent);
 }
 
 .dashboard__health-neutral {
-  color: #e6e8ec;
+  color: var(--text-primary);
 }
 
 @media (max-width: 860px) {

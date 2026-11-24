@@ -6,6 +6,12 @@ import { invoke, isTauri } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
   DesktopProjectContext,
+  DesktopFilePickerOptions,
+  DesktopMcpConfigSnippet,
+  DiscoverSecretsRequest,
+  DiscoveredSecretWire,
+  ProjectListRequest,
+  ProjectSummaryWire,
   DesktopImportEnvRequest,
   DesktopSavePolicyRequest,
   UnlockRequest,
@@ -61,6 +67,22 @@ export type AgentStatusResult =
 
 export type AgentResult<T> = { ok: true; value: T } | { ok: false; error: AgentClientError };
 
+const browserParams =
+  import.meta.env.DEV && typeof window !== 'undefined' && !isTauri()
+    ? new URLSearchParams(window.location?.search)
+    : null;
+export const previewParams = browserParams?.get('preview') === '1' ? browserParams : null;
+const previewRuntime =
+  import.meta.env.DEV && previewParams
+    ? import('../preview/mockRuntime').then(({ createMockRuntime }) =>
+        createMockRuntime(previewParams),
+      )
+    : null;
+
+export function desktopActionsAvailable(): boolean {
+  return isTauri() || previewRuntime !== null;
+}
+
 const AGENT_STATUS_EVENT = 'agent-status';
 const AGENT_STATUS_ERROR_EVENT = 'agent-status-error';
 const AGENT_STATUS_DISCONNECTED_EVENT = 'agent-status-disconnected';
@@ -84,18 +106,8 @@ function tauriUnavailableError(): AgentClientError {
  * can render a sensible fallback banner instead of crashing.
  */
 export async function fetchStatus(): Promise<AgentStatusResult> {
-  if (!isTauri()) {
-    return {
-      ok: false,
-      error: tauriUnavailableError(),
-    };
-  }
-  try {
-    const status = await invoke<AgentStatus>('agent_status');
-    return { ok: true, status };
-  } catch (raw) {
-    return { ok: false, error: normalizeError(raw) };
-  }
+  const result = await callTyped<AgentStatus>('agent_status', {});
+  return result.ok ? { ok: true, status: result.value } : result;
 }
 
 /**
@@ -120,6 +132,9 @@ export async function subscribeStatus(
   onError: (error: AgentClientError) => void,
   options: SubscribeStatusOptions = {},
 ): Promise<AgentResult<UnlistenFn>> {
+  if (previewRuntime) {
+    return { ok: true, value: () => {} };
+  }
   if (!isTauri()) {
     return {
       ok: false,
@@ -195,15 +210,15 @@ async function callTyped<T>(
   command: string,
   args: Record<string, unknown>,
 ): Promise<AgentResult<T>> {
-  if (!isTauri()) {
-    return {
-      ok: false,
-      error: tauriUnavailableError(),
-    };
+  if (!desktopActionsAvailable()) {
+    return { ok: false, error: tauriUnavailableError() };
   }
   try {
-    const value = await invoke<T>(command, args);
-    return { ok: true, value };
+    if (previewRuntime) {
+      const mockInvoke = await previewRuntime;
+      return { ok: true, value: (await mockInvoke(command, args)) as T };
+    }
+    return { ok: true, value: await invoke<T>(command, args) };
   } catch (raw) {
     return { ok: false, error: normalizeError(raw) };
   }
@@ -403,6 +418,44 @@ export async function copySecret(
   request: CopySecretRequest,
 ): Promise<AgentResult<CopySecretResponse>> {
   return callTyped<CopySecretResponse>('agent_copy_secret', { request });
+}
+
+export function desktopGetLaunchAtLogin(): Promise<AgentResult<boolean>> {
+  return callTyped('desktop_get_launch_at_login', {});
+}
+
+export function desktopSetLaunchAtLogin(enabled: boolean): Promise<AgentResult<boolean>> {
+  return callTyped('desktop_set_launch_at_login', { enabled });
+}
+
+export function desktopPickDirectory(title?: string): Promise<AgentResult<string | null>> {
+  return callTyped('desktop_pick_directory', title === undefined ? {} : { title });
+}
+
+export function desktopPickFile(
+  options: DesktopFilePickerOptions = {},
+): Promise<AgentResult<string | null>> {
+  return callTyped('desktop_pick_file', { ...options });
+}
+
+export function desktopCopyTextPlain(text: string): Promise<AgentResult<void>> {
+  return callTyped('desktop_copy_text_plain', { text });
+}
+
+export function desktopMcpConfigSnippet(): Promise<AgentResult<DesktopMcpConfigSnippet>> {
+  return callTyped('desktop_mcp_config_snippet', {});
+}
+
+export function discoverSecrets(
+  request: DiscoverSecretsRequest,
+): Promise<AgentResult<DiscoveredSecretWire[]>> {
+  return callTyped('agent_discover_secrets', { request });
+}
+
+export function listProjects(
+  request: ProjectListRequest,
+): Promise<AgentResult<ProjectSummaryWire[]>> {
+  return callTyped('agent_list_projects', { request });
 }
 
 export async function desktopListProjects(): Promise<AgentResult<DesktopProjectContext[]>> {

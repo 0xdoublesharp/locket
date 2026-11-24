@@ -121,9 +121,9 @@ const renderer = createRenderer<TestNode, TestNode>({
   },
 });
 
-export function mountComponent<State>(component: Component) {
+export function mountComponent<State>(component: Component, props?: Record<string, unknown>) {
   const root = new TestNode('root');
-  const vnode = createVNode(component);
+  const vnode = createVNode(component, props);
   const app = renderer.createApp({ render: () => vnode });
   app.provide(ssrContextKey, {});
   app.mount(root);

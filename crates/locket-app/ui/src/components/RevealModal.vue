@@ -126,15 +126,15 @@ const secretLabel = computed<string>(() =>
 .reveal-backdrop {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.55);
+  background: var(--backdrop);
   display: flex;
   align-items: center;
   justify-content: center;
   z-index: 200;
 }
 .reveal {
-  background: #161a22;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
   border-radius: 0.5rem;
   padding: 1.25rem 1.5rem;
   min-width: 360px;
@@ -154,19 +154,19 @@ const secretLabel = computed<string>(() =>
   font-size: 1.1rem;
 }
 .reveal__caption {
-  color: #9aa3b2;
+  color: var(--text-secondary);
   font-size: 0.8rem;
 }
 .reveal__value {
   margin: 0;
   padding: 0.625rem 0.75rem;
-  background: #0b0d11;
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
   border-radius: 0.375rem;
   white-space: pre-wrap;
   word-break: break-all;
-  color: #f8d77a;
-  font-family: 'SF Mono', Menlo, monospace;
+  color: var(--accent);
+  font-family: var(--font-mono);
   font-size: 0.85rem;
 }
 .reveal__foot {
@@ -176,14 +176,14 @@ const secretLabel = computed<string>(() =>
   gap: 0.75rem;
 }
 .reveal__ttl {
-  color: #f2b879;
+  color: var(--warn);
   font-size: 0.85rem;
 }
 .reveal__close {
   background: transparent;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border: 1px solid var(--border-strong);
   border-radius: 0.375rem;
-  color: #c5cbd6;
+  color: var(--text-secondary);
   padding: 0.35rem 0.75rem;
   cursor: pointer;
 }

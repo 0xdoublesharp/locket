@@ -267,7 +267,7 @@ watch(
   display: grid;
   gap: 0.65rem;
   padding: 1rem;
-  border: 1px solid #343b49;
+  border: 1px solid var(--border-subtle);
   border-radius: 0.5rem;
 }
 h3,

@@ -141,8 +141,8 @@ function refresh(): void {
 
 <style scoped>
 .view {
-  background: #0f1115;
-  color: #e6e8ec;
+  background: var(--bg-surface);
+  color: var(--text-primary);
   padding: 1rem;
   border-radius: 0.5rem;
 }
@@ -165,13 +165,13 @@ function refresh(): void {
 .view__empty {
   margin: 0;
   font-size: 0.875rem;
-  color: #9aa3b2;
+  color: var(--text-secondary);
 }
 
 .view__error {
   margin: 0;
   font-size: 0.875rem;
-  color: #f08a8a;
+  color: var(--danger);
 }
 
 .view__actions {
@@ -181,9 +181,9 @@ function refresh(): void {
 }
 
 .view__button {
-  border: 1px solid rgba(248, 215, 122, 0.35);
-  background: rgba(248, 215, 122, 0.1);
-  color: #f8d77a;
+  border: 1px solid var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
   border-radius: 0.375rem;
   padding: 0.375rem 0.625rem;
   font-size: 0.8125rem;
@@ -196,7 +196,7 @@ function refresh(): void {
 }
 
 .view__button:focus-visible {
-  outline: 2px solid #f8d77a;
+  outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 
@@ -210,20 +210,20 @@ function refresh(): void {
 .view__table td {
   text-align: left;
   padding: 0.5rem 0.75rem;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  border-bottom: 1px solid var(--border-subtle);
   vertical-align: top;
 }
 
 .view__table th {
   font-weight: 600;
-  color: #9aa3b2;
+  color: var(--text-secondary);
   font-size: 0.75rem;
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
 
 .view__muted {
-  color: #9aa3b2;
+  color: var(--text-secondary);
 }
 
 .view__state {
@@ -237,23 +237,23 @@ function refresh(): void {
   width: 0.5rem;
   height: 0.5rem;
   border-radius: 50%;
-  background: rgba(255, 255, 255, 0.16);
+  background: var(--bg-subtle);
 }
 
 .view__dot--running {
-  background: #6fe1a8;
+  background: var(--success);
 }
 
 .view__dot--completed {
-  background: rgba(255, 255, 255, 0.32);
+  background: var(--bg-subtle);
 }
 
 .view__dot--failed {
-  background: #f08a8a;
+  background: var(--danger);
 }
 
 .view__dot--stale {
-  background: #f8d77a;
+  background: var(--accent);
 }
 
 .view__state-label {
@@ -262,7 +262,7 @@ function refresh(): void {
 
 .view__session-id {
   font-size: 0.8125rem;
-  color: #e6e8ec;
+  color: var(--text-primary);
 }
 
 .badge {
@@ -271,14 +271,14 @@ function refresh(): void {
   border-radius: 0.375rem;
   font-size: 0.75rem;
   letter-spacing: 0.02em;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(255, 255, 255, 0.04);
-  color: #e6e8ec;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-subtle);
+  color: var(--text-primary);
 }
 
 .badge--count {
-  background: rgba(120, 170, 255, 0.1);
-  border-color: rgba(120, 170, 255, 0.28);
-  color: #a8c6ff;
+  background: var(--info-soft);
+  border-color: var(--border-strong);
+  color: var(--info);
 }
 </style>

@@ -186,8 +186,8 @@ function onSubmit(): void {
 
 <style scoped>
 .view {
-  background: #0f1115;
-  color: #e6e8ec;
+  background: var(--bg-surface);
+  color: var(--text-primary);
   padding: 1rem;
   border-radius: 0.5rem;
 }
@@ -204,17 +204,17 @@ function onSubmit(): void {
   text-transform: uppercase;
 }
 .view__caption {
-  color: #9aa3b2;
+  color: var(--text-secondary);
   font-size: 0.8rem;
 }
 .view__empty {
-  color: #9aa3b2;
+  color: var(--text-secondary);
   font-size: 0.85rem;
 }
 .view__empty code {
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--bg-subtle);
   border-radius: 0.25rem;
-  color: #e6e8ec;
+  color: var(--text-primary);
   padding: 0.125rem 0.25rem;
 }
 .profile-list {
@@ -226,16 +226,16 @@ function onSubmit(): void {
   gap: 0.25rem;
 }
 .profile-list__item--active .profile-list__btn {
-  background: rgba(248, 215, 122, 0.06);
+  background: var(--accent-soft);
 }
 .profile-list__btn {
   width: 100%;
   text-align: left;
   background: transparent;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--border-subtle);
   border-radius: 0.375rem;
   padding: 0.5rem 0.75rem;
-  color: #e6e8ec;
+  color: var(--text-primary);
   cursor: pointer;
   display: flex;
   align-items: center;
@@ -243,7 +243,7 @@ function onSubmit(): void {
   font-size: 0.9rem;
 }
 .profile-list__btn:hover {
-  background: rgba(255, 255, 255, 0.04);
+  background: var(--bg-subtle);
 }
 .profile-list__name {
   flex: 1;
@@ -254,13 +254,13 @@ function onSubmit(): void {
   gap: 0.625rem;
   margin-top: 1rem;
   padding: 1rem;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--border-subtle);
   border-radius: 0.5rem;
 }
 .switcher-form h3 {
   margin: 0 0 0.5rem;
   font-size: 0.9rem;
-  color: #c5cbd6;
+  color: var(--text-secondary);
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
@@ -271,9 +271,9 @@ function onSubmit(): void {
   font-size: 0.85rem;
 }
 .switcher-form__field input {
-  background: #0b0d11;
-  color: #e6e8ec;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  border: 1px solid var(--border-strong);
   border-radius: 0.375rem;
   padding: 0.4rem 0.6rem;
   font-size: 0.85rem;
@@ -285,7 +285,7 @@ function onSubmit(): void {
   font-size: 0.8rem;
 }
 .switcher-form__error {
-  color: #f08a90;
+  color: var(--danger);
   font-size: 0.75rem;
 }
 .switcher-form__actions {
@@ -293,17 +293,17 @@ function onSubmit(): void {
   justify-content: flex-end;
 }
 .view__button {
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  background: rgba(255, 255, 255, 0.05);
-  color: #e6e8ec;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-subtle);
+  color: var(--text-primary);
   border-radius: 0.375rem;
   padding: 0.4rem 0.85rem;
   font-size: 0.85rem;
   cursor: pointer;
 }
 .view__button--primary {
-  background: #f8d77a;
-  color: #1a1a1a;
+  background: var(--accent);
+  color: var(--accent-fg);
   border-color: transparent;
 }
 .view__button:disabled {
@@ -316,18 +316,18 @@ function onSubmit(): void {
   border-radius: 0.375rem;
   font-size: 0.7rem;
   letter-spacing: 0.02em;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(255, 255, 255, 0.04);
-  color: #e6e8ec;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-subtle);
+  color: var(--text-primary);
 }
 .badge--ok {
-  background: rgba(170, 230, 200, 0.1);
-  border-color: rgba(170, 230, 200, 0.28);
-  color: #b8e6c8;
+  background: var(--success-soft);
+  border-color: var(--border-strong);
+  color: var(--success);
 }
 .badge--warning {
-  background: rgba(248, 215, 122, 0.12);
-  border-color: rgba(248, 215, 122, 0.32);
-  color: #f8d77a;
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
 }
 </style>

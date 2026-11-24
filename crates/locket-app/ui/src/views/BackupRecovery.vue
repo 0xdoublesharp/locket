@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue';
 
+import PathBrowse from '../components/PathBrowse.vue';
 import { exportSelectionKey } from '../backup/actions';
 import type {
   BundleAction,
@@ -169,6 +170,13 @@ function rotateAction(): void {
           <span>Output path</span>
           <input v-model.trim="exportDraft.outputPath" type="text" autocomplete="off" />
         </label>
+        <PathBrowse
+          title="Browse for a backup destination"
+          save
+          default-name="locket-backup.lkb"
+          :disabled="busy"
+          @pick="exportDraft.outputPath = $event"
+        />
 
         <button
           type="button"
@@ -207,6 +215,11 @@ function rotateAction(): void {
           <span>Bundle path</span>
           <input v-model.trim="importDraft.bundlePath" type="text" autocomplete="off" />
         </label>
+        <PathBrowse
+          title="Browse for a bundle to import"
+          :disabled="busy"
+          @pick="importDraft.bundlePath = $event"
+        />
 
         <label class="view__field view__field--inline">
           <input v-model="importDraft.includeAudit" type="checkbox" />
@@ -254,6 +267,11 @@ function rotateAction(): void {
           <span>Bundle path</span>
           <input v-model.trim="verifyDraft.bundlePath" type="text" autocomplete="off" />
         </label>
+        <PathBrowse
+          title="Browse for a bundle to verify"
+          :disabled="busy"
+          @pick="verifyDraft.bundlePath = $event"
+        />
 
         <label class="view__field view__field--inline">
           <input v-model="verifyDraft.requireDecryptable" type="checkbox" />
@@ -323,8 +341,8 @@ function rotateAction(): void {
   overflow-wrap: anywhere;
 }
 .view {
-  background: #0f1115;
-  color: #e6e8ec;
+  background: var(--bg-surface);
+  color: var(--text-primary);
   padding: 1rem;
   border-radius: 0.5rem;
 }
@@ -352,7 +370,7 @@ function rotateAction(): void {
   gap: 0.75rem;
   min-width: 0;
   padding: 0.875rem;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--border-subtle);
   border-radius: 0.5rem;
 }
 
@@ -377,14 +395,14 @@ function rotateAction(): void {
   padding: 0;
   border: 0;
   font-size: 0.8125rem;
-  color: #9aa3b2;
+  color: var(--text-secondary);
 }
 
 .view__field--inline,
 .view__fieldset label {
   flex-direction: row;
   align-items: center;
-  color: #e6e8ec;
+  color: var(--text-primary);
 }
 
 .view__fieldset {
@@ -394,7 +412,7 @@ function rotateAction(): void {
 .view__fieldset legend {
   padding: 0;
   margin-bottom: 0.375rem;
-  color: #9aa3b2;
+  color: var(--text-secondary);
 }
 
 .view__fieldset label {
@@ -407,10 +425,10 @@ function rotateAction(): void {
 .view__field textarea {
   width: 100%;
   box-sizing: border-box;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border: 1px solid var(--border-strong);
   border-radius: 0.375rem;
-  background: rgba(255, 255, 255, 0.04);
-  color: #e6e8ec;
+  background: var(--bg-subtle);
+  color: var(--text-primary);
   padding: 0.5rem;
   font: inherit;
 }
@@ -422,14 +440,14 @@ function rotateAction(): void {
 
 .view__field input[type='checkbox'],
 .view__fieldset input[type='radio'] {
-  accent-color: #f8d77a;
+  accent-color: var(--accent);
 }
 
 .view__field input:focus-visible,
 .view__field textarea:focus-visible,
 .view__fieldset input:focus-visible,
 .view__action:focus-visible {
-  outline: 2px solid #f8d77a;
+  outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 
@@ -442,27 +460,27 @@ function rotateAction(): void {
 }
 
 .view__definitions dt {
-  color: #9aa3b2;
+  color: var(--text-secondary);
 }
 
 .view__definitions dd {
   margin: 0.125rem 0 0;
-  color: #e6e8ec;
+  color: var(--text-primary);
 }
 
 .view__action {
   align-self: flex-start;
-  border: 1px solid rgba(248, 215, 122, 0.32);
+  border: 1px solid var(--accent);
   border-radius: 0.375rem;
-  background: rgba(248, 215, 122, 0.12);
-  color: #f8d77a;
+  background: var(--accent-soft);
+  color: var(--accent);
   padding: 0.375rem 0.875rem;
   font-size: 0.8125rem;
   cursor: pointer;
 }
 
 .view__action:hover:not(:disabled) {
-  background: rgba(248, 215, 122, 0.18);
+  background: var(--accent-soft);
 }
 
 .view__action:disabled {
@@ -471,9 +489,9 @@ function rotateAction(): void {
 }
 
 .view__action--danger {
-  border-color: rgba(240, 138, 138, 0.32);
-  background: rgba(240, 138, 138, 0.12);
-  color: #f4b3b3;
+  border-color: var(--danger);
+  background: var(--danger-soft);
+  color: var(--danger);
 }
 
 .badge {
@@ -482,28 +500,28 @@ function rotateAction(): void {
   border-radius: 0.375rem;
   font-size: 0.75rem;
   letter-spacing: 0.02em;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(255, 255, 255, 0.04);
-  color: #e6e8ec;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-subtle);
+  color: var(--text-primary);
   white-space: nowrap;
 }
 
 .badge--safe {
-  background: rgba(170, 230, 200, 0.1);
-  border-color: rgba(170, 230, 200, 0.28);
-  color: #b8e6c8;
+  background: var(--success-soft);
+  border-color: var(--border-strong);
+  color: var(--success);
 }
 
 .badge--warning {
-  background: rgba(248, 215, 122, 0.12);
-  border-color: rgba(248, 215, 122, 0.32);
-  color: #f8d77a;
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 .badge--danger {
-  background: rgba(240, 138, 138, 0.12);
-  border-color: rgba(240, 138, 138, 0.32);
-  color: #f4b3b3;
+  background: var(--danger-soft);
+  border-color: var(--danger);
+  color: var(--danger);
 }
 
 @media (max-width: 960px) {

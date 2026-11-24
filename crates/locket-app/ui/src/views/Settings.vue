@@ -1,210 +1,368 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { onMounted, ref, watch } from 'vue';
 
+import {
+  desktopActionsAvailable,
+  desktopCopyTextPlain,
+  desktopGetLaunchAtLogin,
+  desktopMcpConfigSnippet,
+  desktopSetLaunchAtLogin,
+} from '../agent/client';
+import { configuredDurationSeconds, unlockTtl } from '../dashboard/health';
+import type { WriteConfigChanges } from '../agent/types';
 import type { SettingsState } from '../types/views';
 
 defineOptions({ name: 'AppSettings' });
 
-interface Props {
+const props = defineProps<{
   state: SettingsState;
   loading: boolean;
+  canEditVault: boolean;
+  projectConnected: boolean;
   errorMessage: string | null;
-}
-
-const props = defineProps<Props>();
-
-const emit = defineEmits<{
-  (e: 'update', patch: Partial<SettingsState>): void;
+  saveMessage?: string | null;
 }>();
+const emit = defineEmits<{ update: [patch: WriteConfigChanges] }>();
 
-const redactNames = computed<boolean>(() => props.state.privacyRedactNames);
+const presets = ['15m', '1h', '4h', '8h'];
+const verificationOptions = [
+  { key: 'unlock', label: 'Unlock vault' },
+  { key: 'reveal', label: 'Reveal a value' },
+  { key: 'copy', label: 'Copy a value' },
+  { key: 'dangerous_profile_switch', label: 'Switch to a dangerous environment' },
+] as const;
 
-function onToggleRedact(event: Event): void {
-  const target = event.target as HTMLInputElement;
-  emit('update', { privacyRedactNames: target.checked });
+const duration = ref('');
+const durationError = ref('');
+watch(
+  () => props.state.unlockTtl,
+  (value) => {
+    duration.value = value ?? '';
+    durationError.value = '';
+  },
+  { immediate: true },
+);
+
+function saveDuration(value: string): void {
+  const next = value.trim();
+  const seconds = configuredDurationSeconds(next);
+  if (seconds !== unlockTtl(seconds)) {
+    durationError.value = 'Enter a duration between 1s and 8h, such as 45m.';
+    return;
+  }
+  durationError.value = '';
+  duration.value = next;
+  emit('update', { agent_unlock_ttl: next });
 }
 
-function userVerificationLabel(value: boolean): string {
-  return value ? 'required' : 'not required';
+function toggle(event: Event, patch: (checked: boolean) => WriteConfigChanges): void {
+  const input = event.target as HTMLInputElement;
+  const next = input.checked;
+  input.checked = !next;
+  emit('update', patch(next));
 }
 
-function dangerousProfileLabel(value: boolean): string {
-  return value ? 'enabled' : 'disabled';
+const desktop = desktopActionsAvailable();
+const launchAtLogin = ref<boolean | null>(null);
+const launchBusy = ref(false);
+const launchMessage = ref('');
+const mcpJson = ref(
+  JSON.stringify({ mcpServers: { locket: { command: 'locket', args: ['mcp'] } } }, null, 2),
+);
+const mcpMessage = ref('');
+
+onMounted(async () => {
+  if (!desktop) return;
+  const [login, snippet] = await Promise.all([
+    desktopGetLaunchAtLogin(),
+    desktopMcpConfigSnippet(),
+  ]);
+  if (login.ok) launchAtLogin.value = login.value;
+  else launchMessage.value = 'Launch at login is unavailable.';
+  if (snippet.ok && typeof snippet.value?.json === 'string') mcpJson.value = snippet.value.json;
+});
+
+async function toggleLaunch(event: Event): Promise<void> {
+  const input = event.target as HTMLInputElement;
+  const next = input.checked;
+  input.checked = launchAtLogin.value ?? false;
+  launchBusy.value = true;
+  launchMessage.value = '';
+  const result = await desktopSetLaunchAtLogin(next);
+  if (result.ok) {
+    launchAtLogin.value = result.value;
+    launchMessage.value = result.value ? 'Launch at login enabled.' : 'Launch at login disabled.';
+  } else {
+    launchMessage.value = 'Could not update launch at login.';
+  }
+  launchBusy.value = false;
+}
+
+async function copyMcp(): Promise<void> {
+  const result = await desktopCopyTextPlain(mcpJson.value);
+  mcpMessage.value = result.ok ? 'Copied MCP JSON.' : 'Could not copy MCP JSON.';
 }
 </script>
 
 <template>
-  <section class="view" aria-labelledby="settings-heading">
-    <header class="view__header">
+  <section class="settings" aria-labelledby="settings-heading">
+    <header>
       <h2 id="settings-heading">Settings</h2>
+      <p>
+        Agent version <code>{{ state.agentVersion }}</code>
+      </p>
     </header>
 
-    <section class="view__section" aria-labelledby="settings-privacy-heading">
-      <h3 id="settings-privacy-heading" class="view__section-heading">Privacy</h3>
-      <p class="view__paragraph">Names are replaced with aliases when redaction is enabled.</p>
-
-      <label class="view__field">
+    <section class="settings__card" aria-labelledby="settings-privacy">
+      <h3 id="settings-privacy">Privacy</h3>
+      <label class="settings__switch">
         <input
           type="checkbox"
-          :checked="redactNames"
-          :disabled="loading"
-          aria-describedby="settings-privacy-help"
-          @change="onToggleRedact"
+          :checked="state.privacyRedactNames"
+          :disabled="loading || (projectConnected && !canEditVault)"
+          @change="toggle($event, (checked) => ({ privacy_redact_names: checked }))"
         />
         <span>Redact names with local aliases</span>
       </label>
-      <p v-if="errorMessage" class="view__error" role="status">{{ errorMessage }}</p>
-      <p id="settings-privacy-help" class="view__help">
-        Affects dashboard, tray, shell status, and notifications.
+      <p>Uses aliases in project, variable, and activity views and the menu bar.</p>
+    </section>
+
+    <section class="settings__card" aria-labelledby="settings-session">
+      <h3 id="settings-session">Vault session</h3>
+      <p>Set how long an unlock stays valid.</p>
+      <div class="settings__actions" aria-label="Session length presets">
+        <button
+          v-for="preset in presets"
+          :key="preset"
+          type="button"
+          :aria-pressed="(state.unlockTtl ?? '15m') === preset"
+          :disabled="loading || !canEditVault"
+          @click="saveDuration(preset)"
+        >
+          {{ preset }}
+        </button>
+      </div>
+      <form
+        class="settings__actions settings__duration-form"
+        @submit.prevent="saveDuration(duration)"
+      >
+        <label class="settings__duration">
+          Custom duration
+          <input
+            v-model="duration"
+            type="text"
+            placeholder="45m"
+            autocomplete="off"
+            :disabled="loading || !canEditVault"
+            :aria-invalid="durationError ? 'true' : undefined"
+            aria-describedby="settings-duration-error"
+            @input="durationError = ''"
+          />
+        </label>
+        <button type="submit" :disabled="loading || !canEditVault || !duration.trim()">
+          Save duration
+        </button>
+      </form>
+      <p id="settings-duration-error" class="settings__error" role="status">{{ durationError }}</p>
+      <p v-if="!canEditVault && !loading && !errorMessage">
+        {{
+          projectConnected
+            ? 'Unlock this project to edit vault settings.'
+            : 'Connect a project to edit vault settings.'
+        }}
       </p>
     </section>
 
-    <section class="view__section" aria-labelledby="settings-agent-heading">
-      <h3 id="settings-agent-heading" class="view__section-heading">Agent &amp; vault</h3>
-      <p class="view__paragraph">
-        These values are owned by the CLI and agent. Use <code>locket</code> commands to change
-        them.
-      </p>
-
-      <dl class="view__definitions">
-        <div class="view__definition">
-          <dt>Unlock TTL</dt>
-          <dd>{{ state.unlockTtlSeconds }}s</dd>
-        </div>
-        <div class="view__definition">
-          <dt>User verification</dt>
-          <dd>{{ userVerificationLabel(state.requireUserVerification) }}</dd>
-        </div>
-        <div class="view__definition">
-          <dt>Dangerous environment</dt>
-          <dd>{{ dangerousProfileLabel(state.dangerousProfileFlag) }}</dd>
-        </div>
-      </dl>
+    <section class="settings__card" aria-labelledby="settings-verification">
+      <h3 id="settings-verification">Touch ID &amp; user verification</h3>
+      <p>Require system verification for individual actions.</p>
+      <label v-for="option in verificationOptions" :key="option.key" class="settings__switch">
+        <input
+          type="checkbox"
+          :checked="state.verification?.[option.key] ?? false"
+          :disabled="loading || !canEditVault"
+          @change="
+            toggle($event, (checked) => ({
+              user_verification_required_for: { [option.key]: checked },
+            }))
+          "
+        />
+        <span>{{ option.label }}</span>
+      </label>
     </section>
 
-    <footer class="view__footer">
-      <span class="view__muted">Agent version</span>
-      <code class="view__version">{{ state.agentVersion }}</code>
-      <span v-if="loading" class="view__muted">Syncing</span>
-    </footer>
+    <section class="settings__card" aria-labelledby="settings-environment">
+      <div class="settings__actions">
+        <h3 id="settings-environment">Environment safety</h3>
+        <span v-if="state.dangerousProfileFlag" class="settings__warning">Dangerous</span>
+      </div>
+      <label class="settings__switch">
+        <input
+          type="checkbox"
+          :checked="state.dangerousProfileFlag"
+          :disabled="loading || !canEditVault || !state.dangerousProfile"
+          @change="toggle($event, (checked) => ({ dangerous_profile: checked }))"
+        />
+        <span>
+          Mark
+          <strong>{{ state.dangerousProfile?.profile_label ?? 'the active environment' }}</strong>
+          as dangerous
+        </span>
+      </label>
+      <p>Dangerous environments require confirmation for sensitive actions.</p>
+    </section>
+
+    <p v-if="loading || saveMessage || errorMessage" class="settings__feedback" role="status">
+      <span v-if="loading">Syncing settings…</span>
+      <span v-else-if="errorMessage" class="settings__error">{{ errorMessage }}</span>
+      <span v-else>{{ saveMessage }}</span>
+    </p>
+
+    <section class="settings__card" aria-labelledby="settings-companion">
+      <h3 id="settings-companion">macOS companion</h3>
+      <label class="settings__switch">
+        <input
+          type="checkbox"
+          :checked="launchAtLogin ?? false"
+          :disabled="launchAtLogin === null || launchBusy"
+          @change="toggleLaunch"
+        />
+        <span>Launch at login</span>
+      </label>
+      <p v-if="!desktop">Available in the macOS desktop app.</p>
+      <p v-else-if="launchMessage" role="status">{{ launchMessage }}</p>
+    </section>
+
+    <section class="settings__card" aria-labelledby="settings-mcp">
+      <h3 id="settings-mcp">AI agents &amp; MCP</h3>
+      <p>
+        Paste this JSON into your MCP client settings. Locket MCP never exposes plaintext reveals.
+      </p>
+      <pre>{{ mcpJson }}</pre>
+      <div class="settings__actions">
+        <button type="button" :disabled="!desktop" @click="copyMcp">Copy MCP JSON</button>
+        <p v-if="mcpMessage" role="status">{{ mcpMessage }}</p>
+      </div>
+    </section>
   </section>
 </template>
 
 <style scoped>
-.view {
-  background: #0f1115;
-  color: #e6e8ec;
+.settings {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  gap: 0.875rem;
+}
+
+.settings header,
+.settings__feedback {
+  grid-column: 1 / -1;
+}
+
+.settings h2,
+.settings h3,
+.settings p,
+.settings pre {
+  margin: 0;
+}
+
+.settings h3 {
+  font-size: 0.95rem;
+}
+
+.settings p {
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+}
+
+.settings__card {
+  display: grid;
+  gap: 0.75rem;
+  min-width: 0;
   padding: 1rem;
-  border-radius: 0.5rem;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+
+.settings__switch {
   display: flex;
-  flex-direction: column;
-  gap: 1rem;
-}
-
-.view__header h2 {
-  margin: 0;
-  font-size: 1rem;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-}
-
-.view__section {
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-  padding: 0.75rem;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 0.5rem;
-}
-
-.view__section-heading {
-  margin: 0;
-  font-size: 0.8125rem;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: #9aa3b2;
-}
-
-.view__paragraph {
-  margin: 0;
-  font-size: 0.875rem;
-  color: #e6e8ec;
-}
-
-.view__paragraph code {
-  background: rgba(255, 255, 255, 0.06);
-  padding: 0.125rem 0.25rem;
-  border-radius: 0.25rem;
-  font-size: 0.8125rem;
-}
-
-.view__field {
-  display: inline-flex;
   align-items: center;
+  gap: 0.55rem;
+  line-height: 1.5;
+}
+
+.settings__switch input {
+  accent-color: var(--accent);
+}
+
+.settings__actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
   gap: 0.5rem;
+}
+
+.settings__duration {
+  display: grid;
+  gap: 0.25rem;
   font-size: 0.875rem;
+}
+
+.settings__duration input {
+  width: 9rem;
+}
+
+.settings__duration-form {
+  align-items: end;
+}
+
+.settings button {
+  min-height: 2.125rem;
+  padding: 0.35rem 0.7rem;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-subtle);
+  color: var(--text-primary);
+  font: inherit;
   cursor: pointer;
 }
 
-.view__field input[type='checkbox'] {
-  width: 1rem;
-  height: 1rem;
-  accent-color: #f8d77a;
+.settings button[aria-pressed='true'] {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
-.view__field input[type='checkbox']:focus-visible {
-  outline: 2px solid #f8d77a;
-  outline-offset: 2px;
-}
-
-.view__help {
-  margin: 0;
+.settings__warning {
+  padding: 0.2rem 0.45rem;
+  border-radius: var(--radius-sm);
+  background: var(--warn-soft);
+  color: var(--warn);
   font-size: 0.75rem;
-  color: #9aa3b2;
+  font-weight: 650;
 }
 
-.view__error {
-  margin: 0;
-  font-size: 0.75rem;
-  color: #f2b879;
+.settings .settings__error {
+  color: var(--danger);
 }
 
-.view__definitions {
-  margin: 0;
-  display: grid;
-  grid-template-columns: max-content 1fr;
-  column-gap: 1rem;
-  row-gap: 0.375rem;
-  font-size: 0.875rem;
+.settings__error:empty {
+  display: none;
 }
 
-.view__definition {
-  display: contents;
+.settings pre {
+  padding: 0.75rem;
+  overflow: auto;
+  background: var(--bg-subtle);
+  border-radius: var(--radius-sm);
+  font: 0.8125rem/1.5 var(--font-mono);
 }
 
-.view__definition dt {
-  color: #9aa3b2;
-}
-
-.view__definition dd {
-  margin: 0;
-  color: #e6e8ec;
-}
-
-.view__footer {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  font-size: 0.8125rem;
-  border-top: 1px solid rgba(255, 255, 255, 0.08);
-  padding-top: 0.75rem;
-}
-
-.view__muted {
-  color: #9aa3b2;
-}
-
-.view__version {
-  color: #e6e8ec;
+@media (max-width: 850px) {
+  .settings {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 </style>

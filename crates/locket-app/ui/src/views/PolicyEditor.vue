@@ -353,8 +353,8 @@ function startDelete(): void {
 
 <style scoped>
 .view {
-  background: #0f1115;
-  color: #e6e8ec;
+  background: var(--bg-surface);
+  color: var(--text-primary);
   padding: 1rem;
   border-radius: 0.5rem;
 }
@@ -389,7 +389,7 @@ function startDelete(): void {
 }
 
 .view__search-label {
-  color: #9aa3b2;
+  color: var(--text-secondary);
   font-size: 0.75rem;
   font-weight: 600;
   letter-spacing: 0.04em;
@@ -400,38 +400,38 @@ function startDelete(): void {
   box-sizing: border-box;
   width: 100%;
   min-height: 2rem;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border: 1px solid var(--border-strong);
   border-radius: 0.375rem;
-  background: rgba(255, 255, 255, 0.05);
-  color: #e6e8ec;
+  background: var(--bg-subtle);
+  color: var(--text-primary);
   font: inherit;
   padding: 0.375rem 0.625rem;
 }
 
 .view__search input:focus {
-  border-color: #f8d77a;
-  outline: 2px solid rgba(248, 215, 122, 0.24);
+  border-color: var(--accent);
+  outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
 
 .view__search input::placeholder {
-  color: #667085;
+  color: var(--text-muted);
 }
 
 .view__button {
   min-height: 2rem;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border: 1px solid var(--border-strong);
   border-radius: 0.375rem;
-  background: rgba(255, 255, 255, 0.05);
-  color: #e6e8ec;
+  background: var(--bg-subtle);
+  color: var(--text-primary);
   cursor: pointer;
   font: inherit;
   padding: 0.375rem 0.625rem;
 }
 
 .view__button:focus {
-  border-color: #f8d77a;
-  outline: 2px solid rgba(248, 215, 122, 0.24);
+  border-color: var(--accent);
+  outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
 
@@ -441,22 +441,22 @@ function startDelete(): void {
 }
 
 .view__button--danger {
-  border-color: rgba(217, 101, 112, 0.4);
-  color: #f08a90;
+  border-color: var(--danger);
+  color: var(--danger);
 }
 
 .view__loading,
 .view__empty {
   margin: 0;
   font-size: 0.875rem;
-  color: #9aa3b2;
+  color: var(--text-secondary);
 }
 
 .view__empty code,
 .policy-detail__command {
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--bg-subtle);
   border-radius: 0.25rem;
-  color: #e6e8ec;
+  color: var(--text-primary);
   font-size: 0.8125rem;
 }
 
@@ -481,7 +481,7 @@ function startDelete(): void {
 .view__table td {
   text-align: left;
   padding: 0.5rem 0.75rem;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  border-bottom: 1px solid var(--border-subtle);
   vertical-align: top;
 }
 
@@ -490,7 +490,7 @@ function startDelete(): void {
   font-weight: 600;
   letter-spacing: 0.04em;
   text-transform: uppercase;
-  color: #9aa3b2;
+  color: var(--text-secondary);
 }
 
 .view__row {
@@ -499,11 +499,11 @@ function startDelete(): void {
 
 .view__row:hover,
 .view__row--selected {
-  background: rgba(255, 255, 255, 0.04);
+  background: var(--bg-subtle);
 }
 
 .view__row:focus {
-  outline: 2px solid #f8d77a;
+  outline: 2px solid var(--accent);
   outline-offset: -2px;
 }
 
@@ -512,7 +512,7 @@ function startDelete(): void {
 }
 
 .view__muted {
-  color: #9aa3b2;
+  color: var(--text-secondary);
 }
 
 .view__badges {
@@ -527,27 +527,27 @@ function startDelete(): void {
   border-radius: 0.375rem;
   font-size: 0.75rem;
   letter-spacing: 0.02em;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(255, 255, 255, 0.04);
-  color: #e6e8ec;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-subtle);
+  color: var(--text-primary);
   white-space: nowrap;
 }
 
 .badge--ok {
-  background: rgba(170, 230, 200, 0.1);
-  border-color: rgba(170, 230, 200, 0.28);
-  color: #b8e6c8;
+  background: var(--success-soft);
+  border-color: var(--border-strong);
+  color: var(--success);
 }
 
 .badge--warning {
-  background: rgba(248, 215, 122, 0.12);
-  border-color: rgba(248, 215, 122, 0.32);
-  color: #f8d77a;
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 .badge--gate,
 .badge--neutral {
-  color: #9aa3b2;
+  color: var(--text-secondary);
 }
 
 .policy-detail {
@@ -555,7 +555,7 @@ function startDelete(): void {
   flex-direction: column;
   gap: 0.875rem;
   padding: 0.875rem;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--border-subtle);
   border-radius: 0.5rem;
 }
 
@@ -572,7 +572,7 @@ function startDelete(): void {
   font-size: 0.75rem;
   letter-spacing: 0.04em;
   text-transform: uppercase;
-  color: #9aa3b2;
+  color: var(--text-secondary);
 }
 
 .policy-detail__grid,
@@ -596,7 +596,7 @@ function startDelete(): void {
 }
 
 .policy-detail dt {
-  color: #9aa3b2;
+  color: var(--text-secondary);
   font-size: 0.75rem;
 }
 

@@ -7,12 +7,7 @@
 export interface ProfileEntry {
   /** Profile name (free-form). Used as the unique key. */
   name: string;
-  /**
-   * Whether the agent has flagged this profile as dangerous. Only the
-   * active profile's flag is reachable via `agent_read_config`; other
-   * entries default to `false` and the agent enforces the real gate
-   * server-side.
-   */
+  /** Whether the agent has flagged this profile as dangerous. */
   dangerous: boolean;
 }
 
@@ -21,12 +16,9 @@ export interface ProfileSwitchState {
   activeProfile: string | null;
   /** Whether the active profile is currently flagged dangerous. */
   activeDangerous: boolean;
-  /**
-   * Local cache of recently used target profile names. The desktop has
-   * no enumeration RPC today, so the view tracks names typed/used by
-   * the user in this session and surfaces them as quick-switch entries.
-   */
+  /** Local cache of recently used target profile names. */
   recentTargets: string[];
+  knownProfiles?: ProfileEntry[];
 }
 
 /** Build the renderable entry list. Active profile is always first. */
@@ -36,6 +28,11 @@ export function profileEntries(state: ProfileSwitchState): ProfileEntry[] {
   if (state.activeProfile !== null && state.activeProfile.length > 0) {
     out.push({ name: state.activeProfile, dangerous: state.activeDangerous });
     seen.add(state.activeProfile);
+  }
+  for (const entry of state.knownProfiles ?? []) {
+    if (!entry.name || seen.has(entry.name)) continue;
+    out.push(entry);
+    seen.add(entry.name);
   }
   for (const target of state.recentTargets) {
     if (target.length === 0 || seen.has(target)) {

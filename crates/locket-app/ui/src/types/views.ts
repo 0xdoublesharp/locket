@@ -1,3 +1,5 @@
+import type { DangerousProfileSetting, EffectiveUserVerificationSettings } from '../agent/types';
+
 // Prop types for the metadata-only desktop views in `src/views/`.
 // These mirror the Rust descriptor inventory in `crates/locket-app/src/lib.rs`
 // and are kept in sync with the desktop UI spec.
@@ -123,7 +125,16 @@ export interface ScanFindingRow {
 export interface SettingsState {
   privacyRedactNames: boolean;
   unlockTtlSeconds: number;
-  requireUserVerification: boolean;
+  unlockTtl: string | null;
+  verification: EffectiveUserVerificationSettings | null;
+  dangerousProfile: DangerousProfileSetting | null;
   dangerousProfileFlag: boolean;
   agentVersion: string;
+}
+
+export interface PaletteAction {
+  id: string;
+  label: string;
+  detail?: string;
+  keywords?: string;
 }

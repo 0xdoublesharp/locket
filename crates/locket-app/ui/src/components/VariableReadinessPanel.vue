@@ -117,11 +117,11 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .readiness {
-  background: #0f1115;
-  border: 1px solid #343a44;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
   border-radius: 0.5rem;
   padding: 1rem;
-  color: #e6e8ec;
+  color: var(--text-primary);
 }
 header,
 .readiness__row {
@@ -138,7 +138,7 @@ h4 {
 }
 button {
   background: transparent;
-  border: 1px solid #59616d;
+  border: 1px solid var(--text-muted);
   border-radius: 0.375rem;
   color: inherit;
   padding: 0.4rem 0.75rem;
@@ -160,16 +160,16 @@ ul {
   gap: 0.75rem;
 }
 li {
-  border-top: 1px solid #343a44;
+  border-top: 1px solid var(--border-subtle);
   padding-top: 0.5rem;
 }
 .readiness__row span,
 .readiness__context {
-  color: #aab3c0;
+  color: var(--text-secondary);
   font-size: 0.85rem;
 }
 .readiness__warning {
-  color: #f8d77a;
+  color: var(--accent);
 }
 .readiness__policy {
   margin-top: 1rem;

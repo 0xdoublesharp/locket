@@ -1,0 +1,201 @@
+<script setup lang="ts">
+import { computed, onScopeDispose, ref, watch } from 'vue';
+import { actionError, discoverSecrets } from '../agent/client';
+import type { DiscoveredSecretWire } from '../agent/types';
+import CopyReference from '../components/CopyReference.vue';
+import { createRequestLifetime } from '../utils/requestLifetime';
+
+const props = defineProps<{
+  privacyMode: boolean;
+  knownProjectIds: string[];
+}>();
+const emit = defineEmits<{ openProject: [row: DiscoveredSecretWire] }>();
+
+const query = ref('');
+const tag = ref('');
+const owner = ref('');
+const rows = ref<DiscoveredSecretWire[]>([]);
+const loading = ref(false);
+const error = ref('');
+const requests = createRequestLifetime();
+const limit = 200;
+const filters = computed(() =>
+  props.privacyMode
+    ? {}
+    : {
+        ...(query.value.trim() && { query: query.value.trim() }),
+        ...(tag.value.trim() && { tag: tag.value.trim() }),
+        ...(owner.value.trim() && { owner: owner.value.trim() }),
+      },
+);
+
+async function search(): Promise<void> {
+  const isCurrent = requests.begin();
+  rows.value = [];
+  error.value = '';
+  loading.value = true;
+  const result = await discoverSecrets({
+    ...filters.value,
+    redact_names: props.privacyMode,
+    limit,
+  });
+  if (!isCurrent()) return;
+  if (result.ok) rows.value = result.value;
+  else error.value = actionError(result.error);
+  loading.value = false;
+}
+
+watch(
+  () => props.privacyMode,
+  (redacted) => {
+    if (redacted) query.value = tag.value = owner.value = '';
+    void search();
+  },
+  { immediate: true, flush: 'sync' },
+);
+onScopeDispose(requests.dispose);
+
+function canOpenProject(row: DiscoveredSecretWire): boolean {
+  return (
+    props.knownProjectIds.includes(row.project_id) ||
+    (!props.privacyMode && row.trusted_roots.length > 0)
+  );
+}
+</script>
+
+<template>
+  <section class="discovery" aria-labelledby="discovery-title">
+    <header>
+      <h2 id="discovery-title">Discover across projects</h2>
+      <p>Find variables by name, tag, or owner, including variables in the shared vault.</p>
+    </header>
+
+    <form v-if="!privacyMode" class="discovery__filters" @submit.prevent="search">
+      <label>Search <input v-model="query" type="search" placeholder="Name or keyword" /></label>
+      <label>Tag <input v-model="tag" type="text" placeholder="Any tag" /></label>
+      <label>Owner <input v-model="owner" type="text" placeholder="Any owner" /></label>
+      <button class="companion-button" type="submit">Search all projects</button>
+    </form>
+    <p v-else>Turn off name redaction in Settings to search by name, tag, or owner.</p>
+
+    <p v-if="loading" role="status">Searching projects…</p>
+    <div v-else-if="error" class="discovery__error" role="alert">
+      <p>{{ error }}</p>
+      <button class="companion-button" type="button" @click="search">Retry</button>
+    </div>
+    <p v-else-if="rows.length === 0" role="status">No matching variables across projects.</p>
+    <template v-else>
+      <p role="status">
+        {{
+          rows.length === limit
+            ? `Showing the first ${limit} results`
+            : `${rows.length} ${rows.length === 1 ? 'result' : 'results'}`
+        }}
+      </p>
+      <ul class="discovery__list">
+        <li v-for="row in rows" :key="row.secret_id">
+          <div>
+            <strong>{{ row.name }}</strong>
+            <p>
+              {{ row.project_name }} <span aria-hidden="true">/</span> {{ row.profile }}
+              <span v-if="row.dangerous" class="discovery__warning">Dangerous</span>
+            </p>
+            <p v-if="!privacyMode && (row.owner || row.tags.length)">
+              {{ [row.owner, ...row.tags].filter(Boolean).join(' · ') }}
+            </p>
+          </div>
+          <div class="discovery__actions">
+            <CopyReference :reference="privacyMode ? null : row.reference" />
+            <button
+              v-if="canOpenProject(row)"
+              class="companion-button"
+              type="button"
+              @click="emit('openProject', row)"
+            >
+              Open project
+            </button>
+            <small v-else-if="!privacyMode">No local folder</small>
+          </div>
+        </li>
+      </ul>
+    </template>
+  </section>
+</template>
+
+<style scoped>
+.discovery {
+  display: grid;
+  gap: 0.875rem;
+}
+.discovery h2,
+.discovery p {
+  margin: 0;
+}
+.discovery p,
+.discovery small {
+  color: var(--text-secondary);
+}
+.discovery header p {
+  margin-top: 0.35rem;
+}
+.discovery__filters,
+.discovery__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 0.5rem;
+}
+.discovery__filters label {
+  display: grid;
+  flex: 1 1 8rem;
+  gap: 0.25rem;
+  font-size: 0.875rem;
+}
+.discovery__filters input {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  min-height: 2.125rem;
+  padding: 0.35rem 0.6rem;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font: inherit;
+}
+.discovery__error p {
+  color: var(--danger);
+}
+.discovery__list {
+  display: grid;
+  gap: 0.5rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.discovery__list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+  padding: 0.75rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  overflow-wrap: anywhere;
+}
+.discovery__list strong {
+  font-family: var(--font-mono);
+}
+.discovery__list p {
+  font-size: 0.85rem;
+}
+.discovery__warning {
+  margin-left: 0.4rem;
+  padding: 0.1rem 0.4rem;
+  border-radius: var(--radius-sm);
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+</style>

@@ -65,9 +65,9 @@ const nextAction = computed<string>(() => {
 
 <style>
 .agent-banner {
-  background: rgba(255, 196, 0, 0.08);
-  border: 1px solid rgba(255, 196, 0, 0.32);
-  color: #f8d77a;
+  background: var(--warn-soft);
+  border: 1px solid var(--warn);
+  color: var(--accent);
   padding: 1rem 1.25rem;
   border-radius: 0.5rem;
   max-width: 420px;
@@ -84,10 +84,10 @@ const nextAction = computed<string>(() => {
 .agent-banner__action {
   margin: 0.25rem 0 0;
   font-size: 0.875rem;
-  color: #e6e8ec;
+  color: var(--text-primary);
 }
 
 .agent-banner__action {
-  color: #9aa3b2;
+  color: var(--text-secondary);
 }
 </style>

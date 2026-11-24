@@ -2,6 +2,14 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import {
   desktopListProjects,
+  desktopGetLaunchAtLogin,
+  desktopSetLaunchAtLogin,
+  desktopPickDirectory,
+  desktopPickFile,
+  desktopCopyTextPlain,
+  desktopMcpConfigSnippet,
+  discoverSecrets,
+  listProjects,
   desktopOpenProject,
   desktopInitializeProject,
   desktopImportEnv,
@@ -42,6 +50,31 @@ describe('typed desktop operations', () => {
     expect(invoke).toHaveBeenLastCalledWith('desktop_run_policy', {
       request: { project_id: 'fixture', policy_name: 'dev' },
     });
+  });
+  it('keeps companion and discovery IPC payloads exact', async () => {
+    const discover = { query: 'postmark', tag: 'email', owner: 'messaging', redact_names: false };
+    const list = { redact_names: true };
+    await desktopGetLaunchAtLogin();
+    await desktopSetLaunchAtLogin(true);
+    await desktopPickDirectory('Project folder');
+    await desktopPickFile({ title: 'Export backup', save: true, defaultName: 'locket-backup.lkb' });
+    await desktopCopyTextPlain('lk://dev/POSTMARK_TOKEN');
+    await desktopMcpConfigSnippet();
+    await discoverSecrets(discover);
+    await listProjects(list);
+    expect(vi.mocked(invoke).mock.calls).toEqual([
+      ['desktop_get_launch_at_login', {}],
+      ['desktop_set_launch_at_login', { enabled: true }],
+      ['desktop_pick_directory', { title: 'Project folder' }],
+      [
+        'desktop_pick_file',
+        { title: 'Export backup', save: true, defaultName: 'locket-backup.lkb' },
+      ],
+      ['desktop_copy_text_plain', { text: 'lk://dev/POSTMARK_TOKEN' }],
+      ['desktop_mcp_config_snippet', {}],
+      ['agent_discover_secrets', { request: discover }],
+      ['agent_list_projects', { request: list }],
+    ]);
   });
   it('saves a single durable policy and confirmation', async () => {
     const request = {

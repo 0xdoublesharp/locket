@@ -3,12 +3,23 @@ import { computed, onBeforeUnmount, onMounted, onUnmounted, ref, watch } from 'v
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 
+import PathBrowse from './components/PathBrowse.vue';
+import CommandPalette from './components/CommandPalette.vue';
+import CopyReference from './components/CopyReference.vue';
+import DiscoverSecrets from './views/DiscoverSecrets.vue';
+import { secretReference } from './secret/reference';
 import AgentUnavailableBanner from './components/AgentUnavailableBanner.vue';
 import PolicyEditorForm from './components/PolicyEditorForm.vue';
 import ProfileSwitcherView from './views/ProfileSwitcherView.vue';
 import RevealModal from './components/RevealModal.vue';
 import UnlockModal from './components/UnlockModal.vue';
-import { auditHealth, auditRowVerified, unlockTtl, projectStatusMatches } from './dashboard/health';
+import {
+  auditHealth,
+  auditRowVerified,
+  configuredDurationSeconds,
+  unlockTtl,
+  projectStatusMatches,
+} from './dashboard/health';
 import { scopedProjectContext, actionAvailability } from './dashboard/context';
 import {
   captureSelection,
@@ -24,12 +35,16 @@ import {
   listAudit,
   listDeviceMembers,
   listPolicies,
+  listProjects,
   listRuntimeSessions,
   listSecrets,
   listVersions,
   lockVault,
   readConfig,
   recoveryRotate,
+  desktopActionsAvailable,
+  desktopCopyTextPlain,
+  previewParams,
   desktopListProjects,
   desktopOpenProject,
   desktopInitializeProject,
@@ -78,6 +93,7 @@ import type {
   CommandPolicyRow,
   DeviceMemberRow,
   RuntimeSessionRow,
+  PaletteAction,
   SecretRowMeta,
   SettingsState,
   VersionHistoryRow,
@@ -85,6 +101,7 @@ import type {
 import type {
   AgentClientError,
   AgentConfigSettings,
+  DiscoveredSecretWire,
   AuditChainStatus,
   AuditWireRow,
   ListAuditRequest,
@@ -101,6 +118,7 @@ import { createRequestLifetime } from './utils/requestLifetime';
 type ViewKey =
   | 'dashboard'
   | 'secrets'
+  | 'discover'
   | 'secret-editor'
   | 'versions'
   | 'execution'
@@ -129,7 +147,7 @@ const projectConnected = computed(
 );
 const projectPath = ref('');
 const knownProjects = ref<DesktopProjectContext[]>([]);
-const desktopAvailable = isTauri();
+const desktopAvailable = desktopActionsAvailable();
 const desktopBusy = ref(false);
 const desktopError = ref<string | null>(null);
 const desktopNotice = ref<string | null>(null);
@@ -147,6 +165,7 @@ useTray(status, error);
 
 const connectionLabel = computed<string>(() => {
   if (!connected.value) {
+    if (desktopAvailable && loading.value) return 'Connecting…';
     return desktopAvailable ? 'Disconnected' : 'Desktop required';
   }
   if (lastSeenAt.value === null) {
@@ -173,7 +192,24 @@ function formatLastSeen(iso: string): string {
   return `${minutes.toString()}m ago`;
 }
 
-const currentView = ref<ViewKey>('dashboard');
+const previewViews: ViewKey[] = [
+  'dashboard',
+  'secrets',
+  'discover',
+  'secret-editor',
+  'policies',
+  'execution',
+  'audit',
+  'team',
+  'recovery',
+  'settings',
+];
+const currentView = ref<ViewKey>(
+  previewViews.find((view) => view === previewParams?.get('view')) ?? 'dashboard',
+);
+const paletteOpen = ref(previewParams?.get('modal') === 'palette');
+const paletteMessage = ref('');
+const metadataClipboardRequests = createRequestLifetime();
 const revealModal = ref<InstanceType<typeof RevealModal> | null>(null);
 const copyError = ref<string | null>(null);
 const revealError = ref<string | null>(null);
@@ -207,9 +243,10 @@ const navGroups: ReadonlyArray<{
   },
 ];
 const secondaryItems = computed<Array<{ key: ViewKey; label: string }>>(() => {
-  if (['secrets', 'secret-editor', 'versions'].includes(currentView.value))
+  if (['secrets', 'discover', 'secret-editor', 'versions'].includes(currentView.value))
     return [
       { key: 'secrets', label: 'Variables' },
+      { key: 'discover', label: 'Discover' },
       { key: 'secret-editor', label: 'Import or add' },
       ...(selectedSecret.value
         ? [{ key: 'versions' as const, label: 'Selected variable history' }]
@@ -318,6 +355,9 @@ watch([secrets, policies, sessions], () => {
 });
 const settingsLoading = ref<boolean>(false);
 const settingsError = ref<string | null>(null);
+const settingsNotice = ref<string | null>(null);
+const settingsReady = ref(false);
+const settingsRequests = createRequestLifetime();
 const auditLoading = ref<boolean>(false);
 const auditError = ref<string | null>(null);
 const auditLastRefreshed = ref<string | undefined>(undefined);
@@ -360,7 +400,9 @@ const secretRows = computed<SecretRowMeta[]>(() =>
 const settings = ref<SettingsState>({
   privacyRedactNames: false,
   unlockTtlSeconds: 900,
-  requireUserVerification: false,
+  unlockTtl: null,
+  verification: null,
+  dangerousProfile: null,
   dangerousProfileFlag: false,
   agentVersion: status.value?.agent_version ?? 'unknown',
 });
@@ -400,41 +442,14 @@ watch(
   { immediate: true },
 );
 
-function applySettingsPatch(patch: Partial<SettingsState>): void {
-  settings.value = { ...settings.value, ...patch };
-}
-
-function durationSeconds(value: string | null): number {
-  if (value === null) {
-    return 0;
-  }
-  const match = /^(\d+)(ms|s|m|h)?$/.exec(value.trim());
-  if (match === null) {
-    return 0;
-  }
-  const amount = Number.parseInt(match[1] ?? '0', 10);
-  switch (match[2] ?? 's') {
-    case 'ms':
-      return Math.ceil(amount / 1000);
-    case 'm':
-      return amount * 60;
-    case 'h':
-      return amount * 3600;
-    default:
-      return amount;
-  }
-}
-
-function verificationRequired(settings: AgentConfigSettings): boolean {
-  return Object.values(settings.user_verification_required_for).some((value) => value);
-}
-
 function applyAgentConfig(config: AgentConfigSettings): void {
   settings.value = {
     ...settings.value,
     privacyRedactNames: config.privacy_redact_names,
-    unlockTtlSeconds: durationSeconds(config.agent_unlock_ttl),
-    requireUserVerification: verificationRequired(config),
+    unlockTtlSeconds: configuredDurationSeconds(config.agent_unlock_ttl) || 900,
+    unlockTtl: config.agent_unlock_ttl,
+    verification: config.user_verification_required_for,
+    dangerousProfile: config.dangerous_profile,
     dangerousProfileFlag: config.dangerous_profile?.dangerous ?? false,
     agentVersion: status.value?.agent_version ?? settings.value.agentVersion,
   };
@@ -453,53 +468,66 @@ function settingsErrorLabel(error: AgentClientError): string {
   }
 }
 
+const settingsContextKey = computed(() =>
+  JSON.stringify([
+    selectionGeneration.value,
+    status.value?.project_id,
+    status.value?.profile_name,
+    status.value?.lock_state,
+  ]),
+);
+
 async function refreshSettings(): Promise<void> {
+  const isCurrent = settingsRequests.begin();
+  settingsReady.value = false;
   settingsLoading.value = true;
   settingsError.value = null;
+  settingsNotice.value = null;
   const currentStatus = status.value;
   const result = await readConfig({
     project_id: currentStatus?.project_id ?? null,
     profile_name: currentStatus?.profile_name ?? null,
   });
+  if (!isCurrent()) return;
   if (result.ok) {
     applyAgentConfig(result.value);
+    settingsReady.value = true;
   } else {
     settingsError.value = settingsErrorLabel(result.error);
   }
   settingsLoading.value = false;
 }
 
-async function handleSettingsPatch(patch: Partial<SettingsState>): Promise<void> {
-  applySettingsPatch(patch);
-
-  if (!('privacyRedactNames' in patch)) {
-    return;
-  }
+async function handleSettingsPatch(changes: WriteConfigChanges): Promise<void> {
+  if (settingsLoading.value) return;
   const projectId = status.value?.project_id;
-  if (projectId === null || projectId === undefined) {
+  if (!projectId) {
+    if (typeof changes.privacy_redact_names === 'boolean') {
+      settings.value.privacyRedactNames = changes.privacy_redact_names;
+    }
     return;
   }
-  const changes: WriteConfigChanges = {
-    privacy_redact_names: patch.privacyRedactNames ?? false,
-  };
+  if (!settingsReady.value || status.value?.lock_state !== 'unlocked') return;
+  const isCurrent = settingsRequests.begin();
   settingsLoading.value = true;
   settingsError.value = null;
+  settingsNotice.value = null;
   const result = await writeConfig({
     project_id: projectId,
     profile_name: status.value?.profile_name ?? null,
     changes,
   });
+  if (!isCurrent()) return;
   if (result.ok) {
     applyAgentConfig(result.value.settings);
+    settingsNotice.value = changes.agent_unlock_ttl
+      ? 'Vault session duration saved.'
+      : 'Settings saved.';
   } else {
     settingsError.value = settingsErrorLabel(result.error);
   }
   settingsLoading.value = false;
 }
-
-const settingsContextKey = computed<string>(
-  () => `${status.value?.project_id ?? ''}:${status.value?.profile_name ?? ''}`,
-);
 
 watch(
   status,
@@ -517,7 +545,7 @@ watch(
   () => {
     void refreshSettings();
   },
-  { immediate: true },
+  { immediate: true, flush: 'sync' },
 );
 
 function selectView(key: ViewKey): void {
@@ -566,6 +594,104 @@ async function handleTrayMenuAction(action: TrayMenuAction): Promise<void> {
 }
 
 const selectedSecret = ref<SecretRowMeta | null>(null);
+const selectedReference = computed(() =>
+  selectedSecret.value
+    ? secretReference(
+        activeContext.value?.profile_name,
+        selectedSecret.value.name,
+        settings.value.privacyRedactNames,
+      )
+    : null,
+);
+const copyNotice = ref<string | null>(null);
+const copyRequests = createRequestLifetime();
+
+type RunnablePaletteAction = PaletteAction & { run: () => void | Promise<void> };
+const paletteActions = computed<RunnablePaletteAction[]>(() => {
+  const redact = settings.value.privacyRedactNames;
+  const views = navGroups
+    .flatMap((group) => group.items)
+    .concat({ key: 'discover', label: 'Discover' });
+  const actions: RunnablePaletteAction[] = views.map(({ key, label }) => ({
+    id: `view:${key}`,
+    label,
+    detail: 'View',
+    run: () => selectView(key),
+  }));
+  if (projectConnected.value) {
+    const unlocked = status.value?.lock_state === 'unlocked';
+    actions.push({
+      id: 'vault',
+      label: unlocked ? 'Lock vault' : 'Unlock vault',
+      run: () => handleTrayMenuAction(unlocked ? 'lock-vault' : 'unlock-vault'),
+    });
+  }
+  actions.push({
+    id: 'add-variable',
+    label: 'Add variable',
+    run: () => selectView('secret-editor'),
+  });
+  knownProjects.value.forEach((project, index) => {
+    actions.push({
+      id: `project:${index}`,
+      label: redact ? `Project ${index + 1}` : project.project_name,
+      detail: redact ? 'Open project' : project.root,
+      keywords: 'open project',
+      run: async () => {
+        if (await connectProject(false, project.root)) selectView('dashboard');
+      },
+    });
+  });
+  if (!secretAccess.value.enabled) return actions;
+  secretRows.value.forEach((row, index) => {
+    const name = secretLabel(row, redact);
+    actions.push({
+      id: `variable:${index}`,
+      label: name,
+      detail: 'Variable details',
+      run: () => selectSecret(row),
+    });
+    const reference = secretReference(activeContext.value?.profile_name, row.name, redact);
+    if (reference) {
+      actions.push({
+        id: `reference:${index}`,
+        label: `Copy ${reference}`,
+        detail: 'Variable reference',
+        run: async () => {
+          const isCurrent = metadataClipboardRequests.begin();
+          const result = await desktopCopyTextPlain(reference);
+          if (!isCurrent()) return;
+          paletteMessage.value = result.ok ? `Copied ${reference}` : 'Could not copy reference.';
+        },
+      });
+    }
+  });
+  return actions;
+});
+
+function runPaletteAction(id: string): void {
+  paletteMessage.value = '';
+  void paletteActions.value.find((action) => action.id === id)?.run();
+}
+
+watch(
+  [settingsContextKey, () => settings.value.privacyRedactNames],
+  () => {
+    metadataClipboardRequests.invalidate();
+    paletteMessage.value = '';
+    copyRequests.invalidate();
+    copyNotice.value = null;
+    copyError.value = null;
+  },
+  { flush: 'sync' },
+);
+
+async function openDiscoveredProject(row: DiscoveredSecretWire): Promise<void> {
+  const root =
+    knownProjects.value.find((project) => project.project_id === row.project_id)?.root ??
+    (settings.value.privacyRedactNames ? undefined : row.trusted_roots[0]);
+  if (root && (await connectProject(false, root))) selectView('dashboard');
+}
 
 function selectSecret(row?: SecretRowMeta): void {
   if (row !== undefined) {
@@ -749,7 +875,9 @@ function revealErrorLabel(err: AgentClientError): string {
 }
 
 async function handleCopySelectedSecret(): Promise<void> {
+  const isCurrent = copyRequests.begin();
   copyError.value = null;
+  copyNotice.value = null;
   const target = selectedSecret.value;
   if (target === null) {
     copyError.value = 'Select a secret in the list before copying.';
@@ -763,19 +891,22 @@ async function handleCopySelectedSecret(): Promise<void> {
   const approved = settings.value.dangerousProfileFlag
     ? await confirmDangerousAction('Copy secret')
     : false;
-  if (approved === undefined) return;
+  if (approved === undefined || !isCurrent()) return;
   const result = await copySecret({
     secret_name: target.name,
     ...(approved && { confirm_dangerous: true }),
     profile_id: profileId,
     project_id: status.value?.project_id ?? undefined,
   });
+  if (!isCurrent()) return;
   if (!result.ok) {
     copyError.value = revealErrorLabel(result.error);
     return;
   }
   if (result.value.kind === 'unsupported') {
     copyError.value = `Clipboard unavailable: ${result.value.unsupported_reason}.`;
+  } else {
+    copyNotice.value = 'Copied value temporarily.';
   }
 }
 
@@ -1007,6 +1138,26 @@ const profileSwitchState = ref<ProfileSwitchState>({
 const profileSwitchInProgress = ref<boolean>(false);
 const profileSwitchError = ref<string | null>(null);
 const profileSwitchLastAt = ref<string | undefined>(undefined);
+
+watch(
+  [currentView, settingsContextKey, () => settings.value.privacyRedactNames],
+  async ([view, context, redact], _previous, onCleanup) => {
+    profileSwitchState.value = { ...profileSwitchState.value, knownProfiles: [] };
+    const projectId = status.value?.project_id;
+    if (view !== 'profiles' || !projectId || redact) return;
+    let cancelled = false;
+    onCleanup(() => {
+      cancelled = true;
+    });
+    const result = await listProjects({ redact_names: false });
+    if (!result.ok || cancelled || context !== settingsContextKey.value) return;
+    const project = result.value.find((row) => row.project_id === projectId);
+    profileSwitchState.value = {
+      ...profileSwitchState.value,
+      knownProfiles: project?.profiles ?? [],
+    };
+  },
+);
 
 watch(
   [() => status.value?.profile_name ?? null, () => settings.value.dangerousProfileFlag],
@@ -1513,13 +1664,21 @@ async function handleEditorReveal(row: SecretRowMeta): Promise<void> {
   await handleRevealSelectedSecret();
 }
 
+async function handleListCopy(row: SecretRowMeta): Promise<void> {
+  if (!secretAccess.value.enabled) return;
+  selectedSecret.value = row;
+  await handleCopySelectedSecret();
+}
+
 async function refreshProjectConnections(): Promise<void> {
   const generation = selectionGeneration.value;
   const result = await desktopListProjects();
   if (result.ok) {
     knownProjects.value = result.value;
     if (generation !== selectionGeneration.value) return;
-    const initial = initialProjectSelection(result.value, selectedProject.value);
+    const initial = previewParams
+      ? result.value[0]
+      : initialProjectSelection(result.value, selectedProject.value);
     if (!selectedProject.value && initial) {
       await connectProject(false, initial.root);
     }
@@ -1527,8 +1686,8 @@ async function refreshProjectConnections(): Promise<void> {
     desktopError.value = actionError(result.error);
 }
 
-async function connectProject(initialize = false, path = projectPath.value): Promise<void> {
-  if (desktopBusy.value || !path.trim()) return;
+async function connectProject(initialize = false, path = projectPath.value): Promise<boolean> {
+  if (desktopBusy.value || !path.trim()) return false;
   selectionGeneration.value++;
   profileSwitchInProgress.value = false;
   profileSwitchError.value = null;
@@ -1539,15 +1698,17 @@ async function connectProject(initialize = false, path = projectPath.value): Pro
     ? await desktopInitializeProject({ path: path.trim() })
     : await desktopOpenProject({ path: path.trim() });
   if (result.ok) {
+    const showPreviewUnlock = !selectedProject.value && previewParams?.get('modal') === 'unlock';
     selectedProject.value = result.value;
     selectedSecret.value = null;
-    unlockOpen.value = false;
+    unlockOpen.value = showPreviewUnlock;
     projectPath.value = result.value.root;
-    desktopNotice.value = `Connected to ${result.value.project_name}.`;
+    desktopNotice.value = 'Project connected.';
     await refreshProjectConnections();
     await refresh();
   } else desktopError.value = actionError(result.error);
   desktopBusy.value = false;
+  return result.ok;
 }
 async function startAgent(): Promise<void> {
   if (desktopBusy.value) return;
@@ -1671,6 +1832,7 @@ watch(
 
 onMounted(() => {
   void refreshProjectConnections();
+  if (previewParams) return;
   void listen<TrayMenuAction>('tray-menu-action', (event) => {
     void handleTrayMenuAction(event.payload);
   })
@@ -1681,6 +1843,9 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  metadataClipboardRequests.dispose();
+  copyRequests.dispose();
+  settingsRequests.dispose();
   scanRequests.dispose();
   scanLaunching.value = false;
   scanError.value = null;
@@ -1760,6 +1925,18 @@ onUnmounted(() => {
     </aside>
 
     <main class="shell__main">
+      <div class="shell__topbar">
+        <button
+          type="button"
+          class="companion-button shell__palette-button"
+          aria-keyshortcuts="Meta+K Control+K"
+          aria-haspopup="dialog"
+          :disabled="unlockOpen || policyFormMode !== null"
+          @click="paletteOpen = true"
+        >
+          Search <kbd>⌘K</kbd>
+        </button>
+      </div>
       <AgentUnavailableBanner v-if="error" :error="error" />
       <p
         v-if="connected && agentStatus && !agentStatus.session_monitoring?.startsWith('active:')"
@@ -1821,6 +1998,12 @@ onUnmounted(() => {
               autocomplete="off"
               :disabled="desktopBusy || !desktopAvailable"
           /></label>
+          <PathBrowse
+            title="Browse for a project folder"
+            directory
+            :disabled="desktopBusy"
+            @pick="projectPath = $event"
+          />
           <button type="submit" :disabled="desktopBusy || !desktopAvailable || !projectPath.trim()">
             Open project
           </button>
@@ -1857,7 +2040,12 @@ onUnmounted(() => {
             >File path
             <input v-model="envPath" type="text" autocomplete="off" :disabled="desktopBusy"
           /></label>
-          <p>Paths are relative to the connected project. The original file remains in place.</p>
+          <PathBrowse
+            title="Browse for an env file"
+            :disabled="desktopBusy"
+            @pick="envPath = $event"
+          />
+          <p>Relative paths start in the connected project.</p>
           <details>
             <summary>Import options</summary>
             <label
@@ -1927,6 +2115,8 @@ onUnmounted(() => {
       <SecretMetadataList
         v-else-if="currentView === 'secrets'"
         :rows="secretRows"
+        :profile-name="activeContext?.profile_name"
+        :can-access-values="secretAccess.enabled"
         :privacy-mode="settings.privacyRedactNames"
         :loading="secretsLoading"
         :error-message="secretsError"
@@ -1934,7 +2124,16 @@ onUnmounted(() => {
         :metadata-loaded="secretAccess.enabled"
         :action-guidance="secretAccess.guidance"
         @select="selectSecret"
+        @copy-value="handleListCopy"
+        @reveal-value="handleEditorReveal"
         @refresh="refreshSecrets"
+      />
+
+      <DiscoverSecrets
+        v-else-if="currentView === 'discover'"
+        :privacy-mode="settings.privacyRedactNames || settingsLoading"
+        :known-project-ids="knownProjects.map((project) => project.project_id)"
+        @open-project="openDiscoveredProject"
       />
 
       <SecretEditorView
@@ -1954,15 +2153,25 @@ onUnmounted(() => {
         @reveal="handleEditorReveal"
       />
 
-      <SecretVersionHistory
-        v-else-if="currentView === 'versions'"
-        :rows="versions.filter((row) => row.secretName === selectedSecret?.name)"
-        :secret-label="secretLabel(selectedSecret, settings.privacyRedactNames)"
-        :loading="versionsLoading"
-        :error-message="versionsError"
-        :last-refreshed-at="versionsLastRefreshed"
-        @refresh="refreshVersions"
-      />
+      <template v-else-if="currentView === 'versions'">
+        <div
+          v-if="selectedSecret && secretAccess.enabled"
+          class="shell__toolbar"
+          aria-label="Variable actions"
+        >
+          <CopyReference :reference="selectedReference" />
+          <button type="button" @click="handleCopySelectedSecret">Copy value</button>
+          <button type="button" @click="handleRevealSelectedSecret">Reveal</button>
+        </div>
+        <SecretVersionHistory
+          :rows="versions.filter((row) => row.secretName === selectedSecret?.name)"
+          :secret-label="secretLabel(selectedSecret, settings.privacyRedactNames)"
+          :loading="versionsLoading"
+          :error-message="versionsError"
+          :last-refreshed-at="versionsLastRefreshed"
+          @refresh="refreshVersions"
+        />
+      </template>
 
       <ExecutionMonitor
         v-else-if="currentView === 'execution'"
@@ -2044,7 +2253,7 @@ onUnmounted(() => {
         :audit-rows="rawAuditRows"
         :dangerous-profiles="settings.dangerousProfileFlag ? (status?.profile_name ?? '') : ''"
         :confirm-dangerous="confirmDangerousAction"
-        :require-accept-user-verification="settings.requireUserVerification"
+        :require-accept-user-verification="settings.verification?.team_accept ?? false"
         :loading="auditLoading"
         :error-message="auditError"
         :last-refreshed-at="auditLastRefreshed"
@@ -2070,10 +2279,15 @@ onUnmounted(() => {
         :state="settings"
         :loading="settingsLoading"
         :error-message="settingsError"
+        :save-message="settingsNotice"
+        :can-edit-vault="settingsReady && status?.lock_state === 'unlocked'"
+        :project-connected="projectConnected"
         @update="handleSettingsPatch"
       />
 
       <p v-if="revealError" role="alert" class="shell__notice">{{ revealError }}</p>
+      <p v-if="paletteMessage" role="status" class="shell__notice">{{ paletteMessage }}</p>
+      <p v-if="copyNotice" role="status" class="shell__notice">{{ copyNotice }}</p>
       <p v-if="copyError" role="alert" class="shell__notice">{{ copyError }}</p>
     </main>
 
@@ -2085,6 +2299,12 @@ onUnmounted(() => {
         <button value="confirm">Allow action</button>
       </form>
     </dialog>
+    <CommandPalette
+      v-model:open="paletteOpen"
+      :actions="paletteActions"
+      :blocked="unlockOpen || policyFormMode !== null"
+      @execute="runPaletteAction"
+    />
     <RevealModal ref="revealModal" @invalidate="invalidateReveal" />
     <UnlockModal
       v-if="unlockOpen"
@@ -2110,29 +2330,24 @@ onUnmounted(() => {
 </template>
 
 <style>
-:root {
-  color-scheme: light dark;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-}
-
 body,
 html,
 #app {
   margin: 0;
   height: 100vh;
-  background: #0f1115;
-  color: #e6e8ec;
+  background: var(--bg-app);
+  color: var(--text-primary);
 }
 
 .shell {
   display: grid;
-  grid-template-columns: 220px 1fr;
+  grid-template-columns: 220px minmax(0, 1fr);
   min-height: 100vh;
 }
 
 .shell__nav {
-  background: #0b0d11;
-  border-right: 1px solid rgba(255, 255, 255, 0.06);
+  background: var(--bg-app);
+  border-right: 1px solid var(--border-subtle);
   padding: 1.25rem 0.875rem;
   display: flex;
   flex-direction: column;
@@ -2144,7 +2359,7 @@ html,
   font-size: 1rem;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: #f8d77a;
+  color: var(--accent);
 }
 
 .shell__status {
@@ -2154,7 +2369,7 @@ html,
   grid-template-columns: auto 1fr;
   column-gap: 0.5rem;
   row-gap: 0.25rem;
-  color: #9aa3b2;
+  color: var(--text-secondary);
 }
 
 .shell__status dt {
@@ -2163,7 +2378,7 @@ html,
 
 .shell__status dd {
   margin: 0;
-  color: #e6e8ec;
+  color: var(--text-primary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2189,19 +2404,19 @@ html,
 }
 
 .shell__connection--ok {
-  color: #8fd19e;
-  background: rgba(143, 209, 158, 0.12);
+  color: var(--success);
+  background: var(--success-soft);
 }
 
 .shell__connection--warn {
-  color: #f2b879;
-  background: rgba(242, 184, 121, 0.14);
+  color: var(--warn);
+  background: var(--warn-soft);
 }
 
 .shell__activity {
   margin-top: 1rem;
   padding-top: 0.875rem;
-  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  border-top: 1px solid var(--border-subtle);
 }
 
 .shell__activity-head {
@@ -2209,7 +2424,7 @@ html,
   justify-content: space-between;
   gap: 0.5rem;
   font-size: 0.7rem;
-  color: #9aa3b2;
+  color: var(--text-secondary);
 }
 
 .shell__activity dl {
@@ -2225,7 +2440,7 @@ html,
 
 .shell__activity dt {
   font-size: 0.68rem;
-  color: #9aa3b2;
+  color: var(--text-secondary);
 }
 
 .shell__activity dd {
@@ -2235,15 +2450,15 @@ html,
 }
 
 .shell__activity-value--ok {
-  color: #8fd19e;
+  color: var(--success);
 }
 
 .shell__activity-value--warn {
-  color: #f2b879;
+  color: var(--warn);
 }
 
 .shell__activity-value--neutral {
-  color: #e6e8ec;
+  color: var(--text-primary);
 }
 
 .shell__nav nav {
@@ -2267,7 +2482,7 @@ html,
 }
 
 .shell__nav-group-label {
-  color: #747d8c;
+  color: var(--text-muted);
   display: block;
   font-size: 0.68rem;
   font-weight: 700;
@@ -2284,23 +2499,23 @@ html,
   padding: 0.5rem 0.625rem;
   border-radius: 0.375rem;
   font-size: 0.875rem;
-  color: #c5cbd6;
+  color: var(--text-secondary);
   cursor: pointer;
 }
 
 .shell__nav-item:hover {
-  background: rgba(255, 255, 255, 0.04);
-  color: #e6e8ec;
+  background: var(--bg-subtle);
+  color: var(--text-primary);
 }
 
 .shell__nav-item:focus-visible {
-  outline: 2px solid #f8d77a;
+  outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 
 .shell__nav-item--active {
-  background: rgba(248, 215, 122, 0.12);
-  color: #f8d77a;
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
 .shell__main {
@@ -2311,6 +2526,35 @@ html,
   overflow: auto;
 }
 
+.shell__topbar {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.shell__palette-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.shell__palette-button kbd {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+}
+
+.shell dialog:not(.palette) {
+  max-width: min(28rem, 85vw);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  box-shadow: var(--shadow-lg);
+}
+
+.shell dialog:not(.palette)::backdrop {
+  background: var(--backdrop);
+}
+
 .shell__toolbar {
   display: flex;
   align-items: end;
@@ -2318,8 +2562,8 @@ html,
   flex-wrap: wrap;
 }
 .shell__panel {
-  background: #161a22;
-  border: 1px solid #303744;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
   border-radius: 0.5rem;
   padding: 1.1rem;
 }
@@ -2328,7 +2572,7 @@ html,
   margin-top: 0;
 }
 .shell__panel p {
-  color: #aeb7c6;
+  color: var(--text-secondary);
   font-size: 0.9rem;
 }
 .shell__panel label {
@@ -2343,9 +2587,9 @@ html,
 .shell__main input[type='text'],
 .shell__toolbar button,
 .shell__panel button {
-  background: #10141c;
-  color: #e6e8ec;
-  border: 1px solid #465064;
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  border: 1px solid var(--border-strong);
   border-radius: 0.35rem;
   padding: 0.55rem 0.75rem;
   font: inherit;
@@ -2355,8 +2599,8 @@ html,
   cursor: not-allowed;
 }
 .shell__toolbar button[aria-current='page'] {
-  border-color: #f8d77a;
-  color: #f8d77a;
+  border-color: var(--accent);
+  color: var(--accent);
 }
 .shell__toolbar:empty {
   display: none;
@@ -2369,12 +2613,37 @@ html,
     padding: 1rem;
   }
 }
+@media (max-width: 620px) {
+  .shell {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .shell__nav {
+    gap: 0.75rem;
+    padding: 0.85rem 1rem;
+    border-right: 0;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .shell__status {
+    grid-template-columns: auto minmax(0, 1fr) auto minmax(0, 1fr);
+  }
+  .shell__activity {
+    display: none;
+  }
+  .shell__nav nav ul {
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 0.25rem;
+  }
+  .shell__main {
+    gap: 1rem;
+  }
+}
 .shell__notice {
   margin: 0;
   padding: 0.5rem 0.75rem;
-  border: 1px solid rgba(248, 215, 122, 0.32);
-  background: rgba(248, 215, 122, 0.08);
-  color: #f8d77a;
+  border: 1px solid var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
   border-radius: 0.375rem;
   font-size: 0.85rem;
 }

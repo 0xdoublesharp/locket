@@ -29,6 +29,13 @@ export function auditRowVerified(
   if (chain.hmac_ok === null) return null;
   return chain.first_break_sequence !== null && sequence < chain.first_break_sequence;
 }
+export function configuredDurationSeconds(value: string | null): number {
+  const match = /^([1-9]\d*)([smhdw])$/.exec(value ?? '');
+  if (!match) return 0;
+  const units: Record<string, number> = { s: 1, m: 60, h: 3600, d: 86400, w: 604800 };
+  return Number(match[1]) * units[match[2]!]!;
+}
+
 export function unlockTtl(configured: number): number {
   return Number.isInteger(configured) && configured > 0 && configured <= 28800 ? configured : 900;
 }

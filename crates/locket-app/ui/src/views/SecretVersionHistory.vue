@@ -169,8 +169,8 @@ function refresh(): void {
 
 <style scoped>
 .view {
-  background: #0f1115;
-  color: #e6e8ec;
+  background: var(--bg-surface);
+  color: var(--text-primary);
   padding: 1rem;
   border-radius: 0.5rem;
 }
@@ -197,10 +197,10 @@ function refresh(): void {
 
 .view__button {
   min-height: 2rem;
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  border: 1px solid var(--border-strong);
   border-radius: 0.375rem;
-  background: rgba(255, 255, 255, 0.06);
-  color: #e6e8ec;
+  background: var(--bg-subtle);
+  color: var(--text-primary);
   cursor: pointer;
   font: inherit;
   font-size: 0.8125rem;
@@ -208,18 +208,18 @@ function refresh(): void {
 }
 
 .view__button:disabled {
-  color: #667085;
+  color: var(--text-muted);
   cursor: not-allowed;
 }
 
 .view__empty {
   margin: 0;
   font-size: 0.875rem;
-  color: #9aa3b2;
+  color: var(--text-secondary);
 }
 
 .view__error {
-  color: #ffb4a8;
+  color: var(--danger);
   margin: 0;
 }
 
@@ -233,13 +233,13 @@ function refresh(): void {
 .view__table td {
   text-align: left;
   padding: 0.5rem 0.75rem;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  border-bottom: 1px solid var(--border-subtle);
   vertical-align: top;
 }
 
 .view__table th {
   font-weight: 600;
-  color: #9aa3b2;
+  color: var(--text-secondary);
   font-size: 0.75rem;
   text-transform: uppercase;
   letter-spacing: 0.04em;
@@ -250,21 +250,21 @@ function refresh(): void {
 }
 
 .view__muted {
-  color: #9aa3b2;
+  color: var(--text-secondary);
 }
 
 .view__check {
-  color: #b8e6c8;
+  color: var(--success);
 }
 
 .view__cross {
-  color: #9aa3b2;
+  color: var(--text-secondary);
 }
 
 .view__expand {
-  background: rgba(255, 255, 255, 0.04);
-  color: #e6e8ec;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: var(--bg-subtle);
+  color: var(--text-primary);
+  border: 1px solid var(--border-subtle);
   border-radius: 0.375rem;
   padding: 0.125rem 0.5rem;
   font-size: 0.75rem;
@@ -272,22 +272,22 @@ function refresh(): void {
 }
 
 .view__expand:hover {
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--bg-subtle);
 }
 
 .view__expand:focus-visible {
-  outline: 2px solid #f8d77a;
+  outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 
 .view__detail {
-  background: rgba(255, 255, 255, 0.02);
+  background: var(--bg-subtle);
 }
 
 .view__detail-text {
   margin: 0;
   font-size: 0.8125rem;
-  color: #9aa3b2;
+  color: var(--text-secondary);
   white-space: pre-wrap;
 }
 
@@ -297,25 +297,25 @@ function refresh(): void {
   border-radius: 0.375rem;
   font-size: 0.75rem;
   letter-spacing: 0.02em;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(255, 255, 255, 0.04);
-  color: #e6e8ec;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-subtle);
+  color: var(--text-primary);
 }
 
 .badge--state-current {
-  background: rgba(170, 230, 200, 0.1);
-  border-color: rgba(170, 230, 200, 0.28);
-  color: #b8e6c8;
+  background: var(--success-soft);
+  border-color: var(--border-strong);
+  color: var(--success);
 }
 
 .badge--state-deprecated {
-  background: rgba(248, 215, 122, 0.12);
-  border-color: rgba(248, 215, 122, 0.32);
-  color: #f8d77a;
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 .badge--state-purged {
-  background: rgba(255, 255, 255, 0.04);
-  color: #9aa3b2;
+  background: var(--bg-subtle);
+  color: var(--text-secondary);
 }
 </style>

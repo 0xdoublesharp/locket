@@ -50,8 +50,8 @@ function onScan(): void {
 
 <style scoped>
 .view {
-  background: #0f1115;
-  color: #e6e8ec;
+  background: var(--bg-surface);
+  color: var(--text-primary);
   padding: 1rem;
   border-radius: 0.5rem;
 }
@@ -73,9 +73,9 @@ function onScan(): void {
 }
 
 .view__action {
-  background: rgba(255, 255, 255, 0.04);
-  color: #e6e8ec;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: var(--bg-subtle);
+  color: var(--text-primary);
+  border: 1px solid var(--border-subtle);
   border-radius: 0.375rem;
   padding: 0.25rem 0.75rem;
   font-size: 0.8125rem;
@@ -83,7 +83,7 @@ function onScan(): void {
 }
 
 .view__action:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--bg-subtle);
 }
 
 .view__action:disabled {
@@ -92,7 +92,7 @@ function onScan(): void {
 }
 
 .view__action:focus-visible {
-  outline: 2px solid #f8d77a;
+  outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 
@@ -100,14 +100,14 @@ function onScan(): void {
 .view__notice,
 .view__error {
   font-size: 0.875rem;
-  color: #9aa3b2;
+  color: var(--text-secondary);
 }
 
 .view__notice {
-  color: #f8d77a;
+  color: var(--accent);
 }
 
 .view__error {
-  color: #f4b3b3;
+  color: var(--danger);
 }
 </style>

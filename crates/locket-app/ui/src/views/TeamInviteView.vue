@@ -461,8 +461,8 @@ function statusBadge(status: TeamInviteRow['status']): string {
 
 <style scoped>
 .view {
-  background: #0f1115;
-  color: #e6e8ec;
+  background: var(--bg-surface);
+  color: var(--text-primary);
   padding: 1rem;
   border-radius: 0.5rem;
   display: flex;
@@ -489,8 +489,8 @@ function statusBadge(status: TeamInviteRow['status']): string {
   margin-left: auto;
 }
 .view__panel {
-  background: #11141a;
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
   border-radius: 0.5rem;
   padding: 0.875rem 1rem;
   display: flex;
@@ -502,7 +502,7 @@ function statusBadge(status: TeamInviteRow['status']): string {
   font-size: 0.85rem;
   letter-spacing: 0.04em;
   text-transform: uppercase;
-  color: #9aa3b2;
+  color: var(--text-secondary);
 }
 .view__field {
   display: flex;
@@ -513,9 +513,9 @@ function statusBadge(status: TeamInviteRow['status']): string {
 .view__field input,
 .view__field select,
 .view__field textarea {
-  background: #0f1115;
-  color: #e6e8ec;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  border: 1px solid var(--border-strong);
   border-radius: 0.375rem;
   padding: 0.4rem 0.6rem;
   font: inherit;
@@ -535,23 +535,23 @@ function statusBadge(status: TeamInviteRow['status']): string {
 .view__warn {
   margin: 0;
   padding: 0.5rem 0.625rem;
-  background: rgba(248, 215, 122, 0.08);
-  border: 1px solid rgba(248, 215, 122, 0.32);
-  color: #f8d77a;
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+  color: var(--accent);
   border-radius: 0.375rem;
   font-size: 0.8rem;
 }
 .view__notice {
   margin: 0;
   padding: 0.5rem 0.625rem;
-  background: rgba(120, 170, 255, 0.06);
-  border: 1px solid rgba(120, 170, 255, 0.2);
-  color: #a8c6ff;
+  background: var(--info-soft);
+  border: 1px solid var(--border-strong);
+  color: var(--info);
   border-radius: 0.375rem;
   font-size: 0.78rem;
 }
 .view__notice code {
-  background: rgba(255, 255, 255, 0.04);
+  background: var(--bg-subtle);
   padding: 0 0.25rem;
   border-radius: 0.25rem;
 }
@@ -562,10 +562,10 @@ function statusBadge(status: TeamInviteRow['status']): string {
 }
 .view__button {
   min-height: 2rem;
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  border: 1px solid var(--border-strong);
   border-radius: 0.375rem;
-  background: rgba(255, 255, 255, 0.06);
-  color: #e6e8ec;
+  background: var(--bg-subtle);
+  color: var(--text-primary);
   cursor: pointer;
   font: inherit;
   font-size: 0.8125rem;
@@ -576,28 +576,28 @@ function statusBadge(status: TeamInviteRow['status']): string {
   cursor: not-allowed;
 }
 .view__button--primary {
-  background: #f8d77a;
-  color: #1a1a1a;
+  background: var(--accent);
+  color: var(--accent-fg);
   border-color: transparent;
 }
 .view__button--danger {
-  background: #d96570;
-  color: #1a1a1a;
+  background: var(--danger);
+  color: var(--accent-fg);
   border-color: transparent;
 }
 .view__loading,
 .view__empty {
   margin: 0;
   font-size: 0.875rem;
-  color: #9aa3b2;
+  color: var(--text-secondary);
 }
 .view__error {
   margin: 0;
-  color: #f08a90;
+  color: var(--danger);
   font-size: 0.8rem;
 }
 .view__muted {
-  color: #9aa3b2;
+  color: var(--text-secondary);
 }
 .view__search {
   display: grid;
@@ -605,7 +605,7 @@ function statusBadge(status: TeamInviteRow['status']): string {
   min-width: min(18rem, 100%);
 }
 .view__search-label {
-  color: #9aa3b2;
+  color: var(--text-secondary);
   font-size: 0.75rem;
   font-weight: 600;
   letter-spacing: 0.04em;
@@ -615,10 +615,10 @@ function statusBadge(status: TeamInviteRow['status']): string {
   box-sizing: border-box;
   width: 100%;
   min-height: 2rem;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border: 1px solid var(--border-strong);
   border-radius: 0.375rem;
-  background: rgba(255, 255, 255, 0.05);
-  color: #e6e8ec;
+  background: var(--bg-subtle);
+  color: var(--text-primary);
   font: inherit;
   padding: 0.375rem 0.625rem;
 }
@@ -631,12 +631,12 @@ function statusBadge(status: TeamInviteRow['status']): string {
 .view__table td {
   text-align: left;
   padding: 0.5rem 0.75rem;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  border-bottom: 1px solid var(--border-subtle);
   vertical-align: top;
 }
 .view__table th {
   font-weight: 600;
-  color: #9aa3b2;
+  color: var(--text-secondary);
   font-size: 0.75rem;
   text-transform: uppercase;
   letter-spacing: 0.04em;
@@ -646,31 +646,31 @@ function statusBadge(status: TeamInviteRow['status']): string {
   padding: 0.125rem 0.5rem;
   border-radius: 0.375rem;
   font-size: 0.75rem;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(255, 255, 255, 0.04);
-  color: #e6e8ec;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-subtle);
+  color: var(--text-primary);
 }
 .badge--info {
-  background: rgba(120, 170, 255, 0.12);
-  border-color: rgba(120, 170, 255, 0.32);
-  color: #a8c6ff;
+  background: var(--info-soft);
+  border-color: var(--border-strong);
+  color: var(--info);
 }
 .badge--ok {
-  background: rgba(143, 209, 158, 0.12);
-  border-color: rgba(143, 209, 158, 0.32);
-  color: #8fd19e;
+  background: var(--success-soft);
+  border-color: var(--border-strong);
+  color: var(--success);
 }
 .badge--warning {
-  background: rgba(248, 215, 122, 0.12);
-  border-color: rgba(248, 215, 122, 0.32);
-  color: #f8d77a;
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
 }
 .badge--danger {
-  background: rgba(217, 101, 112, 0.12);
-  border-color: rgba(217, 101, 112, 0.32);
-  color: #f08a90;
+  background: var(--danger-soft);
+  border-color: var(--danger);
+  color: var(--danger);
 }
 .badge--neutral {
-  color: #9aa3b2;
+  color: var(--text-secondary);
 }
 </style>

@@ -386,9 +386,77 @@ export interface SecretWireRow {
   current_version: number;
   state: string;
   required: boolean;
+  optional?: boolean;
+  owner?: string;
+  tags?: string[];
   created_at: number;
   updated_at: number;
   last_rotated_at: number | null;
+}
+
+export interface ProjectListRequest {
+  store_path?: string;
+  redact_names?: boolean;
+}
+
+export interface DiscoverSecretsRequest extends ProjectListRequest {
+  project?: string;
+  profile?: string;
+  query?: string;
+  name_glob?: string;
+  tag?: string;
+  owner?: string;
+  source?: string;
+  include_deleted?: boolean;
+  limit?: number;
+}
+
+export interface ProjectSummaryWire {
+  project_id: string;
+  name: string;
+  profiles: { id: string; name: string; dangerous: boolean }[];
+  trusted_roots: string[];
+  active_secret_count: number;
+}
+
+export interface DiscoveredSecretWire {
+  project_id: string;
+  project_name: string;
+  trusted_roots: string[];
+  profile_id: string;
+  profile: string;
+  dangerous: boolean;
+  secret_id: string;
+  name: string;
+  source: string;
+  source_precedence: number;
+  origin: string;
+  version: number;
+  state: string;
+  description: string | null;
+  owner: string | null;
+  tags: string[];
+  required: boolean;
+  created_at: number;
+  updated_at: number;
+  last_rotated_at: number | null;
+  reference: string;
+  expiry_status?: 'expired' | 'expiring_soon' | null;
+  expires_at?: number | null;
+  rotate_after_days?: number | null;
+  stale?: boolean;
+}
+
+export interface DesktopFilePickerOptions {
+  title?: string;
+  save?: boolean;
+  defaultName?: string;
+}
+
+export interface DesktopMcpConfigSnippet {
+  command: string;
+  args: string[];
+  json: string;
 }
 
 export interface ListSecretsResponse {
@@ -440,6 +508,7 @@ export interface EffectiveUserVerificationSettings {
 export interface DangerousProfileSetting {
   profile_id: string;
   profile_name: string;
+  profile_label: string;
   dangerous: boolean;
 }
 

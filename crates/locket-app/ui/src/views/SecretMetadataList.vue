@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
 
+import CopyReference from '../components/CopyReference.vue';
+import { secretReference } from '../secret/reference';
 import type { SecretRowMeta } from '../types/views';
 import {
   defaultSecretFilter,
@@ -14,6 +16,8 @@ import {
 
 interface Props {
   rows: SecretRowMeta[];
+  profileName?: string | null;
+  canAccessValues?: boolean;
   privacyMode: boolean;
   loading: boolean;
   metadataLoaded: boolean;
@@ -27,6 +31,7 @@ const props = defineProps<Props>();
 const emit = defineEmits<{
   (e: 'select', row: SecretRowMeta): void;
   (e: 'refresh'): void;
+  (e: 'copyValue' | 'revealValue', row: SecretRowMeta): void;
 }>();
 
 const searchQuery = ref<string>('');
@@ -135,7 +140,7 @@ function refresh(): void {
 }
 
 function onKey(event: KeyboardEvent, row: SecretRowMeta): void {
-  if (event.key === 'Enter' || event.key === ' ') {
+  if (event.target === event.currentTarget && (event.key === 'Enter' || event.key === ' ')) {
     event.preventDefault();
     emit('select', row);
   }
@@ -253,92 +258,113 @@ function onKey(event: KeyboardEvent, row: SecretRowMeta): void {
 
     <p v-else-if="isFilteredEmpty" class="view__empty">No matching secrets.</p>
 
-    <table v-else class="view__table" aria-describedby="secret-metadata-list-heading">
-      <thead>
-        <tr>
-          <th scope="col">Name</th>
-          <th scope="col">Source</th>
-          <th scope="col">Required</th>
-          <th scope="col">Owner</th>
-          <th scope="col">Tags</th>
-          <th scope="col">Created</th>
-          <th scope="col">Rotated</th>
-          <th scope="col">Version</th>
-          <th scope="col">Status</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr
-          v-for="row in filteredRows"
-          :key="row.id"
-          class="view__row"
-          tabindex="0"
-          :aria-label="`Open metadata for ${displayName(row)}`"
-          @click="onActivate(row)"
-          @keydown="onKey($event, row)"
-        >
-          <td>
-            <span class="view__name">{{ displayName(row) }}</span>
-          </td>
-          <td>
-            <span :class="['badge', `badge--source-${row.source}`]">
-              {{ sourceLabel(row.source) }}
-            </span>
-          </td>
-          <td>
-            <span v-if="row.required" class="badge badge--required">required</span>
-            <span v-else-if="row.optional" class="badge badge--optional">optional</span>
-            <span v-else class="badge badge--neutral">—</span>
-          </td>
-          <td>
-            <span class="view__muted">{{ row.ownerLabel ?? '—' }}</span>
-          </td>
-          <td>
-            <span v-if="row.tags && row.tags.length > 0" class="view__tags">
-              <span v-for="tag in row.tags" :key="tag" class="badge badge--tag">{{ tag }}</span>
-            </span>
-            <span v-else class="view__muted">—</span>
-          </td>
-          <td>
-            <time :datetime="row.createdAt">{{ row.createdAt }}</time>
-          </td>
-          <td>
-            <time v-if="row.rotatedAt" :datetime="row.rotatedAt">{{ row.rotatedAt }}</time>
-            <span v-else class="view__muted">—</span>
-          </td>
-          <td>
-            <span class="view__muted">v{{ row.currentVersion }}</span>
-          </td>
-          <td>
-            <span
-              v-if="row.deprecatedReferenceWarnings && row.deprecatedReferenceWarnings.length > 0"
-              class="view__badges"
-            >
-              <span
-                v-for="warning in row.deprecatedReferenceWarnings"
-                :key="`${row.id}:v${warning.version}:${warning.status}:${warning.surface}`"
-                class="badge badge--warning"
-                role="note"
-                :title="warning.graceUntil ? `Grace until ${warning.graceUntil}` : undefined"
-              >
-                {{ warningLabel(warning) }}
+    <div v-else class="view__table-scroll">
+      <table class="view__table" aria-describedby="secret-metadata-list-heading">
+        <thead>
+          <tr>
+            <th scope="col">Name</th>
+            <th scope="col">Source</th>
+            <th scope="col">Required</th>
+            <th scope="col">Owner</th>
+            <th scope="col">Tags</th>
+            <th scope="col">Created</th>
+            <th scope="col">Rotated</th>
+            <th scope="col">Version</th>
+            <th scope="col">Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr
+            v-for="row in filteredRows"
+            :key="row.id"
+            class="view__row"
+            tabindex="0"
+            :aria-label="`Open metadata for ${displayName(row)}`"
+            @click="onActivate(row)"
+            @keydown="onKey($event, row)"
+          >
+            <td>
+              <span class="view__name">{{ displayName(row) }}</span>
+              <div class="view__row-actions" @click.stop>
+                <CopyReference :reference="secretReference(profileName, row.name, privacyMode)" />
+                <button
+                  v-if="canAccessValues"
+                  class="companion-button"
+                  type="button"
+                  @click="emit('copyValue', row)"
+                >
+                  Copy value
+                </button>
+                <button
+                  v-if="canAccessValues"
+                  class="companion-button"
+                  type="button"
+                  @click="emit('revealValue', row)"
+                >
+                  Reveal
+                </button>
+              </div>
+            </td>
+            <td>
+              <span :class="['badge', `badge--source-${row.source}`]">
+                {{ sourceLabel(row.source) }}
               </span>
-            </span>
-            <span v-else-if="row.hasDeprecatedGrace" class="badge badge--warning" role="note">
-              deprecated grace
-            </span>
-            <span v-else class="view__muted">—</span>
-          </td>
-        </tr>
-      </tbody>
-    </table>
+            </td>
+            <td>
+              <span v-if="row.required" class="badge badge--required">required</span>
+              <span v-else-if="row.optional" class="badge badge--optional">optional</span>
+              <span v-else class="badge badge--neutral">—</span>
+            </td>
+            <td>
+              <span class="view__muted">{{ row.ownerLabel ?? '—' }}</span>
+            </td>
+            <td>
+              <span v-if="row.tags && row.tags.length > 0" class="view__tags">
+                <span v-for="tag in row.tags" :key="tag" class="badge badge--tag">{{ tag }}</span>
+              </span>
+              <span v-else class="view__muted">—</span>
+            </td>
+            <td>
+              <time :datetime="row.createdAt">{{ row.createdAt }}</time>
+            </td>
+            <td>
+              <time v-if="row.rotatedAt" :datetime="row.rotatedAt">{{ row.rotatedAt }}</time>
+              <span v-else class="view__muted">—</span>
+            </td>
+            <td>
+              <span class="view__muted">v{{ row.currentVersion }}</span>
+            </td>
+            <td>
+              <span
+                v-if="row.deprecatedReferenceWarnings && row.deprecatedReferenceWarnings.length > 0"
+                class="view__badges"
+              >
+                <span
+                  v-for="warning in row.deprecatedReferenceWarnings"
+                  :key="`${row.id}:v${warning.version}:${warning.status}:${warning.surface}`"
+                  class="badge badge--warning"
+                  role="note"
+                  :title="warning.graceUntil ? `Grace until ${warning.graceUntil}` : undefined"
+                >
+                  {{ warningLabel(warning) }}
+                </span>
+              </span>
+              <span v-else-if="row.hasDeprecatedGrace" class="badge badge--warning" role="note">
+                deprecated grace
+              </span>
+              <span v-else class="view__muted">—</span>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
   </section>
 </template>
 
 <style scoped>
 .view {
-  background: #0f1115;
-  color: #e6e8ec;
+  background: var(--bg-surface);
+  color: var(--text-primary);
   padding: 1rem;
   border-radius: 0.5rem;
 }
@@ -368,10 +394,10 @@ function onKey(event: KeyboardEvent, row: SecretRowMeta): void {
 
 .view__button {
   min-height: 2rem;
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  border: 1px solid var(--border-strong);
   border-radius: 0.375rem;
-  background: rgba(255, 255, 255, 0.06);
-  color: #e6e8ec;
+  background: var(--bg-subtle);
+  color: var(--text-primary);
   cursor: pointer;
   font: inherit;
   font-size: 0.8125rem;
@@ -379,7 +405,7 @@ function onKey(event: KeyboardEvent, row: SecretRowMeta): void {
 }
 
 .view__button:disabled {
-  color: #667085;
+  color: var(--text-muted);
   cursor: not-allowed;
 }
 
@@ -390,7 +416,7 @@ function onKey(event: KeyboardEvent, row: SecretRowMeta): void {
 }
 
 .view__search-label {
-  color: #9aa3b2;
+  color: var(--text-secondary);
   font-size: 0.75rem;
   font-weight: 600;
   letter-spacing: 0.04em;
@@ -401,30 +427,30 @@ function onKey(event: KeyboardEvent, row: SecretRowMeta): void {
   box-sizing: border-box;
   width: 100%;
   min-height: 2rem;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border: 1px solid var(--border-strong);
   border-radius: 0.375rem;
-  background: rgba(255, 255, 255, 0.05);
-  color: #e6e8ec;
+  background: var(--bg-subtle);
+  color: var(--text-primary);
   font: inherit;
   padding: 0.375rem 0.625rem;
 }
 
 .view__search input:focus {
-  border-color: #f8d77a;
-  outline: 2px solid rgba(248, 215, 122, 0.24);
+  border-color: var(--accent);
+  outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
 
 .view__search input::placeholder {
-  color: #667085;
+  color: var(--text-muted);
 }
 
 .view__filters {
   margin: 0 0 0.75rem;
   padding: 0.625rem 0.75rem;
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--border-subtle);
   border-radius: 0.375rem;
-  background: rgba(255, 255, 255, 0.02);
+  background: var(--bg-subtle);
   display: flex;
   flex-wrap: wrap;
   gap: 0.5rem 0.875rem;
@@ -432,7 +458,7 @@ function onKey(event: KeyboardEvent, row: SecretRowMeta): void {
 }
 .view__filters-legend {
   padding: 0 0.25rem;
-  color: #9aa3b2;
+  color: var(--text-secondary);
   font-size: 0.7rem;
   letter-spacing: 0.04em;
   text-transform: uppercase;
@@ -445,15 +471,15 @@ function onKey(event: KeyboardEvent, row: SecretRowMeta): void {
 }
 .view__filter-label {
   font-size: 0.7rem;
-  color: #9aa3b2;
+  color: var(--text-secondary);
   letter-spacing: 0.02em;
   text-transform: uppercase;
   margin-right: 0.25rem;
 }
 .view__filter-chip {
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  background: rgba(255, 255, 255, 0.04);
-  color: #c5cbd6;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-subtle);
+  color: var(--text-secondary);
   font: inherit;
   font-size: 0.75rem;
   padding: 0.125rem 0.5rem;
@@ -461,19 +487,19 @@ function onKey(event: KeyboardEvent, row: SecretRowMeta): void {
   cursor: pointer;
 }
 .view__filter-chip--active {
-  background: rgba(248, 215, 122, 0.16);
-  color: #f8d77a;
-  border-color: rgba(248, 215, 122, 0.5);
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: var(--accent);
 }
 .view__filter-chip:focus-visible {
-  outline: 2px solid #f8d77a;
+  outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
 .view__filter-clear {
   margin-left: auto;
   border: 0;
   background: transparent;
-  color: #9aa3b2;
+  color: var(--text-secondary);
   font: inherit;
   font-size: 0.75rem;
   text-decoration: underline;
@@ -484,19 +510,34 @@ function onKey(event: KeyboardEvent, row: SecretRowMeta): void {
 .view__empty {
   margin: 0;
   font-size: 0.875rem;
-  color: #9aa3b2;
+  color: var(--text-secondary);
 }
 
 .view__error {
-  color: #ffb4a8;
+  color: var(--danger);
   margin: 0;
 }
 
 .view__empty code {
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--bg-subtle);
   padding: 0.125rem 0.25rem;
   border-radius: 0.25rem;
   font-size: 0.8125rem;
+}
+
+.view__table-scroll {
+  overflow-x: auto;
+}
+.view__row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  min-width: 9rem;
+  margin-top: 0.35rem;
+}
+.view__row-actions .companion-button {
+  font-size: 0.75rem;
+  white-space: nowrap;
 }
 
 .view__table {
@@ -509,13 +550,13 @@ function onKey(event: KeyboardEvent, row: SecretRowMeta): void {
 .view__table td {
   text-align: left;
   padding: 0.5rem 0.75rem;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  border-bottom: 1px solid var(--border-subtle);
   vertical-align: top;
 }
 
 .view__table th {
   font-weight: 600;
-  color: #9aa3b2;
+  color: var(--text-secondary);
   font-size: 0.75rem;
   text-transform: uppercase;
   letter-spacing: 0.04em;
@@ -526,11 +567,11 @@ function onKey(event: KeyboardEvent, row: SecretRowMeta): void {
 }
 
 .view__row:hover {
-  background: rgba(255, 255, 255, 0.03);
+  background: var(--bg-subtle);
 }
 
 .view__row:focus {
-  outline: 2px solid #f8d77a;
+  outline: 2px solid var(--accent);
   outline-offset: -2px;
 }
 
@@ -539,7 +580,7 @@ function onKey(event: KeyboardEvent, row: SecretRowMeta): void {
 }
 
 .view__muted {
-  color: #9aa3b2;
+  color: var(--text-secondary);
 }
 
 .view__tags {
@@ -560,52 +601,52 @@ function onKey(event: KeyboardEvent, row: SecretRowMeta): void {
   border-radius: 0.375rem;
   font-size: 0.75rem;
   letter-spacing: 0.02em;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(255, 255, 255, 0.04);
-  color: #e6e8ec;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-subtle);
+  color: var(--text-primary);
 }
 
 .badge--source-team {
-  background: rgba(120, 170, 255, 0.12);
-  border-color: rgba(120, 170, 255, 0.32);
-  color: #a8c6ff;
+  background: var(--info-soft);
+  border-color: var(--border-strong);
+  color: var(--info);
 }
 
 .badge--source-user-local {
-  background: rgba(170, 230, 200, 0.1);
-  border-color: rgba(170, 230, 200, 0.28);
-  color: #b8e6c8;
+  background: var(--success-soft);
+  border-color: var(--border-strong);
+  color: var(--success);
 }
 
 .badge--source-machine-local {
-  background: rgba(220, 200, 170, 0.1);
-  border-color: rgba(220, 200, 170, 0.28);
-  color: #e0cfa8;
+  background: var(--warn-soft);
+  border-color: var(--border-strong);
+  color: var(--warn);
 }
 
 .badge--required {
-  background: rgba(248, 215, 122, 0.12);
-  border-color: rgba(248, 215, 122, 0.32);
-  color: #f8d77a;
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 .badge--optional {
-  background: rgba(255, 255, 255, 0.04);
-  color: #9aa3b2;
+  background: var(--bg-subtle);
+  color: var(--text-secondary);
 }
 
 .badge--neutral {
-  color: #9aa3b2;
+  color: var(--text-secondary);
 }
 
 .badge--tag {
-  background: rgba(255, 255, 255, 0.04);
-  color: #9aa3b2;
+  background: var(--bg-subtle);
+  color: var(--text-secondary);
 }
 
 .badge--warning {
-  background: rgba(248, 215, 122, 0.12);
-  border-color: rgba(248, 215, 122, 0.32);
-  color: #f8d77a;
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
 }
 </style>

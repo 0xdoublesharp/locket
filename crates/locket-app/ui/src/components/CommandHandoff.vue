@@ -62,7 +62,7 @@ async function copyCommand(): Promise<void> {
 .handoff__label {
   display: grid;
   gap: 0.25rem;
-  color: #9aa3b2;
+  color: var(--text-secondary);
   font-size: 0.75rem;
   font-weight: 600;
   letter-spacing: 0.04em;
@@ -73,9 +73,9 @@ async function copyCommand(): Promise<void> {
   width: 100%;
   min-height: 4.75rem;
   resize: vertical;
-  background: #0f1115;
-  color: #e6e8ec;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  border: 1px solid var(--border-strong);
   border-radius: 0.375rem;
   padding: 0.5rem 0.625rem;
   font:
@@ -97,10 +97,10 @@ async function copyCommand(): Promise<void> {
 }
 .handoff__button {
   min-height: 2rem;
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  border: 1px solid var(--border-strong);
   border-radius: 0.375rem;
-  background: rgba(255, 255, 255, 0.06);
-  color: #e6e8ec;
+  background: var(--bg-subtle);
+  color: var(--text-primary);
   cursor: pointer;
   font: inherit;
   font-size: 0.8125rem;
@@ -108,15 +108,15 @@ async function copyCommand(): Promise<void> {
 }
 .handoff__button:focus-visible,
 .handoff__command:focus-visible {
-  outline: 2px solid #a8c6ff;
+  outline: 2px solid var(--info);
   outline-offset: 2px;
 }
 .handoff__status {
   margin: 0;
-  color: #8fd19e;
+  color: var(--success);
   font-size: 0.8rem;
 }
 .handoff__status--error {
-  color: #f08a90;
+  color: var(--danger);
 }
 </style>

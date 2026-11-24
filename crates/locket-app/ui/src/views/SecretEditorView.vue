@@ -480,8 +480,8 @@ function errorLabel(error: AgentClientError): string {
 
 <style scoped>
 .view {
-  background: #0f1115;
-  color: #e6e8ec;
+  background: var(--bg-surface);
+  color: var(--text-primary);
   padding: 1rem;
   border-radius: 0.5rem;
   display: flex;
@@ -508,8 +508,8 @@ function errorLabel(error: AgentClientError): string {
   margin-left: auto;
 }
 .view__panel {
-  background: #11141a;
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
   border-radius: 0.5rem;
   padding: 0.875rem 1rem;
   display: flex;
@@ -521,7 +521,7 @@ function errorLabel(error: AgentClientError): string {
   font-size: 0.85rem;
   letter-spacing: 0.04em;
   text-transform: uppercase;
-  color: #9aa3b2;
+  color: var(--text-secondary);
 }
 .view__field {
   display: flex;
@@ -531,9 +531,9 @@ function errorLabel(error: AgentClientError): string {
 }
 .view__field input,
 .view__field select {
-  background: #0f1115;
-  color: #e6e8ec;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  border: 1px solid var(--border-strong);
   border-radius: 0.375rem;
   padding: 0.4rem 0.6rem;
   font: inherit;
@@ -546,10 +546,10 @@ function errorLabel(error: AgentClientError): string {
 }
 .view__button {
   min-height: 2rem;
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  border: 1px solid var(--border-strong);
   border-radius: 0.375rem;
-  background: rgba(255, 255, 255, 0.06);
-  color: #e6e8ec;
+  background: var(--bg-subtle);
+  color: var(--text-primary);
   cursor: pointer;
   font: inherit;
   font-size: 0.8125rem;
@@ -560,46 +560,46 @@ function errorLabel(error: AgentClientError): string {
   cursor: not-allowed;
 }
 .view__button--primary {
-  background: #f8d77a;
-  color: #1a1a1a;
+  background: var(--accent);
+  color: var(--accent-fg);
   border-color: transparent;
 }
 .view__button--danger {
-  background: #d96570;
-  color: #1a1a1a;
+  background: var(--danger);
+  color: var(--accent-fg);
   border-color: transparent;
 }
 .view__loading,
 .view__empty {
   margin: 0;
   font-size: 0.875rem;
-  color: #9aa3b2;
+  color: var(--text-secondary);
 }
 .view__error {
   margin: 0;
-  color: #f08a90;
+  color: var(--danger);
   font-size: 0.8rem;
 }
 .view__notice {
   margin: 0;
   padding: 0.5rem 0.625rem;
-  background: rgba(120, 170, 255, 0.06);
-  border: 1px solid rgba(120, 170, 255, 0.2);
-  color: #a8c6ff;
+  background: var(--info-soft);
+  border: 1px solid var(--border-strong);
+  color: var(--info);
   border-radius: 0.375rem;
   font-size: 0.8rem;
 }
 .view__notice code {
-  background: rgba(255, 255, 255, 0.04);
+  background: var(--bg-subtle);
   padding: 0 0.25rem;
   border-radius: 0.25rem;
 }
 .view__muted {
-  color: #9aa3b2;
+  color: var(--text-secondary);
   font-size: 0.8rem;
 }
 .view__muted code {
-  background: rgba(255, 255, 255, 0.04);
+  background: var(--bg-subtle);
   padding: 0 0.25rem;
   border-radius: 0.25rem;
 }
@@ -608,7 +608,7 @@ function errorLabel(error: AgentClientError): string {
   gap: 0.25rem;
 }
 .view__search-label {
-  color: #9aa3b2;
+  color: var(--text-secondary);
   font-size: 0.75rem;
   font-weight: 600;
   letter-spacing: 0.04em;
@@ -618,10 +618,10 @@ function errorLabel(error: AgentClientError): string {
   box-sizing: border-box;
   width: 100%;
   min-height: 2rem;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border: 1px solid var(--border-strong);
   border-radius: 0.375rem;
-  background: rgba(255, 255, 255, 0.05);
-  color: #e6e8ec;
+  background: var(--bg-subtle);
+  color: var(--text-primary);
   font: inherit;
   padding: 0.375rem 0.625rem;
 }
@@ -634,12 +634,12 @@ function errorLabel(error: AgentClientError): string {
 .view__table td {
   text-align: left;
   padding: 0.5rem 0.75rem;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  border-bottom: 1px solid var(--border-subtle);
   vertical-align: top;
 }
 .view__table th {
   font-weight: 600;
-  color: #9aa3b2;
+  color: var(--text-secondary);
   font-size: 0.75rem;
   text-transform: uppercase;
   letter-spacing: 0.04em;

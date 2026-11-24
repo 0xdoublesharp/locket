@@ -312,7 +312,7 @@ function onDismiss(): void {
 .modal-backdrop {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.55);
+  background: var(--backdrop);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -320,8 +320,8 @@ function onDismiss(): void {
   overflow: auto;
 }
 .modal {
-  background: #161a22;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
   border-radius: 0.5rem;
   padding: 1.25rem 1.5rem;
   min-width: 400px;
@@ -347,7 +347,7 @@ function onDismiss(): void {
 }
 .modal__warn {
   margin: 0.25rem 0 0;
-  color: #f2b879;
+  color: var(--warn);
   font-size: 0.8rem;
 }
 .modal__field {
@@ -359,9 +359,9 @@ function onDismiss(): void {
 .modal__field input,
 .modal__field textarea,
 .modal__field select {
-  background: #0f1115;
-  color: #e6e8ec;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  border: 1px solid var(--border-strong);
   border-radius: 0.375rem;
   padding: 0.4rem 0.6rem;
   font-size: 0.85rem;
@@ -373,12 +373,12 @@ function onDismiss(): void {
   gap: 0.5rem;
 }
 .modal__fieldset {
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--border-subtle);
   border-radius: 0.375rem;
   padding: 0.5rem 0.75rem;
 }
 .modal__fieldset legend {
-  color: #9aa3b2;
+  color: var(--text-secondary);
   font-size: 0.75rem;
 }
 .modal__check {
@@ -391,10 +391,10 @@ function onDismiss(): void {
 .modal__caption {
   margin: 0;
   font-size: 0.9rem;
-  color: #c5cbd6;
+  color: var(--text-secondary);
 }
 .modal__error {
-  color: #f08a90;
+  color: var(--danger);
   font-size: 0.75rem;
 }
 .modal__actions {
@@ -410,12 +410,12 @@ function onDismiss(): void {
   cursor: pointer;
 }
 .modal__btn--primary {
-  background: #f8d77a;
-  color: #1a1a1a;
+  background: var(--accent);
+  color: var(--accent-fg);
 }
 .modal__btn--danger {
-  background: #d96570;
-  color: #1a1a1a;
+  background: var(--danger);
+  color: var(--accent-fg);
 }
 .modal__btn:disabled {
   opacity: 0.5;
@@ -423,7 +423,7 @@ function onDismiss(): void {
 }
 .modal__btn--ghost {
   background: transparent;
-  color: #c5cbd6;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-strong);
 }
 </style>

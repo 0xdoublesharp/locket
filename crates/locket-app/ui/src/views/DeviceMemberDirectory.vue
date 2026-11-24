@@ -168,8 +168,8 @@ function refreshRows(): void {
 
 <style scoped>
 .view {
-  background: #0f1115;
-  color: #e6e8ec;
+  background: var(--bg-surface);
+  color: var(--text-primary);
   padding: 1rem;
   border-radius: 0.5rem;
 }
@@ -196,18 +196,18 @@ function refreshRows(): void {
 
 .view__button {
   min-height: 2rem;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border: 1px solid var(--border-strong);
   border-radius: 0.375rem;
-  background: rgba(255, 255, 255, 0.05);
-  color: #e6e8ec;
+  background: var(--bg-subtle);
+  color: var(--text-primary);
   cursor: pointer;
   font: inherit;
   padding: 0.375rem 0.625rem;
 }
 
 .view__button:focus-visible {
-  border-color: #f8d77a;
-  outline: 2px solid rgba(248, 215, 122, 0.24);
+  border-color: var(--accent);
+  outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
 
@@ -228,7 +228,7 @@ function refreshRows(): void {
 
 .view__label {
   font-size: 0.75rem;
-  color: #9aa3b2;
+  color: var(--text-secondary);
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
@@ -237,23 +237,23 @@ function refreshRows(): void {
 .view__select select {
   min-height: 2rem;
   border-radius: 0.375rem;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(255, 255, 255, 0.04);
-  color: #e6e8ec;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-subtle);
+  color: var(--text-primary);
   padding: 0.25rem 0.5rem;
   font: inherit;
 }
 
 .view__search input:focus-visible,
 .view__select select:focus-visible {
-  outline: 2px solid #f8d77a;
+  outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 
 .view__empty {
   margin: 0;
   font-size: 0.875rem;
-  color: #9aa3b2;
+  color: var(--text-secondary);
 }
 
 .view__table {
@@ -266,13 +266,13 @@ function refreshRows(): void {
 .view__table td {
   text-align: left;
   padding: 0.5rem 0.75rem;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  border-bottom: 1px solid var(--border-subtle);
   vertical-align: top;
 }
 
 .view__table th {
   font-weight: 600;
-  color: #9aa3b2;
+  color: var(--text-secondary);
   font-size: 0.75rem;
   text-transform: uppercase;
   letter-spacing: 0.04em;
@@ -283,12 +283,12 @@ function refreshRows(): void {
 }
 
 .view__muted {
-  color: #9aa3b2;
+  color: var(--text-secondary);
 }
 
 .view__fingerprint {
-  color: #e6e8ec;
-  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-primary);
+  background: var(--bg-subtle);
   padding: 0.125rem 0.25rem;
   border-radius: 0.25rem;
   font-size: 0.8125rem;
@@ -300,28 +300,28 @@ function refreshRows(): void {
   border-radius: 0.375rem;
   font-size: 0.75rem;
   letter-spacing: 0.02em;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(255, 255, 255, 0.04);
-  color: #e6e8ec;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-subtle);
+  color: var(--text-primary);
 }
 
 .badge--status-active {
-  background: rgba(170, 230, 200, 0.1);
-  border-color: rgba(170, 230, 200, 0.28);
-  color: #b8e6c8;
+  background: var(--success-soft);
+  border-color: var(--border-strong);
+  color: var(--success);
 }
 
 .badge--status-pending {
-  background: rgba(120, 170, 255, 0.12);
-  border-color: rgba(120, 170, 255, 0.32);
-  color: #a8c6ff;
+  background: var(--info-soft);
+  border-color: var(--border-strong);
+  color: var(--info);
 }
 
 .badge--status-revoked,
 .badge--status-removed {
-  background: rgba(240, 138, 138, 0.12);
-  border-color: rgba(240, 138, 138, 0.32);
-  color: #f4b3b3;
+  background: var(--danger-soft);
+  border-color: var(--danger);
+  color: var(--danger);
 }
 
 @media (max-width: 760px) {
