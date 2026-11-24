@@ -124,6 +124,7 @@ pub async fn handle_resolve(
         let Some(grant_id) = typed.grant_id.as_deref() else {
             let key = cached_master_key_for_denial().await;
             crate::audit_deny::try_append_grant_denial(
+                state,
                 project_id,
                 profile_id,
                 Some(Path::new(store_path)),
@@ -132,7 +133,8 @@ pub async fn handle_resolve(
                 0,
                 now_unix_nanos,
                 "agent",
-            );
+            )
+            .await;
             return grant_required(request);
         };
         let grants = state.grants.lock().await;
@@ -152,6 +154,7 @@ pub async fn handle_resolve(
     if !matches!(grant_validation, GrantValidation::Valid) {
         let key = cached_master_key_for_denial().await;
         crate::audit_deny::try_append_grant_denial(
+            state,
             project_id,
             profile_id,
             Some(Path::new(store_path)),
@@ -160,7 +163,8 @@ pub async fn handle_resolve(
             0,
             now_unix_nanos,
             "agent",
-        );
+        )
+        .await;
         return grant_required(request);
     }
 
@@ -186,12 +190,24 @@ pub async fn handle_resolve(
         );
     };
 
+    let (store, _) = match crate::keys::open_verified_store_for_state(
+        state,
+        project_id,
+        Path::new(store_path),
+        now_unix_nanos,
+    )
+    .await
+    {
+        Ok(opened) => opened,
+        Err(error) => return crate::server::store_open_error(request, &error),
+    };
+
     match resolve_reference(
         &typed.reference,
         project_id,
         profile_id,
         policy_name,
-        Path::new(store_path),
+        store,
         &master_key,
         now_unix_nanos,
         typed.binding.as_ref(),
@@ -225,7 +241,7 @@ fn typed_error(
 }
 
 #[derive(Debug)]
-struct ResolveFailure {
+pub struct ResolveFailure {
     error: &'static str,
     message: &'static str,
     kind: LocketError,
@@ -243,7 +259,7 @@ fn resolve_reference(
     project_id: &str,
     authorized_profile_id: &str,
     policy_name: &str,
-    store_path: &Path,
+    mut store: Store,
     master_key: &[u8],
     now_unix_nanos: i128,
     binding: Option<&GrantBinding>,
@@ -256,7 +272,6 @@ fn resolve_reference(
         )
     })?;
     let master_key = master_key_array(master_key).map_err(|_| corrupt_db())?;
-    let mut store = Store::open(store_path).map_err(|_| corrupt_db())?;
     match resolve_reference_inner(
         &store,
         project_id,
@@ -481,6 +496,38 @@ fn authorize_policy_reference_context(
     if execution.is_some_and(|scope| scope.policy_name != policy_name) {
         return Err(reference_access_denied());
     }
+    let (parsed, root, _) = approved_policy_document(store, project_id, policy_name)?;
+    let cwd = match execution {
+        Some(scope) => scope.cwd.canonicalize().map_err(|_| reference_access_denied())?,
+        None => root.clone(),
+    };
+    let relative = cwd.strip_prefix(&root).map_err(|_| reference_access_denied())?;
+    let relative = if relative.as_os_str().is_empty() { Path::new(".") } else { relative };
+    if let Some(expected) =
+        parsed.path_scope_for(&root, &cwd).and_then(|scope| scope.profile.as_ref())
+        && profile_name.is_some_and(|name| name != expected.as_str())
+    {
+        return Err(reference_access_denied());
+    }
+    let effective =
+        parsed.effective_command(policy_name, &root, &cwd).ok_or_else(reference_access_denied)?;
+    let argv = match &effective.command {
+        locket_core::CommandSpec::Argv(argv) => Some(argv.as_slice()),
+        locket_core::CommandSpec::Shell(_) => None,
+    };
+    if !parsed.denied_secrets(policy_name, argv, relative, &effective.allowed_secrets).is_empty()
+        || !effective.allowed_secrets.iter().any(|name| name.as_str() == secret_name)
+    {
+        return Err(reference_access_denied());
+    }
+    Ok(())
+}
+
+pub fn approved_policy_document(
+    store: &Store,
+    project_id: &str,
+    policy_name: &str,
+) -> Result<(locket_core::PolicyDocument, std::path::PathBuf, Option<String>), ResolveFailure> {
     let Some(policy) =
         store.get_command_policy_index(project_id, policy_name).map_err(|_| corrupt_db())?
     else {
@@ -532,30 +579,9 @@ fn authorize_policy_reference_context(
         .ok_or_else(reference_access_denied)?
         .canonicalize()
         .map_err(|_| reference_access_denied())?;
-    let cwd = match execution {
-        Some(scope) => scope.cwd.canonicalize().map_err(|_| reference_access_denied())?,
-        None => root.clone(),
-    };
-    let relative = cwd.strip_prefix(&root).map_err(|_| reference_access_denied())?;
-    let relative = if relative.as_os_str().is_empty() { Path::new(".") } else { relative };
-    if let Some(expected) =
-        parsed.path_scope_for(&root, &cwd).and_then(|scope| scope.profile.as_ref())
-        && profile_name.is_some_and(|name| name != expected.as_str())
-    {
-        return Err(reference_access_denied());
-    }
-    let effective =
-        parsed.effective_command(policy_name, &root, &cwd).ok_or_else(reference_access_denied)?;
-    let argv = match &effective.command {
-        locket_core::CommandSpec::Argv(argv) => Some(argv.as_slice()),
-        locket_core::CommandSpec::Shell(_) => None,
-    };
-    if !parsed.denied_secrets(policy_name, argv, relative, &effective.allowed_secrets).is_empty()
-        || !effective.allowed_secrets.iter().any(|name| name.as_str() == secret_name)
-    {
-        return Err(reference_access_denied());
-    }
-    Ok(())
+    let default_profile =
+        document.get("default_profile").and_then(toml::Value::as_str).map(str::to_owned);
+    Ok((parsed, root, default_profile))
 }
 
 const fn reference_access_denied() -> ResolveFailure {
@@ -816,6 +842,45 @@ mod tests {
             profile_fingerprint_key,
             expected_value,
         })
+    }
+
+    #[tokio::test]
+    async fn run_grant_uses_the_approved_profile_and_working_directory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = build_fixture()?;
+        let source = format!(
+            "schema_version=1\nproject_id='{PROJECT_ID}'\ndefault_profile='{PROFILE_NAME}'\n[commands.{POLICY_NAME}]\nargv=['pnpm','deploy']\nttl='30s'\n"
+        );
+        install_source_policy(&fixture, &source, &[])?;
+        let state = AgentSocketState::locked("test")
+            .with_canonical_store_path(fixture.store_path.clone())
+            .with_daemon_user_verification(true);
+        let local = locket_platform::current_process_binding()?;
+        let binding = GrantBinding::new(local.pid, local.process_start_time)
+            .with_execution(POLICY_NAME, fixture.directory.path().canonicalize()?);
+        let peer =
+            crate::PeerIdentity { uid: state.daemon_uid, pid: Some(binding.pid), connection_id: 1 };
+        let mut request = RequestEnvelope::new(
+            "run",
+            AgentMethod::RequestGrant,
+            json!({
+                "project_id": PROJECT_ID, "profile_id": PROFILE_ID, "action": "RunPolicy",
+                "policy_name": POLICY_NAME, "ttl_seconds": 60, "binding": binding,
+            }),
+        );
+        let response = crate::dispatch_with_peer(&request, &state, Some(peer)).await;
+        let ResponseEnvelope::Success(response) = response else {
+            return Err(format!("{response:?}").into());
+        };
+        assert_eq!(response.payload["binding"], serde_json::to_value(&binding)?);
+        assert_eq!(response.payload["ttl_seconds"], 30);
+
+        request.payload["binding"]["execution"]["cwd"] = json!(fixture.directory.path().parent());
+        assert_eq!(
+            error_code(crate::dispatch_with_peer(&request, &state, Some(peer)).await)?,
+            "AccessDenied"
+        );
+        Ok(())
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1550,7 +1615,8 @@ mod tests {
             json!({"project_id": PROJECT_ID, "ttl_seconds": 60}),
         );
         assert!(matches!(crate::dispatch(&unlock, &state).await, ResponseEnvelope::Success(_)));
-        let pid = std::process::id();
+        let binding = locket_platform::current_process_binding()?;
+        let pid = binding.pid;
         let peer = crate::PeerIdentity { uid: state.daemon_uid, pid: Some(pid), connection_id: 1 };
         let other = crate::PeerIdentity { pid: Some(pid ^ 1), connection_id: 2, ..peer };
         let mint = RequestEnvelope::new(
@@ -1558,7 +1624,7 @@ mod tests {
             AgentMethod::RequestGrant,
             json!({
                 "project_id": PROJECT_ID, "profile_id": PROFILE_ID, "action": "ResolveReference",
-                "ttl_seconds": 30, "binding": {"pid": pid, "process_start_time": "0"},
+                "ttl_seconds": 30, "binding": {"pid": pid, "process_start_time": binding.process_start_time},
             }),
         );
         assert_eq!(
@@ -1572,6 +1638,7 @@ mod tests {
         };
         let mut request = resolve_request(&fixture);
         request.grant_id = grant.payload["grant_id"].as_str().map(str::to_owned);
+        request.binding = Some(GrantBinding::new(pid, binding.process_start_time));
         let resolve = RequestEnvelope::new(
             "resolve",
             AgentMethod::ResolveReference,

@@ -2964,8 +2964,15 @@ pub(crate) fn write_runtime_policy_audit_if_available(
     {
         metadata.insert("grant_actions".to_owned(), json!(["RunPolicy"]));
         metadata.insert("ttl_seconds".to_owned(), json!(grant.ttl_seconds));
-        metadata.insert("process_id".to_owned(), json!(grant.process_id));
-        metadata.insert("process_start_time".to_owned(), json!(grant.process_start_time.as_str()));
+        metadata.insert("process_id".to_owned(), json!(grant.binding.pid));
+        metadata.insert(
+            "process_start_time".to_owned(),
+            json!(grant.binding.process_start_time.as_str()),
+        );
+        if let Some(scope) = &grant.binding.execution {
+            let hash = Sha256::digest(scope.cwd.to_string_lossy().as_bytes());
+            metadata.insert("directory_hash".to_owned(), json!(format_hex(&hash)));
+        }
     }
     let audit = AuditWrite {
         project_id: resolved.config.project_id.as_str(),

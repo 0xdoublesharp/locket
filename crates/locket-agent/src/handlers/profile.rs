@@ -74,6 +74,8 @@ enum SetActiveProfileError {
     #[error(transparent)]
     Store(#[from] locket_store::StoreError),
     #[error(transparent)]
+    StoreIdentity(#[from] crate::keys::StoreIdentityError),
+    #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
     TomlDeserialize(#[from] toml::de::Error),
@@ -96,6 +98,7 @@ impl SetActiveProfileError {
             | Self::TomlSerialize(_)
             | Self::PolicyFile(_) => "MetadataInvalid",
             Self::Key(_) => "AuditIntegrityFailed",
+            Self::StoreIdentity(_) => "AccessDenied",
             Self::Store(error) => match error.locket_error() {
                 locket_core::LocketError::StorageBusy => "StorageBusy",
                 locket_core::LocketError::SchemaNewerThanBinary => "SchemaNewerThanBinary",
@@ -142,7 +145,13 @@ async fn set_active_profile(
         ));
     }
 
-    let mut store = Store::open(&request.store_path)?;
+    let (mut store, _) = crate::keys::open_verified_store_for_state(
+        state,
+        &request.project_id,
+        &request.store_path,
+        now_unix_nanos,
+    )
+    .await?;
     let audit_key = unwrap_audit_key_with_master(&store, &request.project_id, &master_key)?;
     let new_profile = store
         .get_profile_by_name(&request.project_id, profile_name.as_str())?

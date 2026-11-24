@@ -1,7 +1,7 @@
 //! Stdio MCP server for metadata queries and encrypted vault writes.
 
 use std::fs;
-use std::io::{BufRead, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::Path;
 
 use locket_agent::DiscoveryFilters;
@@ -306,7 +306,7 @@ fn store_secret(
     } else {
         let value = match (value, args.value_file) {
             (Some(value), None) => value,
-            (None, Some(path)) => read_value_file(context, &path)?,
+            (None, Some(path)) => read_value_file(context, &store, &target.project.id, &path)?,
             _ => return Err(metadata_invalid_error("provide exactly one of value or value_file")),
         };
         (value, "manual")
@@ -314,19 +314,81 @@ fn store_secret(
     write_value(context, &mut store, &target, &request, &value, origin, now_unix_nanos()?)
 }
 
-fn read_value_file(context: &RuntimeContext, path: &str) -> Result<Zeroizing<String>, CliError> {
+fn read_value_file(
+    context: &RuntimeContext,
+    store: &Store,
+    project_id: &str,
+    path: &str,
+) -> Result<Zeroizing<String>, CliError> {
     let path = context.cwd.join(Path::new(path));
-    if !fs::metadata(&path)?.is_file() {
+    if !fs::symlink_metadata(&path)?.is_file() {
+        return Err(metadata_invalid_error("value_file must be a regular file"));
+    }
+    let canonical = path.canonicalize()?;
+    let trusted = store.list_project_roots(project_id)?.into_iter().any(|root| {
+        root.display_path.and_then(|path| fs::canonicalize(path).ok()).is_some_and(|path| {
+            canonical != path
+                && canonical.starts_with(&path)
+                && crate::root_hash(&path).is_ok_and(|hash| hash == root.root_hash)
+        })
+    });
+    if !trusted {
+        return Err(crate::runtime::error::access_denied_error(
+            "value_file must be inside a trusted project root",
+        ));
+    }
+    let file = open_value_file(&canonical)?;
+    if !file.metadata()?.is_file() {
         return Err(metadata_invalid_error("value_file must be a regular file"));
     }
     let mut bytes = Zeroizing::new(Vec::new());
-    fs::File::open(path)?.take(MAX_INPUT_BYTES + 1).read_to_end(&mut bytes)?;
+    file.take(MAX_INPUT_BYTES + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_INPUT_BYTES {
         return Err(metadata_invalid_error("value file exceeds size limit"));
     }
     let value = std::str::from_utf8(&bytes)
         .map_err(|_| metadata_invalid_error("value file must contain UTF-8"))?;
     Ok(Zeroizing::new(value.trim_end_matches(['\r', '\n']).to_owned()))
+}
+
+#[cfg(unix)]
+fn open_value_file(path: &Path) -> Result<fs::File, CliError> {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    // Walk from the filesystem root using open directory descriptors so a
+    // renamed component cannot redirect the open through a symlink.
+    let mut directory = fs::File::open("/")?;
+    let mut components = path.components().skip(1).peekable();
+    while let Some(component) = components.next() {
+        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let flags = if components.peek().is_some() {
+            flags | OFlags::DIRECTORY
+        } else {
+            flags | OFlags::NONBLOCK
+        };
+        directory = openat(&directory, component.as_os_str(), flags, Mode::empty())
+            .map(fs::File::from)
+            .map_err(io::Error::from)?;
+    }
+    Ok(directory)
+}
+
+#[cfg(windows)]
+fn open_value_file(path: &Path) -> Result<fs::File, CliError> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let file =
+        fs::OpenOptions::new().read(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(path)?;
+    if path.canonicalize()? != path {
+        return Err(metadata_invalid_error("value_file changed while opening"));
+    }
+    Ok(file)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_value_file(path: &Path) -> Result<fs::File, CliError> {
+    Ok(fs::File::open(path)?)
 }
 
 fn update_metadata(context: &RuntimeContext, args: UpdateArgs) -> Result<Value, CliError> {

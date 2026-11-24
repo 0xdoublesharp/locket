@@ -214,23 +214,41 @@ fn label(kind: &str, id: &str, name: &str, redact: bool) -> String {
     if redact { privacy_alias(kind, id) } else { name.to_owned() }
 }
 
-pub fn handle_list_projects(request: &RequestEnvelope) -> ResponseEnvelope {
+pub fn handle_list_projects(
+    request: &RequestEnvelope,
+    state: &crate::AgentSocketState,
+) -> ResponseEnvelope {
     let Ok(payload) = ListProjectsRequest::deserialize(&request.payload) else {
         return invalid_payload(request);
     };
-    let result = Store::open_read_only(payload.store_path)
-        .map_err(DiscoveryError::from)
-        .and_then(|store| list_projects(&store, payload.redact_names));
+    let Ok((store, _)) = state.open_store(std::path::Path::new(&payload.store_path), None, true)
+    else {
+        return crate::server::error_response(
+            request,
+            "AccessDenied",
+            "could not verify discovery store",
+        );
+    };
+    let result = list_projects(&store, payload.redact_names);
     response(request, result, "projects")
 }
 
-pub fn handle_discover_secrets(request: &RequestEnvelope) -> ResponseEnvelope {
+pub fn handle_discover_secrets(
+    request: &RequestEnvelope,
+    state: &crate::AgentSocketState,
+) -> ResponseEnvelope {
     let Ok(payload) = DiscoverSecretsRequest::deserialize(&request.payload) else {
         return invalid_payload(request);
     };
-    let result = Store::open_read_only(payload.store_path)
-        .map_err(DiscoveryError::from)
-        .and_then(|store| discover_secrets(&store, payload.filters));
+    let Ok((store, _)) = state.open_store(std::path::Path::new(&payload.store_path), None, true)
+    else {
+        return crate::server::error_response(
+            request,
+            "AccessDenied",
+            "could not verify discovery store",
+        );
+    };
+    let result = discover_secrets(&store, payload.filters);
     response(request, result, "secrets")
 }
 

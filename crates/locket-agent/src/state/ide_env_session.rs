@@ -228,8 +228,15 @@ pub async fn handle_register_ide_env_session(
         }
         Err(error) => return error_response(request, "CorruptDb", error.to_string()),
     };
-    let Ok(mut store) = Store::open(&payload.store_path) else {
-        return error_response(request, "CorruptDb", "failed to open store");
+    let Ok((mut store, _)) = crate::keys::open_verified_store_for_state(
+        state,
+        &payload.project_id,
+        &payload.store_path,
+        now_unix_nanos,
+    )
+    .await
+    else {
+        return error_response(request, "AccessDenied", "could not verify IDE session store");
     };
     let audit_key = match unwrap_audit_key_with_master(&store, &payload.project_id, &master_key) {
         Ok(key) => key,

@@ -24,8 +24,6 @@ use serde_json::Value;
 use zeroize::Zeroizing;
 
 use crate::commands::agent::ensure_agent_running_for_execution;
-#[cfg(all(any(unix, windows), not(test)))]
-use crate::commands::agent::request_agent_once;
 use crate::commands::config::spec::{config_get_value, read_user_config};
 use crate::runtime::RuntimeContext;
 use crate::runtime::error::{
@@ -77,10 +75,8 @@ pub struct RunPolicyGrantRequest {
 pub struct RunPolicyGrantMetadata {
     /// Live grant TTL from the command policy.
     pub ttl_seconds: u64,
-    /// Child process id bound to the grant.
-    pub process_id: u32,
-    /// Platform process-start token bound to the grant.
-    pub process_start_time: String,
+    /// Exact launcher process binding and execution scope returned by the agent.
+    pub binding: locket_agent::GrantBinding,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -202,7 +198,7 @@ impl RunProtection {
                     &policy.prepared,
                     &locket_exec::NetworkContainmentPolicy {
                         allowed_loopback_ports: vec![broker.local_addr().port()],
-                        allow_unix_sockets: true,
+                        allow_unix_sockets: false,
                     },
                 )
                 .map_err(|error| {
@@ -1397,6 +1393,7 @@ fn request_agent_grant(
         profile_id: profile.id.clone(),
         policy_name: None,
         action,
+        confirm_dangerous: profile.dangerous,
         ttl_seconds: policy.ttl.as_secs(),
         binding: binding.clone(),
     };
@@ -1765,30 +1762,19 @@ fn execute_runtime_child(
     if protection.is_some() {
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
     }
-    let mut child = command.spawn()?;
+    let run_policy_grant = request
+        .run_policy_grant
+        .map(|grant| request_run_policy_grant(context, request, grant.ttl_seconds))
+        .transpose()?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            revoke_run_policy_grant(context, run_policy_grant.as_ref());
+            return Err(error.into());
+        }
+    };
     drop(command);
     let process_id = child.id();
-    let run_policy_grant = match request.run_policy_grant {
-        Some(grant_request) => {
-            let grant = match request_run_policy_grant(
-                context,
-                request.resolved.config.project_id.as_str(),
-                &request.profile.id,
-                request.policy_name,
-                process_id,
-                grant_request.ttl_seconds,
-            ) {
-                Ok(grant) => grant,
-                Err(error) => {
-                    let _ignored = child.kill();
-                    let _ignored = child.wait();
-                    return Err(error);
-                }
-            };
-            Some(grant)
-        }
-        None => None,
-    };
     let session = RuntimeSessionRecord {
         id: session_id,
         project_id: request.resolved.config.project_id.to_string(),
@@ -1848,115 +1834,99 @@ fn execute_runtime_child(
     })
 }
 
+#[derive(serde::Deserialize)]
+struct RunPolicyGrantResponse {
+    grant_id: String,
+    project_id: String,
+    profile_id: String,
+    action: locket_agent::GrantAction,
+    expires_at_unix_nanos: String,
+    ttl_seconds: u64,
+    binding: locket_agent::GrantBinding,
+}
+
 fn request_run_policy_grant(
     context: &RuntimeContext,
-    project_id: &str,
-    profile_id: &str,
-    policy_name: Option<&str>,
-    process_id: u32,
+    request: &RuntimeExecutionRequest<'_>,
     ttl_seconds: u64,
 ) -> Result<RunPolicyGrant, CliError> {
-    let binding = locket_platform::process_binding_for_pid(process_id)?;
-    request_run_policy_grant_with_binding(
+    let policy_name =
+        request.policy_name.ok_or_else(|| invalid_policy_error("run grant needs a policy"))?;
+    let cwd = request.current_dir.unwrap_or(&context.cwd).canonicalize()?;
+    let binding = agent_grant_binding()?.with_execution(policy_name, cwd);
+    // Unit fixtures without an agent exercise local child behavior. Fixtures
+    // with an explicit endpoint use the same grant exchange as production.
+    #[cfg(test)]
+    if context.agent_data_dir.is_none() {
+        return Ok(RunPolicyGrant {
+            grant_id: "lk_grant_test".to_owned(),
+            metadata: RunPolicyGrantMetadata { ttl_seconds, binding },
+        });
+    }
+    #[cfg(not(test))]
+    crate::commands::policy::refresh_command_policy_for_run(
         context,
-        project_id,
-        profile_id,
+        request.resolved,
         policy_name,
-        binding,
-        ttl_seconds,
-    )
-}
+    )?;
 
-#[cfg(all(any(unix, windows), not(test)))]
-fn request_run_policy_grant_with_binding(
-    context: &RuntimeContext,
-    project_id: &str,
-    profile_id: &str,
-    policy_name: Option<&str>,
-    binding: locket_platform::ProcessBinding,
-    ttl_seconds: u64,
-) -> Result<RunPolicyGrant, CliError> {
     let payload = locket_agent::RequestGrantPayload {
-        project_id: project_id.to_owned(),
-        profile_id: profile_id.to_owned(),
-        policy_name: policy_name.map(ToOwned::to_owned),
+        project_id: request.resolved.config.project_id.to_string(),
+        profile_id: request.profile.id.clone(),
+        policy_name: Some(policy_name.to_owned()),
         action: locket_agent::GrantAction::RunPolicy,
+        confirm_dangerous: request.profile.dangerous,
         ttl_seconds,
-        binding: agent_grant_binding()?,
+        binding: binding.clone(),
     };
-    let response = request_agent_once(
+    let response: RunPolicyGrantResponse = agent_invoke(
         context,
         locket_agent::AgentMethod::RequestGrant,
-        serde_json::to_value(payload)?,
+        &payload,
+        "authorize policy launch",
     )?;
-    let grant_id = response
-        .get("grant_id")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| corrupt_db_error("agent RequestGrant response omitted grant_id"))?
-        .to_owned();
+    let now = now_unix_nanos()?;
+    if response.binding != binding
+        || response.project_id != payload.project_id
+        || response.profile_id != payload.profile_id
+        || response.action != payload.action
+        || locket_core::id::GrantId::new(&response.grant_id).is_err()
+        || !response.expires_at_unix_nanos.parse::<i64>().is_ok_and(|expiry| expiry > now)
+        || !(1..=3600).contains(&response.ttl_seconds)
+    {
+        revoke_run_policy_grant_id(context, &response.grant_id);
+        return Err(typed_cli_error(
+            LocketError::GrantRequired,
+            "agent returned an invalid policy grant",
+        ));
+    }
     Ok(RunPolicyGrant {
-        grant_id,
+        grant_id: response.grant_id,
         metadata: RunPolicyGrantMetadata {
-            ttl_seconds,
-            process_id: binding.pid,
-            process_start_time: binding.process_start_time,
-        },
-    })
-}
-
-#[cfg(all(not(any(unix, windows)), not(test)))]
-fn request_run_policy_grant_with_binding(
-    _context: &RuntimeContext,
-    _project_id: &str,
-    _profile_id: &str,
-    _policy_name: Option<&str>,
-    _binding: locket_platform::ProcessBinding,
-    _ttl_seconds: u64,
-) -> Result<RunPolicyGrant, CliError> {
-    Err(crate::runtime::error::typed_cli_error(
-        locket_core::LocketError::AgentUnavailable,
-        "agent daemon is only supported on Unix targets",
-    ))
-}
-
-#[cfg(test)]
-#[allow(clippy::unnecessary_wraps)]
-fn request_run_policy_grant_with_binding(
-    _context: &RuntimeContext,
-    _project_id: &str,
-    _profile_id: &str,
-    _policy_name: Option<&str>,
-    binding: locket_platform::ProcessBinding,
-    ttl_seconds: u64,
-) -> Result<RunPolicyGrant, CliError> {
-    Ok(RunPolicyGrant {
-        grant_id: "lk_grant_test".to_owned(),
-        metadata: RunPolicyGrantMetadata {
-            ttl_seconds,
-            process_id: binding.pid,
-            process_start_time: binding.process_start_time,
+            ttl_seconds: response.ttl_seconds,
+            binding: response.binding,
         },
     })
 }
 
 fn revoke_run_policy_grant(context: &RuntimeContext, grant: Option<&RunPolicyGrant>) {
-    let Some(grant) = grant else {
-        return;
-    };
-    revoke_run_policy_grant_id(context, &grant.grant_id);
+    if let Some(grant) = grant {
+        revoke_run_policy_grant_id(context, &grant.grant_id);
+    }
 }
 
-#[cfg(all(any(unix, windows), not(test)))]
 fn revoke_run_policy_grant_id(context: &RuntimeContext, grant_id: &str) {
-    let _ignored = request_agent_once(
+    #[cfg(test)]
+    if context.agent_data_dir.is_none() {
+        return;
+    }
+    let _ignored: Result<serde_json::Value, _> = agent_invoke(
         context,
         locket_agent::AgentMethod::RevokeGrant,
-        serde_json::json!({ "grant_id": grant_id }),
+        &serde_json::json!({"grant_id": grant_id}),
+        "revoke policy launch grant",
     );
 }
-
-#[cfg(any(not(any(unix, windows)), test))]
-const fn revoke_run_policy_grant_id(_context: &RuntimeContext, _grant_id: &str) {}
 
 fn runtime_session_retention(
     context: &RuntimeContext,

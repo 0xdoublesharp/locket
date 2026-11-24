@@ -7,7 +7,7 @@
 //! See `docs/specs/agent.md` for the gated-value-access contract and
 //! `docs/specs/errors.md` for the `UnlockRequired` error semantics.
 //!
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use locket_core::{LocketError, SecretName};
 use locket_crypto::{
@@ -208,6 +208,7 @@ async fn handle_value_access(
                     .map(|entry| Zeroizing::new(entry.key_bytes().to_vec()))
             };
             crate::audit_deny::try_append_grant_denial(
+                state,
                 project_id,
                 &profile_id,
                 Some(store_path),
@@ -216,7 +217,8 @@ async fn handle_value_access(
                 0,
                 now_unix_nanos,
                 "agent",
-            );
+            )
+            .await;
         }
         return grant_required(request);
     };
@@ -253,6 +255,7 @@ async fn handle_value_access(
                 .map(|entry| Zeroizing::new(entry.key_bytes().to_vec()))
         };
         crate::audit_deny::try_append_grant_denial(
+            state,
             project_id,
             &profile_id,
             Some(store_path),
@@ -261,7 +264,8 @@ async fn handle_value_access(
             ttl_seconds,
             now_unix_nanos,
             "agent",
-        );
+        )
+        .await;
         return grant_required(request);
     }
 
@@ -290,12 +294,24 @@ async fn handle_value_access(
         );
     };
 
+    let (store, _) = match crate::keys::open_verified_store_for_state(
+        state,
+        project_id,
+        store_path,
+        now_unix_nanos,
+    )
+    .await
+    {
+        Ok(opened) => opened,
+        Err(error) => return crate::server::store_open_error(request, &error),
+    };
+
     match read_secret_value(
         project_id,
         &profile_id,
         &secret_name,
         access,
-        store_path,
+        store,
         &master_key,
         ttl_seconds,
         now_unix_nanos,
@@ -385,13 +401,12 @@ fn read_secret_value(
     profile_id: &str,
     secret_name: &str,
     access: AccessKind,
-    store_path: &Path,
+    mut store: Store,
     master_key: &[u8],
     ttl_seconds: u32,
     timestamp: i128,
 ) -> Result<ResolvedValue, ValueAccessFailure> {
     let master_key = master_key_array(master_key).map_err(|_| corrupt_db())?;
-    let mut store = Store::open(store_path).map_err(|_| corrupt_db())?;
     match read_secret_value_inner(
         &store,
         project_id,

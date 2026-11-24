@@ -428,32 +428,6 @@ fn agent_status_command(context: &RuntimeContext, output: &mut impl Write) -> Re
     Ok(())
 }
 
-#[cfg(all(any(unix, target_os = "windows"), not(test)))]
-pub(super) fn request_agent_once(
-    context: &RuntimeContext,
-    method: locket_agent::AgentMethod,
-    payload: Value,
-) -> Result<Value, CliError> {
-    request_agent_endpoint(&agent_socket_path(context), method, payload).map_err(|error| {
-        typed_cli_error(
-            locket_core::LocketError::AgentUnavailable,
-            format!("agent request {} failed: {error}", method.as_str()),
-        )
-    })
-}
-
-#[cfg(all(not(any(unix, target_os = "windows")), not(test)))]
-pub(super) fn request_agent_once(
-    _context: &RuntimeContext,
-    _method: (),
-    _payload: Value,
-) -> Result<Value, CliError> {
-    Err(typed_cli_error(
-        locket_core::LocketError::AgentUnavailable,
-        "agent daemon is only supported on Unix targets",
-    ))
-}
-
 fn agent_stop_command(context: &RuntimeContext, output: &mut impl Write) -> Result<(), CliError> {
     let pid_path = agent_pid_path(context);
     let socket_path = agent_socket_path(context);
@@ -931,7 +905,9 @@ fn bind_and_record(
     ))
     .map_err(socket_error_to_cli)?;
     let state = AgentSocketState::locked(env!("CARGO_PKG_VERSION"))
-        .with_canonical_store_path(store_path.to_path_buf());
+        .with_canonical_store_path(store_path.to_path_buf())
+        .with_user_verifier(locket_platform::default_local_user_verifier())
+        .with_daemon_user_verification(true);
     Ok((listener, state))
 }
 
@@ -1096,7 +1072,9 @@ pub fn run_internal_agent_serve(
             .map_err(|error| io::Error::other(error.to_string()))?;
         let mut listener = locket_agent::bind_named_pipe_listener(&config)?;
         let state = locket_agent::AgentSocketState::locked(env!("CARGO_PKG_VERSION"))
-            .with_canonical_store_path(store_path.to_path_buf());
+            .with_canonical_store_path(store_path.to_path_buf())
+        .with_user_verifier(locket_platform::default_local_user_verifier())
+        .with_daemon_user_verification(true);
         let mut observer = start_session_observer(&state, args.require_session_monitoring).await?;
         write_pid_file(&args.pid_file).map_err(|error| io::Error::other(error.to_string()))?;
         let sync_task = locket_agent::team_sync::spawn_team_sync_poll(state.clone());
@@ -1363,6 +1341,7 @@ mod tests {
                 action: GrantAction::RunPolicy,
                 binding: GrantBinding::new(std::process::id(), "test"),
                 observed_peer_pid: None,
+                observed_connection_id: None,
                 issued_at_unix_nanos: 0,
                 ttl_seconds: 30,
                 expires_at_unix_nanos: i128::MAX,

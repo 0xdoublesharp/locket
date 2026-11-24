@@ -175,6 +175,7 @@ pub struct BackupActionResponse {
 
 struct UnlockedProject {
     store_path: PathBuf,
+    store_identity: Option<crate::keys::StoreFileIdentity>,
     profile_id: Option<String>,
     master_key: zeroize::Zeroizing<locket_crypto::KeyBytes>,
 }
@@ -424,7 +425,7 @@ pub async fn handle_export_bundle(
         return error_response(envelope, "InvalidReference", "bundle export requires a recipient");
     }
     let grants = state.grants.lock().await;
-    match export_bundle(&request, &unlocked, &grants) {
+    match export_bundle(&request, &unlocked, &grants, state) {
         Ok(response) => success_response(envelope, response),
         Err((code, message)) => error_response(envelope, code, &message),
     }
@@ -493,9 +494,10 @@ pub async fn handle_verify_bundle(
             Ok(unlocked) => unlocked,
             Err(response) => return response,
         };
-        let result = Store::open_read_only(&unlocked.store_path)
-            .map_err(|error| ("CorruptDb", format!("could not open store: {error}")))
-            .and_then(|store| decrypt_local_bundle(&bundle, &store, &unlocked, state));
+        let result = state
+            .open_store(&unlocked.store_path, unlocked.store_identity.as_ref(), true)
+            .map_err(|error| ("AccessDenied", error.to_string()))
+            .and_then(|(store, _)| decrypt_local_bundle(&bundle, &store, &unlocked, state));
         if let Err((code, message)) = result {
             return error_response(envelope, code, &message);
         }
@@ -553,13 +555,15 @@ fn export_bundle(
     request: &ExportBundleRequest,
     unlocked: &UnlockedProject,
     grants: &GrantTable,
+    state: &AgentSocketState,
 ) -> BackupResult<BackupActionResponse> {
     let grant_required = || {
         ("GrantRequired", "live Export grant covering the selected scope is required".to_owned())
     };
     let grant_id = request.grant_id.as_deref().ok_or_else(grant_required)?;
-    let mut store = Store::open(&unlocked.store_path)
-        .map_err(|error| ("CorruptDb", format!("could not open store: {error}")))?;
+    let (mut store, _) = state
+        .open_store(&unlocked.store_path, unlocked.store_identity.as_ref(), false)
+        .map_err(|error| ("AccessDenied", error.to_string()))?;
     if store
         .get_project(&request.project_id)
         .map_err(|error| ("CorruptDb", format!("could not read project: {error}")))?
@@ -722,8 +726,9 @@ fn import_bundle(
         ));
     }
 
-    let mut store = Store::open(&unlocked.store_path)
-        .map_err(|error| ("CorruptDb", format!("could not open store: {error}")))?;
+    let (mut store, _) = state
+        .open_store(&unlocked.store_path, unlocked.store_identity.as_ref(), false)
+        .map_err(|error| ("AccessDenied", error.to_string()))?;
     if store
         .get_project(&request.project_id)
         .map_err(|error| ("CorruptDb", format!("could not read project: {error}")))?
@@ -2294,11 +2299,13 @@ async fn unlocked_project(
             "bundle operation requires unlock audit context with store_path",
         ));
     };
-    if entry.store_identity.as_ref().is_some_and(|pin| !pin.matches(&context.store_path)) {
+    if let Some(path) = envelope.payload.get("store_path").and_then(serde_json::Value::as_str)
+        && !entry.store_identity.as_ref().is_some_and(|pin| pin.matches(Path::new(path)))
+    {
         return Err(error_response(
             envelope,
             "AccessDenied",
-            "bundle store no longer matches the pinned vault",
+            "store does not match the pinned vault",
         ));
     }
     let master_key = master_key_array(entry.key_bytes()).map_err(|_| {
@@ -2306,6 +2313,7 @@ async fn unlocked_project(
     })?;
     Ok(UnlockedProject {
         store_path: context.store_path.clone(),
+        store_identity: entry.store_identity.clone(),
         profile_id: context.profile_id.clone(),
         master_key,
     })
@@ -2399,7 +2407,8 @@ mod tests {
         let state = AgentSocketState::locked("bundle-test");
         let master_key = Zeroizing::new([42; 32]);
         state.seed_master_key(PROJECT_ID, &master_key)?;
-        let unlocked = UnlockedProject { store_path, profile_id: None, master_key };
+        let unlocked =
+            UnlockedProject { store_path, store_identity: None, profile_id: None, master_key };
         let unlock = RequestEnvelope::new(
             "unlock",
             crate::AgentMethod::Unlock,
@@ -2476,6 +2485,7 @@ mod tests {
                 profile_id: BUNDLE_PROJECT_GRANT_SCOPE.to_owned(),
                 policy_name: None,
                 action: GrantAction::ImportDotenv,
+                confirm_dangerous: false,
                 ttl_seconds: 30,
                 binding: binding.clone(),
             },
@@ -2983,18 +2993,23 @@ mod tests {
         };
         let unlocked = UnlockedProject {
             store_path: store_path.clone(),
+            store_identity: None,
             profile_id: Some(PROFILE_ID.to_owned()),
             master_key: zeroize::Zeroizing::new(master_key),
         };
 
         let mut grants = GrantTable::default();
-        assert!(matches!(export_bundle(&request, &unlocked, &grants), Err(("GrantRequired", _))));
+        assert!(matches!(
+            export_bundle(&request, &unlocked, &grants, &AgentSocketState::locked("test")),
+            Err(("GrantRequired", _))
+        ));
         let binding = GrantBinding::new(42, "fixture");
         let mut grant_request = crate::RequestGrantPayload {
             project_id: PROJECT_ID.to_owned(),
             profile_id: PROFILE_ID.to_owned(),
             policy_name: None,
             action: GrantAction::Copy,
+            confirm_dangerous: false,
             ttl_seconds: 60,
             binding: binding.clone(),
         };
@@ -3002,26 +3017,30 @@ mod tests {
         let now = current_unix_nanos();
         let expiry = now + 60_000_000_000;
         request.grant_id = Some(grants.issue(grant_request.clone(), now, expiry)?.grant_id);
-        assert!(matches!(export_bundle(&request, &unlocked, &grants), Err(("GrantRequired", _))));
+        assert!(matches!(
+            export_bundle(&request, &unlocked, &grants, &AgentSocketState::locked("test")),
+            Err(("GrantRequired", _))
+        ));
         assert!(!output_path.exists());
         grant_request.action = GrantAction::Export;
         request.grant_id = Some(grants.issue(grant_request.clone(), now, expiry)?.grant_id);
         let mut preview_request = request.clone();
         preview_request.preview_only = true;
         let preview =
-            export_bundle(&preview_request, &unlocked, &grants).map_err(|(_, message)| message)?;
+            export_bundle(&preview_request, &unlocked, &grants, &AgentSocketState::locked("test"))
+                .map_err(|(_, message)| message)?;
         assert_eq!(preview.status, "preview");
         assert!(preview.message.contains("No team-managed values"));
         assert!(!output_path.exists());
         preview_request.scope = BundleExportScope::AllProfiles;
         assert!(matches!(
-            export_bundle(&preview_request, &unlocked, &grants),
+            export_bundle(&preview_request, &unlocked, &grants, &AgentSocketState::locked("test")),
             Err(("GrantRequired", _))
         ));
         grant_request.profile_id = BUNDLE_PROJECT_GRANT_SCOPE.to_owned();
         preview_request.grant_id = Some(grants.issue(grant_request, now, expiry)?.grant_id);
         assert!(
-            matches!(export_bundle(&preview_request, &unlocked, &grants), Ok(result) if result.status == "preview")
+            matches!(export_bundle(&preview_request, &unlocked, &grants, &AgentSocketState::locked("test")), Ok(result) if result.status == "preview")
         );
 
         let store = Store::open(&store_path)?;
@@ -3030,12 +3049,13 @@ mod tests {
             .execute("UPDATE profiles SET dangerous = 1 WHERE id = ?1", [PROFILE_ID])?;
         drop(store);
         assert!(matches!(
-            export_bundle(&request, &unlocked, &grants),
+            export_bundle(&request, &unlocked, &grants, &AgentSocketState::locked("test")),
             Err(("ConfirmationFailed", _))
         ));
         request.confirm_dangerous = true;
         let response =
-            export_bundle(&request, &unlocked, &grants).map_err(|(_, message)| message)?;
+            export_bundle(&request, &unlocked, &grants, &AgentSocketState::locked("test"))
+                .map_err(|(_, message)| message)?;
         assert_eq!(response.status, "exported");
         let bytes = fs::read(&output_path)?;
         let bundle = BundleContainer::deserialize(&bytes)?;

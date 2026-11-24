@@ -10,7 +10,11 @@ import {
   desktopTeamSyncPreserveOverride,
 } from '../agent/client';
 import { joinCommand, syncMessage, type TeamSyncStatus } from '../team/sync';
-const props = defineProps<{ projectId?: string; privacyMode?: boolean }>();
+const props = defineProps<{
+  projectId?: string;
+  privacyMode?: boolean;
+  confirmDangerous?: (action: string) => Promise<boolean | undefined>;
+}>();
 const status = ref<TeamSyncStatus | null>(null);
 const busy = ref(false);
 const error = ref('');
@@ -45,7 +49,14 @@ async function perform(kind: 'status' | 'now' | 'configure') {
   busy.value = true;
   error.value = '';
   try {
-    const request = { project_id: project };
+    const approved =
+      kind === 'status' || !props.confirmDangerous
+        ? false
+        : await props.confirmDangerous(
+            kind === 'now' ? 'Sync team updates' : 'Configure team sync',
+          );
+    if (approved === undefined || token !== generation || project !== props.projectId) return;
+    const request = { project_id: project, ...(approved && { confirm_dangerous: true }) };
     const result =
       kind === 'now'
         ? await desktopTeamSyncNow(request)
@@ -70,16 +81,23 @@ async function reconcile(incoming: string, localId: string, kind: 'profile' | 'v
   busy.value = true;
   error.value = '';
   try {
+    const approved = props.confirmDangerous
+      ? await props.confirmDangerous('Reconcile team changes')
+      : false;
+    if (approved === undefined || token !== generation || project !== props.projectId) return;
+    const confirmation = approved ? { confirm_dangerous: true } : {};
     const result =
       kind === 'profile'
         ? await desktopTeamSyncRenameProfile({
             project_id: project,
+            ...confirmation,
             incoming_profile_id: incoming,
             local_profile_id: localId,
             new_name: localNames.value[incoming]?.trim() ?? '',
           })
         : await desktopTeamSyncPreserveOverride({
             project_id: project,
+            ...confirmation,
             incoming_profile_id: incoming,
             local_secret_id: localId,
           });

@@ -100,6 +100,9 @@ pub struct GrantRecord {
     /// Kernel-observed PID of the process that requested this grant, when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_peer_pid: Option<u32>,
+    /// Daemon-assigned connection that issued a socket grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_connection_id: Option<u64>,
     /// Issue timestamp in Unix nanoseconds.
     pub issued_at_unix_nanos: i128,
     /// TTL in seconds.
@@ -140,6 +143,7 @@ impl GrantRecord {
             action: fields.action,
             binding: fields.binding,
             observed_peer_pid: None,
+            observed_connection_id: None,
             issued_at_unix_nanos: fields.issued_at_unix_nanos,
             ttl_seconds: fields.ttl_seconds,
             expires_at_unix_nanos: fields.expires_at_unix_nanos,
@@ -156,12 +160,15 @@ impl GrantRecord {
         if self.action == GrantAction::PrepareExec && self.binding.pid != issuer {
             return pid == self.binding.pid && self.binding.matches_live_process();
         }
+        // Local clients reconnect between RPCs. Require the original kernel
+        // process identity on subsequent connections, including PID reuse.
         pid == issuer
+            && (self.observed_connection_id.is_none() || self.binding.matches_live_process())
     }
 }
 
 impl GrantBinding {
-    fn matches_live_process(&self) -> bool {
+    pub(crate) fn matches_live_process(&self) -> bool {
         locket_platform::process_binding_for_pid(self.pid)
             .is_ok_and(|live| live.process_start_time == self.process_start_time)
     }
@@ -351,7 +358,7 @@ impl GrantTable {
         issued_at_unix_nanos: i128,
         expires_at_unix_nanos: i128,
     ) -> Result<GrantRecord, locket_core::id::IdGenerationError> {
-        self.issue_with_peer(payload, issued_at_unix_nanos, expires_at_unix_nanos, None)
+        self.issue_with_peer(payload, issued_at_unix_nanos, expires_at_unix_nanos, None, None)
     }
 
     pub(crate) fn issue_with_peer(
@@ -360,6 +367,7 @@ impl GrantTable {
         issued_at_unix_nanos: i128,
         expires_at_unix_nanos: i128,
         observed_peer_pid: Option<u32>,
+        observed_connection_id: Option<u64>,
     ) -> Result<GrantRecord, locket_core::id::IdGenerationError> {
         let grant_id = locket_core::id::GrantId::generate()?;
         let mut record = GrantRecord::new(GrantRecordFields {
@@ -373,6 +381,7 @@ impl GrantTable {
             expires_at_unix_nanos,
         });
         record.observed_peer_pid = observed_peer_pid;
+        record.observed_connection_id = observed_connection_id;
         self.insert(record.clone());
         Ok(record)
     }
@@ -390,6 +399,9 @@ pub struct RequestGrantPayload {
     pub policy_name: Option<String>,
     /// Action set authorized by this grant.
     pub action: GrantAction,
+    /// Explicit confirmation to grant access to a dangerous profile.
+    #[serde(default)]
+    pub confirm_dangerous: bool,
     /// Requested TTL in seconds. Overridden by `policy_name` when present.
     pub ttl_seconds: u64,
     /// Caller's process binding.
@@ -577,6 +589,7 @@ mod tests {
                 profile_id: "prof-1".to_owned(),
                 policy_name: None,
                 action: GrantAction::ScanKnownValues,
+                confirm_dangerous: false,
                 ttl_seconds: 45,
                 binding: GrantBinding::new(4242, "start-a"),
             },
@@ -720,6 +733,7 @@ mod tests {
                     profile_id: "prof-1".to_owned(),
                     policy_name: None,
                     action,
+                    confirm_dangerous: false,
                     ttl_seconds: 30,
                     binding: GrantBinding::new(4242, "start-a"),
                 },

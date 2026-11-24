@@ -164,6 +164,7 @@ pub async fn handle_prepare_exec(
         profile_id: typed.profile_id.clone(),
         policy_name: Some(policy.name.clone()),
         action: GrantAction::PrepareExec,
+        confirm_dangerous: false,
         ttl_seconds,
         binding,
     };
@@ -184,6 +185,7 @@ pub async fn handle_prepare_exec(
             now_unix_nanos,
             now_unix_nanos.saturating_add(ttl_nanos),
             observed_pid,
+            None,
         )
     };
     let grant_id = match issued {

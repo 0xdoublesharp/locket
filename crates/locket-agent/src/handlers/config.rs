@@ -7,6 +7,7 @@ use std::str::FromStr;
 
 use locket_core::{Duration as LocketDuration, privacy_alias};
 use locket_store::{AuditWrite, Store};
+use rusqlite::OptionalExtension as _;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -24,6 +25,68 @@ const VERIFICATION_DANGEROUS_PROFILE_SWITCH: &str =
 const VERIFICATION_RECOVERY: &str = "user_verification_required_for.recovery";
 const VERIFICATION_TEAM_ACCEPT: &str = "user_verification_required_for.team_accept";
 const VERIFICATION_DEVICE_REGISTER: &str = "user_verification_required_for.device_register";
+
+pub fn requires_user_verification(
+    user_config_path: Option<&Path>,
+    store: Option<&Store>,
+    project_id: &str,
+    actions: &[&str],
+) -> Result<bool, ConfigRpcError> {
+    let config_requires = |config: &toml::Table| -> Result<bool, ConfigRpcError> {
+        for action in actions {
+            if bool_config_value(config, &format!("user_verification_required_for.{action}"))?
+                == Some(true)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    if let Some(path) = user_config_path
+        && config_requires(&read_config_table(path)?)?
+    {
+        return Ok(true);
+    }
+    let Some(store) = store else { return Ok(false) };
+    let stored: Option<String> = store
+        .connection()
+        .query_row(
+            "SELECT user_verification_policy_json FROM projects WHERE id = ?1",
+            [project_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(locket_store::StoreError::from)?;
+    if let Some(stored) = stored {
+        let stored: serde_json::Value = serde_json::from_str(&stored).map_err(|_| {
+            ConfigRpcError::MetadataInvalid("invalid project verification policy".into())
+        })?;
+        let settings = stored.get("user_verification_required_for").unwrap_or(&stored);
+        for action in actions {
+            match settings.get(action) {
+                Some(serde_json::Value::Bool(true)) => return Ok(true),
+                Some(serde_json::Value::Bool(false)) | None => {}
+                Some(_) => {
+                    return Err(ConfigRpcError::MetadataInvalid(
+                        "invalid project verification setting".into(),
+                    ));
+                }
+            }
+        }
+    }
+    for root in store.list_project_roots(project_id)? {
+        let Some(path) = root.display_path.and_then(|path| fs::canonicalize(path).ok()) else {
+            continue;
+        };
+        let hash: [u8; 32] = Sha256::digest(path.to_string_lossy().as_bytes()).into();
+        if hash == root.root_hash
+            && config_requires(&read_config_table(&path.join("locket.toml"))?)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
 
 /// Request payload for `ReadConfig`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -157,7 +220,7 @@ pub struct WriteConfigResponse {
 }
 
 #[derive(Debug, thiserror::Error)]
-enum ConfigRpcError {
+pub enum ConfigRpcError {
     #[error("{0}")]
     Protocol(String),
     #[error("{0}")]
@@ -170,6 +233,8 @@ enum ConfigRpcError {
     Key(#[from] KeyError),
     #[error(transparent)]
     Store(#[from] locket_store::StoreError),
+    #[error(transparent)]
+    StoreIdentity(#[from] crate::keys::StoreIdentityError),
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
@@ -189,6 +254,7 @@ impl ConfigRpcError {
             Self::UnlockRequired => "UnlockRequired",
             Self::ProfileNotFound => "ProfileNotFound",
             Self::Key(_) => "AuditIntegrityFailed",
+            Self::StoreIdentity(_) => "AccessDenied",
             Self::Store(error) => match error.locket_error() {
                 locket_core::LocketError::StorageBusy => "StorageBusy",
                 locket_core::LocketError::SchemaNewerThanBinary => "SchemaNewerThanBinary",
@@ -201,14 +267,17 @@ impl ConfigRpcError {
 }
 
 /// Handles a `ReadConfig` request.
-pub fn handle_read_config(request: &RequestEnvelope) -> ResponseEnvelope {
+pub async fn handle_read_config(
+    request: &RequestEnvelope,
+    state: &crate::AgentSocketState,
+) -> ResponseEnvelope {
     let payload: ReadConfigRequest = match serde_json::from_value(request.payload.clone()) {
         Ok(payload) => payload,
         Err(_) => {
             return error_response(request, "ProtocolError", "invalid ReadConfig payload");
         }
     };
-    match read_settings(&payload) {
+    match read_settings(&payload, state).await {
         Ok(settings) => success_response(request, settings),
         Err(error) => error_response(request, error.error_name(), error.to_string()),
     }
@@ -245,11 +314,33 @@ fn error_response(
     ResponseEnvelope::Error(ErrorEnvelope::new(request.id.clone(), error, message, false))
 }
 
-fn read_settings(request: &ReadConfigRequest) -> Result<AgentConfigSettings, ConfigRpcError> {
+async fn read_settings(
+    request: &ReadConfigRequest,
+    state: &crate::AgentSocketState,
+) -> Result<AgentConfigSettings, ConfigRpcError> {
     let config = read_config_table(&request.config_path)?;
+    let store = if let (Some(path), Some(project_id), Some(_)) = (
+        request.store_path.as_deref(),
+        request.project_id.as_deref(),
+        request.profile_name.as_deref(),
+    ) {
+        Some(
+            crate::keys::open_verified_store_for_state_with(
+                state,
+                project_id,
+                path,
+                crate::server::current_unix_nanos(),
+                true,
+            )
+            .await?
+            .0,
+        )
+    } else {
+        None
+    };
     settings_from_config(
         &config,
-        request.store_path.as_deref(),
+        store.as_ref(),
         request.project_id.as_deref(),
         request.profile_name.as_deref(),
     )
@@ -306,7 +397,13 @@ async fn write_settings(
         )?;
     }
 
-    let mut store = Store::open(&request.store_path)?;
+    let (mut store, _) = crate::keys::open_verified_store_for_state(
+        state,
+        &request.project_id,
+        &request.store_path,
+        now_unix_nanos,
+    )
+    .await?;
     let audit_key = unwrap_audit_key_with_master(&store, &request.project_id, &master_key)?;
     if !changed_keys.is_empty() {
         write_config_table(&request.config_path, &config)?;
@@ -345,7 +442,7 @@ async fn write_settings(
 
     let settings = settings_from_config(
         &config,
-        Some(request.store_path.as_path()),
+        Some(&store),
         Some(request.project_id.as_str()),
         request.profile_name.as_deref(),
     )?;
@@ -405,7 +502,7 @@ fn append_config_update_audit(
 
 fn settings_from_config(
     config: &toml::Table,
-    store_path: Option<&Path>,
+    store: Option<&Store>,
     project_id: Option<&str>,
     profile_name: Option<&str>,
 ) -> Result<AgentConfigSettings, ConfigRpcError> {
@@ -422,7 +519,7 @@ fn settings_from_config(
         device_register: bool_config_value(config, VERIFICATION_DEVICE_REGISTER)?.unwrap_or(false),
     };
     let dangerous_profile =
-        dangerous_profile_setting(store_path, project_id, profile_name, privacy_redact_names)?;
+        dangerous_profile_setting(store, project_id, profile_name, privacy_redact_names)?;
 
     Ok(AgentConfigSettings {
         privacy_redact_names,
@@ -433,17 +530,15 @@ fn settings_from_config(
 }
 
 fn dangerous_profile_setting(
-    store_path: Option<&Path>,
+    store: Option<&Store>,
     project_id: Option<&str>,
     profile_name: Option<&str>,
     redact_names: bool,
 ) -> Result<Option<DangerousProfileSetting>, ConfigRpcError> {
-    let (Some(store_path), Some(project_id), Some(profile_name)) =
-        (store_path, project_id, profile_name)
+    let (Some(store), Some(project_id), Some(profile_name)) = (store, project_id, profile_name)
     else {
         return Ok(None);
     };
-    let store = Store::open(store_path)?;
     let Some(profile) = store.get_profile_by_name(project_id, profile_name)? else {
         return Err(ConfigRpcError::ProfileNotFound);
     };
@@ -587,8 +682,8 @@ mod tests {
         store
     }
 
-    #[test]
-    fn read_config_defaults_missing_values() {
+    #[tokio::test]
+    async fn read_config_defaults_missing_values() {
         let directory = tempdir().expect("tempdir");
         let request = ReadConfigRequest {
             config_path: directory.path().join("missing.toml"),
@@ -597,7 +692,9 @@ mod tests {
             profile_name: None,
         };
 
-        let settings = read_settings(&request).expect("read settings");
+        let settings = read_settings(&request, &crate::AgentSocketState::locked("test"))
+            .await
+            .expect("read settings");
 
         assert!(!settings.privacy_redact_names);
         assert!(settings.agent_unlock_ttl.is_none());
@@ -608,8 +705,8 @@ mod tests {
         assert!(settings.dangerous_profile.is_none());
     }
 
-    #[test]
-    fn read_config_applies_privacy_alias_to_profile_label() {
+    #[tokio::test]
+    async fn read_config_applies_privacy_alias_to_profile_label() {
         let directory = tempdir().expect("tempdir");
         let config_path = directory.path().join("config.toml");
         let store_path = directory.path().join("store.db");
@@ -622,7 +719,9 @@ mod tests {
             profile_name: Some("default".to_owned()),
         };
 
-        let settings = read_settings(&request).expect("read settings");
+        let settings = read_settings(&request, &crate::AgentSocketState::locked("test"))
+            .await
+            .expect("read settings");
         let dangerous = settings.dangerous_profile.expect("dangerous profile");
 
         assert_eq!(dangerous.profile_name, "default");
@@ -630,8 +729,8 @@ mod tests {
         assert!(!dangerous.dangerous);
     }
 
-    #[test]
-    fn read_config_returns_profile_not_found_for_missing_profile_context() {
+    #[tokio::test]
+    async fn read_config_returns_profile_not_found_for_missing_profile_context() {
         let directory = tempdir().expect("tempdir");
         let config_path = directory.path().join("config.toml");
         let store_path = directory.path().join("store.db");
@@ -648,7 +747,9 @@ mod tests {
             }),
         );
 
-        let ResponseEnvelope::Error(error) = handle_read_config(&request) else {
+        let ResponseEnvelope::Error(error) =
+            handle_read_config(&request, &crate::AgentSocketState::locked("test")).await
+        else {
             panic!("missing profile should fail");
         };
 

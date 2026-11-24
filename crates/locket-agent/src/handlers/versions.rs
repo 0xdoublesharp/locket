@@ -77,8 +77,16 @@ pub struct ListVersionsRow {
 /// # Errors
 ///
 /// Returns [`StoreError`] when the store cannot be opened or queried.
+#[cfg(test)]
 pub fn list_versions(request: &ListVersionsRequest) -> Result<ListVersionsResponse, StoreError> {
-    let store = Store::open(&request.store_path)?;
+    let (store, _) = crate::keys::open_verified_store(&request.store_path, None)?;
+    list_versions_from_store(&store, request)
+}
+
+pub fn list_versions_from_store(
+    store: &Store,
+    request: &ListVersionsRequest,
+) -> Result<ListVersionsResponse, StoreError> {
     let rows = store
         .list_secret_version_metadata_by_profile(&request.project_id, &request.profile_id)?
         .into_iter()

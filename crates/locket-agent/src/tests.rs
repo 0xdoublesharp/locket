@@ -994,7 +994,7 @@ async fn lock_audit_failure_returns_corrupt_db_after_clearing_state()
 
     let tempdir = tempfile::tempdir()?;
     let store_path = tempdir.path().join("locket.sqlite3");
-    std::fs::File::create(&store_path)?;
+    locket_store::Store::open(&store_path)?.initialize_schema()?;
     let state = AgentSocketState::locked("test-version");
     state.seed_master_key("lk_proj_test", &[7; 32])?;
     let unlock = RequestEnvelope::new(
@@ -1405,6 +1405,7 @@ async fn expired_unlock_revokes_its_grants() {
                 profile_id: "profile".into(),
                 policy_name: None,
                 action: crate::GrantAction::ResolveReference,
+                confirm_dangerous: false,
                 ttl_seconds: 900,
                 binding: crate::GrantBinding::new(123, "start"),
             },
@@ -1958,6 +1959,170 @@ async fn status_lazily_evicts_expired_unlock_entries() {
     assert!(state.unlock_cache.lock().await.is_empty());
 }
 
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn daemon_verification_gates_unlock_grants_and_client_registration()
+-> Result<(), Box<dyn std::error::Error>> {
+    use locket_platform::MemoryLocalUserVerifier;
+    use std::sync::Arc;
+
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("store.db");
+    let mut store = locket_store::Store::open(&path)?;
+    store.initialize_schema()?;
+    store.insert_project_if_absent("p", "fixture", 1)?;
+    store.insert_profile_if_absent("dev", "p", "dev", false, 1)?;
+    store.insert_profile_if_absent("prod", "p", "prod", true, 1)?;
+    insert_wrapped_audit_key(&store, "p", &[42; 32], &[11; 32])?;
+
+    let rejected = crate::AgentSocketState::locked("test")
+        .with_canonical_store_path(path.clone())
+        .with_daemon_user_verification(true)
+        .with_user_verifier(Arc::new(MemoryLocalUserVerifier::denying()));
+    let approved =
+        rejected.clone().with_user_verifier(Arc::new(MemoryLocalUserVerifier::allowing()));
+    approved.seed_master_key("p", &[42; 32])?;
+    let binding = locket_platform::current_process_binding()?;
+    let peer =
+        crate::PeerIdentity { uid: approved.daemon_uid, pid: Some(binding.pid), connection_id: 77 };
+    let make = |method, payload| RequestEnvelope::new("approval", method, payload);
+    let unlock = make(AgentMethod::Unlock, json!({"project_id":"p", "ttl_seconds":120}));
+    let grant = |action, profile, confirm_dangerous| {
+        make(
+            AgentMethod::RequestGrant,
+            json!({
+                "project_id":"p", "profile_id": profile, "action": action, "ttl_seconds":30,
+                "confirm_dangerous":confirm_dangerous,
+                "binding": {"pid":binding.pid, "process_start_time":binding.process_start_time},
+            }),
+        )
+    };
+    let register = make(
+        AgentMethod::RegisterClient,
+        json!({
+            "project_id":"p", "store_path":path, "name":"fixture",
+            "public_key":vec![0_u8; 32], "storage":"external",
+            "allowed_actions":["run-policy"], "allowed_policies":["test-policy"],
+        }),
+    );
+    let assert_denied = |response: ResponseEnvelope, code| {
+        assert!(
+            matches!(&response, ResponseEnvelope::Error(error) if error.error == code),
+            "{response:?}"
+        );
+    };
+    assert_denied(
+        crate::dispatch_with_peer(&unlock, &rejected, Some(peer)).await,
+        "UserVerificationFailed",
+    );
+    assert_denied(
+        crate::dispatch_with_peer(&grant("Reveal", "dev", false), &approved, Some(peer)).await,
+        "UnlockRequired",
+    );
+    assert!(matches!(
+        crate::dispatch_with_peer(&unlock, &approved, Some(peer)).await,
+        ResponseEnvelope::Success(_)
+    ));
+    for action in ["Reveal", "Copy", "Export"] {
+        let request = grant(action, "dev", false);
+        assert_denied(
+            crate::dispatch_with_peer(&request, &rejected, Some(peer)).await,
+            "UserVerificationFailed",
+        );
+        let response = crate::dispatch_with_peer(&request, &approved, Some(peer)).await;
+        let ResponseEnvelope::Success(success) = response else {
+            return Err(format!("{response:?}").into());
+        };
+        let id = success.payload()["grant_id"].as_str().ok_or("missing grant ID")?.to_owned();
+        let grants = approved.grants.lock().await;
+        let record = grants.get(&id).ok_or("grant missing from table")?;
+        assert_eq!(record.observed_peer_pid, peer.pid);
+        assert_eq!(record.observed_connection_id, Some(77));
+        assert_eq!(record.binding.process_start_time, binding.process_start_time);
+        drop(grants);
+    }
+    assert_denied(
+        crate::dispatch_with_peer(&grant("Copy", "prod", false), &approved, Some(peer)).await,
+        "ConfirmationFailed",
+    );
+    assert!(matches!(
+        crate::dispatch_with_peer(&grant("Copy", "prod", true), &approved, Some(peer)).await,
+        ResponseEnvelope::Success(_)
+    ));
+    assert_denied(
+        crate::dispatch_with_peer(&register, &rejected, Some(peer)).await,
+        "UserVerificationFailed",
+    );
+    assert!(matches!(
+        crate::dispatch_with_peer(&register, &approved, Some(peer)).await,
+        ResponseEnvelope::Success(_)
+    ));
+    let rows = store.list_exportable_audit_rows("p")?;
+    assert_eq!(rows.len(), 6);
+    for row in rows {
+        let metadata: serde_json::Value = serde_json::from_str(&row.metadata_json)?;
+        let verification = &metadata["user_verification"];
+        assert_eq!(verification["verified"], true);
+        assert_eq!(verification["method"], "test");
+        assert!(verification["verified_at_unix_nanos"].as_i64().is_some_and(|time| time > 0));
+    }
+    assert!(store.verify_audit_chain_read_only("p", &[11; 32])?.hmac_ok);
+    Ok(())
+}
+
+#[tokio::test]
+async fn stored_unlock_verification_policy_is_enforced_without_daemon_default()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("store.db");
+    let mut store = locket_store::Store::open(&path)?;
+    store.initialize_schema()?;
+    store.insert_project_if_absent("p", "fixture", 1)?;
+    store.connection().execute(
+        "UPDATE projects SET user_verification_policy_json = ?1 WHERE id = 'p'",
+        [json!({"unlock":true}).to_string()],
+    )?;
+    let state = crate::AgentSocketState::locked("test").with_canonical_store_path(path);
+    state.seed_master_key("p", &[42; 32])?;
+    let unlock = RequestEnvelope::new(
+        "unlock",
+        AgentMethod::Unlock,
+        json!({"project_id":"p", "ttl_seconds":60}),
+    );
+    let response = crate::dispatch(&unlock, &state).await;
+    assert!(
+        matches!(&response, ResponseEnvelope::Error(error) if error.error == "UserVerificationFailed"),
+        "{response:?}"
+    );
+    assert!(state.unlock_cache.lock().await.is_empty());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn verified_store_rejects_database_and_sidecar_symlinks() -> Result<(), Box<dyn std::error::Error>>
+{
+    use std::os::unix::fs::symlink;
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("store.db");
+    let mut store = locket_store::Store::open(&path)?;
+    store.initialize_schema()?;
+    drop(store);
+    let alias = directory.path().join("alias.db");
+    symlink(&path, &alias)?;
+    assert!(crate::keys::open_verified_store(&alias, None).is_err());
+    let (_, identity) = crate::keys::open_verified_store(&path, None)?;
+    let fixture = directory.path().join("fixture");
+    std::fs::write(&fixture, b"fixture")?;
+    for suffix in ["wal", "shm"] {
+        let sidecar = directory.path().join(format!("store.db-{suffix}"));
+        symlink(&fixture, &sidecar)?;
+        assert!(crate::keys::open_verified_store(&path, Some(&identity)).is_err());
+        std::fs::remove_file(sidecar)?;
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn request_grant_returns_id_bound_to_caller_process() {
     use crate::envelope::{RequestEnvelope, ResponseEnvelope};
@@ -2164,6 +2329,7 @@ fn seed_automation_client_store(
     let mut store = locket_store::Store::open(store_path)?;
     store.initialize_schema()?;
     store.insert_project_if_absent("lk_proj_auth", "auth", 1)?;
+    store.insert_profile_if_absent("lk_prof_auth", "lk_proj_auth", "dev", false, 1)?;
     insert_snapshot_fixture_audit_key(&store, "lk_proj_auth")?;
     store.insert_automation_client(&locket_store::AutomationClientRecord {
         id: "lk_client_auth".to_owned(),
@@ -3541,6 +3707,7 @@ mod server_tests {
         client: &mut UnixStream,
         buffer: &mut Vec<u8>,
     ) -> Result<String, Box<dyn std::error::Error>> {
+        let binding = locket_platform::current_process_binding()?;
         let grant = request_success_frame(
             client,
             buffer,
@@ -3553,8 +3720,8 @@ mod server_tests {
                     "action": "RunPolicy",
                     "ttl_seconds": 30,
                     "binding": {
-                        "pid": std::process::id(),
-                        "process_start_time": "e2e-start"
+                        "pid": binding.pid,
+                        "process_start_time": binding.process_start_time
                     }
                 }),
             ),

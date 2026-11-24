@@ -726,6 +726,7 @@ async fn desktop_backup_mints_required_grants_and_forwards_dangerous_confirmatio
                 assert_eq!(request.kind, expected);
                 let payload = if expected == "RequestGrant" {
                     assert_eq!(request.payload["action"], action);
+                    assert_eq!(request.payload["confirm_dangerous"], true);
                     assert_eq!(
                         request.payload["profile_id"],
                         locket_agent::BUNDLE_PROJECT_GRANT_SCOPE

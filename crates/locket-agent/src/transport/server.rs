@@ -17,7 +17,10 @@ use std::sync::{Arc, OnceLock};
 use locket_crypto::KeyBytes;
 #[cfg(not(test))]
 use locket_platform::KeyringMasterKeyStore;
-use locket_platform::{MasterKeyStore, PassphraseFallbackMasterKeyStore, PlatformError};
+use locket_platform::{
+    LocalUserVerificationMethod, LocalUserVerificationRequest, LocalUserVerifier, MasterKeyStore,
+    PassphraseFallbackMasterKeyStore, PlatformError,
+};
 use locket_store::{Store, StoreError};
 #[cfg(unix)]
 use tokio::io::AsyncWriteExt;
@@ -33,7 +36,9 @@ use crate::framing::decode_request_frame;
 #[cfg(unix)]
 use crate::framing::encode_frame;
 use crate::keys::{
-    KeyError, StoreFileIdentity, cached_master_key, master_key_array, unwrap_audit_key_with_master,
+    KeyError, StoreFileIdentity, StoreIdentityError, cached_master_key, master_key_array,
+    open_verified_store, open_verified_store_for_state, open_verified_store_with,
+    unwrap_audit_key_with_master,
 };
 use crate::method::AgentMethod;
 use crate::peer_cred::PeerIdentity;
@@ -265,6 +270,28 @@ fn prepare_parent_directory(parent: &Path) -> Result<(), SocketServerError> {
     Ok(())
 }
 
+#[derive(serde::Serialize)]
+pub struct UserVerificationAudit {
+    required: bool,
+    satisfied: bool,
+    verified: bool,
+    method: Option<LocalUserVerificationMethod>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verified_at_unix_nanos: Option<i64>,
+}
+
+impl UserVerificationAudit {
+    pub const fn not_required() -> Self {
+        Self {
+            required: false,
+            satisfied: false,
+            verified: false,
+            method: None,
+            verified_at_unix_nanos: None,
+        }
+    }
+}
+
 /// State shared across every accepted connection.
 #[derive(Clone)]
 pub struct AgentSocketState {
@@ -277,6 +304,9 @@ pub struct AgentSocketState {
     connections: Arc<AtomicU64>,
     canonical_store_path: Option<PathBuf>,
     canonical_store_identity: Arc<OnceLock<StoreFileIdentity>>,
+    pub(crate) enforce_daemon_user_verification: bool,
+    user_verifier: Arc<dyn LocalUserVerifier + Send + Sync>,
+    user_config_path: Option<PathBuf>,
     /// Per-project unlock-key cache populated by `Unlock` and cleared
     /// by `Lock`. Status responses derive `lock_state` and
     /// `unlock_ttl_seconds` from the live entries here.
@@ -374,6 +404,9 @@ impl AgentSocketState {
             connections: Arc::new(AtomicU64::new(1)),
             canonical_store_path: None,
             canonical_store_identity: Arc::new(OnceLock::new()),
+            enforce_daemon_user_verification: false,
+            user_verifier: Arc::new(locket_platform::UnavailableLocalUserVerifier),
+            user_config_path: None,
             unlock_cache: Arc::new(Mutex::new(crate::unlock_cache::UnlockCache::default())),
             grants: Arc::new(Mutex::new(crate::grant::GrantTable::default())),
             runtime_sessions: Arc::new(Mutex::new(Vec::new())),
@@ -416,6 +449,9 @@ impl AgentSocketState {
             connections: Arc::new(AtomicU64::new(1)),
             canonical_store_path: None,
             canonical_store_identity: Arc::new(OnceLock::new()),
+            enforce_daemon_user_verification: false,
+            user_verifier: Arc::new(locket_platform::UnavailableLocalUserVerifier),
+            user_config_path: None,
             unlock_cache: cache,
             grants: Arc::new(Mutex::new(crate::grant::GrantTable::default())),
             runtime_sessions: Arc::new(Mutex::new(Vec::new())),
@@ -451,6 +487,88 @@ impl AgentSocketState {
         self.canonical_store_path = Some(path);
         self.canonical_store_identity = Arc::new(identity);
         self
+    }
+
+    /// Supplies the trusted verifier used for daemon-side user approval.
+    #[must_use]
+    pub fn with_user_verifier(
+        mut self,
+        verifier: Arc<dyn LocalUserVerifier + Send + Sync>,
+    ) -> Self {
+        self.user_verifier = verifier;
+        self
+    }
+
+    /// Requires fresh platform verification for sensitive local authorization.
+    #[must_use]
+    pub const fn with_daemon_user_verification(mut self, enforce: bool) -> Self {
+        self.enforce_daemon_user_verification = enforce;
+        self
+    }
+
+    /// Supplies the daemon's trusted user configuration path.
+    #[must_use]
+    pub fn with_user_config_path(mut self, path: PathBuf) -> Self {
+        self.user_config_path = Some(path);
+        self
+    }
+
+    pub(crate) fn open_store(
+        &self,
+        requested: &Path,
+        project_pin: Option<&StoreFileIdentity>,
+        read_only: bool,
+    ) -> Result<(Store, StoreFileIdentity), StoreIdentityError> {
+        let (path, identity) = self.validate_store_path(requested)?;
+        if project_pin.is_some_and(|pin| pin != &identity) {
+            return Err(StoreIdentityError::Mismatch);
+        }
+        open_verified_store_with(&path, Some(&identity), read_only)
+    }
+
+    fn verification_required(
+        &self,
+        store: Option<&Store>,
+        project_id: &str,
+        actions: &[&str],
+    ) -> Result<bool, ()> {
+        if self.enforce_daemon_user_verification {
+            return Ok(true);
+        }
+        crate::config::requires_user_verification(
+            self.user_config_path.as_deref(),
+            store,
+            project_id,
+            actions,
+        )
+        .map_err(|_| ())
+    }
+
+    pub(crate) async fn verify_local_user(
+        &self,
+        request: &RequestEnvelope,
+        action: &'static str,
+        reason: impl Into<String>,
+    ) -> Result<UserVerificationAudit, ResponseEnvelope> {
+        let verifier = Arc::clone(&self.user_verifier);
+        let ceremony = LocalUserVerificationRequest::new(action, reason);
+        let result = tokio::task::spawn_blocking(move || verifier.verify_user(&ceremony)).await;
+        match result {
+            Ok(Ok(verification)) => Ok(UserVerificationAudit {
+                required: true,
+                satisfied: true,
+                verified: true,
+                method: Some(verification.method),
+                verified_at_unix_nanos: Some(
+                    i64::try_from(current_unix_nanos()).unwrap_or(i64::MAX),
+                ),
+            }),
+            _ => Err(error_response(
+                request,
+                "UserVerificationFailed",
+                "fresh local user verification failed or is unavailable",
+            )),
+        }
     }
 
     fn validate_store_path(&self, path: &Path) -> io::Result<(PathBuf, StoreFileIdentity)> {
@@ -822,13 +940,8 @@ fn append_lock_audits(
 ) -> Result<(), StoreError> {
     let timestamp = i64::try_from(now_unix_nanos).unwrap_or(i64::MAX);
     for material in audit_material {
-        if material.store_identity.as_ref().is_some_and(|pin| !pin.matches(&material.store_path)) {
-            return Err(StoreError::AuditIntegrity {
-                sequence: 0,
-                reason: "store identity changed before lock audit".into(),
-            });
-        }
-        let mut store = Store::open(&material.store_path)?;
+        let (mut store, _) =
+            open_verified_store(&material.store_path, material.store_identity.as_ref())?;
         let key_error = || StoreError::AuditIntegrity {
             sequence: 0,
             reason: "project audit key unavailable during lock".into(),
@@ -1123,8 +1236,19 @@ pub fn current_unix_nanos() -> i128 {
     })
 }
 
-fn error_response(envelope: &RequestEnvelope, error: &str, message: &str) -> ResponseEnvelope {
+pub fn error_response(envelope: &RequestEnvelope, error: &str, message: &str) -> ResponseEnvelope {
     ResponseEnvelope::Error(ErrorEnvelope::new(envelope.id.clone(), error, message, false))
+}
+
+pub fn store_open_error(
+    envelope: &RequestEnvelope,
+    error: &StoreIdentityError,
+) -> ResponseEnvelope {
+    if error.is_identity_error() {
+        error_response(envelope, "AccessDenied", "request store does not match the pinned vault")
+    } else {
+        error_response(envelope, "CorruptDb", "could not open the vault database")
+    }
 }
 
 /// Dispatches one validated agent request envelope against shared
@@ -1148,13 +1272,6 @@ pub async fn dispatch_with_peer(
         None
     };
     let observed_pid = peer.and_then(|peer| peer.pid);
-    let Ok(store_path) = request_store_path(envelope, state).await else {
-        return error_response(
-            envelope,
-            "AccessDenied",
-            "request store does not match the pinned vault",
-        );
-    };
     let grant_id = envelope.payload.get("grant_id").and_then(serde_json::Value::as_str);
     if let (Some(pid), Some(grant_id)) = (observed_pid, grant_id) {
         let revoking = matches!(method, Ok(AgentMethod::RevokeGrant | AgentMethod::ExpireGrant));
@@ -1167,22 +1284,11 @@ pub async fn dispatch_with_peer(
             );
         }
     }
-    if let Some(response) = crate::auth::authenticate_request_if_present(
-        envelope,
-        state,
-        current_unix_nanos(),
-        store_path.as_deref(),
-    )
-    .await
+    if let Some(response) =
+        crate::auth::authenticate_request_if_present(envelope, state, current_unix_nanos()).await
     {
         return response;
     }
-    let normalized = store_path.map(|path| {
-        let mut copy = envelope.clone();
-        copy.payload["store_path"] = serde_json::Value::String(path);
-        copy
-    });
-    let envelope = normalized.as_ref().unwrap_or(envelope);
     if let Some(session) = unlock_session {
         return handle_unlock(envelope, state, session).await;
     }
@@ -1252,7 +1358,10 @@ pub async fn dispatch_with_peer(
             ))
         }
         Ok(AgentMethod::ClientHello) => crate::auth::handle_client_hello(envelope, state).await,
-        Ok(AgentMethod::RequestGrant) => handle_request_grant(envelope, state, observed_pid).await,
+        Ok(AgentMethod::RequestGrant) => {
+            handle_request_grant(envelope, state, peer, envelope.payload.get("auth").is_some())
+                .await
+        }
         Ok(AgentMethod::RevokeGrant) => handle_revoke_grant(envelope, state).await,
         Ok(AgentMethod::ExpireGrant) => handle_expire_grant(envelope, state).await,
         Ok(AgentMethod::Reveal) => {
@@ -1266,7 +1375,7 @@ pub async fn dispatch_with_peer(
         }
         Ok(AgentMethod::ListRuntimeSessions) => handle_list_runtime_sessions(envelope, state).await,
         Ok(AgentMethod::ListPolicies) => handle_list_policies(envelope, state).await,
-        Ok(AgentMethod::ListDeviceMembers) => handle_list_device_members(envelope),
+        Ok(AgentMethod::ListDeviceMembers) => handle_list_device_members(envelope, state).await,
         Ok(AgentMethod::RegisterCommandPolicies) => {
             handle_register_command_policies(envelope, state).await
         }
@@ -1283,10 +1392,12 @@ pub async fn dispatch_with_peer(
             crate::resolve::handle_resolve(envelope, state, current_unix_nanos()).await
         }
         Ok(AgentMethod::PrepareExec) => prepare_exec_dispatch(envelope, state, observed_pid).await,
-        Ok(AgentMethod::ListSecrets) => handle_list_secrets(envelope),
-        Ok(AgentMethod::ListProjects) => crate::discovery::handle_list_projects(envelope),
-        Ok(AgentMethod::DiscoverSecrets) => crate::discovery::handle_discover_secrets(envelope),
-        Ok(AgentMethod::ListVersions) => handle_list_versions(envelope),
+        Ok(AgentMethod::ListSecrets) => handle_list_secrets(envelope, state).await,
+        Ok(AgentMethod::ListProjects) => crate::discovery::handle_list_projects(envelope, state),
+        Ok(AgentMethod::DiscoverSecrets) => {
+            crate::discovery::handle_discover_secrets(envelope, state)
+        }
+        Ok(AgentMethod::ListVersions) => handle_list_versions(envelope, state).await,
         Ok(AgentMethod::ImportDotenv) => {
             crate::mutations::handle_import_dotenv(envelope, state, current_unix_nanos()).await
         }
@@ -1301,7 +1412,7 @@ pub async fn dispatch_with_peer(
         }
         Ok(AgentMethod::VerifyAudit) => handle_verify_audit(envelope, state).await,
         Ok(AgentMethod::ListAudit) => handle_list_audit(envelope, state).await,
-        Ok(AgentMethod::ReadConfig) => crate::config::handle_read_config(envelope),
+        Ok(AgentMethod::ReadConfig) => crate::config::handle_read_config(envelope, state).await,
         Ok(AgentMethod::WriteConfig) => crate::config::handle_write_config(envelope, state).await,
         Ok(method @ (AgentMethod::RegisterIdeEnvSession | AgentMethod::IdeEnvSession)) => {
             ide_env_session_dispatch(method, envelope, state).await
@@ -1325,60 +1436,6 @@ pub async fn dispatch_with_peer(
             false,
         )),
     }
-}
-
-async fn request_store_path(
-    envelope: &RequestEnvelope,
-    state: &AgentSocketState,
-) -> Result<Option<String>, ()> {
-    let payload = &envelope.payload;
-    let supplied =
-        [payload.get("store_path"), payload.get("audit").and_then(|audit| audit.get("store_path"))];
-    let uses_cached_store = matches!(
-        envelope.method(),
-        Ok(AgentMethod::TeamSyncStatus
-            | AgentMethod::TeamSyncConfigure
-            | AgentMethod::TeamSyncNow
-            | AgentMethod::TeamSyncReconcile)
-    );
-    if !uses_cached_store && supplied.iter().flatten().all(|value| value.is_null()) {
-        return Ok(None);
-    }
-    let cache = state.unlock_cache.lock().await;
-    let entry = payload
-        .get("project_id")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|project| cache.lookup(project, current_unix_nanos()));
-    let pin = entry.and_then(|entry| entry.store_identity.as_ref());
-    if state.canonical_store_path.is_none() && pin.is_none() {
-        return Ok(None);
-    }
-    let check = |path: &Path| {
-        let (path, identity) = state.validate_store_path(path).map_err(|_| ())?;
-        if pin.is_some_and(|pin| identity != *pin) {
-            return Err(());
-        }
-        Ok(path)
-    };
-    let mut path = None;
-    for (index, value) in supplied.into_iter().enumerate() {
-        if let Some(value) = value.filter(|value| !value.is_null()) {
-            let requested = value.as_str().ok_or(())?;
-            let trusted = check(Path::new(requested))?;
-            if index == 0 {
-                let trusted = trusted.into_os_string().into_string().map_err(|_| ())?;
-                if trusted != requested {
-                    path = Some(trusted);
-                }
-            }
-        }
-    }
-    if uses_cached_store
-        && let Some(context) = entry.and_then(crate::unlock_cache::UnlockEntry::audit_context)
-    {
-        check(&context.store_path)?;
-    }
-    Ok(path)
 }
 
 async fn prepare_exec_dispatch(
@@ -1443,7 +1500,7 @@ async fn handle_unlock(
         return error_response(envelope, "UnlockRequired", "OS session is locked or suspended");
     }
     let now = current_unix_nanos();
-    let mut payload: UnlockPayload = match serde::Deserialize::deserialize(&envelope.payload) {
+    let payload: UnlockPayload = match serde::Deserialize::deserialize(&envelope.payload) {
         Ok(payload) => payload,
         Err(_) => return error_response(envelope, "ProtocolError", "invalid Unlock payload"),
     };
@@ -1456,11 +1513,10 @@ async fn handle_unlock(
         );
     }
 
-    let (store_identity, previous_context) =
-        match pin_unlock_store(envelope, state, &mut payload, now).await {
-            Ok(pinned) => pinned,
-            Err(message) => return error_response(envelope, "AccessDenied", message),
-        };
+    let unlock_store = match open_unlock_store(envelope, state, &payload, now).await {
+        Ok(pinned) => pinned,
+        Err(message) => return error_response(envelope, "AccessDenied", message),
+    };
 
     if state.expire_unlocks(now).await.is_err() {
         return error_response(envelope, "CorruptDb", "failed to audit expired unlock");
@@ -1478,6 +1534,27 @@ async fn handle_unlock(
         ));
     }
 
+    let Ok(verification_required) = state.verification_required(
+        unlock_store.as_ref().map(|opened| &opened.store),
+        &payload.project_id,
+        &["unlock"],
+    ) else {
+        return error_response(
+            envelope,
+            "AccessDenied",
+            "could not read unlock verification policy",
+        );
+    };
+    let verification = if verification_required {
+        match state.verify_local_user(envelope, "unlock", "Unlock the Locket vault").await {
+            Ok(verification) => verification,
+            Err(response) => return response,
+        }
+    } else {
+        UserVerificationAudit::not_required()
+    };
+    let now = current_unix_nanos();
+
     let (master_key_bytes, resolved_method) = match resolve_master_key(
         envelope,
         state,
@@ -1488,37 +1565,28 @@ async fn handle_unlock(
         Err(error) => return error,
     };
 
-    if let Some(audit) = payload.audit.as_ref()
-        && let Err(response) = append_unlock_audit_row(
-            envelope,
-            &audit.store_path,
-            &payload.project_id,
-            audit.profile_id.as_deref(),
-            &master_key_bytes,
-            resolved_method,
-            payload.ttl_seconds,
-            now,
-        )
-    {
-        return response;
-    }
-
     let mut entry = crate::unlock_cache::UnlockEntry::new_zeroizing(
         Zeroizing::new(master_key_bytes.to_vec()),
         now,
         std::time::Duration::from_secs(payload.ttl_seconds),
         resolved_method,
     );
-    entry.store_identity = store_identity;
-    let audit_context = payload
-        .audit
-        .map(|audit| crate::unlock_cache::UnlockAuditContext {
-            store_path: audit.store_path,
-            profile_id: audit.profile_id,
-        })
-        .or(previous_context);
-    if let Some(context) = audit_context {
-        entry = entry.with_audit_context(context);
+    if let Some(mut opened) = unlock_store {
+        if let Err(response) = append_unlock_audit_row(
+            envelope,
+            &mut opened.store,
+            &payload.project_id,
+            opened.context.profile_id.as_deref(),
+            &master_key_bytes,
+            resolved_method,
+            payload.ttl_seconds,
+            now,
+            &verification,
+        ) {
+            return response;
+        }
+        entry.store_identity = Some(opened.identity);
+        entry = entry.with_audit_context(opened.context);
     }
     state.unlock_cache.lock().await.insert(payload.project_id, entry);
     drop(session);
@@ -1526,45 +1594,51 @@ async fn handle_unlock(
     ResponseEnvelope::Success(SuccessEnvelope::new(envelope.id.clone(), serde_json::Value::Null))
 }
 
-async fn pin_unlock_store(
+struct OpenUnlockStore {
+    store: Store,
+    identity: StoreFileIdentity,
+    context: crate::unlock_cache::UnlockAuditContext,
+}
+
+async fn open_unlock_store(
     envelope: &RequestEnvelope,
     state: &AgentSocketState,
-    payload: &mut UnlockPayload,
+    payload: &UnlockPayload,
     now: i128,
-) -> Result<
-    (Option<StoreFileIdentity>, Option<crate::unlock_cache::UnlockAuditContext>),
-    &'static str,
-> {
-    let (previous_pin, previous_context) = {
-        let cache = state.unlock_cache.lock().await;
-        cache.lookup(&payload.project_id, now).map_or((None, None), |entry| {
-            (entry.store_identity.clone(), entry.audit_context().cloned())
-        })
-    };
+) -> Result<Option<OpenUnlockStore>, &'static str> {
+    let cache = state.unlock_cache.lock().await;
+    let entry = cache.lookup(&payload.project_id, now);
+    let previous_context = entry.and_then(crate::unlock_cache::UnlockEntry::audit_context);
+    let request_path = envelope.payload.get("store_path").and_then(serde_json::Value::as_str);
     let store_path = payload
         .audit
         .as_ref()
         .map(|audit| audit.store_path.as_path())
-        .or_else(|| {
-            envelope.payload.get("store_path").and_then(serde_json::Value::as_str).map(Path::new)
-        })
-        .or(state.canonical_store_path.as_deref())
-        .or_else(|| previous_context.as_ref().map(|context| context.store_path.as_path()));
-    let store_identity = if let Some(path) = store_path {
-        let Ok((path, identity)) = state.validate_store_path(path) else {
-            return Err("could not verify unlock store identity");
-        };
-        if previous_pin.is_some_and(|pin| pin != identity) {
-            return Err("unlock store identity changed");
-        }
-        if let Some(audit) = payload.audit.as_mut() {
-            audit.store_path = path;
-        }
-        Some(identity)
-    } else {
-        previous_pin
+        .or_else(|| request_path.map(Path::new))
+        .or_else(|| previous_context.map(|context| context.store_path.as_path()))
+        .or(state.canonical_store_path.as_deref());
+    let Some(path) = store_path else { return Ok(None) };
+    let pin = entry.and_then(|entry| entry.store_identity.as_ref());
+    let (store, identity) =
+        state.open_store(path, pin, false).map_err(|_| "could not verify unlock store identity")?;
+    // The optional request-level selector must agree with the audit selector.
+    if payload.audit.is_some()
+        && let Some(request_path) = request_path
+        && !identity.matches(Path::new(request_path))
+    {
+        return Err("unlock paths do not select the same vault");
+    }
+    let profile_id = payload
+        .audit
+        .as_ref()
+        .and_then(|audit| audit.profile_id.clone())
+        .or_else(|| previous_context.and_then(|context| context.profile_id.clone()));
+    let context = crate::unlock_cache::UnlockAuditContext {
+        store_path: state.canonical_store_path.as_deref().unwrap_or(path).to_path_buf(),
+        profile_id,
     };
-    Ok((store_identity, previous_context))
+    drop(cache);
+    Ok(Some(OpenUnlockStore { store, identity, context }))
 }
 
 /// Loads the master key for `project_id` from the OS keychain, falling
@@ -1629,24 +1703,25 @@ const fn classify_platform_error(error: &PlatformError) -> &'static str {
 #[allow(clippy::too_many_arguments)]
 fn append_unlock_audit_row(
     envelope: &RequestEnvelope,
-    store_path: &Path,
+    store: &mut Store,
     project_id: &str,
     profile_id: Option<&str>,
     master_key: &KeyBytes,
     method: crate::unlock_cache::UnlockMethod,
     ttl_seconds: u64,
     now_unix_nanos: i128,
+    verification: &UserVerificationAudit,
 ) -> Result<(), ResponseEnvelope> {
-    // The agent's UNLOCK row mirrors the CLI's metadata-only behavior:
-    // if the project store cannot be opened or the audit key cannot be
-    // unwrapped, the unlock itself still succeeds — the row is skipped
-    // rather than poisoning the unlock path. The cached master key
-    // remains correct so subsequent RPCs can still authenticate.
-    let Ok(mut store) = Store::open(store_path) else {
-        return Ok(());
-    };
-    let Ok(audit_key) = unwrap_audit_key_with_master(&store, project_id, master_key) else {
-        return Ok(());
+    let audit_key = match unwrap_audit_key_with_master(store, project_id, master_key) {
+        Ok(key) => key,
+        Err(_) if !verification.verified => return Ok(()),
+        Err(_) => {
+            return Err(error_response(
+                envelope,
+                "AuditIntegrityFailed",
+                "unlock audit key unavailable",
+            ));
+        }
     };
 
     let timestamp = i64::try_from(now_unix_nanos).unwrap_or(i64::MAX);
@@ -1664,11 +1739,7 @@ fn append_unlock_audit_row(
         "method": unlock_method_str,
         "agent_available": true,
         "cached_keys": true,
-        "user_verification": {
-            "required": false,
-            "satisfied": false,
-            "method": null,
-        },
+        "user_verification": verification,
         "grant_actions": [],
         "ttl_seconds": ttl_seconds,
     });
@@ -1727,7 +1798,10 @@ async fn handle_list_runtime_sessions(
     crate::runtime_sessions::success_response(envelope, response)
 }
 
-fn handle_list_device_members(envelope: &RequestEnvelope) -> ResponseEnvelope {
+async fn handle_list_device_members(
+    envelope: &RequestEnvelope,
+    state: &AgentSocketState,
+) -> ResponseEnvelope {
     let payload: crate::device_members::ListDeviceMembersRequest =
         match serde_json::from_value(envelope.payload.clone()) {
             Ok(payload) => payload,
@@ -1739,7 +1813,18 @@ fn handle_list_device_members(envelope: &RequestEnvelope) -> ResponseEnvelope {
                 );
             }
         };
-    match crate::device_members::list_device_members(&payload) {
+    let Ok((store, _)) = crate::keys::open_verified_store_for_state_with(
+        state,
+        &payload.project_id,
+        &payload.store_path,
+        current_unix_nanos(),
+        true,
+    )
+    .await
+    else {
+        return error_response(envelope, "AccessDenied", "could not verify metadata store");
+    };
+    match crate::device_members::list_device_members_from_store(&store, &payload) {
         Ok(response) => {
             let payload = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
             ResponseEnvelope::Success(SuccessEnvelope::new(envelope.id.clone(), payload))
@@ -1756,7 +1841,10 @@ fn handle_list_device_members(envelope: &RequestEnvelope) -> ResponseEnvelope {
     }
 }
 
-fn handle_list_secrets(envelope: &RequestEnvelope) -> ResponseEnvelope {
+async fn handle_list_secrets(
+    envelope: &RequestEnvelope,
+    state: &AgentSocketState,
+) -> ResponseEnvelope {
     let payload: crate::secrets::ListSecretsRequest =
         match serde_json::from_value(envelope.payload.clone()) {
             Ok(payload) => payload,
@@ -1764,7 +1852,18 @@ fn handle_list_secrets(envelope: &RequestEnvelope) -> ResponseEnvelope {
                 return error_response(envelope, "ProtocolError", "invalid ListSecrets payload");
             }
         };
-    match crate::secrets::list_secrets(&payload) {
+    let Ok((store, _)) = crate::keys::open_verified_store_for_state_with(
+        state,
+        &payload.project_id,
+        &payload.store_path,
+        current_unix_nanos(),
+        true,
+    )
+    .await
+    else {
+        return error_response(envelope, "AccessDenied", "could not verify metadata store");
+    };
+    match crate::secrets::list_secrets_from_store(&store, &payload) {
         Ok(response) => {
             let payload = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
             ResponseEnvelope::Success(SuccessEnvelope::new(envelope.id.clone(), payload))
@@ -1781,7 +1880,10 @@ fn handle_list_secrets(envelope: &RequestEnvelope) -> ResponseEnvelope {
     }
 }
 
-fn handle_list_versions(envelope: &RequestEnvelope) -> ResponseEnvelope {
+async fn handle_list_versions(
+    envelope: &RequestEnvelope,
+    state: &AgentSocketState,
+) -> ResponseEnvelope {
     let payload: crate::versions::ListVersionsRequest =
         match serde_json::from_value(envelope.payload.clone()) {
             Ok(payload) => payload,
@@ -1789,7 +1891,18 @@ fn handle_list_versions(envelope: &RequestEnvelope) -> ResponseEnvelope {
                 return error_response(envelope, "ProtocolError", "invalid ListVersions payload");
             }
         };
-    match crate::versions::list_versions(&payload) {
+    let Ok((store, _)) = crate::keys::open_verified_store_for_state_with(
+        state,
+        &payload.project_id,
+        &payload.store_path,
+        current_unix_nanos(),
+        true,
+    )
+    .await
+    else {
+        return error_response(envelope, "AccessDenied", "could not verify metadata store");
+    };
+    match crate::versions::list_versions_from_store(&store, &payload) {
         Ok(response) => {
             let payload = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
             ResponseEnvelope::Success(SuccessEnvelope::new(envelope.id.clone(), payload))
@@ -1853,12 +1966,15 @@ enum AuditReadError {
     Key(#[from] KeyError),
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[error(transparent)]
+    StoreIdentity(#[from] StoreIdentityError),
 }
 
 impl AuditReadError {
     fn error_name(&self) -> String {
         match self {
             Self::Key(_) => "AuditIntegrityFailed".to_owned(),
+            Self::StoreIdentity(_) => "AccessDenied".to_owned(),
             Self::Store(error) => format!("{:?}", error.locket_error()),
         }
     }
@@ -1873,7 +1989,13 @@ async fn verify_audit(
     else {
         return Ok(crate::audit_verify::VerifyAuditResponse::locked());
     };
-    let store = Store::open(&payload.store_path)?;
+    let (store, _) = open_verified_store_for_state(
+        state,
+        &payload.project_id,
+        &payload.store_path,
+        current_unix_nanos(),
+    )
+    .await?;
     let audit_key = unwrap_audit_key_with_master(&store, &payload.project_id, &master_key)?;
     Ok(crate::audit_verify::verify_audit(&store, payload, audit_key.as_ref())?)
 }
@@ -1883,7 +2005,13 @@ async fn list_audit(
     state: &AgentSocketState,
 ) -> Result<crate::audit::ListAuditResponse, AuditReadError> {
     let master_key = cached_master_key(state, &payload.project_id, current_unix_nanos()).await?;
-    let store = Store::open(&payload.store_path)?;
+    let (store, _) = open_verified_store_for_state(
+        state,
+        &payload.project_id,
+        &payload.store_path,
+        current_unix_nanos(),
+    )
+    .await?;
     let audit_key = master_key
         .as_ref()
         .map(|key| unwrap_audit_key_with_master(&store, &payload.project_id, key))
@@ -1891,10 +2019,12 @@ async fn list_audit(
     Ok(crate::audit::list_audit(&store, payload, audit_key.as_ref().map(AsRef::as_ref))?)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_request_grant(
     envelope: &RequestEnvelope,
     state: &AgentSocketState,
-    observed_pid: Option<u32>,
+    peer: Option<PeerIdentity>,
+    authenticated_automation: bool,
 ) -> ResponseEnvelope {
     let session = state.session_gate.lock().await;
     if !session.is_empty() {
@@ -1914,7 +2044,33 @@ async fn handle_request_grant(
             "grant TTL must be between 1 and 3600 seconds",
         );
     }
-    if let Some(policy_name) = payload.policy_name.clone() {
+    let observed_pid = peer.and_then(|peer| peer.pid);
+    if observed_pid
+        .is_some_and(|pid| pid != payload.binding.pid || !payload.binding.matches_live_process())
+    {
+        return error_response(
+            envelope,
+            "AccessDenied",
+            "grant binding does not match the connecting process",
+        );
+    }
+    let verification_actions = secret_grant_verification_actions(payload.action);
+    if verification_actions.is_some()
+        && state
+            .unlock_cache
+            .lock()
+            .await
+            .lookup(&payload.project_id, current_unix_nanos())
+            .is_none()
+    {
+        return unlock_required_for_grant(envelope);
+    }
+    if state.enforce_daemon_user_verification && payload.action == crate::GrantAction::RunPolicy {
+        payload.ttl_seconds = match authorize_run_policy_grant(envelope, state, &payload).await {
+            Ok(ttl) => ttl,
+            Err(response) => return response,
+        };
+    } else if let Some(policy_name) = payload.policy_name.clone() {
         let policy_ttl_seconds = {
             let policies = state.command_policies.lock().await;
             policies
@@ -1936,30 +2092,269 @@ async fn handle_request_grant(
         }
         payload.ttl_seconds = policy_ttl_seconds;
     }
-    if !crate::grant::constrain_peer_grant(&mut payload, observed_pid) {
-        return error_response(
-            envelope,
-            "AccessDenied",
-            "grant binding does not match the connecting process",
-        );
-    }
+    let grant_audit = if let Some(actions) = verification_actions {
+        match authorize_secret_grant(envelope, state, &payload, actions, authenticated_automation)
+            .await
+        {
+            Ok(audit) => audit,
+            Err(response) => return response,
+        }
+    } else {
+        None
+    };
+    let cache =
+        if verification_actions.is_some() { Some(state.unlock_cache.lock().await) } else { None };
     let now = current_unix_nanos();
+    if cache.as_ref().is_some_and(|cache| cache.lookup(&payload.project_id, now).is_none()) {
+        return unlock_required_for_grant(envelope);
+    }
     let ttl_nanos = i128::from(payload.ttl_seconds).saturating_mul(1_000_000_000);
     let record = {
         let mut grants = state.grants.lock().await;
-        match grants.issue_with_peer(payload, now, now.saturating_add(ttl_nanos), observed_pid) {
-            Ok(record) => record,
+        let connection_id = peer.filter(|peer| peer.pid.is_some()).map(|peer| peer.connection_id);
+        match grants.issue_with_peer(
+            payload,
+            now,
+            now.saturating_add(ttl_nanos),
+            observed_pid,
+            connection_id,
+        ) {
+            Ok(record) => {
+                if let Some(mut audit) = grant_audit
+                    && append_grant_verification_audit(&mut audit, &record, now).is_err()
+                {
+                    let _ = grants.revoke(&record.grant_id);
+                    return error_response(
+                        envelope,
+                        "AuditIntegrityFailed",
+                        "could not audit grant approval",
+                    );
+                }
+                drop(grants);
+                record
+            }
             Err(_) => {
                 return error_response(envelope, "ProtocolError", "failed to allocate grant id");
             }
         }
     };
+    drop(cache);
     drop(session);
     let response_payload = serde_json::json!({
         "grant_id": record.grant_id,
         "expires_at_unix_nanos": record.expires_at_unix_nanos.to_string(),
+        "project_id": record.project_id,
+        "profile_id": record.profile_id,
+        "action": record.action,
+        "ttl_seconds": record.ttl_seconds,
+        "binding": record.binding,
     });
     ResponseEnvelope::Success(SuccessEnvelope::new(envelope.id.clone(), response_payload))
+}
+
+async fn authorize_run_policy_grant(
+    envelope: &RequestEnvelope,
+    state: &AgentSocketState,
+    payload: &crate::RequestGrantPayload,
+) -> Result<u64, ResponseEnvelope> {
+    let denied = || {
+        error_response(
+            envelope,
+            "AccessDenied",
+            "run grant does not match the approved execution scope",
+        )
+    };
+    let scope = payload.binding.execution.as_ref().ok_or_else(denied)?;
+    if payload.policy_name.as_deref() != Some(scope.policy_name.as_str()) {
+        return Err(denied());
+    }
+    let path = state.canonical_store_path.as_deref().ok_or_else(denied)?;
+    let (store, _) = crate::keys::open_verified_store_for_state_with(
+        state,
+        &payload.project_id,
+        path,
+        current_unix_nanos(),
+        true,
+    )
+    .await
+    .map_err(|_| denied())?;
+    let (document, root, default_profile) =
+        crate::resolve::approved_policy_document(&store, &payload.project_id, &scope.policy_name)
+            .map_err(|_| denied())?;
+    if !scope.cwd.starts_with(&root) || scope.cwd.canonicalize().ok().as_ref() != Some(&scope.cwd) {
+        return Err(denied());
+    }
+    let policy =
+        document.effective_command(&scope.policy_name, &root, &scope.cwd).ok_or_else(denied)?;
+    let profile = store
+        .list_profiles(&payload.project_id)
+        .map_err(|_| denied())?
+        .into_iter()
+        .find(|profile| profile.id == payload.profile_id)
+        .ok_or_else(denied)?;
+    let scoped_profile =
+        document.path_scope_for(&root, &scope.cwd).and_then(|scope| scope.profile.as_ref());
+    let expected_profile = scoped_profile
+        .map(locket_core::ProfileName::as_str)
+        .or(default_profile.as_deref())
+        .ok_or_else(denied)?;
+    if profile.name != expected_profile || (profile.dangerous && !payload.confirm_dangerous) {
+        return Err(denied());
+    }
+    let ttl = policy.ttl.as_secs();
+    if !crate::grant::valid_grant_ttl(ttl) {
+        return Err(denied());
+    }
+    Ok(ttl)
+}
+
+struct GrantVerificationAudit {
+    store: Store,
+    key: Zeroizing<KeyBytes>,
+    verification: UserVerificationAudit,
+}
+
+fn unlock_required_for_grant(envelope: &RequestEnvelope) -> ResponseEnvelope {
+    error_response(envelope, "UnlockRequired", "unlock the project before requesting a grant")
+}
+
+const fn secret_grant_verification_actions(
+    action: crate::GrantAction,
+) -> Option<&'static [&'static str]> {
+    use crate::GrantAction;
+
+    match action {
+        GrantAction::Reveal => Some(&["reveal"]),
+        GrantAction::Copy => Some(&["copy"]),
+        GrantAction::Export
+        | GrantAction::ImportDotenv
+        | GrantAction::SetSecret
+        | GrantAction::ApplyPolicy => Some(&["reveal", "copy"]),
+        GrantAction::TeamSync | GrantAction::ResolveReference | GrantAction::ScanKnownValues => {
+            Some(&[])
+        }
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn authorize_secret_grant(
+    envelope: &RequestEnvelope,
+    state: &AgentSocketState,
+    payload: &crate::grant::RequestGrantPayload,
+    verification_actions: &[&str],
+    authenticated_automation: bool,
+) -> Result<Option<GrantVerificationAudit>, ResponseEnvelope> {
+    use crate::GrantAction;
+
+    let locked = || unlock_required_for_grant(envelope);
+    let (store, master) = {
+        let cache = state.unlock_cache.lock().await;
+        let entry = cache.lookup(&payload.project_id, current_unix_nanos()).ok_or_else(locked)?;
+        let path = envelope
+            .payload
+            .get("store_path")
+            .and_then(serde_json::Value::as_str)
+            .map(Path::new)
+            .or_else(|| entry.audit_context().map(|context| context.store_path.as_path()))
+            .or(state.canonical_store_path.as_deref());
+        let store = path
+            .map(|path| state.open_store(path, entry.store_identity.as_ref(), false))
+            .transpose()
+            .map_err(|_| error_response(envelope, "AccessDenied", "could not verify grant store"))?
+            .map(|(store, _)| store);
+        let master = master_key_array(entry.key_bytes());
+        drop(cache);
+        (store, master)
+    };
+    if let Some(store) = &store {
+        let profiles = store
+            .list_profiles(&payload.project_id)
+            .map_err(|_| error_response(envelope, "CorruptDb", "could not read grant profile"))?;
+        let project_wide = payload.profile_id == crate::backup::BUNDLE_PROJECT_GRANT_SCOPE
+            && matches!(payload.action, GrantAction::Export | GrantAction::ImportDotenv);
+        let dangerous = if project_wide {
+            profiles.iter().any(|profile| profile.dangerous)
+        } else {
+            profiles
+                .iter()
+                .find(|profile| profile.id == payload.profile_id)
+                .ok_or_else(|| {
+                    error_response(envelope, "ProfileNotFound", "grant profile not found")
+                })?
+                .dangerous
+        };
+        if dangerous && !payload.confirm_dangerous {
+            return Err(error_response(
+                envelope,
+                "ConfirmationFailed",
+                "dangerous profile requires explicit confirmation",
+            ));
+        }
+    }
+
+    if verification_actions.is_empty() || authenticated_automation {
+        return Ok(None);
+    }
+    let required = state
+        .verification_required(store.as_ref(), &payload.project_id, verification_actions)
+        .map_err(|()| {
+            error_response(envelope, "AccessDenied", "could not read grant verification policy")
+        })?;
+    if !required {
+        return Ok(None);
+    }
+    let reason = format!(
+        "Approve {:?} for Locket project {} and profile {}",
+        payload.action, payload.project_id, payload.profile_id
+    );
+    let verification = state.verify_local_user(envelope, "request_grant", reason).await?;
+    if state.unlock_cache.lock().await.lookup(&payload.project_id, current_unix_nanos()).is_none() {
+        return Err(locked());
+    }
+    let Some(store) = store else { return Ok(None) };
+    let missing_key =
+        || error_response(envelope, "AuditIntegrityFailed", "grant audit key unavailable");
+    let master = master.map_err(|_| missing_key())?;
+    let key = unwrap_audit_key_with_master(&store, &payload.project_id, &master)
+        .map_err(|_| missing_key())?;
+    Ok(Some(GrantVerificationAudit { store, key, verification }))
+}
+
+fn append_grant_verification_audit(
+    audit: &mut GrantVerificationAudit,
+    record: &crate::grant::GrantRecord,
+    now: i128,
+) -> Result<(), StoreError> {
+    let metadata = serde_json::json!({
+        "schema_version": 1,
+        "action": "AGENT_GRANT",
+        "status": "SUCCESS",
+        "command": "agent RequestGrant",
+        "client_kind": "agent",
+        "grant_actions": [record.action],
+        "process_id": record.binding.pid,
+        "process_start_time": record.binding.process_start_time,
+        "grant_id": record.grant_id,
+        "ttl_seconds": record.ttl_seconds,
+        "user_verification": audit.verification,
+    });
+    let profile_id = (record.profile_id != crate::backup::BUNDLE_PROJECT_GRANT_SCOPE)
+        .then_some(record.profile_id.as_str());
+    audit.store.append_audit(
+        audit.key.as_ref(),
+        &locket_store::AuditWrite {
+            project_id: &record.project_id,
+            profile_id,
+            action: "AGENT_GRANT",
+            status: "SUCCESS",
+            secret_name: None,
+            command: Some("agent RequestGrant"),
+            metadata_json: &metadata,
+            timestamp: i64::try_from(now).unwrap_or(i64::MAX),
+        },
+    )?;
+    Ok(())
 }
 
 async fn handle_revoke_grant(

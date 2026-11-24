@@ -26,27 +26,155 @@ pub struct StoreFileIdentity {
 
 impl StoreFileIdentity {
     pub(crate) fn capture(path: &Path) -> io::Result<(PathBuf, Self)> {
-        let path = fs::canonicalize(path)?;
-        let metadata = fs::symlink_metadata(&path)?;
-        if !metadata.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "store must be a regular file",
-            ));
-        }
+        let metadata = check_store_files(path)?;
+        let canonical = fs::canonicalize(path)?;
+        let metadata = if canonical == path { metadata } else { check_store_files(&canonical)? };
         #[cfg(unix)]
         let identity = {
             use std::os::unix::fs::MetadataExt;
             Self { device: metadata.dev(), inode: metadata.ino() }
         };
         #[cfg(not(unix))]
-        let identity = Self { path: path.clone() };
-        Ok((path, identity))
+        let identity = Self { path: canonical.clone() };
+        Ok((canonical, identity))
     }
 
     pub(crate) fn matches(&self, path: &Path) -> bool {
         Self::capture(path).is_ok_and(|(_, identity)| *self == identity)
     }
+}
+
+fn check_store_files(path: &Path) -> io::Result<fs::Metadata> {
+    let main = fs::symlink_metadata(path)?;
+    if main.is_symlink() {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "store must not be a symlink"));
+    }
+    if !main.is_file() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "store must be a regular file"));
+    }
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        match fs::symlink_metadata(sidecar) {
+            Ok(metadata) if metadata.is_file() => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "store sidecar must be a regular file",
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(main)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum StoreIdentityError {
+    #[error("could not inspect the vault file")]
+    Path(#[from] io::Error),
+    #[error("could not open the vault database")]
+    Store(#[from] StoreError),
+    #[error("could not inspect the open vault database")]
+    Sqlite(#[from] rusqlite::Error),
+    #[error("store does not match the pinned vault")]
+    Mismatch,
+}
+
+impl StoreIdentityError {
+    pub fn is_identity_error(&self) -> bool {
+        match self {
+            Self::Mismatch => true,
+            Self::Path(error) => matches!(
+                error.kind(),
+                io::ErrorKind::InvalidInput | io::ErrorKind::PermissionDenied
+            ),
+            Self::Store(_) | Self::Sqlite(_) => false,
+        }
+    }
+}
+
+impl From<StoreIdentityError> for StoreError {
+    fn from(error: StoreIdentityError) -> Self {
+        match error {
+            StoreIdentityError::Store(error) => error,
+            StoreIdentityError::Sqlite(error) => Self::Sqlite(error),
+            error => Self::AuditIntegrity { sequence: 0, reason: error.to_string() },
+        }
+    }
+}
+
+pub fn open_verified_store(
+    path: &Path,
+    expected_identity: Option<&StoreFileIdentity>,
+) -> Result<(Store, StoreFileIdentity), StoreIdentityError> {
+    open_verified_store_with(path, expected_identity, false)
+}
+
+pub fn open_verified_store_with(
+    path: &Path,
+    expected_identity: Option<&StoreFileIdentity>,
+    read_only: bool,
+) -> Result<(Store, StoreFileIdentity), StoreIdentityError> {
+    let (canonical_path, before) = StoreFileIdentity::capture(path)?;
+    if expected_identity.is_some_and(|expected| expected != &before) {
+        return Err(StoreIdentityError::Mismatch);
+    }
+    let store = if read_only {
+        Store::open_read_only(&canonical_path)?
+    } else {
+        Store::open(&canonical_path)?
+    };
+    let opened: String = store.connection().query_row(
+        "SELECT file FROM pragma_database_list WHERE name = 'main'",
+        [],
+        |row| row.get(0),
+    )?;
+    let (opened_path, after) = StoreFileIdentity::capture(Path::new(&opened))?;
+    if opened_path != canonical_path || after != before {
+        return Err(StoreIdentityError::Mismatch);
+    }
+    // The Unix VFS compares its open descriptor's device/inode to the pathname.
+    #[cfg(unix)]
+    {
+        let mut moved = 0;
+        store
+            .connection()
+            .file_control(Some("main"), rusqlite::FileControl::HasMoved(&mut moved))?;
+        if moved != 0 {
+            return Err(StoreIdentityError::Mismatch);
+        }
+    }
+    if StoreFileIdentity::capture(path)?.1 != after {
+        return Err(StoreIdentityError::Mismatch);
+    }
+    Ok((store, after))
+}
+
+pub async fn open_verified_store_for_state(
+    state: &AgentSocketState,
+    project_id: &str,
+    requested_path: &Path,
+    now_unix_nanos: i128,
+) -> Result<(Store, StoreFileIdentity), StoreIdentityError> {
+    open_verified_store_for_state_with(state, project_id, requested_path, now_unix_nanos, false)
+        .await
+}
+
+pub async fn open_verified_store_for_state_with(
+    state: &AgentSocketState,
+    project_id: &str,
+    requested_path: &Path,
+    now_unix_nanos: i128,
+    read_only: bool,
+) -> Result<(Store, StoreFileIdentity), StoreIdentityError> {
+    let cache = state.unlock_cache.lock().await;
+    let pin =
+        cache.lookup(project_id, now_unix_nanos).and_then(|entry| entry.store_identity.as_ref());
+    let opened = state.open_store(requested_path, pin, read_only);
+    drop(cache);
+    opened
 }
 
 #[derive(Debug, thiserror::Error)]

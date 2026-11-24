@@ -188,6 +188,45 @@ describe('automatic locking availability', () => {
 });
 
 describe('reveal request lifetime in the mounted app', () => {
+  it('sends dangerous-profile approval only after the user confirms', async () => {
+    overrides.set('agent_read_config', () => ({
+      privacy_redact_names: false,
+      agent_unlock_ttl: '15m',
+      user_verification_required_for: {},
+      dangerous_profile: { dangerous: true },
+    }));
+    const app = await connectedApp();
+    const dialog = findNode(app.root, (node) => node.tag === 'dialog');
+    expect(dialog).toBeDefined();
+    if (!dialog) return;
+    const control = Object.assign(dialog, {
+      open: false,
+      returnValue: '',
+      showModal() {
+        this.open = true;
+      },
+      close(result = '') {
+        this.open = false;
+        this.returnValue = result;
+        dialog.dispatchEvent(new Event('close'));
+      },
+    });
+
+    const canceled = app.state.handleEditorReveal(secret());
+    expect(control.open).toBe(true);
+    expect(calls).not.toContain('agent_reveal');
+    control.close();
+    await canceled;
+    expect(calls).not.toContain('agent_reveal');
+
+    const approved = app.state.handleEditorReveal(secret());
+    control.close('confirm');
+    await approved;
+    expect(invoke).toHaveBeenCalledWith('agent_reveal', {
+      request: { secret_name: 'TOKEN', profile_id: a.profile_id, confirm_dangerous: true },
+    });
+  });
+
   it('shows a current response and keeps its TTL countdown', async () => {
     const app = await connectedApp();
     await app.state.handleEditorReveal(secret());

@@ -223,9 +223,15 @@ pub async fn handle_import_dotenv(
     let result = async {
         let typed: ImportDotenvRequest =
             serde_json::from_value(request.payload.clone()).map_err(|_| metadata())?;
-        let (_cache_guard, master) =
+        let (cache_guard, master) =
             authorize(&typed.scope, GrantAction::ImportDotenv, state, now).await?;
-        import_dotenv_with_master(&typed, &master, i64::try_from(now).map_err(|_| storage())?)
+        let pin = cache_guard
+            .lookup(&typed.scope.project_id, now)
+            .and_then(|entry| entry.store_identity.as_ref());
+        let (store, _) = state
+            .open_store(&typed.scope.store_path, pin, false)
+            .map_err(|_| failure("AccessDenied", "could not verify mutation store"))?;
+        import_dotenv_in_store(store, &typed, &master, i64::try_from(now).map_err(|_| storage())?)
     }
     .await;
     response(request, result)
@@ -240,12 +246,22 @@ pub async fn handle_apply_policy(
     let result = async {
         let typed: ApplyPolicyRequest =
             serde_json::from_value(request.payload.clone()).map_err(|_| metadata())?;
-        let (_cache_guard, master) =
+        let (cache_guard, master) =
             authorize(&typed.scope, GrantAction::ApplyPolicy, state, now).await?;
+        let pin = cache_guard
+            .lookup(&typed.scope.project_id, now)
+            .and_then(|entry| entry.store_identity.as_ref());
+        let (store, _) = state
+            .open_store(&typed.scope.store_path, pin, false)
+            .map_err(|_| failure("AccessDenied", "could not verify mutation store"))?;
         // Serialize snapshot publication with other policy publishers. Never publish before the durable commit.
         let mut snapshots = state.command_policies.lock().await;
-        let (result, fresh) =
-            apply_policy_with_master(&typed, &master, i64::try_from(now).map_err(|_| storage())?)?;
+        let (result, fresh) = apply_policy_in_store(
+            store,
+            &typed,
+            &master,
+            i64::try_from(now).map_err(|_| storage())?,
+        )?;
         snapshots.retain(|policy| policy.project_id != typed.scope.project_id);
         snapshots.extend(fresh);
         drop(snapshots);
@@ -264,8 +280,18 @@ pub fn import_dotenv_with_master(
     master: &KeyBytes,
     timestamp: i64,
 ) -> Result<ImportDotenvResponse, MutationError> {
+    let (store, _) = crate::keys::open_verified_store(&request.scope.store_path, None)
+        .map_err(locket_store::StoreError::from)?;
+    import_dotenv_in_store(store, request, master, timestamp)
+}
+
+fn import_dotenv_in_store(
+    mut store: Store,
+    request: &ImportDotenvRequest,
+    master: &KeyBytes,
+    timestamp: i64,
+) -> Result<ImportDotenvResponse, MutationError> {
     let _guard = MUTATION_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut store = Store::open(&request.scope.store_path)?;
     let verified = context(&store, &request.scope)?;
     if request.overwrite
         && verified.profile.dangerous
@@ -314,7 +340,6 @@ pub fn import_dotenv_with_master(
                 }
             }
             let operation = SetSecretOperation {
-                store_path: &request.scope.store_path,
                 project_id: &request.scope.project_id,
                 profile_id: &request.scope.profile_id,
                 name: &entry.key,
@@ -512,11 +537,21 @@ pub fn apply_policy_with_master(
     master: &KeyBytes,
     timestamp: i64,
 ) -> Result<(ApplyPolicyResponse, Vec<CommandPolicySnapshot>), MutationError> {
+    let (store, _) = crate::keys::open_verified_store(&request.scope.store_path, None)
+        .map_err(locket_store::StoreError::from)?;
+    apply_policy_in_store(store, request, master, timestamp)
+}
+
+fn apply_policy_in_store(
+    mut store: Store,
+    request: &ApplyPolicyRequest,
+    master: &KeyBytes,
+    timestamp: i64,
+) -> Result<(ApplyPolicyResponse, Vec<CommandPolicySnapshot>), MutationError> {
     let _guard = MUTATION_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if serde_json::to_vec(request).map_err(|_| metadata())?.len() > MAX_POLICY_BYTES {
         return Err(failure("MetadataInvalid", "policy request exceeds 64 KiB"));
     }
-    let mut store = Store::open(&request.scope.store_path)?;
     let verified = context(&store, &request.scope)?;
     if verified.profile.dangerous
         && request.confirmation.as_deref() != Some(verified.profile.name.as_str())

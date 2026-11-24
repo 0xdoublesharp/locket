@@ -75,8 +75,10 @@ pub struct ListSecretsRow {
 /// # Errors
 ///
 /// Returns [`StoreError`] when the store cannot be opened or queried.
-pub fn list_secrets(request: &ListSecretsRequest) -> Result<ListSecretsResponse, StoreError> {
-    let store = Store::open(&request.store_path)?;
+pub fn list_secrets_from_store(
+    store: &Store,
+    request: &ListSecretsRequest,
+) -> Result<ListSecretsResponse, StoreError> {
     let rows = store
         .list_active_secret_metadata_by_profile(&request.project_id, &request.profile_id)?
         .into_iter()

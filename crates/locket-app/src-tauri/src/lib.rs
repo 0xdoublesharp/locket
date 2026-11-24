@@ -478,14 +478,34 @@ async fn agent_set_active_profile(
         .await
 }
 
+#[derive(Deserialize)]
+struct DesktopValueAccess<T> {
+    #[serde(flatten)]
+    request: T,
+    #[serde(default)]
+    confirm_dangerous: bool,
+}
+
+fn value_access_payload(
+    request: impl Serialize,
+    confirm_dangerous: bool,
+) -> Result<serde_json::Value, AgentClientError> {
+    let mut payload = serde_json::to_value(request).map_err(|_| AgentClientError::Protocol {
+        reason: "Invalid secret access request.".into(),
+    })?;
+    payload["confirm_dangerous"] = serde_json::json!(confirm_dangerous);
+    Ok(payload)
+}
+
 /// Tauri command exposing the agent's `Reveal` RPC to the webview.
 ///
 /// Resolves native project context and obtains a grant before requesting
 /// plaintext. The webview owns the reveal's focus, context, and TTL lifetime.
 #[tauri::command]
 async fn agent_reveal(
-    request: locket_agent::RevealRequest,
+    request: DesktopValueAccess<locket_agent::RevealRequest>,
 ) -> Result<locket_agent::RevealResponse, AgentClientError> {
+    let DesktopValueAccess { request, confirm_dangerous } = request;
     let store = resolve_path(request.store_path.clone(), default_store_path)?;
     let project =
         request.project_id.clone().map(Ok).unwrap_or_else(desktop_actions::selected_project_id)?;
@@ -495,9 +515,7 @@ async fn agent_reveal(
     desktop_actions::invoke_granted(
         locket_agent::AgentMethod::Reveal,
         locket_agent::GrantAction::Reveal,
-        serde_json::to_value(&request).map_err(|_| AgentClientError::Protocol {
-            reason: "Invalid secret access request.".into(),
-        })?,
+        value_access_payload(&request, confirm_dangerous)?,
         &store,
         &project,
         &request.profile_id,
@@ -508,8 +526,9 @@ async fn agent_reveal(
 /// Tauri command exposing the agent's `Copy` RPC to the webview.
 #[tauri::command]
 async fn agent_copy(
-    request: locket_agent::CopyRequest,
+    request: DesktopValueAccess<locket_agent::CopyRequest>,
 ) -> Result<locket_agent::CopyResponse, AgentClientError> {
+    let DesktopValueAccess { request, confirm_dangerous } = request;
     let store = resolve_path(request.store_path.clone(), default_store_path)?;
     let project =
         request.project_id.clone().map(Ok).unwrap_or_else(desktop_actions::selected_project_id)?;
@@ -519,9 +538,7 @@ async fn agent_copy(
     desktop_actions::invoke_granted(
         locket_agent::AgentMethod::Copy,
         locket_agent::GrantAction::Copy,
-        serde_json::to_value(&request).map_err(|_| AgentClientError::Protocol {
-            reason: "Invalid secret access request.".into(),
-        })?,
+        value_access_payload(&request, confirm_dangerous)?,
         &store,
         &project,
         &request.profile_id,
@@ -723,6 +740,8 @@ struct DesktopSetSecretRequest {
     profile_id: String,
     secret_name: String,
     #[serde(default)]
+    confirm_dangerous: bool,
+    #[serde(default)]
     source: Option<String>,
     #[serde(deserialize_with = "deserialize_secret")]
     value: Zeroizing<String>,
@@ -736,6 +755,8 @@ struct AgentSetSecretPayload<'a> {
     project_id: &'a str,
     profile_id: &'a str,
     secret_name: &'a str,
+    #[serde(skip)]
+    confirm_dangerous: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<&'a str>,
     value: &'a str,
@@ -747,6 +768,10 @@ struct AgentSetSecretPayload<'a> {
 }
 
 impl desktop_actions::GrantPayload for AgentSetSecretPayload<'_> {
+    fn confirms_dangerous(&self, _profile_name: &str) -> bool {
+        self.confirm_dangerous
+    }
+
     fn authorize(
         &mut self,
         grant: &locket_agent::GrantIdPayload,
@@ -764,6 +789,7 @@ impl DesktopSetSecretRequest {
             project_id: &self.project_id,
             profile_id: &self.profile_id,
             secret_name: &self.secret_name,
+            confirm_dangerous: self.confirm_dangerous,
             source: self.source.as_deref(),
             value: self.value.as_str(),
             rotate,
@@ -885,6 +911,8 @@ struct DesktopClipboardCopyRequest {
     project_id: Option<String>,
     store_path: Option<PathBuf>,
     ttl_seconds: Option<u32>,
+    #[serde(default)]
+    confirm_dangerous: bool,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -922,8 +950,7 @@ async fn agent_copy_secret(
     let response: locket_agent::CopyResponse = desktop_actions::invoke_granted(
         locket_agent::AgentMethod::Copy,
         locket_agent::GrantAction::Copy,
-        serde_json::to_value(&agent_request)
-            .map_err(|_| AgentClientError::Protocol { reason: "Invalid copy request.".into() })?,
+        value_access_payload(&agent_request, request.confirm_dangerous)?,
         &store,
         &project,
         &agent_request.profile_id,

@@ -11,11 +11,11 @@
 
 use std::path::Path;
 
-use locket_store::{AuditWrite, Store};
+use locket_store::AuditWrite;
 use serde_json::json;
 
 use crate::grant::GrantAction;
-use crate::keys::{master_key_array, unwrap_audit_key_with_master};
+use crate::keys::{master_key_array, open_verified_store_for_state, unwrap_audit_key_with_master};
 
 /// Append a metadata-only `AGENT_REVOKE DENIED` audit row best-effort.
 ///
@@ -23,7 +23,8 @@ use crate::keys::{master_key_array, unwrap_audit_key_with_master};
 /// vault, missing keys, store I/O) is swallowed so the agent's typed
 /// `GrantRequired` response is never blocked on audit availability.
 #[allow(clippy::too_many_arguments)]
-pub fn try_append_grant_denial(
+pub async fn try_append_grant_denial(
+    state: &crate::AgentSocketState,
     project_id: &str,
     profile_id: &str,
     store_path: Option<&Path>,
@@ -37,7 +38,11 @@ pub fn try_append_grant_denial(
     let Some(master_key) = master_key else { return false };
     let Ok(master_key) = master_key_array(master_key) else { return false };
     let Ok(timestamp) = i64::try_from(timestamp_unix_nanos) else { return false };
-    let Ok(mut store) = Store::open(store_path) else { return false };
+    let Ok((mut store, _)) =
+        open_verified_store_for_state(state, project_id, store_path, timestamp_unix_nanos).await
+    else {
+        return false;
+    };
     let Ok(audit_key) = unwrap_audit_key_with_master(&store, project_id, &master_key) else {
         return false;
     };
@@ -88,9 +93,10 @@ const fn grant_action_label(action: GrantAction) -> &'static str {
 mod tests {
     use super::*;
 
-    #[test]
-    fn try_append_grant_denial_returns_false_without_master_key() {
+    #[tokio::test]
+    async fn try_append_grant_denial_returns_false_without_master_key() {
         let appended = try_append_grant_denial(
+            &crate::AgentSocketState::locked("test"),
             "lk_proj_x",
             "lk_profile_x",
             None,
@@ -99,14 +105,16 @@ mod tests {
             0,
             1_700_000_000_000_000_000,
             "agent",
-        );
+        )
+        .await;
         assert!(!appended, "no master key means no row is appended");
     }
 
-    #[test]
-    fn try_append_grant_denial_returns_false_without_store_path() {
+    #[tokio::test]
+    async fn try_append_grant_denial_returns_false_without_store_path() {
         let key = [0_u8; 32];
         let appended = try_append_grant_denial(
+            &crate::AgentSocketState::locked("test"),
             "lk_proj_x",
             "lk_profile_x",
             None,
@@ -115,7 +123,8 @@ mod tests {
             0,
             1_700_000_000_000_000_000,
             "agent",
-        );
+        )
+        .await;
         assert!(!appended, "no store path means no row is appended");
     }
 

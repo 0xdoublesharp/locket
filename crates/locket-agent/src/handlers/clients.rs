@@ -12,13 +12,13 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use locket_core::ClientId;
-use locket_store::{AuditWrite, AutomationClientRecord, Store};
+use locket_store::{AuditWrite, AutomationClientRecord, StoreError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::envelope::{ErrorEnvelope, RequestEnvelope, ResponseEnvelope, SuccessEnvelope};
-use crate::keys::{cached_master_key, unwrap_audit_key_with_master};
+use crate::keys::{cached_master_key, open_verified_store_for_state, unwrap_audit_key_with_master};
 
 /// Request payload for `RegisterClient`.
 ///
@@ -88,6 +88,7 @@ pub struct RevokeClientResponse {
 }
 
 /// Handler for `RegisterClient`.
+#[allow(clippy::too_many_lines)]
 pub async fn handle_register_client(
     request: &RequestEnvelope,
     state: &crate::server::AgentSocketState,
@@ -122,9 +123,16 @@ pub async fn handle_register_client(
         }
         Err(error) => return corrupt_db(request, error.to_string()),
     };
-    let mut store = match Store::open(&payload.store_path) {
-        Ok(store) => store,
-        Err(error) => return corrupt_db(request, format!("failed to open store: {error}")),
+    let (mut store, _) = match open_verified_store_for_state(
+        state,
+        &payload.project_id,
+        &payload.store_path,
+        now_unix_nanos,
+    )
+    .await
+    {
+        Ok(opened) => opened,
+        Err(error) => return crate::server::store_open_error(request, &error),
     };
     let audit_key = match unwrap_audit_key_with_master(&store, &payload.project_id, &master_key) {
         Ok(key) => key,
@@ -137,6 +145,33 @@ pub async fn handle_register_client(
             ));
         }
     };
+
+    let verification = if state.enforce_daemon_user_verification {
+        let reason = format!(
+            "Register Locket automation client {name} for project {} with permissions {} on {}",
+            payload.project_id,
+            actions.join(", "),
+            policies.join(", "),
+        );
+        match state.verify_local_user(request, "register_client", reason).await {
+            Ok(verification) => verification,
+            Err(response) => return response,
+        }
+    } else {
+        crate::server::UserVerificationAudit::not_required()
+    };
+    let now_unix_nanos = if state.enforce_daemon_user_verification {
+        crate::server::current_unix_nanos()
+    } else {
+        now_unix_nanos
+    };
+    let cache = state.unlock_cache.lock().await;
+    if cache
+        .lookup(&payload.project_id, now_unix_nanos)
+        .is_none_or(|entry| entry.key_bytes() != master_key.as_slice())
+    {
+        return unlock_required(request, "unlock required to register automation client");
+    }
 
     let id = match ClientId::generate() {
         Ok(id) => id,
@@ -157,9 +192,6 @@ pub async fn handle_register_client(
         last_used_at: None,
         revoked_at: None,
     };
-    if let Err(error) = store.insert_automation_client(&record) {
-        return corrupt_db(request, format!("failed to insert automation client: {error}"));
-    }
     let metadata = json!({
         "schema_version": 1,
         "action": "CLIENT_ADD",
@@ -173,6 +205,7 @@ pub async fn handle_register_client(
         "allowed_actions": &actions,
         "allowed_policies": &policies,
         "created_by_locket": payload.created_by_locket,
+        "user_verification": verification,
     });
     let audit = AuditWrite {
         project_id: &payload.project_id,
@@ -184,13 +217,18 @@ pub async fn handle_register_client(
         metadata_json: &metadata,
         timestamp,
     };
-    if let Err(error) = store.append_audit(audit_key.as_ref(), &audit) {
-        return corrupt_db(request, format!("failed to append CLIENT_ADD audit row: {error}"));
+    if let Err(error) = store.with_atomic_write::<_, StoreError>(|store| {
+        store.insert_automation_client(&record)?;
+        store.append_audit(audit_key.as_ref(), &audit)
+    }) {
+        return corrupt_db(request, format!("failed to record automation client: {error}"));
     }
+    drop(cache);
     success(request, RegisterClientResponse { client_id: record.id, fingerprint })
 }
 
 /// Handler for `RevokeClient`.
+#[allow(clippy::too_many_lines)]
 pub async fn handle_revoke_client(
     request: &RequestEnvelope,
     state: &crate::server::AgentSocketState,
@@ -206,9 +244,16 @@ pub async fn handle_revoke_client(
         Ok(None) => return unlock_required(request, "unlock required to revoke automation client"),
         Err(error) => return corrupt_db(request, error.to_string()),
     };
-    let mut store = match Store::open(&payload.store_path) {
-        Ok(store) => store,
-        Err(error) => return corrupt_db(request, format!("failed to open store: {error}")),
+    let (mut store, _) = match open_verified_store_for_state(
+        state,
+        &payload.project_id,
+        &payload.store_path,
+        now_unix_nanos,
+    )
+    .await
+    {
+        Ok(opened) => opened,
+        Err(error) => return crate::server::store_open_error(request, &error),
     };
     let audit_key = match unwrap_audit_key_with_master(&store, &payload.project_id, &master_key) {
         Ok(key) => key,

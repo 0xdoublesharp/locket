@@ -28,6 +28,7 @@ pub struct TeamSyncConfigureRequest {
     #[serde(default)]
     pub allow_dangerous: bool,
 }
+#[cfg(test)]
 fn open_sync_store(path: impl AsRef<std::path::Path>) -> team_sync::Result<locket_store::Store> {
     let mut store = locket_store::Store::open(path)?;
     store.initialize_schema()?;
@@ -62,26 +63,35 @@ pub async fn handle_team_sync_status(
     let Ok(typed) = serde_json::from_value::<TeamSyncRequest>(request.payload.clone()) else {
         return error(request, "ProtocolError", "invalid sync status request");
     };
-    let cache = state.unlock_cache.lock().await;
-    let entry = cache.lookup(&typed.project_id, crate::server::current_unix_nanos());
-    let path =
-        entry.and_then(|e| e.audit_context()).map(|c| c.store_path.clone()).or(typed.store_path);
-    let unlocked = entry.is_some();
-    drop(cache);
+    let (path, pin, unlocked) = {
+        let cache = state.unlock_cache.lock().await;
+        let entry = cache.lookup(&typed.project_id, crate::server::current_unix_nanos());
+        let context = entry.and_then(crate::UnlockEntry::audit_context);
+        if let Some(context) = context
+            && check_selected_store(typed.store_path.as_deref(), &context.store_path).is_err()
+        {
+            return error(request, "AccessDenied", "selected store differs from unlock context");
+        }
+        let path = context.map(|context| context.store_path.clone()).or(typed.store_path);
+        let pin = entry.and_then(|entry| entry.store_identity.clone());
+        let unlocked = entry.is_some();
+        drop(cache);
+        (path, pin, unlocked)
+    };
     let project = typed.project_id.clone();
+    let worker_state = state.clone();
     let result = tokio::task::spawn_blocking(move || {
         let Some(path) = path.filter(|path| path.is_file()) else {
             return Ok(SyncStatus::default());
         };
+        let (mut store, _) = worker_state
+            .open_store(&path, pin.as_ref(), !unlocked)
+            .map_err(locket_store::StoreError::from)?;
         if unlocked {
-            open_sync_store(path).and_then(|store| team_sync::status(&store, &project))
-        } else {
-            // Locked metadata reads never migrate or create a caller-selected store.
-            let result = locket_store::Store::open_read_only(path)
-                .map_err(team_sync::SyncError::from)
-                .and_then(|store| team_sync::status(&store, &project));
-            Ok(result.unwrap_or_default())
+            store.initialize_schema()?;
         }
+        let result = team_sync::status(&store, &project);
+        if unlocked { result } else { Ok(result.unwrap_or_default()) }
     })
     .await;
     let Ok(Ok(mut result)) = result else {
@@ -127,13 +137,13 @@ async fn configure_cached(
     request: TeamSyncConfigureRequest,
 ) -> team_sync::Result<SyncStatus> {
     let project = request.scope.project_id.clone();
-    let (key, context, expiry) = cached_sync_context(state, &project).await?;
+    let (key, context, expiry, pin) = cached_sync_context(state, &project).await?;
     let authorization = granted_commit_authorization(
         state,
         &request.scope,
         commit_authorization(state, &project, &context.store_path, expiry, &key),
     );
-    run_sync_worker(state, project, context.store_path.clone(), move |store| {
+    run_sync_worker(state, project, context.store_path.clone(), pin, move |store| {
         configure_store(store, &request, &context.store_path, &authorization)
     })
     .await
@@ -198,9 +208,9 @@ async fn run_cached_sync(
     project: String,
     selected_store: Option<PathBuf>,
 ) -> team_sync::Result<SyncStatus> {
-    let (key, context, expiry) = cached_sync_context(state, &project).await?;
+    let (key, context, expiry, pin) = cached_sync_context(state, &project).await?;
     let authorization = commit_authorization(state, &project, &context.store_path, expiry, &key);
-    run_sync_worker(state, project.clone(), context.store_path.clone(), move |store| {
+    run_sync_worker(state, project.clone(), context.store_path.clone(), pin, move |store| {
         check_selected_store(selected_store.as_deref(), &context.store_path)?;
         let configured = store.connection().query_row(
             "SELECT EXISTS(SELECT 1 FROM team_sync_folders WHERE project_id=?1 AND enabled=1)",
@@ -232,11 +242,15 @@ async fn run_sync_worker(
     state: &AgentSocketState,
     project: String,
     store_path: PathBuf,
+    pin: Option<crate::keys::StoreFileIdentity>,
     operation: impl FnOnce(&mut locket_store::Store) -> team_sync::Result<SyncStatus> + Send + 'static,
 ) -> team_sync::Result<SyncStatus> {
     let worker_project = project.clone();
+    let worker_state = state.clone();
     let worker = tokio::task::spawn_blocking(move || -> team_sync::Result<_> {
-        let mut store = open_sync_store(store_path)?;
+        let (mut store, _) = worker_state.open_store(&store_path, pin.as_ref(), false)
+            .map_err(locket_store::StoreError::from)?;
+        store.initialize_schema()?;
         let result = operation(&mut store);
         let invalidated = store.connection().query_row(
             "SELECT EXISTS(SELECT 1 FROM team_sync_heads WHERE project_id=?1 AND state IN ('removed','fork'))",
@@ -275,6 +289,7 @@ async fn cached_sync_context(
     zeroize::Zeroizing<locket_crypto::KeyBytes>,
     crate::unlock_cache::UnlockAuditContext,
     i128,
+    Option<crate::keys::StoreFileIdentity>,
 )> {
     {
         let cache = state.unlock_cache.lock().await;
@@ -284,14 +299,9 @@ async fn cached_sync_context(
         let context = entry.audit_context().cloned().ok_or_else(|| {
             team_sync::SyncError::Rejected("unlock context lacks store path".into())
         })?;
-        if entry.store_identity.as_ref().is_some_and(|pin| !pin.matches(&context.store_path)) {
-            return Err(team_sync::SyncError::Rejected(
-                "sync store no longer matches the pinned vault".into(),
-            ));
-        }
         let key = crate::keys::master_key_array(entry.key_bytes())
             .map_err(|_| team_sync::SyncError::Rejected("invalid cached key".into()))?;
-        let result = (key, context, entry.expires_at_unix_nanos());
+        let result = (key, context, entry.expires_at_unix_nanos(), entry.store_identity.clone());
         drop(cache);
         Ok(result)
     }
@@ -301,9 +311,12 @@ async fn unlocked_pending_details(
     state: &AgentSocketState,
     project: String,
 ) -> team_sync::Result<Vec<team_sync::PendingProfileDetails>> {
-    let (key, context, _) = cached_sync_context(state, &project).await?;
+    let (key, context, _, pin) = cached_sync_context(state, &project).await?;
+    let worker_state = state.clone();
     tokio::task::spawn_blocking(move || {
-        let store = open_sync_store(&context.store_path)?;
+        let (store, _) = worker_state
+            .open_store(&context.store_path, pin.as_ref(), true)
+            .map_err(locket_store::StoreError::from)?;
         pending_details(&store, &project, &key, &context.store_path, sync_now()?)
     })
     .await
@@ -337,13 +350,13 @@ async fn reconcile_cached(
 ) -> team_sync::Result<SyncStatus> {
     use locket_platform::{LocalDevicePrivateKeyStorage, MasterKeyStore};
     let project = request.scope.project_id.clone();
-    let (key, context, expiry) = cached_sync_context(state, &project).await?;
+    let (key, context, expiry, pin) = cached_sync_context(state, &project).await?;
     let authorization = granted_commit_authorization(
         state,
         &request.scope,
         commit_authorization(state, &project, &context.store_path, expiry, &key),
     );
-    run_sync_worker(state, project.clone(), context.store_path.clone(), move |store| {
+    run_sync_worker(state, project.clone(), context.store_path.clone(), pin, move |store| {
         check_selected_store(request.scope.store_path.as_deref(), &context.store_path)?;
         let local = store
             .get_active_local_device(&project)?

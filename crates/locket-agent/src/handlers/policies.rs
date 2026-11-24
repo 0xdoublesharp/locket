@@ -376,7 +376,9 @@ pub async fn handle_register_command_policies(
         metadata_json: &metadata,
         timestamp,
     };
-    let Ok(mut store) = Store::open(&typed.store_path) else {
+    let Ok((mut store, _)) =
+        state.open_store(&typed.store_path, entry.store_identity.as_ref(), false)
+    else {
         return ResponseEnvelope::Error(ErrorEnvelope::new(
             request.id.clone(),
             "CorruptDb",
@@ -447,16 +449,21 @@ pub async fn handle_policy_doctor(
         );
     }
 
-    let store = match Store::open(&typed.store_path) {
-        Ok(store) => store,
-        Err(error) => {
-            return typed_error(
-                request,
-                "CorruptDb",
-                format!("failed to open store: {error}"),
-                LocketError::CorruptDb,
-            );
-        }
+    let Ok((store, _)) = crate::keys::open_verified_store_for_state_with(
+        state,
+        &typed.project_id,
+        &typed.store_path,
+        now_unix_nanos,
+        true,
+    )
+    .await
+    else {
+        return typed_error(
+            request,
+            "AccessDenied",
+            "could not verify policy store",
+            LocketError::AccessDenied,
+        );
     };
 
     let references = if typed.references.is_empty() {

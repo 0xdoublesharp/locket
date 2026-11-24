@@ -114,16 +114,12 @@ pub async fn authenticate_request_if_present(
     request: &RequestEnvelope,
     state: &crate::server::AgentSocketState,
     now_unix_nanos: i128,
-    trusted_store_path: Option<&str>,
 ) -> Option<ResponseEnvelope> {
-    let mut context = match auth_context(request) {
+    let context = match auth_context(request) {
         Ok(Some(context)) => context,
         Ok(None) => return None,
         Err(message) => return Some(error_response(request, "ProtocolError", message)),
     };
-    if let Some(path) = trusted_store_path {
-        context.store_path = PathBuf::from(path);
-    }
     match authenticate_request(request, state, now_unix_nanos, context).await {
         Ok(()) => None,
         Err(error) => Some(error_response(request, error.error_name(), error.to_string())),
@@ -137,7 +133,14 @@ async fn authenticate_request(
     context: AuthContext,
 ) -> Result<(), AuthError> {
     let now = i64::try_from(now_unix_nanos).unwrap_or(i64::MAX);
-    let mut store = Store::open(&context.store_path)?;
+    let (mut store, _) = crate::keys::open_verified_store_for_state(
+        state,
+        &context.project_id,
+        &context.store_path,
+        now_unix_nanos,
+    )
+    .await
+    .map_err(StoreError::from)?;
     let client = store
         .get_automation_client(&context.project_id, &context.auth.client_id)?
         .ok_or(AuthError::NotTrusted("client not registered"))?;

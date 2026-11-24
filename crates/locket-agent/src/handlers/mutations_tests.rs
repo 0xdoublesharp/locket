@@ -324,6 +324,7 @@ async fn real_passphrase_unlock_then_dispatch_import_and_policy_without_keychain
             profile_id: PROFILE.into(),
             policy_name: None,
             action,
+            confirm_dangerous: false,
             ttl_seconds: 30,
             binding: fixture.scope.binding.clone().unwrap(),
         };

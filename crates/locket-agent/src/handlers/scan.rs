@@ -13,7 +13,7 @@
 //! redacted match metadata without persisting or returning values.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use locket_core::{LocketError, privacy_alias};
 use locket_crypto::{
@@ -168,6 +168,7 @@ pub async fn handle_scan(
     let Some(grant_id) = typed.grant_id.as_deref() else {
         let key = cached_master_key_for_denial().await;
         crate::audit_deny::try_append_grant_denial(
+            state,
             project_id,
             profile_id,
             Some(store_path),
@@ -176,7 +177,8 @@ pub async fn handle_scan(
             0,
             now_unix_nanos,
             "agent",
-        );
+        )
+        .await;
         return grant_required(request);
     };
     let grant_validation = {
@@ -193,6 +195,7 @@ pub async fn handle_scan(
     if !matches!(grant_validation, GrantValidation::Valid) {
         let key = cached_master_key_for_denial().await;
         crate::audit_deny::try_append_grant_denial(
+            state,
             project_id,
             profile_id,
             Some(store_path),
@@ -201,7 +204,8 @@ pub async fn handle_scan(
             0,
             now_unix_nanos,
             "agent",
-        );
+        )
+        .await;
         return grant_required(request);
     }
 
@@ -226,11 +230,23 @@ pub async fn handle_scan(
         };
     };
 
+    let (store, _) = match crate::keys::open_verified_store_for_state(
+        state,
+        project_id,
+        store_path,
+        now_unix_nanos,
+    )
+    .await
+    {
+        Ok(opened) => opened,
+        Err(error) => return crate::server::store_open_error(request, &error),
+    };
+
     match scan_known_values(
         &typed,
         project_id,
         profile_id,
-        store_path,
+        store,
         &master_key,
         now_unix_nanos,
         policy_name,
@@ -332,13 +348,12 @@ fn scan_known_values(
     request: &ScanRequest,
     project_id: &str,
     profile_id: &str,
-    store_path: &Path,
+    mut store: Store,
     master_key: &[u8],
     now_unix_nanos: i128,
     policy_name: Option<&str>,
 ) -> Result<ScanResponse, ScanFailure> {
     let master_key = master_key_array(master_key).map_err(|_| corrupt_db())?;
-    let mut store = Store::open(store_path).map_err(|_| corrupt_db())?;
     ensure_profile_exists(&store, project_id, profile_id)?;
     let allowed_secrets =
         policy_name.map(|name| allowed_scan_secrets(&store, project_id, name)).transpose()?;

@@ -661,6 +661,45 @@ watch(
   { flush: 'sync' },
 );
 
+const dangerousConfirmDialog = ref<HTMLDialogElement | null>(null);
+const dangerousAction = ref('');
+
+async function confirmDangerousAction(action: string): Promise<boolean | undefined> {
+  if (!settings.value.dangerousProfileFlag) return false;
+  const dialog = dangerousConfirmDialog.value;
+  if (!dialog || dialog.open) return;
+  const generation = selectionGeneration.value;
+  const profile = activeContext.value?.profile_id;
+  dangerousAction.value = action;
+  dialog.returnValue = '';
+  const approved = await new Promise<boolean>((resolve) => {
+    dialog.addEventListener('close', () => resolve(dialog.returnValue === 'confirm'), {
+      once: true,
+    });
+    dialog.showModal();
+  });
+  if (
+    approved &&
+    generation === selectionGeneration.value &&
+    profile === activeContext.value?.profile_id
+  ) {
+    return true;
+  }
+}
+
+watch(
+  [selectionGeneration, () => activeContext.value?.profile_id, () => status.value?.lock_state],
+  () => {
+    const dialog = dangerousConfirmDialog.value;
+    if (dialog?.open) dialog.close();
+  },
+  { flush: 'sync' },
+);
+
+onBeforeUnmount(() => {
+  if (dangerousConfirmDialog.value?.open) dangerousConfirmDialog.value.close();
+});
+
 async function handleRevealSelectedSecret(): Promise<void> {
   invalidateReveal();
   const isCurrent = revealRequests.begin();
@@ -675,9 +714,14 @@ async function handleRevealSelectedSecret(): Promise<void> {
     revealError.value = 'Active profile unavailable.';
     return;
   }
+  const approved = settings.value.dangerousProfileFlag
+    ? await confirmDangerousAction('Reveal secret')
+    : false;
+  if (approved === undefined || !isCurrent()) return;
   const result = await revealAgent({
     secret_name: target.name,
     profile_id: profileId,
+    ...(approved && { confirm_dangerous: true }),
   });
   if (!isCurrent()) return;
   if (!result.ok) {
@@ -716,8 +760,13 @@ async function handleCopySelectedSecret(): Promise<void> {
     copyError.value = 'Active profile unavailable.';
     return;
   }
+  const approved = settings.value.dangerousProfileFlag
+    ? await confirmDangerousAction('Copy secret')
+    : false;
+  if (approved === undefined) return;
   const result = await copySecret({
     secret_name: target.name,
+    ...(approved && { confirm_dangerous: true }),
     profile_id: profileId,
     project_id: status.value?.project_id ?? undefined,
   });
@@ -1431,7 +1480,12 @@ async function triggerBackupAction(action: BundleAction): Promise<void> {
 async function handleSetSecret(
   payload: SetSecretRequest,
 ): Promise<{ ok: true; value: SetSecretResponse } | { ok: false; error: AgentClientError }> {
-  const result = await setSecret(payload);
+  const approved = settings.value.dangerousProfileFlag
+    ? await confirmDangerousAction('Save secret')
+    : false;
+  if (approved === undefined)
+    return { ok: false, error: { kind: 'protocol', reason: 'Action canceled.' } };
+  const result = await setSecret(approved ? { ...payload, confirm_dangerous: true } : payload);
   if (result.ok) {
     await refreshSecrets();
   }
@@ -1441,7 +1495,12 @@ async function handleSetSecret(
 async function handleRotateSecret(
   payload: SetSecretRequest,
 ): Promise<{ ok: true; value: SetSecretResponse } | { ok: false; error: AgentClientError }> {
-  const result = await rotateSecret(payload);
+  const approved = settings.value.dangerousProfileFlag
+    ? await confirmDangerousAction('Rotate secret')
+    : false;
+  if (approved === undefined)
+    return { ok: false, error: { kind: 'protocol', reason: 'Action canceled.' } };
+  const result = await rotateSecret(approved ? { ...payload, confirm_dangerous: true } : payload);
   if (result.ok) {
     await refreshSecrets();
     await refreshVersions();
@@ -1536,6 +1595,11 @@ async function handleUnlock(source: UnlockRequest['source']): Promise<void> {
 async function importEnv(): Promise<void> {
   const projectId = selectedProject.value?.project_id ?? status.value?.project_id;
   if (!secretAccess.value.enabled || !projectId || desktopBusy.value || !envPath.value.trim())
+    return;
+  if (
+    settings.value.dangerousProfileFlag &&
+    importConfirmation.value !== activeContext.value?.profile_name
+  )
     return;
   desktopBusy.value = true;
   desktopError.value = null;
@@ -1803,8 +1867,8 @@ onUnmounted(() => {
               text</label
             >
           </details>
-          <label v-if="importOverwrite && settings.dangerousProfileFlag">
-            Type {{ activeContext?.profile_name }} to confirm replacement in this environment
+          <label v-if="settings.dangerousProfileFlag">
+            Type {{ activeContext?.profile_name }} to confirm import into this environment
             <input
               v-model="importConfirmation"
               type="text"
@@ -1819,9 +1883,7 @@ onUnmounted(() => {
               desktopBusy ||
               !secretAccess.enabled ||
               !envPath.trim() ||
-              (importOverwrite &&
-                settings.dangerousProfileFlag &&
-                importConfirmation !== activeContext?.profile_name)
+              (settings.dangerousProfileFlag && importConfirmation !== activeContext?.profile_name)
             "
           >
             {{ desktopBusy ? 'Importing…' : 'Import variables' }}
@@ -1981,6 +2043,7 @@ onUnmounted(() => {
         :privacy-mode="settings.privacyRedactNames"
         :audit-rows="rawAuditRows"
         :dangerous-profiles="settings.dangerousProfileFlag ? (status?.profile_name ?? '') : ''"
+        :confirm-dangerous="confirmDangerousAction"
         :require-accept-user-verification="settings.requireUserVerification"
         :loading="auditLoading"
         :error-message="auditError"
@@ -2014,6 +2077,14 @@ onUnmounted(() => {
       <p v-if="copyError" role="alert" class="shell__notice">{{ copyError }}</p>
     </main>
 
+    <dialog ref="dangerousConfirmDialog" aria-labelledby="dangerous-action-title">
+      <form method="dialog">
+        <h2 id="dangerous-action-title">{{ dangerousAction }}</h2>
+        <p>Allow this action in the dangerous profile {{ profileLabel }}?</p>
+        <button value="cancel" autofocus>Cancel</button>
+        <button value="confirm">Allow action</button>
+      </form>
+    </dialog>
     <RevealModal ref="revealModal" @invalidate="invalidateReveal" />
     <UnlockModal
       v-if="unlockOpen"

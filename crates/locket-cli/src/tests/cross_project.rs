@@ -67,6 +67,60 @@ fn init(context: &RuntimeContext, name: &str) -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn mcp_value_file_requires_trusted_project_root() -> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let outside = tempdir()?;
+    let context = test_context_with_secret_value(&directory, "test-value");
+    init(&context, "app")?;
+    let outside_file = outside.path().join("input");
+    let inside_file = directory.path().join("input");
+    fs::write(&outside_file, "outside fixture")?;
+    fs::write(&inside_file, "inside fixture")?;
+
+    let outside_reply = mcp_exchange(
+        &context,
+        &[rpc(
+            1,
+            "locket_store_secret",
+            &json!({
+                "project":"app", "name":"OUTSIDE", "value_file":outside_file,
+            }),
+        )],
+    )?;
+    assert_eq!(serde_json::from_str::<Value>(outside_reply.trim())?["result"]["isError"], true);
+
+    #[cfg(unix)]
+    {
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&outside_file, &link)?;
+        let reply = mcp_exchange(
+            &context,
+            &[rpc(
+                2,
+                "locket_store_secret",
+                &json!({
+                    "project":"app", "name":"LINK", "value_file":link,
+                }),
+            )],
+        )?;
+        assert_eq!(serde_json::from_str::<Value>(reply.trim())?["result"]["isError"], true);
+    }
+
+    let inside_reply = mcp_exchange(
+        &context,
+        &[rpc(
+            3,
+            "locket_store_secret",
+            &json!({
+                "project":"app", "name":"INSIDE", "value_file":inside_file,
+            }),
+        )],
+    )?;
+    assert_eq!(serde_json::from_str::<Value>(inside_reply.trim())?["result"]["isError"], false);
+    Ok(())
+}
+
+#[test]
 fn configured_reveal_and_copy_require_verification_without_flags() -> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;
     let context = test_context_with_secret_value(&directory, CANARY);

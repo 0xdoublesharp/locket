@@ -462,6 +462,38 @@ fn protected_run_fixture(
 }
 
 #[test]
+#[cfg(unix)]
+fn denied_run_policy_grant_never_spawns_the_child() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let mut context = test_context(&directory);
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--name", "app", "--profile", "dev"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    let argv = serde_json::to_string(&[test_shell(), "-c", "touch grant-launch-canary"])?;
+    writeln!(
+        fs::OpenOptions::new().append(true).open(directory.path().join("locket.toml"))?,
+        "\n[commands.canary]\nargv = {argv}\nenv_mode = 'strict'\ninherit_env = ['PATH']",
+    )?;
+    let denial = locket_agent::ErrorEnvelope::new(
+        "run-authorize policy launch",
+        "AccessDenied",
+        "test grant refusal",
+        false,
+    );
+    let frame = locket_agent::encode_frame(&denial, locket_agent::DEFAULT_MAX_MESSAGE_SIZE)?;
+    let invocation = Cli::try_parse_from(["locket", "run", "canary"])?;
+    let result = crate::commands::agent::framing_tests::with_open_peer(vec![frame], move |peer| {
+        context.agent_data_dir = Some(crate::agent_data_dir(peer));
+        run_with_context(invocation, &context, &mut Vec::new())
+    });
+    assert_error_contains(result, "test grant refusal");
+    assert!(!directory.path().join("grant-launch-canary").exists());
+    Ok(())
+}
+
+#[test]
 fn run_policy_audit_records_selected_source_by_precedence_without_values()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempdir()?;
@@ -520,8 +552,10 @@ ttl = "30s"
     assert_eq!(metadata_json["override_explicit"], json!(false));
     assert_eq!(metadata_json["grant_actions"], json!(["RunPolicy"]));
     assert_eq!(metadata_json["ttl_seconds"], json!(30));
-    assert!(metadata_json["process_id"].as_u64().is_some_and(|pid| pid > 0));
-    assert!(metadata_json["process_start_time"].as_str().is_some_and(|start| !start.is_empty()));
+    let launcher = locket_platform::current_process_binding()?;
+    assert_eq!(metadata_json["process_id"], launcher.pid);
+    assert_eq!(metadata_json["process_start_time"], launcher.process_start_time);
+    assert!(metadata_json["directory_hash"].as_str().is_some_and(|hash| hash.len() == 64));
     assert_eq!(
         metadata_json["secrets"],
         json!([{

@@ -79,10 +79,10 @@ pub struct DeviceMemberRow {
 /// # Errors
 ///
 /// Returns [`StoreError`] when the store cannot be opened or queried.
-pub fn list_device_members(
+pub fn list_device_members_from_store(
+    store: &Store,
     request: &ListDeviceMembersRequest,
 ) -> Result<ListDeviceMembersResponse, StoreError> {
-    let store = Store::open(&request.store_path)?;
     let mut rows = store
         .list_devices(&request.project_id, request.include_revoked_devices)?
         .into_iter()

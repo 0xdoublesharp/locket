@@ -71,6 +71,7 @@ export function isRejected(
 export interface RevealRequest {
   secret_name: string;
   profile_id: string;
+  confirm_dangerous?: boolean;
 }
 
 export interface RevealResponse {
@@ -593,9 +594,11 @@ export interface TeamSyncRenameProfileRequest {
   incoming_profile_id: string;
   local_profile_id: string;
   new_name: string;
+  confirm_dangerous?: boolean;
 }
 export interface TeamSyncPreserveOverrideRequest {
   project_id: string;
   incoming_profile_id: string;
   local_secret_id: string;
+  confirm_dangerous?: boolean;
 }

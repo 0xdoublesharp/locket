@@ -153,6 +153,7 @@ pub struct SetSecretResponse {
 }
 
 /// Handler for `SetSecret`.
+#[allow(clippy::too_many_lines)]
 pub async fn handle_set_secret(
     request: &RequestEnvelope,
     state: &crate::server::AgentSocketState,
@@ -228,9 +229,21 @@ pub async fn handle_set_secret(
         );
     };
 
+    let (store, _) = match crate::keys::open_verified_store_for_state(
+        state,
+        &typed.project_id,
+        Path::new(&typed.store_path),
+        now_unix_nanos,
+    )
+    .await
+    {
+        Ok(opened) => opened,
+        Err(error) => return crate::server::store_open_error(request, &error),
+    };
+
     match set_secret(
+        store,
         SetSecretOperation {
-            store_path: Path::new(&typed.store_path),
             project_id: &typed.project_id,
             profile_id: &typed.profile_id,
             name: name.as_str(),
@@ -285,7 +298,6 @@ impl SetSecretFailure {
 
 #[derive(Clone, Copy)]
 pub(super) struct SetSecretOperation<'a> {
-    pub(crate) store_path: &'a Path,
     pub(crate) project_id: &'a str,
     pub(crate) profile_id: &'a str,
     pub(crate) name: &'a str,
@@ -300,12 +312,12 @@ pub(super) struct SetSecretOperation<'a> {
 }
 
 fn set_secret(
+    mut store: Store,
     operation: SetSecretOperation<'_>,
     options: &WriteOptions<'_>,
 ) -> Result<SetSecretResponse, SetSecretFailure> {
     let timestamp = i64::try_from(operation.timestamp).map_err(|_| corrupt_db())?;
     let master_key = master_key_array(operation.master_key).map_err(|_| corrupt_db())?;
-    let mut store = Store::open(operation.store_path).map_err(|_| corrupt_db())?;
     store.with_atomic_write(|store| {
         apply_secret_write(store, &operation, &master_key, timestamp, options)
     })

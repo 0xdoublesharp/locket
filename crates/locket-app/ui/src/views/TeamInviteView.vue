@@ -35,6 +35,7 @@ import type { AuditWireRow } from '../agent/types';
 interface Props {
   projectId?: string;
   privacyMode?: boolean;
+  confirmDangerous?: (action: string) => Promise<boolean | undefined>;
   /** Audit rows for the active project, used for invite reconstruction. */
   auditRows: ReadonlyArray<AuditWireRow>;
   /** Comma-separated list of dangerous-profile names from agent settings. */
@@ -177,7 +178,11 @@ function statusBadge(status: TeamInviteRow['status']): string {
       </label>
     </header>
 
-    <TeamSharingPanel :project-id="projectId" :privacy-mode="privacyMode" />
+    <TeamSharingPanel
+      :project-id="projectId"
+      :privacy-mode="privacyMode"
+      :confirm-dangerous="confirmDangerous"
+    />
     <details v-if="!privacyMode">
       <summary>Invite history and advanced commands</summary>
       <p class="view__notice">
