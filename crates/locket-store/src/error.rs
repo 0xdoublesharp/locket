@@ -141,6 +141,13 @@ pub enum StoreError {
         /// Invite identifier the caller tried to mark accepted.
         invite_id: String,
     },
+
+    /// An automation client was revoked or missing when authentication attempted to commit.
+    #[error("automation client {client_id} was revoked before authentication committed")]
+    AutomationClientRevoked {
+        /// Client identifier whose authentication could not commit.
+        client_id: String,
+    },
 }
 
 impl StoreError {
@@ -162,6 +169,7 @@ impl StoreError {
             | Self::InviteNotFound { .. } => LocketError::MetadataInvalid,
             Self::Json(_) | Self::OutdatedSchema { .. } => LocketError::CorruptDb,
             Self::InviteReplayDetected { .. } => LocketError::ReplayDetected,
+            Self::AutomationClientRevoked { .. } => LocketError::AccessDenied,
         }
     }
 }

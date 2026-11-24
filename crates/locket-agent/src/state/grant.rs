@@ -180,8 +180,11 @@ impl GrantBinding {
 
 /// Checks the sole exception to issuing a grant for the connecting process.
 pub fn constrain_peer_grant(payload: &mut RequestGrantPayload, observed_pid: Option<u32>) -> bool {
-    if observed_pid.is_none_or(|pid| pid == payload.binding.pid) {
+    let Some(observed_pid) = observed_pid else {
         return true;
+    };
+    if observed_pid == payload.binding.pid {
+        return payload.binding.matches_live_process();
     }
     let Some(scope) = &payload.binding.execution else {
         return false;
@@ -189,7 +192,7 @@ pub fn constrain_peer_grant(payload: &mut RequestGrantPayload, observed_pid: Opt
     if payload.action != GrantAction::PrepareExec
         || payload.policy_name.as_deref() != Some(scope.policy_name.as_str())
         || !scope.cwd.is_absolute()
-        || child_parent_pid(payload.binding.pid) != observed_pid
+        || child_parent_pid(payload.binding.pid) != Some(observed_pid)
         || !payload.binding.matches_live_process()
     {
         return false;

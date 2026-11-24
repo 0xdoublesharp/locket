@@ -1392,13 +1392,8 @@ pub async fn dispatch_with_peer(
             crate::resolve::handle_resolve(envelope, state, current_unix_nanos()).await
         }
         Ok(AgentMethod::PrepareExec) => {
-            prepare_exec_dispatch(
-                envelope,
-                state,
-                observed_pid,
-                envelope.payload.get("auth").is_some(),
-            )
-            .await
+            prepare_exec_dispatch(envelope, state, peer, envelope.payload.get("auth").is_some())
+                .await
         }
         Ok(AgentMethod::ListSecrets) => handle_list_secrets(envelope, state).await,
         Ok(AgentMethod::ListProjects) => crate::discovery::handle_list_projects(envelope, state),
@@ -1449,7 +1444,7 @@ pub async fn dispatch_with_peer(
 async fn prepare_exec_dispatch(
     envelope: &RequestEnvelope,
     state: &AgentSocketState,
-    observed_pid: Option<u32>,
+    peer: Option<PeerIdentity>,
     authenticated_automation: bool,
 ) -> ResponseEnvelope {
     let session = state.session_gate.lock().await;
@@ -1460,7 +1455,7 @@ async fn prepare_exec_dispatch(
         envelope,
         state,
         current_unix_nanos(),
-        observed_pid,
+        peer,
         authenticated_automation,
     )
     .await;

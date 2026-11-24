@@ -2197,6 +2197,34 @@ async fn daemon_verification_gates_resolve_and_prepare_exec_and_binds_policy()
         return Err("approved PrepareExec should succeed".into());
     };
     let grant_id = prepared.payload()["grant_id"].as_str().ok_or("missing grant_id")?.to_owned();
+    assert_eq!(
+        approved
+            .grants
+            .lock()
+            .await
+            .get(&grant_id)
+            .and_then(|record| record.observed_connection_id),
+        Some(91)
+    );
+
+    // Same-PID PrepareExec with a stale start-time token must fail closed.
+    let stale_prepare = RequestEnvelope::new(
+        "prepare-stale",
+        AgentMethod::PrepareExec,
+        json!({
+            "project_id": "p",
+            "profile_id": "dev",
+            "policy_name": "policy-a",
+            "confirm_dangerous": false,
+            "binding": {"pid": binding.pid, "process_start_time": "stale-start-token"},
+        }),
+    );
+    let ResponseEnvelope::Error(stale_err) =
+        crate::dispatch_with_peer(&stale_prepare, &approved, Some(peer)).await
+    else {
+        return Err("stale-start-token PrepareExec must fail".into());
+    };
+    assert_eq!(stale_err.error, "AccessDenied");
 
     // Using the policy-a PrepareExec grant to resolve under policy-b must fail closed.
     let cross_policy = RequestEnvelope::new(
@@ -2225,6 +2253,64 @@ async fn daemon_verification_gates_resolve_and_prepare_exec_and_binds_policy()
             .await,
         ResponseEnvelope::Success(_)
     ));
+
+    // Commit-time revocation check rolls back nonce and audit if client was revoked concurrently.
+    let client = locket_store::AutomationClientRecord {
+        id: "lk_client_race".to_owned(),
+        project_id: "p".to_owned(),
+        name: "race-ci".to_owned(),
+        public_key: vec![0_u8; 32],
+        fingerprint: "fp-race".to_owned(),
+        storage: "external".to_owned(),
+        allowed_actions: vec!["run-policy".to_owned()],
+        allowed_policies: vec!["policy-a".to_owned()],
+        created_at: 1,
+        last_used_at: None,
+        revoked_at: Some(2),
+    };
+    store.insert_automation_client(&client)?;
+    let before_audit: i64 = store.connection().query_row(
+        "SELECT COUNT(*) FROM audit_log WHERE project_id = 'p'",
+        [],
+        |row| row.get(0),
+    )?;
+    let nonce = locket_store::AutomationClientNonceRecord {
+        client_id: client.id,
+        nonce: [9_u8; 24],
+        request_timestamp: 3,
+        seen_at: 3,
+        expires_at: 100,
+    };
+    let race_meta = json!({
+        "schema_version": 1,
+        "action": "CLIENT_AUTH",
+        "status": "SUCCESS",
+        "command": "agent client-auth",
+        "project_id": "p",
+        "client_id": "lk_client_race",
+    });
+    let race_audit = locket_store::AuditWrite {
+        project_id: "p",
+        profile_id: None,
+        action: "CLIENT_AUTH",
+        status: "SUCCESS",
+        secret_name: None,
+        command: Some("agent client-auth"),
+        metadata_json: &race_meta,
+        timestamp: 3,
+    };
+    let err = store
+        .record_automation_client_auth_with_audit(&nonce, 3, &[11; 32], &race_audit)
+        .expect_err("revoked client auth commit must fail closed");
+    assert!(matches!(err, locket_store::StoreError::AutomationClientRevoked { .. }));
+    let (nonce_count, after_audit): (i64, i64) = store.connection().query_row(
+        "SELECT (SELECT COUNT(*) FROM automation_client_nonces WHERE client_id = 'lk_client_race'),
+                (SELECT COUNT(*) FROM audit_log WHERE project_id = 'p')",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!((nonce_count, after_audit), (0, before_audit));
+
     assert!(store.verify_audit_chain_read_only("p", &[11; 32])?.hmac_ok);
     Ok(())
 }

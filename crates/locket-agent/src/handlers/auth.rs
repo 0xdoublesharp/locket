@@ -377,6 +377,9 @@ const fn timestamp_is_stale(timestamp: i128, now: i128) -> bool {
 }
 
 fn classify_auth_write_error(error: StoreError) -> AuthError {
+    if matches!(&error, StoreError::AutomationClientRevoked { .. }) {
+        return AuthError::NotTrusted("client revoked");
+    }
     // This transaction also updates client usage and appends an audit row.
     // Only a duplicate of the nonce table's composite key proves replay.
     if matches!(

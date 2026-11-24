@@ -293,18 +293,6 @@ pub async fn handle_revoke_client(
     }
 
     let timestamp = i64::try_from(now_unix_nanos).unwrap_or(i64::MAX);
-    match store.revoke_automation_client(&payload.project_id, &client.id, timestamp) {
-        Ok(true) => {}
-        Ok(false) => {
-            return ResponseEnvelope::Error(ErrorEnvelope::new(
-                request.id.clone(),
-                "PolicyNotFound",
-                "automation client was revoked concurrently",
-                false,
-            ));
-        }
-        Err(error) => return corrupt_db(request, format!("failed to revoke client: {error}")),
-    }
     let metadata = json!({
         "schema_version": 1,
         "action": "CLIENT_REVOKE",
@@ -329,8 +317,23 @@ pub async fn handle_revoke_client(
         metadata_json: &metadata,
         timestamp,
     };
-    if let Err(error) = store.append_audit(audit_key.as_ref(), &audit) {
-        return corrupt_db(request, format!("failed to append CLIENT_REVOKE audit row: {error}"));
+    let revoked = match store.with_atomic_write::<_, StoreError>(|store| {
+        if !store.revoke_automation_client(&payload.project_id, &client.id, timestamp)? {
+            return Ok(false);
+        }
+        store.append_audit(audit_key.as_ref(), &audit)?;
+        Ok(true)
+    }) {
+        Ok(revoked) => revoked,
+        Err(error) => return corrupt_db(request, format!("failed to revoke client: {error}")),
+    };
+    if !revoked {
+        return ResponseEnvelope::Error(ErrorEnvelope::new(
+            request.id.clone(),
+            "PolicyNotFound",
+            "automation client was revoked concurrently",
+            false,
+        ));
     }
     success(
         request,

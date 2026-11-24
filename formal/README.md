@@ -129,11 +129,11 @@ for the same rollback guarantee.
   [Auth handler](../crates/locket-agent/src/handlers/auth.rs),
   [IDE sessions](../crates/locket-agent/src/state/ide_env_session.rs), and
   [auth transaction](../crates/locket-store/src/access/runtime_session.rs)
-- **Commit-time revocation.** The automation model rechecks revocation at
-  commit. Rust reads `revoked_at` before taking the challenge, and the final
-  transaction updates usage by client ID without rechecking revocation. A
-  request that passes the first check can commit after concurrent revocation.
-  `RevokeClient` also persists its update before appending the revocation audit.
+- **Commit-time revocation.** Both the automation model and Rust recheck
+  `revoked_at IS NULL` inside the final authentication commit transaction,
+  rolling back the nonce and audit write if a concurrent `RevokeClient`
+  committed first. `RevokeClient` also wraps client revocation and its
+  `CLIENT_REVOKE` audit row in one atomic transaction.
   [Auth handler](../crates/locket-agent/src/handlers/auth.rs),
   [client registry](../crates/locket-agent/src/handlers/clients.rs), and
   [auth transaction](../crates/locket-store/src/access/runtime_session.rs)
@@ -151,12 +151,9 @@ for the same rollback guarantee.
   cached key during verification. Grant issuance rechecks the cache, while
   verified unlock can install a fresh entry after an old entry expires.
   The authorization model requires expiry to invalidate an ongoing unlock
-  refresh as well. `RequestGrant` records the connection ID and checks the
-  live process start token on use. Direct `PrepareExec` passes no connection
-  ID, so its same-PID path checks the PID and the supplied binding without
-  independently rechecking the live start token. Its child handoff path
-  rechecks the live child process. The model requires a live token match for
-  both entry points.
+  refresh as well. Both `RequestGrant` and direct `PrepareExec` record the
+  peer connection ID and check the live process start token at issuance and on
+  subsequent use, matching the model's PID-reuse protection.
   [Dispatch](../crates/locket-agent/src/transport/server.rs),
   [PrepareExec](../crates/locket-agent/src/handlers/prepare_exec.rs), and
   [grant binding](../crates/locket-agent/src/state/grant.rs)

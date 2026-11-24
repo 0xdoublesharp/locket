@@ -680,12 +680,15 @@ impl Store {
                 nonce.expires_at,
             ],
         )?;
-        transaction.execute(
+        let updated = transaction.execute(
             "UPDATE automation_clients
              SET last_used_at = ?2
-             WHERE id = ?1",
+             WHERE id = ?1 AND revoked_at IS NULL",
             params![nonce.client_id.as_str(), now],
         )?;
+        if updated == 0 {
+            return Err(StoreError::AutomationClientRevoked { client_id: nonce.client_id.clone() });
+        }
         append_audit(&transaction, audit_key, audit)?;
         transaction.commit()?;
         Ok(())

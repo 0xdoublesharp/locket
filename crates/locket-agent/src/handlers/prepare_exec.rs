@@ -107,7 +107,12 @@ pub async fn handle_prepare_exec(
     now_unix_nanos: i128,
     observed_pid: Option<u32>,
 ) -> ResponseEnvelope {
-    handle_prepare_exec_with_auth(request, state, now_unix_nanos, observed_pid, false).await
+    let peer = observed_pid.map(|pid| crate::peer_cred::PeerIdentity {
+        uid: state.daemon_uid,
+        pid: Some(pid),
+        connection_id: 0,
+    });
+    handle_prepare_exec_with_auth(request, state, now_unix_nanos, peer, false).await
 }
 
 #[allow(clippy::too_many_lines)]
@@ -115,9 +120,11 @@ pub async fn handle_prepare_exec_with_auth(
     request: &RequestEnvelope,
     state: &crate::server::AgentSocketState,
     now_unix_nanos: i128,
-    observed_pid: Option<u32>,
+    peer: Option<crate::peer_cred::PeerIdentity>,
     authenticated_automation: bool,
 ) -> ResponseEnvelope {
+    let observed_pid = peer.and_then(|peer| peer.pid);
+    let connection_id = peer.filter(|peer| peer.pid.is_some()).map(|peer| peer.connection_id);
     let Ok(typed) = serde_json::from_value::<PrepareExecRequest>(request.payload.clone()) else {
         return protocol_error(request, "invalid PrepareExec payload");
     };
@@ -224,7 +231,7 @@ pub async fn handle_prepare_exec_with_auth(
             issue_now,
             issue_now.saturating_add(ttl_nanos),
             observed_pid,
-            None,
+            connection_id,
         ) {
             if let Some(mut audit) = grant_audit
                 && crate::server::append_grant_verification_audit(&mut audit, &record, issue_now)
