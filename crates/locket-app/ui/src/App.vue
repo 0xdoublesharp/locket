@@ -3182,6 +3182,30 @@ html,
   }
 
   .shell__agent {
+    gap: 0.25rem;
+  }
+
+  .shell__vault {
+    padding: 0.15rem 0.35rem;
+    font-size: 0.7rem;
+  }
+
+  .shell__connection[data-connected='true'] {
+    display: none;
+  }
+
+  .shell__connection[data-connected='false'] {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.15rem 0.35rem;
+    border-radius: 999px;
+    background: var(--danger-soft);
+    color: var(--danger);
+    font-size: 0.7rem;
+    font-weight: 650;
+  }
+
+  .shell__agent:has(.shell__connection[data-connected='false']) .shell__vault {
     display: none;
   }
 
