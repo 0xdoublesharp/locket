@@ -6,6 +6,7 @@
 
 mod auditing;
 mod handlers;
+mod keys;
 mod protocol;
 mod state;
 mod transport;

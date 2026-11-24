@@ -21,7 +21,7 @@ use locket_core::bundle::{
 use locket_core::{CommandPolicy, CommandSpec, ExternalEnvSource, KeyId, PolicyDocument};
 use locket_crypto::{
     HkdfWrapInfo, KeyPurpose, KeyWrapAad, KeyWrapPurpose, WrappedKeyMaterial,
-    derive_wrapping_key_v1, key_wrap_aad_v1, unwrap_key_material_v1, wrap_key_material_v1,
+    derive_wrapping_key_v1, key_wrap_aad_v1, wrap_key_material_v1,
 };
 use locket_platform::{
     LocalDevicePrivateKeyStorage, PlatformError, WrappedLocalFileDevicePrivateKeyStorage,
@@ -33,6 +33,9 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::envelope::{ErrorEnvelope, RequestEnvelope, ResponseEnvelope, SuccessEnvelope};
+use crate::keys::{
+    KeyError, master_key_array, unwrap_audit_key_with_master, unwrap_profile_key_with_master,
+};
 use crate::server::{AgentSocketState, current_unix_nanos};
 
 /// Bundle export profile scope.
@@ -1835,28 +1838,8 @@ fn load_profile_key_with_master(
     purpose: KeyPurpose,
     master_key: &locket_crypto::KeyBytes,
 ) -> BackupResult<zeroize::Zeroizing<locket_crypto::KeyBytes>> {
-    let record = store
-        .get_key_by_scope(project_id, Some(profile_id), purpose.as_str())
-        .map_err(|error| ("CorruptDb", format!("could not read profile key: {error}")))?
-        .ok_or_else(|| {
-            ("AuditIntegrityFailed", format!("profile {} key is missing", purpose.as_str()))
-        })?;
-    let wrapping_key = derive_wrapping_key_v1(
-        master_key,
-        &HkdfWrapInfo::new(project_id, Some(profile_id), purpose),
-    )
-    .map_err(|error| ("MetadataInvalid", format!("profile key derivation failed: {error}")))?;
-    let aad = key_wrap_aad_v1(&KeyWrapAad::new(
-        project_id,
-        &record.id,
-        Some(profile_id),
-        0,
-        KeyWrapPurpose::from(purpose),
-    ))
-    .map_err(|error| ("MetadataInvalid", format!("profile key aad failed: {error}")))?;
-    let wrapped = WrappedKeyMaterial { ciphertext: record.wrapped_material, nonce: record.nonce };
-    unwrap_key_material_v1(&wrapping_key, &wrapped, &aad)
-        .map_err(|error| ("AuditIntegrityFailed", format!("profile key unwrap failed: {error}")))
+    unwrap_profile_key_with_master(store, project_id, profile_id, master_key, purpose)
+        .map_err(|error| backup_key_error(error, "profile"))
 }
 
 fn bundle_secret(secret: SecretRecord) -> SealedBundleSecretV1 {
@@ -1951,7 +1934,8 @@ fn write_export_audit(
     path_kind: &'static str,
     timestamp: i64,
 ) -> BackupResult<()> {
-    let audit_key = load_project_key_with_master(store, project_id, KeyPurpose::Audit, master_key)?;
+    let audit_key = unwrap_audit_key_with_master(store, project_id, master_key)
+        .map_err(|error| backup_key_error(error, "project"))?;
     let metadata = json!({
         "schema_version": 1,
         "action": "BACKUP_EXPORT",
@@ -2002,7 +1986,8 @@ fn write_import_audit(
     include_audit_requested: bool,
     timestamp: i64,
 ) -> BackupResult<()> {
-    let audit_key = load_project_key_with_master(store, project_id, KeyPurpose::Audit, master_key)?;
+    let audit_key = unwrap_audit_key_with_master(store, project_id, master_key)
+        .map_err(|error| backup_key_error(error, "project"))?;
     let metadata = json!({
         "schema_version": 1,
         "action": "BACKUP_IMPORT",
@@ -2077,33 +2062,17 @@ fn map_private_key_load_error(error: PlatformError) -> (&'static str, String) {
     }
 }
 
-fn load_project_key_with_master(
-    store: &Store,
-    project_id: &str,
-    purpose: KeyPurpose,
-    master_key: &locket_crypto::KeyBytes,
-) -> BackupResult<zeroize::Zeroizing<locket_crypto::KeyBytes>> {
-    let record = store
-        .get_key_by_scope(project_id, None, purpose.as_str())
-        .map_err(|error| ("CorruptDb", format!("could not read project key: {error}")))?
-        .ok_or_else(|| {
-            ("AuditIntegrityFailed", format!("project {} key is missing", purpose.as_str()))
-        })?;
-    let wrapping_key =
-        derive_wrapping_key_v1(master_key, &HkdfWrapInfo::new(project_id, None, purpose)).map_err(
-            |error| ("MetadataInvalid", format!("project key derivation failed: {error}")),
-        )?;
-    let aad = key_wrap_aad_v1(&KeyWrapAad::new(
-        project_id,
-        &record.id,
-        None,
-        0,
-        KeyWrapPurpose::from(purpose),
-    ))
-    .map_err(|error| ("MetadataInvalid", format!("project key aad failed: {error}")))?;
-    let wrapped = WrappedKeyMaterial { ciphertext: record.wrapped_material, nonce: record.nonce };
-    unwrap_key_material_v1(&wrapping_key, &wrapped, &aad)
-        .map_err(|error| ("AuditIntegrityFailed", format!("project key unwrap failed: {error}")))
+fn backup_key_error(error: KeyError, scope: &str) -> (&'static str, String) {
+    match error {
+        KeyError::Store(error) => ("CorruptDb", format!("could not read {scope} key: {error}")),
+        KeyError::Missing(purpose) => {
+            ("AuditIntegrityFailed", format!("{scope} {purpose} key is missing"))
+        }
+        KeyError::Unwrap(error) => {
+            ("AuditIntegrityFailed", format!("{scope} key unwrap failed: {error}"))
+        }
+        error => ("MetadataInvalid", format!("{scope} key metadata invalid: {error}")),
+    }
 }
 
 fn write_bundle_file(path: &Path, bundle: &BundleContainer) -> BackupResult<()> {
@@ -2198,13 +2167,13 @@ async fn unlocked_project(
             "bundle export requires unlock audit context with store_path",
         ));
     };
-    let master_key: locket_crypto::KeyBytes = entry.key_bytes().try_into().map_err(|_| {
+    let master_key = master_key_array(entry.key_bytes()).map_err(|_| {
         error_response(envelope, "MetadataInvalid", "cached master key has invalid length")
     })?;
     Ok(UnlockedProject {
         store_path: context.store_path.clone(),
         profile_id: context.profile_id.clone(),
-        master_key: zeroize::Zeroizing::new(master_key),
+        master_key,
     })
 }
 

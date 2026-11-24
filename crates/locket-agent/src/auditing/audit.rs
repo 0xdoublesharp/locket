@@ -81,12 +81,12 @@ pub struct AuditChainStatus {
 ///
 /// # Errors
 ///
-/// Returns [`StoreError`] when the store cannot be opened, queried, or verified.
+/// Returns [`StoreError`] when the chain cannot be queried or verified.
 pub fn list_audit(
+    store: &Store,
     request: &ListAuditRequest,
     audit_key: Option<&[u8]>,
 ) -> Result<ListAuditResponse, StoreError> {
-    let store = Store::open(&request.store_path)?;
     let limit = request.limit.unwrap_or(DEFAULT_LIST_AUDIT_ROWS).clamp(1, MAX_LIST_AUDIT_ROWS);
     let filter = AuditListFilter {
         profile_id: request.profile_id.clone(),

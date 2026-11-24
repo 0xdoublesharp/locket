@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::envelope::{ErrorEnvelope, RequestEnvelope, ResponseEnvelope, SuccessEnvelope};
+use crate::keys::{cached_master_key, unwrap_audit_key_with_master};
 
 /// Request payload for `RegisterClient`.
 ///
@@ -114,14 +115,27 @@ pub async fn handle_register_client(
         Err(message) => return metadata_invalid(request, message),
     };
 
-    let Some(audit_key) = audit_key_for_project(state, &payload.project_id, now_unix_nanos).await
-    else {
-        return unlock_required(request, "unlock required to register automation client");
+    let master_key = match cached_master_key(state, &payload.project_id, now_unix_nanos).await {
+        Ok(Some(master_key)) => master_key,
+        Ok(None) => {
+            return unlock_required(request, "unlock required to register automation client");
+        }
+        Err(error) => return corrupt_db(request, error.to_string()),
     };
-
     let mut store = match Store::open(&payload.store_path) {
         Ok(store) => store,
         Err(error) => return corrupt_db(request, format!("failed to open store: {error}")),
+    };
+    let audit_key = match unwrap_audit_key_with_master(&store, &payload.project_id, &master_key) {
+        Ok(key) => key,
+        Err(error) => {
+            return ResponseEnvelope::Error(ErrorEnvelope::new(
+                request.id.clone(),
+                "AuditIntegrityFailed",
+                error.to_string(),
+                false,
+            ));
+        }
     };
 
     let id = match ClientId::generate() {
@@ -170,7 +184,7 @@ pub async fn handle_register_client(
         metadata_json: &metadata,
         timestamp,
     };
-    if let Err(error) = store.append_audit(&audit_key, &audit) {
+    if let Err(error) = store.append_audit(audit_key.as_ref(), &audit) {
         return corrupt_db(request, format!("failed to append CLIENT_ADD audit row: {error}"));
     }
     success(request, RegisterClientResponse { client_id: record.id, fingerprint })
@@ -187,14 +201,25 @@ pub async fn handle_revoke_client(
         Err(_) => return protocol_error(request, "invalid RevokeClient payload"),
     };
 
-    let Some(audit_key) = audit_key_for_project(state, &payload.project_id, now_unix_nanos).await
-    else {
-        return unlock_required(request, "unlock required to revoke automation client");
+    let master_key = match cached_master_key(state, &payload.project_id, now_unix_nanos).await {
+        Ok(Some(master_key)) => master_key,
+        Ok(None) => return unlock_required(request, "unlock required to revoke automation client"),
+        Err(error) => return corrupt_db(request, error.to_string()),
     };
-
     let mut store = match Store::open(&payload.store_path) {
         Ok(store) => store,
         Err(error) => return corrupt_db(request, format!("failed to open store: {error}")),
+    };
+    let audit_key = match unwrap_audit_key_with_master(&store, &payload.project_id, &master_key) {
+        Ok(key) => key,
+        Err(error) => {
+            return ResponseEnvelope::Error(ErrorEnvelope::new(
+                request.id.clone(),
+                "AuditIntegrityFailed",
+                error.to_string(),
+                false,
+            ));
+        }
     };
 
     let client = match store.get_automation_client(&payload.project_id, &payload.client) {
@@ -259,7 +284,7 @@ pub async fn handle_revoke_client(
         metadata_json: &metadata,
         timestamp,
     };
-    if let Err(error) = store.append_audit(&audit_key, &audit) {
+    if let Err(error) = store.append_audit(audit_key.as_ref(), &audit) {
         return corrupt_db(request, format!("failed to append CLIENT_REVOKE audit row: {error}"));
     }
     success(
@@ -271,19 +296,6 @@ pub async fn handle_revoke_client(
             revoked_at: timestamp,
         },
     )
-}
-
-async fn audit_key_for_project(
-    state: &crate::server::AgentSocketState,
-    project_id: &str,
-    now_unix_nanos: i128,
-) -> Option<Vec<u8>> {
-    state
-        .unlock_cache
-        .lock()
-        .await
-        .lookup(project_id, now_unix_nanos)
-        .map(|entry| entry.key_bytes().to_vec())
 }
 
 fn client_public_key_fingerprint(public_key: &[u8; 32]) -> String {

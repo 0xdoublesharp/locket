@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::envelope::{ErrorEnvelope, RequestEnvelope, ResponseEnvelope, SuccessEnvelope};
+use crate::keys::{KeyError, cached_master_key, unwrap_audit_key_with_master};
 
 /// Request payload for `SetActiveProfile`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -69,6 +70,8 @@ enum SetActiveProfileError {
     #[error("{0}")]
     MetadataInvalid(String),
     #[error(transparent)]
+    Key(#[from] KeyError),
+    #[error(transparent)]
     Store(#[from] locket_store::StoreError),
     #[error(transparent)]
     Io(#[from] io::Error),
@@ -92,6 +95,7 @@ impl SetActiveProfileError {
             | Self::TomlDeserialize(_)
             | Self::TomlSerialize(_)
             | Self::PolicyFile(_) => "MetadataInvalid",
+            Self::Key(_) => "AuditIntegrityFailed",
             Self::Store(error) => match error.locket_error() {
                 locket_core::LocketError::StorageBusy => "StorageBusy",
                 locket_core::LocketError::SchemaNewerThanBinary => "SchemaNewerThanBinary",
@@ -128,7 +132,9 @@ async fn set_active_profile(
 ) -> Result<SetActiveProfileResponse, SetActiveProfileError> {
     let profile_name = ProfileName::new(request.profile_name.clone())
         .map_err(|_| SetActiveProfileError::InvalidProfileName)?;
-    let audit_key = audit_key_for_project(state, &request.project_id, now_unix_nanos).await?;
+    let master_key = cached_master_key(state, &request.project_id, now_unix_nanos)
+        .await?
+        .ok_or(SetActiveProfileError::UnlockRequired)?;
     let mut project_config = read_project_config(&request.config_path)?;
     if project_config.project_id.as_str() != request.project_id {
         return Err(SetActiveProfileError::MetadataInvalid(
@@ -137,6 +143,7 @@ async fn set_active_profile(
     }
 
     let mut store = Store::open(&request.store_path)?;
+    let audit_key = unwrap_audit_key_with_master(&store, &request.project_id, &master_key)?;
     let new_profile = store
         .get_profile_by_name(&request.project_id, profile_name.as_str())?
         .ok_or(SetActiveProfileError::ProfileNotFound)?;
@@ -176,7 +183,7 @@ async fn set_active_profile(
         &prior_profile,
         &new_profile,
         u32::try_from(live_grants_to_revoke).unwrap_or(u32::MAX),
-        &audit_key,
+        audit_key.as_ref(),
         i64::try_from(now_unix_nanos).unwrap_or(i64::MAX),
     )?;
     let revoked = {
@@ -191,20 +198,6 @@ async fn set_active_profile(
         request.privacy_redact_names,
         u32::try_from(revoked).unwrap_or(u32::MAX),
     ))
-}
-
-async fn audit_key_for_project(
-    state: &crate::server::AgentSocketState,
-    project_id: &str,
-    now_unix_nanos: i128,
-) -> Result<Vec<u8>, SetActiveProfileError> {
-    state
-        .unlock_cache
-        .lock()
-        .await
-        .lookup(project_id, now_unix_nanos)
-        .map(|entry| entry.key_bytes().to_vec())
-        .ok_or(SetActiveProfileError::UnlockRequired)
 }
 
 fn read_project_config(path: &Path) -> Result<ProjectConfig, SetActiveProfileError> {

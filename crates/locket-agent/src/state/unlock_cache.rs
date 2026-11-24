@@ -72,7 +72,16 @@ impl UnlockEntry {
         ttl: Duration,
         method: UnlockMethod,
     ) -> Self {
-        Self { key: Zeroizing::new(key), inserted_at_unix_nanos, ttl, method, audit_context: None }
+        Self::new_zeroizing(Zeroizing::new(key), inserted_at_unix_nanos, ttl, method)
+    }
+
+    pub(crate) const fn new_zeroizing(
+        key: Zeroizing<Vec<u8>>,
+        inserted_at_unix_nanos: i128,
+        ttl: Duration,
+        method: UnlockMethod,
+    ) -> Self {
+        Self { key, inserted_at_unix_nanos, ttl, method, audit_context: None }
     }
 
     /// Adds metadata-only audit context to an unlock entry.

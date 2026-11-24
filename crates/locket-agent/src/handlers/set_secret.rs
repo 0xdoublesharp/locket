@@ -9,9 +9,8 @@ use std::str::FromStr;
 
 use locket_core::{LocketError, SecretId, SecretName, SecretSource};
 use locket_crypto::{
-    EncryptedSecretValue, HkdfWrapInfo, KeyPurpose, KeyWrapAad, KeyWrapPurpose, SecretBlobAad,
-    WrappedKeyMaterial, derive_wrapping_key_v1, encrypt_secret_value_v1, key_wrap_aad_v1,
-    secret_blob_aad_v1, secret_fingerprint_v1, unwrap_key_material_v1,
+    EncryptedSecretValue, KeyPurpose, KeyWrapAad, KeyWrapPurpose, SecretBlobAad,
+    encrypt_secret_value_v1, key_wrap_aad_v1, secret_blob_aad_v1, secret_fingerprint_v1,
 };
 use locket_store::{
     AuditContext, AuditWrite, SecretBlobRecord, SecretFingerprintRecord, SecretRecord,
@@ -23,6 +22,7 @@ use zeroize::Zeroizing;
 
 use crate::envelope::{ErrorEnvelope, RequestEnvelope, ResponseEnvelope, SuccessEnvelope};
 use crate::grant::{GrantAction, GrantBinding, GrantValidation};
+use crate::keys::{master_key_array, unwrap_audit_key_with_master, unwrap_profile_key_with_master};
 
 const DEFAULT_SOURCE: &str = "user-local";
 const ORIGIN: &str = "manual";
@@ -138,9 +138,11 @@ pub async fn handle_set_secret(
 
     let master_key = {
         let cache = state.unlock_cache.lock().await;
-        cache.lookup(&typed.project_id, now_unix_nanos).map(|entry| entry.key_bytes().to_vec())
+        cache
+            .lookup(&typed.project_id, now_unix_nanos)
+            .map(|entry| Zeroizing::new(entry.key_bytes().to_vec()))
     };
-    let Some(master_key) = master_key.map(Zeroizing::new) else {
+    let Some(master_key) = master_key else {
         return typed_error(
             request,
             ERROR_UNLOCK_REQUIRED,
@@ -219,7 +221,7 @@ pub(super) struct SetSecretOperation<'a> {
 
 fn set_secret(operation: SetSecretOperation<'_>) -> Result<SetSecretResponse, SetSecretFailure> {
     let timestamp = i64::try_from(operation.timestamp).map_err(|_| corrupt_db())?;
-    let master_key = Zeroizing::new(key_array(operation.master_key).ok_or_else(corrupt_db)?);
+    let master_key = master_key_array(operation.master_key).map_err(|_| corrupt_db())?;
     let mut store = Store::open(operation.store_path).map_err(|_| corrupt_db())?;
     set_secret_in_store(&mut store, &operation, &master_key, timestamp)
 }
@@ -292,9 +294,8 @@ fn create_secret(
         operation.value,
         master_key,
     )?;
-    let audit_key =
-        load_project_key_with_master(store, operation.project_id, KeyPurpose::Audit, master_key)
-            .map_err(|_| corrupt_db())?;
+    let audit_key = unwrap_audit_key_with_master(store, operation.project_id, master_key)
+        .map_err(|_| corrupt_db())?;
     let secret_id = secret_id.into_string();
     let metadata = secret_audit_metadata(
         if operation.imported { "IMPORT" } else { "SET" },
@@ -404,9 +405,8 @@ fn rotate_secret(
         operation.value,
         master_key,
     )?;
-    let audit_key =
-        load_project_key_with_master(store, operation.project_id, KeyPurpose::Audit, master_key)
-            .map_err(|_| corrupt_db())?;
+    let audit_key = unwrap_audit_key_with_master(store, operation.project_id, master_key)
+        .map_err(|_| corrupt_db())?;
     let metadata = json!({
         "schema_version": 1,
         "action": "ROTATE",
@@ -521,20 +521,20 @@ fn encrypt_secret_version(
     value: &str,
     master_key: &locket_crypto::KeyBytes,
 ) -> Result<(EncryptedSecretValue, Vec<u8>), SetSecretFailure> {
-    let profile_secret_key = load_profile_key_with_master(
+    let profile_secret_key = unwrap_profile_key_with_master(
         store,
         project_id,
         profile_id,
-        KeyPurpose::ProfileSecret,
         master_key,
+        KeyPurpose::ProfileSecret,
     )
     .map_err(|_| corrupt_db())?;
-    let profile_fingerprint_key = load_profile_key_with_master(
+    let profile_fingerprint_key = unwrap_profile_key_with_master(
         store,
         project_id,
         profile_id,
-        KeyPurpose::ProfileFingerprint,
         master_key,
+        KeyPurpose::ProfileFingerprint,
     )
     .map_err(|_| corrupt_db())?;
     let value_aad = secret_blob_aad_v1(&SecretBlobAad::new(
@@ -593,59 +593,6 @@ fn secret_audit_metadata(
         "source": source,
         "version": version,
     })
-}
-
-fn load_profile_key_with_master(
-    store: &Store,
-    project_id: &str,
-    profile_id: &str,
-    purpose: KeyPurpose,
-    master_key: &locket_crypto::KeyBytes,
-) -> Result<Zeroizing<locket_crypto::KeyBytes>, locket_crypto::CryptoError> {
-    let record = store
-        .get_key_by_scope(project_id, Some(profile_id), purpose.as_str())
-        .map_err(|_| locket_crypto::CryptoError::DecryptionFailed)?
-        .ok_or(locket_crypto::CryptoError::DecryptionFailed)?;
-    let wrapping_key = derive_wrapping_key_v1(
-        master_key,
-        &HkdfWrapInfo::new(project_id, Some(profile_id), purpose),
-    )?;
-    let aad = key_wrap_aad_v1(&KeyWrapAad::new(
-        project_id,
-        &record.id,
-        Some(profile_id),
-        0,
-        KeyWrapPurpose::from(purpose),
-    ))?;
-    let wrapped = WrappedKeyMaterial { ciphertext: record.wrapped_material, nonce: record.nonce };
-    unwrap_key_material_v1(&wrapping_key, &wrapped, &aad)
-}
-
-pub(super) fn load_project_key_with_master(
-    store: &Store,
-    project_id: &str,
-    purpose: KeyPurpose,
-    master_key: &locket_crypto::KeyBytes,
-) -> Result<Zeroizing<locket_crypto::KeyBytes>, locket_crypto::CryptoError> {
-    let record = store
-        .get_key_by_scope(project_id, None, purpose.as_str())
-        .map_err(|_| locket_crypto::CryptoError::DecryptionFailed)?
-        .ok_or(locket_crypto::CryptoError::DecryptionFailed)?;
-    let wrapping_key =
-        derive_wrapping_key_v1(master_key, &HkdfWrapInfo::new(project_id, None, purpose))?;
-    let aad = key_wrap_aad_v1(&KeyWrapAad::new(
-        project_id,
-        &record.id,
-        None,
-        0,
-        KeyWrapPurpose::from(purpose),
-    ))?;
-    let wrapped = WrappedKeyMaterial { ciphertext: record.wrapped_material, nonce: record.nonce };
-    unwrap_key_material_v1(&wrapping_key, &wrapped, &aad)
-}
-
-fn key_array(bytes: &[u8]) -> Option<locket_crypto::KeyBytes> {
-    bytes.try_into().ok()
 }
 
 const fn corrupt_db() -> SetSecretFailure {

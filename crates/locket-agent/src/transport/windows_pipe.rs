@@ -147,7 +147,8 @@ pub async fn handle_named_pipe_connection(
 ) -> io::Result<()> {
     use tokio::io::AsyncWriteExt;
 
-    let mut buffer = Vec::with_capacity(4 * 1024);
+    let mut buffer =
+        zeroize::Zeroizing::new(Vec::with_capacity(super::server::FRAME_READ_CHUNK_SIZE));
     loop {
         let Some(request) = super::server::read_one_frame(&mut stream, &mut buffer).await? else {
             return Ok(());
@@ -155,6 +156,7 @@ pub async fn handle_named_pipe_connection(
         let response = crate::server::dispatch(&request, &state).await;
         let frame = crate::framing::encode_frame(&response, crate::DEFAULT_MAX_MESSAGE_SIZE)
             .map_err(|error| io::Error::other(error.to_string()))?;
+        let frame = zeroize::Zeroizing::new(frame);
         stream.write_all(&frame).await?;
         stream.flush().await?;
     }

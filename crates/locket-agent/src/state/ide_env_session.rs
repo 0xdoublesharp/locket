@@ -35,6 +35,7 @@ use serde_json::json;
 use tokio::sync::Mutex;
 
 use crate::envelope::{ErrorEnvelope, RequestEnvelope, ResponseEnvelope, SuccessEnvelope};
+use crate::keys::{cached_master_key, unwrap_audit_key_with_master};
 
 /// Maximum TTL accepted for an IDE env-session registration.
 ///
@@ -186,20 +187,28 @@ pub async fn handle_register_ide_env_session(
     // The audit row is HMAC-chained with the project audit key, so we
     // require an unlocked vault — `RegisterIdeEnvSession` is a write of
     // metadata-grade authorization state.
-    let audit_key = {
-        let cache = state.unlock_cache.lock().await;
-        cache.lookup(&payload.project_id, now_unix_nanos).map(|entry| entry.key_bytes().to_vec())
+    let master_key = match cached_master_key(state, &payload.project_id, now_unix_nanos).await {
+        Ok(Some(key)) => key,
+        Ok(None) => {
+            return error_response(
+                request,
+                "UnlockRequired",
+                "unlock required to register an IDE env session",
+            );
+        }
+        Err(error) => return error_response(request, "CorruptDb", error.to_string()),
     };
-    let Some(audit_key) = audit_key else {
-        return error_response(
-            request,
-            "UnlockRequired",
-            "unlock required to register an IDE env session",
-        );
+    let Ok(mut store) = Store::open(&payload.store_path) else {
+        return error_response(request, "CorruptDb", "failed to open store");
     };
-
-    if let Err(message) = append_register_audit(&payload, &audit_key, ttl_seconds, now_unix_nanos) {
-        return error_response(request, "CorruptDb", message);
+    let audit_key = match unwrap_audit_key_with_master(&store, &payload.project_id, &master_key) {
+        Ok(key) => key,
+        Err(error) => return error_response(request, "AuditIntegrityFailed", error.to_string()),
+    };
+    if append_register_audit(&mut store, &payload, audit_key.as_ref(), ttl_seconds, now_unix_nanos)
+        .is_err()
+    {
+        return error_response(request, "CorruptDb", "failed to append AGENT_GRANT audit row");
     }
 
     let ttl_nanos = i128::from(ttl_seconds).saturating_mul(1_000_000_000);
@@ -291,12 +300,12 @@ enum SessionLookup {
 }
 
 fn append_register_audit(
+    store: &mut Store,
     payload: &RegisterIdeEnvSessionRequest,
     audit_key: &[u8],
     ttl_seconds: u64,
     now_unix_nanos: i128,
-) -> Result<(), &'static str> {
-    let mut store = Store::open(&payload.store_path).map_err(|_| "failed to open store")?;
+) -> Result<(), locket_store::StoreError> {
     // Audit metadata is restricted to the known-field set in
     // `locket-store::audit`. We intentionally omit a numeric env-name
     // count here because the field is not on the allow-list; the
@@ -321,7 +330,7 @@ fn append_register_audit(
         metadata_json: &metadata,
         timestamp,
     };
-    store.append_audit(audit_key, &write).map_err(|_| "failed to append AGENT_GRANT audit row")
+    store.append_audit(audit_key, &write)
 }
 
 fn success_response<T: Serialize>(request: &RequestEnvelope, payload: T) -> ResponseEnvelope {
@@ -373,6 +382,7 @@ mod tests {
                 [],
             )
             .unwrap();
+        crate::tests::insert_wrapped_audit_key(&store, "proj-1", &[7; 32], &[11; 32]).unwrap();
     }
 
     fn unlocked_state(project_id: &str, now: i128) -> AgentSocketState {
