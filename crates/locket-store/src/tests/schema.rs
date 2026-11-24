@@ -4,7 +4,7 @@ use tempfile::tempdir;
 
 use crate::{AUDIT_ACTION_SCHEMA_MIGRATE, SCHEMA_VERSION, Store, StoreError};
 
-use super::{insert_project_profile, open_initialized_store};
+use super::{insert_project_profile, insert_project_profile_secret, open_initialized_store};
 
 #[test]
 fn creates_schema_and_records_migration() -> Result<(), Box<dyn Error>> {
@@ -30,6 +30,7 @@ fn creates_schema_and_records_migration() -> Result<(), Box<dyn Error>> {
         "project_roots",
         "directory_grants",
         "audit_log",
+        "audit_witness_receipts",
         "imported_audit_chains",
         "fingerprints",
         "runtime_sessions",
@@ -315,7 +316,7 @@ fn fresh_initialize_reports_pending_schema_migration() -> Result<(), Box<dyn Err
     assert!(outcome.advanced(), "fresh store must advance the ledger");
     assert_eq!(outcome.before, None);
     assert_eq!(outcome.after, SCHEMA_VERSION);
-    assert_eq!(outcome.applied_steps.as_slice(), &["schema.bootstrap_v6"]);
+    assert_eq!(outcome.applied_steps.as_slice(), &["schema.bootstrap_v7"]);
 
     Ok(())
 }
@@ -339,7 +340,8 @@ fn v1_store_migrates_recent_schema_alignment_columns_and_indexes() -> Result<(),
             "schema.migrate_v3_team_member_profiles",
             "schema.migrate_v4_device_signing",
             "schema.migrate_v5_authenticated_team_sync",
-            "schema.migrate_v6_pending_team_profiles"
+            "schema.migrate_v6_pending_team_profiles",
+            "schema.migrate_v7_expiry_and_witnesses",
         ]
     );
     assert_eq!(store.current_schema_version()?, Some(i64::from(SCHEMA_VERSION)));
@@ -593,7 +595,38 @@ fn schema_migrations_applied_at_is_positive_integer() -> Result<(), Box<dyn Erro
 
 #[test]
 fn schema_version_constant_is_current() {
-    assert_eq!(SCHEMA_VERSION, 6);
+    assert_eq!(SCHEMA_VERSION, 7);
+}
+
+#[test]
+fn schema_six_upgrades_with_existing_secrets_and_nullable_expiry() -> Result<(), Box<dyn Error>> {
+    let mut test_store = open_initialized_store()?;
+    insert_project_profile_secret(&test_store.store)?;
+    test_store.store.connection().execute_batch(
+        "DROP TABLE audit_witness_receipts;
+         ALTER TABLE secrets DROP COLUMN expires_at;
+         ALTER TABLE secrets DROP COLUMN rotate_after_days;
+         DELETE FROM schema_migrations WHERE version = 7;",
+    )?;
+
+    let migration = test_store.store.initialize_schema()?;
+    assert_eq!(migration.before, Some(6));
+    assert_eq!(migration.after, 7);
+    assert_eq!(migration.applied_steps, ["schema.migrate_v7_expiry_and_witnesses"]);
+    assert_eq!(
+        test_store.store.get_secret_expiry_policy("lk_sec_test")?,
+        Some(crate::SecretExpiryPolicy::default())
+    );
+    assert_eq!(test_store.store.list_audit_witness_receipts("lk_proj_test")?, []);
+    assert!(!test_store.store.initialize_schema()?.advanced());
+
+    // A repeated migration must tolerate columns and the witness table already existing.
+    let policy = crate::SecretExpiryPolicy { expires_at: Some(20), rotate_after_days: Some(2) };
+    assert!(test_store.store.set_secret_expiry_policy("lk_sec_test", policy, 10)?);
+    test_store.store.connection().execute("DELETE FROM schema_migrations WHERE version = 7", [])?;
+    assert!(test_store.store.initialize_schema()?.advanced());
+    assert_eq!(test_store.store.get_secret_expiry_policy("lk_sec_test")?, Some(policy));
+    Ok(())
 }
 
 #[test]
@@ -897,7 +930,7 @@ fn schema_five_adds_pending_tables_with_an_explicit_six_migration() -> Result<()
     let directory = tempdir()?;
     let mut store = Store::open(directory.path().join("store.db"))?;
     store.initialize_schema()?;
-    store.connection().execute("DELETE FROM schema_migrations WHERE version=6", [])?;
+    store.connection().execute("DELETE FROM schema_migrations WHERE version >= 6", [])?;
     store.connection().execute_batch(
         "DROP TABLE team_sync_pending_profiles; DROP TABLE team_sync_pending_packages;",
     )?;
@@ -910,8 +943,11 @@ fn schema_five_adds_pending_tables_with_an_explicit_six_migration() -> Result<()
     store.connection().execute("INSERT INTO team_sync_seen VALUES ('old-team-project','first-three',3,'applied'),('old-team-project','head-five',5,'applied')",[])?;
     let migration = store.initialize_schema()?;
     assert_eq!(migration.before, Some(5));
-    assert_eq!(migration.after, 6);
-    assert_eq!(migration.applied_steps, vec!["schema.migrate_v6_pending_team_profiles"]);
+    assert_eq!(migration.after, 7);
+    assert_eq!(
+        migration.applied_steps,
+        ["schema.migrate_v6_pending_team_profiles", "schema.migrate_v7_expiry_and_witnesses"]
+    );
     let tables:i64=store.connection().query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('team_sync_pending_profiles','team_sync_pending_packages')",[],|row|row.get(0))?;
     assert_eq!(tables, 2);
     let join: i64 = store.connection().query_row(

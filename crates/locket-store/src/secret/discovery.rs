@@ -1,5 +1,6 @@
 //! Cross-project queries over secret metadata.
 
+use locket_core::source_precedence;
 use rusqlite::{Row, params};
 
 use crate::{Store, StoreError};
@@ -128,10 +129,10 @@ impl Store {
             "SELECT p.id, p.name, f.id, f.name, f.dangerous, s.id, s.name, s.source,
                     s.description, s.owner, s.tags_json, s.required,
                     CASE s.source
-                      WHEN 'machine-local' THEN 3
-                      WHEN 'user-local' THEN 2
-                      WHEN 'team-managed' THEN 1
-                      ELSE 0
+                      WHEN 'machine-local' THEN ?6
+                      WHEN 'user-local' THEN ?7
+                      WHEN 'team-managed' THEN ?8
+                      ELSE ?9
                     END AS source_precedence,
                     s.origin, s.current_version, s.state, s.created_at, s.updated_at, s.last_rotated_at
              FROM secrets s
@@ -156,6 +157,10 @@ impl Store {
             filter.source.as_deref(),
             filter.include_deleted,
             sql_limit,
+            source_precedence("machine-local"),
+            source_precedence("user-local"),
+            source_precedence("team-managed"),
+            source_precedence(""),
         ])?;
 
         let query = filter.query.as_deref().map(str::to_lowercase);

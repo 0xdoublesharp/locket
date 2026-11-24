@@ -7,7 +7,7 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::error::StoreError;
 
 /// Current storage schema version.
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Audit action written for each schema migration step when project context is available.
 pub const AUDIT_ACTION_SCHEMA_MIGRATE: &str = "SCHEMA_MIGRATE";
@@ -72,7 +72,7 @@ pub fn initialize_schema(
             for version in 1..=SCHEMA_VERSION {
                 insert_schema_migration_row(&transaction, version)?;
             }
-            applied_steps.push("schema.bootstrap_v6");
+            applied_steps.push("schema.bootstrap_v7");
         }
         Some(version) => {
             transaction.execute_batch(SCHEMA_MIGRATIONS_SQL)?;
@@ -113,6 +113,17 @@ pub fn initialize_schema(
                 transaction.execute("INSERT OR IGNORE INTO team_sync_join_checkpoints(project_id,epoch) SELECT h.project_id,COALESCE((SELECT MIN(s.epoch) FROM team_sync_seen s WHERE s.project_id=h.project_id AND s.outcome='applied'),h.epoch) FROM team_sync_heads h",[])?;
                 insert_schema_migration_row(&transaction, 6)?;
                 applied_steps.push("schema.migrate_v6_pending_team_profiles");
+            }
+            if version < 7 {
+                add_column_if_missing(&transaction, "secrets", "expires_at", "expires_at INTEGER")?;
+                add_column_if_missing(
+                    &transaction,
+                    "secrets",
+                    "rotate_after_days",
+                    "rotate_after_days INTEGER",
+                )?;
+                insert_schema_migration_row(&transaction, 7)?;
+                applied_steps.push("schema.migrate_v7_expiry_and_witnesses");
             }
             transaction.execute_batch(SCHEMA_SQL)?;
         }
@@ -362,6 +373,8 @@ CREATE TABLE IF NOT EXISTS secrets (
   updated_at INTEGER NOT NULL,
   last_rotated_at INTEGER,
   deleted_at INTEGER,
+  expires_at INTEGER,
+  rotate_after_days INTEGER,
   UNIQUE (project_id, profile_id, name, source)
 );
 
@@ -648,6 +661,23 @@ CREATE TABLE IF NOT EXISTS audit_log (
   hmac BLOB NOT NULL CHECK (length(hmac) = 32),
   PRIMARY KEY (project_id, sequence)
 );
+
+CREATE TABLE IF NOT EXISTS audit_witness_receipts (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  seq_no INTEGER NOT NULL CHECK (seq_no >= 1),
+  checkpoint_hmac_hex TEXT NOT NULL,
+  prev_receipt_sha256_hex TEXT,
+  receipt_sha256_hex TEXT NOT NULL UNIQUE,
+  witness_id TEXT NOT NULL,
+  signer_id TEXT NOT NULL,
+  receipt_json TEXT NOT NULL,
+  recorded_at INTEGER NOT NULL,
+  UNIQUE (project_id, seq_no)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS audit_witness_receipts_project_nonce_idx
+  ON audit_witness_receipts(project_id, json_extract(receipt_json, '$.statement.nonce_hex'));
 
 CREATE TABLE IF NOT EXISTS imported_audit_chains (
   id TEXT PRIMARY KEY,

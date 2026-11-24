@@ -282,10 +282,9 @@ impl SignedStatement {
         if len != (bytes.len() - 18) as u64 {
             return Err(PackageError("incomplete container".into()));
         }
-        let plaintext = zeroize::Zeroizing::new(
-            crate::decrypt_bundle_payload_with_x25519_secret(&bytes[18..], secret)
-                .map_err(|_| PackageError("not decryptable".into()))?,
-        );
+        let plaintext =
+            crate::decrypt_bundle_payload_with_x25519_secret_zeroizing(&bytes[18..], secret)
+                .map_err(|_| PackageError("not decryptable".into()))?;
         Ok(serde_json::from_slice(&plaintext)?)
     }
 }

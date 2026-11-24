@@ -1,7 +1,7 @@
 //! Secret create / rotate / copy / purge / tombstone lifecycle methods.
 
 use locket_core::canonical_json_string;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
 use crate::Store;
@@ -518,7 +518,8 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Sqlite`] when `SQLite` rejects the updates.
+    /// Returns [`StoreError::ActiveSecretVersionPurge`] for an active current
+    /// version, or [`StoreError::Sqlite`] when `SQLite` rejects the updates.
     pub fn purge_secret_version(
         &mut self,
         secret_id: &str,
@@ -535,7 +536,8 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Sqlite`] when `SQLite` rejects the updates.
+    /// Returns [`StoreError::ActiveSecretVersionPurge`] for an active current
+    /// version, or [`StoreError::Sqlite`] when `SQLite` rejects the updates.
     pub fn purge_secret_versions(
         &mut self,
         secret_id: &str,
@@ -549,6 +551,8 @@ impl Store {
     ///
     /// # Errors
     ///
+    /// Returns [`StoreError::ActiveSecretVersionPurge`] if the selection
+    /// includes the current version of an active secret.
     /// Returns [`StoreError`] when `SQLite` rejects a row or audit canonicalization fails.
     pub fn purge_secret_versions_with_audit(
         &mut self,
@@ -557,7 +561,25 @@ impl Store {
         purged_at: i64,
         audit: Option<AuditContext<'_>>,
     ) -> Result<bool, StoreError> {
+        if versions.is_empty() {
+            return Ok(false);
+        }
         let transaction = self.connection.savepoint()?;
+        let active_current = transaction
+            .query_row(
+                "SELECT current_version FROM secrets WHERE id = ?1 AND state = 'active'",
+                [secret_id],
+                |row| row.get::<_, u32>(0),
+            )
+            .optional()?;
+        if let Some(version) = active_current
+            && versions.contains(&version)
+        {
+            return Err(StoreError::ActiveSecretVersionPurge {
+                secret_id: secret_id.to_owned(),
+                version,
+            });
+        }
         let mut changed_any = false;
         for version in versions {
             let changed = transaction.execute(

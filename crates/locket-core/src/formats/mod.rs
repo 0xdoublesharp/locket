@@ -1,4 +1,5 @@
 pub mod audit;
+pub mod audit_witness;
 pub mod bundle;
 pub mod dotenv;
 pub mod invite;

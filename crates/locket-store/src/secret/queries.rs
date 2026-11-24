@@ -1,5 +1,6 @@
 //! Read-only secret queries.
 
+use locket_core::source_precedence;
 use rusqlite::{OptionalExtension, params};
 
 use crate::Store;
@@ -145,10 +146,10 @@ impl Store {
         let mut statement = self.connection.prepare_cached(
             "SELECT id, project_id, profile_id, name, source,
                     CASE source
-                      WHEN 'machine-local' THEN 3
-                      WHEN 'user-local' THEN 2
-                      WHEN 'team-managed' THEN 1
-                      ELSE 0
+                      WHEN 'machine-local' THEN ?3
+                      WHEN 'user-local' THEN ?4
+                      WHEN 'team-managed' THEN ?5
+                      ELSE ?6
                     END AS source_precedence,
                     origin, current_version, state, required, created_at, updated_at,
                     last_rotated_at
@@ -159,7 +160,17 @@ impl Store {
                       source",
         )?;
         let secrets = statement
-            .query_map((project_id, profile_id), secret_metadata_record_from_row)?
+            .query_map(
+                (
+                    project_id,
+                    profile_id,
+                    source_precedence("machine-local"),
+                    source_precedence("user-local"),
+                    source_precedence("team-managed"),
+                    source_precedence(""),
+                ),
+                secret_metadata_record_from_row,
+            )?
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(secrets)
@@ -225,10 +236,10 @@ impl Store {
         let mut statement = self.connection.prepare_cached(
             "SELECT s.id, s.project_id, s.profile_id, s.name, s.source,
                     CASE s.source
-                      WHEN 'machine-local' THEN 3
-                      WHEN 'user-local' THEN 2
-                      WHEN 'team-managed' THEN 1
-                      ELSE 0
+                      WHEN 'machine-local' THEN ?3
+                      WHEN 'user-local' THEN ?4
+                      WHEN 'team-managed' THEN ?5
+                      ELSE ?6
                     END AS source_precedence,
                     s.origin, s.state, s.current_version, s.last_rotated_at,
                     v.version, v.state, v.created_at, v.deprecated_at, v.grace_until, v.purged_at
@@ -241,7 +252,17 @@ impl Store {
                       v.version DESC",
         )?;
         let versions = statement
-            .query_map((project_id, profile_id), secret_version_metadata_record_from_row)?
+            .query_map(
+                (
+                    project_id,
+                    profile_id,
+                    source_precedence("machine-local"),
+                    source_precedence("user-local"),
+                    source_precedence("team-managed"),
+                    source_precedence(""),
+                ),
+                secret_version_metadata_record_from_row,
+            )?
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(versions)

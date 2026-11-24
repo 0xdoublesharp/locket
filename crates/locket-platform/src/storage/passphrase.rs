@@ -14,8 +14,8 @@ use zeroize::Zeroizing;
 
 use crate::error::PlatformError;
 use crate::fs_helpers::{
-    decode_bytes, decode_nonce, encode_bytes, replace_user_only_file, secure_directory,
-    validate_path_component,
+    decode_bytes, decode_nonce, encode_bytes, secure_directory, validate_path_component,
+    write_user_only_file,
 };
 
 const PASSPHRASE_FALLBACK_SCHEMA_VERSION: u16 = 1;
@@ -79,7 +79,7 @@ impl PassphraseFallbackMasterKeyStore {
 
         secure_directory(&self.directory)?;
         let rendered = toml::to_string_pretty(&envelope)?;
-        replace_user_only_file(&path, rendered.as_bytes())
+        write_user_only_file(&path, rendered.as_bytes())
     }
 
     /// Loads a master key from the passphrase fallback envelope for `project_id`.

@@ -8,7 +8,7 @@ use locket_crypto::NONCE_LEN;
 use serde::{Deserialize, Serialize};
 
 use crate::error::PlatformError;
-use crate::fs_helpers::{replace_user_only_file, secure_directory};
+use crate::fs_helpers::{secure_directory, write_user_only_file};
 
 /// Schema version for recovery KDF TOML files.
 pub const RECOVERY_KDF_TOML_VERSION: u32 = 1;
@@ -319,7 +319,7 @@ pub fn save_recovery_kdf_toml(
     let path = recovery_dir.join("kdf.toml");
     let text =
         toml::to_string(kdf).map_err(|e| PlatformError::InvalidRecoveryEnvelope(e.to_string()))?;
-    replace_user_only_file(&path, text.as_bytes())
+    write_user_only_file(&path, text.as_bytes())
 }
 
 /// Loads and deserializes `envelope.bin` from a recovery directory.
@@ -420,5 +420,5 @@ pub fn decode_recovery_state(
 
 fn write_recovery_atomically(recovery_dir: &Path, data: &[u8]) -> Result<(), PlatformError> {
     secure_directory(recovery_dir)?;
-    replace_user_only_file(&recovery_dir.join("envelope.bin"), data)
+    write_user_only_file(&recovery_dir.join("envelope.bin"), data)
 }

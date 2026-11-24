@@ -26,6 +26,7 @@ pub use audit::{
     AuditLogRecord, AuditWrite, ExportableAuditRow, ImportedAuditChainRow,
     ImportedAuditChainVerification, verify_imported_audit_chain_structure,
 };
+pub use auditing::witness::AuditWitnessReceiptRecord;
 pub use command_policy::CommandPolicyIndexRecord;
 pub use device::DeviceRecord;
 pub use error::StoreError;
@@ -47,8 +48,9 @@ pub use runtime_session::{
 pub use schema::{AUDIT_ACTION_SCHEMA_MIGRATE, SCHEMA_VERSION, SchemaMigrationOutcome};
 pub use secret::{
     DiscoveredSecretRecord, SecretBlobRecord, SecretCopyTarget, SecretDiscoveryFilter,
-    SecretFingerprintRecord, SecretInitialMetadata, SecretMetadataRecord, SecretMetadataUpdate,
-    SecretMutableMetadata, SecretRecord, SecretVersionRecord, VersionDeprecation,
+    SecretExpirationNotice, SecretExpiryPolicy, SecretExpiryStatus, SecretFingerprintRecord,
+    SecretInitialMetadata, SecretMetadataRecord, SecretMetadataUpdate, SecretMutableMetadata,
+    SecretRecord, SecretVersionRecord, VersionDeprecation,
 };
 pub use team::{
     PendingTeamInviteRecord, StoredTeamInviteRecord, TeamInviteRecord, TeamMemberListRecord,

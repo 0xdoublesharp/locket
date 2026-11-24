@@ -21,8 +21,8 @@ use zeroize::Zeroizing;
 
 use crate::error::PlatformError;
 use crate::fs_helpers::{
-    decode_bytes, decode_nonce, encode_bytes, replace_user_only_file, secure_directory,
-    validate_path_component,
+    decode_bytes, decode_nonce, encode_bytes, secure_directory, validate_path_component,
+    write_user_only_file,
 };
 use crate::master_key::MasterKeyStore;
 
@@ -185,7 +185,7 @@ impl LocalDevicePrivateKeyStorage for WrappedLocalFileDevicePrivateKeyStorage {
         };
         secure_directory(&self.devices_directory())?;
         let rendered = toml::to_string_pretty(&envelope)?;
-        replace_user_only_file(&path, rendered.as_bytes())
+        write_user_only_file(&path, rendered.as_bytes())
     }
 
     fn load(&self, device_id: &str) -> Result<Zeroizing<PrivateKeyBytes>, PlatformError> {

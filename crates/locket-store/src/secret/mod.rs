@@ -3,10 +3,12 @@
 use crate::audit::AuditContext;
 
 mod discovery;
+mod expiry;
 mod lifecycle;
 mod queries;
 
 pub use discovery::{DiscoveredSecretRecord, SecretDiscoveryFilter};
+pub use expiry::{SecretExpirationNotice, SecretExpiryPolicy, SecretExpiryStatus};
 
 /// Secret metadata row.
 #[derive(Clone, Debug, Eq, PartialEq)]

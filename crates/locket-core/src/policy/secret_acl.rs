@@ -231,13 +231,13 @@ const fn glob_matches(pattern: &str, value: &str) -> bool {
     let (mut star_index, mut star_match_index) = (None, 0);
 
     while value_index < value.len() {
-        if pattern_index < pattern.len() && pattern[pattern_index] == value[value_index] {
-            pattern_index += 1;
-            value_index += 1;
-        } else if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+        if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
             star_index = Some(pattern_index);
             star_match_index = value_index;
             pattern_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == value[value_index] {
+            pattern_index += 1;
+            value_index += 1;
         } else if let Some(star) = star_index {
             pattern_index = star + 1;
             star_match_index += 1;
@@ -264,6 +264,13 @@ mod tests {
         assert!(glob_matches("npm:*", "npm:dev"));
         assert!(glob_matches("release:*", "release:prod"));
         assert!(!glob_matches("npm:*", "cargo:test"));
+    }
+
+    #[test]
+    fn token_glob_treats_stars_in_the_value_as_input() {
+        assert!(glob_matches("*foo", "*barfoo"));
+        assert!(glob_matches("*a*b", "*x*ab"));
+        assert!(glob_matches("**", "*"));
     }
 
     #[test]

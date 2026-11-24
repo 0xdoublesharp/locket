@@ -105,6 +105,19 @@ pub enum SecretSource {
     MachineLocal,
 }
 
+/// Returns the runtime priority for a persisted source name, or zero if unknown.
+///
+/// Higher values take precedence when multiple sources provide the same secret.
+#[must_use]
+pub const fn source_precedence(source: &str) -> u8 {
+    match source.as_bytes() {
+        b"machine-local" => 3,
+        b"user-local" => 2,
+        b"team-managed" => 1,
+        _ => 0,
+    }
+}
+
 impl SecretSource {
     /// Returns the canonical URI/query string value for this source.
     #[must_use]
@@ -265,6 +278,18 @@ fn parse_query(query: &str) -> Result<Option<SecretSource>, InvalidReferenceUri>
 #[cfg(test)]
 mod tests {
     use super::{InvalidReferenceUri, LkReferenceUri, SecretSource};
+
+    #[test]
+    fn runtime_source_precedence_uses_persisted_names() {
+        for (source, rank) in [
+            (SecretSource::MachineLocal, 3),
+            (SecretSource::UserLocal, 2),
+            (SecretSource::TeamManaged, 1),
+        ] {
+            assert_eq!(super::source_precedence(source.as_str()), rank);
+        }
+        assert_eq!(super::source_precedence("unknown"), 0);
+    }
 
     #[test]
     fn parses_valid_runtime_spec_examples() -> Result<(), InvalidReferenceUri> {

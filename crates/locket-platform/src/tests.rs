@@ -46,7 +46,29 @@ fn rejects_invalid_encoded_key_alphabet() {
 
 #[cfg(unix)]
 #[test]
-fn replace_user_only_file_restricts_existing_permissions() -> Result<(), PlatformError> {
+fn write_user_only_file_refuses_existing_symlink() -> Result<(), PlatformError> {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir()?;
+    let referent = directory.path().join("referent");
+    let path = directory.path().join("envelope");
+    fs::write(&referent, b"original")?;
+    symlink(&referent, &path)?;
+
+    assert!(matches!(
+        super::write_user_only_file(&path, b"replacement"),
+        Err(PlatformError::Io(_))
+    ));
+    assert_eq!(fs::read(&referent)?, b"original");
+    assert_eq!(fs::read_link(&path)?, referent);
+    assert_eq!(fs::read_dir(directory.path())?.count(), 2);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn write_user_only_file_restricts_existing_permissions() -> Result<(), PlatformError> {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
@@ -55,7 +77,7 @@ fn replace_user_only_file_restricts_existing_permissions() -> Result<(), Platfor
     fs::write(&path, b"previous")?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
 
-    super::fs_helpers::replace_user_only_file(&path, b"replacement")?;
+    super::fs_helpers::write_user_only_file(&path, b"replacement")?;
 
     assert_eq!(fs::read(&path)?, b"replacement");
     assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);

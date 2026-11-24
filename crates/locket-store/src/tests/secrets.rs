@@ -299,7 +299,13 @@ impl ConcurrentSecretChange {
                 Ok(3)
             }
             Self::Purge => {
-                assert!(store.purge_secret_version(&secret.id, 1, 200)?);
+                // Simulate a store written before the active-current purge guard.
+                store.connection().execute_batch(
+                    "UPDATE secret_versions SET state = 'purged', purged_at = 200
+                     WHERE secret_id = 'lk_sec_test' AND version = 1;
+                     DELETE FROM blobs WHERE secret_id = 'lk_sec_test' AND version = 1;
+                     DELETE FROM fingerprints WHERE secret_id = 'lk_sec_test' AND version = 1;",
+                )?;
                 Ok(2)
             }
         }
@@ -528,6 +534,15 @@ fn purge_secret_versions_removes_material_but_keeps_version_rows() -> Result<(),
         Some(500),
     )?;
 
+    let result =
+        test_store.store.purge_secret_versions_with_audit("lk_sec_test", &[1, 2], 550, None);
+    assert!(matches!(
+        result,
+        Err(StoreError::ActiveSecretVersionPurge { ref secret_id, version: 2 })
+            if secret_id == "lk_sec_test"
+    ));
+    assert!(test_store.store.get_blob("lk_sec_test", 1)?.is_some());
+    assert!(test_store.store.get_blob("lk_sec_test", 2)?.is_some());
     assert!(test_store.store.purge_secret_version("lk_sec_test", 1, 600)?);
     assert!(!test_store.store.purge_secret_version("lk_sec_test", 1, 700)?);
 
@@ -545,6 +560,10 @@ fn purge_secret_versions_removes_material_but_keeps_version_rows() -> Result<(),
         |row| row.get::<_, i64>(0),
     )?;
     assert_eq!(fingerprint_rows, 0);
+
+    test_store.store.tombstone_secret("lk_sec_test", 800)?;
+    assert!(test_store.store.purge_secret_versions_with_audit("lk_sec_test", &[2], 900, None)?);
+    assert_eq!(test_store.store.get_blob("lk_sec_test", 2)?, None);
 
     Ok(())
 }
@@ -755,5 +774,93 @@ fn rotate_secret_metadata_is_preserved_or_replaced_atomically() -> Result<(), Bo
     let rows = store.list_audit_rows_since(&secret.project_id, &secret.profile_id, 0)?;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].action, "ROTATE");
+    Ok(())
+}
+
+#[test]
+fn secret_expiry_policy_round_trips_and_can_be_cleared() -> Result<(), Box<dyn Error>> {
+    use crate::SecretExpiryPolicy;
+
+    let test_store = open_initialized_store()?;
+    let store = &test_store.store;
+    insert_project_profile_secret(store)?;
+    let secret = "lk_sec_test";
+    assert_eq!(store.get_secret_expiry_policy(secret)?, Some(SecretExpiryPolicy::default()));
+    assert_eq!(store.get_secret_expiry_policy("missing")?, None);
+
+    let policy = SecretExpiryPolicy { expires_at: Some(200), rotate_after_days: Some(3) };
+    assert!(!store.set_secret_expiry_policy("missing", policy, 100)?);
+    assert!(store.set_secret_expiry_policy(secret, policy, 100)?);
+    assert_eq!(store.get_secret_expiry_policy(secret)?, Some(policy));
+    let stored_updated_at: i64 = store.connection().query_row(
+        "SELECT updated_at FROM secrets WHERE id = ?1",
+        [secret],
+        |row| row.get(0),
+    )?;
+    assert_eq!(stored_updated_at, 100);
+
+    assert!(store.set_secret_expiry_policy(secret, SecretExpiryPolicy::default(), 150)?);
+    assert_eq!(store.get_secret_expiry_policy(secret)?, Some(SecretExpiryPolicy::default()));
+    assert_eq!(store.list_expiring_or_stale_secrets(None, 300, 0)?, []);
+    Ok(())
+}
+
+#[test]
+fn secret_expiry_notices_respect_boundaries_rotation_and_project_scope()
+-> Result<(), Box<dyn Error>> {
+    use crate::{SecretExpiryPolicy, SecretExpiryStatus};
+
+    const DAY: i64 = 86_400_000_000_000;
+    let test_store = open_initialized_store()?;
+    let store = &test_store.store;
+    insert_project_profile(store)?;
+    let connection = store.connection();
+    connection.execute_batch(
+        "INSERT INTO projects(id, name, created_at) VALUES ('other', 'other', 0);
+         INSERT INTO profiles(id, project_id, name, dangerous, created_at)
+         VALUES ('other-profile', 'other', 'default', 0, 0);",
+    )?;
+    let now = 2 * DAY;
+
+    for (id, project, profile, state, expiry, rotate_days, rotated_at) in [
+        ("a-expired", "lk_proj_test", "lk_prof_test", "active", Some(now), Some(2_u32), None),
+        ("b-soon", "lk_proj_test", "lk_prof_test", "active", Some(now + 5), Some(2), Some(DAY)),
+        ("c-stale", "lk_proj_test", "lk_prof_test", "active", None, Some(1), Some(DAY)),
+        ("d-later", "lk_proj_test", "lk_prof_test", "active", Some(now + 6), Some(u32::MAX), None),
+        ("e-deleted", "lk_proj_test", "lk_prof_test", "deleted", Some(1), Some(1), None),
+        ("f-other", "other", "other-profile", "active", Some(now - 1), None, None),
+    ] {
+        connection.execute(
+            "INSERT INTO secrets(
+               id, project_id, profile_id, name, source, origin, required,
+               current_version, state, created_at, updated_at, last_rotated_at
+             ) VALUES (?1, ?2, ?3, ?1, 'user-local', 'manual', 0, 1, ?4, 0, 0, ?5)",
+            rusqlite::params![id, project, profile, state, rotated_at],
+        )?;
+        assert!(store.set_secret_expiry_policy(
+            id,
+            SecretExpiryPolicy { expires_at: expiry, rotate_after_days: rotate_days },
+            DAY,
+        )?);
+    }
+
+    let notices = store.list_expiring_or_stale_secrets(Some("lk_proj_test"), now, 5)?;
+    let summarized = notices
+        .iter()
+        .map(|row| (row.secret_id.as_str(), row.expiry_status, row.stale))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        summarized,
+        [
+            ("a-expired", Some(SecretExpiryStatus::Expired), true),
+            ("b-soon", Some(SecretExpiryStatus::ExpiringSoon), false),
+            ("c-stale", None, true),
+        ]
+    );
+    assert_eq!(store.list_expiring_or_stale_secrets(None, now, -1)?.len(), 3);
+    let other = store.list_expiring_or_stale_secrets(Some("other"), now, 0)?;
+    assert_eq!(other.len(), 1);
+    assert_eq!(other[0].secret_id, "f-other");
+    assert_eq!(store.list_expiring_or_stale_secrets(Some("missing"), now, 0)?, []);
     Ok(())
 }
