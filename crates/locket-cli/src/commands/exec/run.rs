@@ -172,6 +172,7 @@ impl RunProtection {
                 EgressProxyConfig {
                     allow_private_destinations_for_allowed_hosts: false,
                     strict_connect_allowlist: !args.egress_allow_unlisted_connect,
+                    tls_mitm_enabled: !args.no_egress_tls_mitm,
                     ..EgressProxyConfig::default()
                 },
             )
@@ -196,6 +197,20 @@ impl RunProtection {
                     .map(|(name, value)| (name.clone(), value.clone())),
             );
             policy.prepared.env.extend(overrides);
+            if !args.allow_uncontained_egress {
+                policy.prepared = locket_exec::wrap_command_with_network_containment(
+                    &policy.prepared,
+                    &locket_exec::NetworkContainmentPolicy {
+                        allowed_loopback_ports: vec![broker.local_addr().port()],
+                        allow_unix_sockets: true,
+                    },
+                )
+                .map_err(|error| {
+                    metadata_invalid_error(format!(
+                        "{error}; pass --allow-uncontained-egress to run without kernel network containment"
+                    ))
+                })?;
+            }
             Some(broker)
         };
         Ok(Some(Self {

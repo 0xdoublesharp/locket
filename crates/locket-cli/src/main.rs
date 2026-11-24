@@ -600,6 +600,7 @@ pub struct ExecArgs {
                         Locket expands the runner command and applies any matching path scope.\n\
                         Secret ACLs in [secrets.<NAME>] can further limit delivery by command identity,\n\
                         structured argv pattern, and project-relative path.")]
+#[allow(clippy::struct_excessive_bools)]
 pub struct RunArgs {
     /// Permit lk:// substitution into process arguments visible to ps and /proc.
     #[arg(long)]
@@ -613,6 +614,12 @@ pub struct RunArgs {
     /// Permit CONNECT tunnels to hosts outside the binding allowlist.
     #[arg(long, requires = "egress_host")]
     pub egress_allow_unlisted_connect: bool,
+    /// Disable ephemeral-CA HTTPS TLS interception for egress bindings (plain HTTP only).
+    #[arg(long, requires = "egress_host")]
+    pub no_egress_tls_mitm: bool,
+    /// Run without OS-level kernel outbound network containment for egress bindings.
+    #[arg(long, requires = "egress_host")]
+    pub allow_uncontained_egress: bool,
     /// Command policy name, or a runner adapter such as npm, pnpm, yarn, bun, cargo, make, just, task, poetry, uv, or python.
     #[arg(default_value = "")]
     pub policy: String,

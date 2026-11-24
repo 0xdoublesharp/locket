@@ -423,15 +423,18 @@ fn run_egress_validates_bindings_and_injects_placeholder() -> Result<(), Box<dyn
         ));
         assert!(!directory.path().join("child-ran").exists());
     }
-    let cli = Cli::try_parse_from([
+    let mut run_argv = vec![
         "locket",
         "run",
         "--egress-host",
         "API_KEY=example.com",
         "--egress-host",
         "API_KEY=*.example.net",
-        "protected_run",
-    ])?;
+    ];
+    #[cfg(not(target_os = "macos"))]
+    run_argv.push("--allow-uncontained-egress");
+    run_argv.push("protected_run");
+    let cli = Cli::try_parse_from(run_argv)?;
     run_with_context(cli, &context, &mut Vec::new())?;
     assert!(directory.path().join("child-ran").is_file());
     Ok(())

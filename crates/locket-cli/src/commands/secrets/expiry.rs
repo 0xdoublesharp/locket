@@ -8,11 +8,13 @@ use crate::{
 };
 
 pub const SECRET_EXPIRED_MESSAGE: &str = "secret has expired; rotate or update expiry before use";
-const EXPIRY_SCHEMA_VERSION: i64 = 7;
 const NOTICE_WINDOW_NANOS: i64 = 7 * 86_400 * NANOS_PER_SECOND;
 
 pub fn check_secret_expiry(store: &Store, secret_id: &str) -> Result<(), CliError> {
-    if store.current_schema_version()?.is_none_or(|version| version < EXPIRY_SCHEMA_VERSION) {
+    if store
+        .current_schema_version()?
+        .is_none_or(|version| version < i64::from(locket_store::SCHEMA_VERSION))
+    {
         return Ok(());
     }
     let now = now_unix_nanos()?;
@@ -31,7 +33,10 @@ pub fn expiry_notices(
     project_id: &str,
     now: i64,
 ) -> Result<Vec<SecretExpirationNotice>, CliError> {
-    if store.current_schema_version()?.is_none_or(|version| version < EXPIRY_SCHEMA_VERSION) {
+    if store
+        .current_schema_version()?
+        .is_none_or(|version| version < i64::from(locket_store::SCHEMA_VERSION))
+    {
         return Ok(Vec::new());
     }
     Ok(store.list_expiring_or_stale_secrets(Some(project_id), now, NOTICE_WINDOW_NANOS)?)

@@ -134,7 +134,10 @@ pub fn discover_secrets(store: &Store, filters: DiscoveryFilters) -> Result<Valu
         include_deleted: filters.include_deleted,
         limit: filters.limit,
     })?;
-    let notices = if store.current_schema_version()?.is_some_and(|version| version >= 7) {
+    let notices = if store
+        .current_schema_version()?
+        .is_some_and(|version| version >= i64::from(locket_store::SCHEMA_VERSION))
+    {
         store.list_expiring_or_stale_secrets(
             project.as_deref(),
             i64::try_from(crate::server::current_unix_nanos()).unwrap_or(i64::MAX),
