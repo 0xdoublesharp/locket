@@ -110,9 +110,8 @@ use locket_scan::{FindingKind, redact_text, scan_text};
 #[cfg(test)]
 use locket_store::DeviceRecord;
 use locket_store::{
-    AuditContext, AuditWrite, KeyRecord, ProfileRecord, SCHEMA_VERSION, SecretBlobRecord,
-    SecretCopyTarget, SecretFingerprintRecord, SecretRecord, SecretVersionRecord, Store,
-    VersionDeprecation,
+    AuditContext, AuditWrite, KeyRecord, ProfileRecord, SecretBlobRecord, SecretCopyTarget,
+    SecretFingerprintRecord, SecretRecord, SecretVersionRecord, Store, VersionDeprecation,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -139,8 +138,6 @@ const AGENT_LOG_RETAINED_FILES: u8 = 5;
 const AGENT_LOG_FOLLOW_SLEEP_MS: u64 = 250;
 const AI_SAFE_READ_CHUNK_BYTES: usize = 8 * 1024;
 const AI_SAFE_PARTIAL_LINE_MAX_BYTES: usize = 64 * 1024;
-const PRE_MIGRATION_BACKUP_DIR: &str = "pre-migration-backups";
-const BACKUP_SKIPPED_PREFIX: &str = "backup-skipped-";
 
 pub(crate) fn next_secret_version(current_version: u32) -> Result<u32, CliError> {
     current_version
@@ -2386,115 +2383,9 @@ pub(crate) fn open_store(context: &RuntimeContext) -> Result<Store, CliError> {
     if let Some(parent) = context.store_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let existing_store_len = match fs::metadata(&context.store_path) {
-        Ok(metadata) if metadata.is_file() => metadata.len(),
-        Ok(_) => 0,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
-        Err(error) => return Err(error.into()),
-    };
     let mut store = Store::open(&context.store_path)?;
-    maybe_create_pre_migration_backup(context, &store, existing_store_len)?;
     store.initialize_schema()?;
     Ok(store)
-}
-
-fn maybe_create_pre_migration_backup(
-    context: &RuntimeContext,
-    store: &Store,
-    existing_store_len: u64,
-) -> Result<(), CliError> {
-    if existing_store_len == 0 {
-        return Ok(());
-    }
-
-    let current_version = store.current_schema_version()?;
-    if current_version.is_some_and(|version| version >= i64::from(SCHEMA_VERSION)) {
-        return Ok(());
-    }
-
-    create_pre_migration_backup(context, current_version)
-}
-
-fn create_pre_migration_backup(
-    context: &RuntimeContext,
-    current_version: Option<i64>,
-) -> Result<(), CliError> {
-    let backup_root = pre_migration_backup_root(context)?;
-    fs::create_dir_all(&backup_root)?;
-    set_user_only_dir_permissions(&backup_root)?;
-
-    let from_version =
-        current_version.map_or_else(|| "none".to_owned(), |version| version.to_string());
-    let backup_dir = backup_root.join(format!(
-        "{}-schema-v{}-to-v{}",
-        now_unix_nanos()?,
-        from_version,
-        SCHEMA_VERSION
-    ));
-    fs::create_dir(&backup_dir)?;
-    set_user_only_dir_permissions(&backup_dir)?;
-
-    copy_backup_file(&context.store_path, &backup_dir.join("store.db"))?;
-    copy_backup_file_if_present(
-        &sqlite_sidecar_path(&context.store_path, "wal"),
-        &backup_dir.join("store.db-wal"),
-    )?;
-    copy_backup_file_if_present(
-        &sqlite_sidecar_path(&context.store_path, "shm"),
-        &backup_dir.join("store.db-shm"),
-    )?;
-
-    let recovery_dir = context.cwd.join(".locket").join("recovery");
-    if recovery_dir.exists() {
-        let backup_recovery_dir = backup_dir.join("recovery");
-        fs::create_dir(&backup_recovery_dir)?;
-        set_user_only_dir_permissions(&backup_recovery_dir)?;
-        copy_backup_file_if_present(
-            &recovery_dir.join("kdf.toml"),
-            &backup_recovery_dir.join("kdf.toml"),
-        )?;
-        copy_backup_file_if_present(
-            &recovery_dir.join("envelope.bin"),
-            &backup_recovery_dir.join("envelope.bin"),
-        )?;
-    }
-
-    Ok(())
-}
-
-fn copy_backup_file_if_present(source: &Path, destination: &Path) -> Result<(), CliError> {
-    match fs::metadata(source) {
-        Ok(metadata) if metadata.is_file() => copy_backup_file(source, destination),
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn copy_backup_file(source: &Path, destination: &Path) -> Result<(), CliError> {
-    fs::copy(source, destination)?;
-    set_user_only_file_permissions(destination)?;
-    Ok(())
-}
-
-fn sqlite_sidecar_path(store_path: &Path, suffix: &str) -> PathBuf {
-    PathBuf::from(format!("{}-{suffix}", store_path.display()))
-}
-
-fn pre_migration_backup_root(context: &RuntimeContext) -> Result<PathBuf, CliError> {
-    let parent = context
-        .store_path
-        .parent()
-        .ok_or_else(|| corrupt_db_error("could not resolve pre-migration backup directory"))?;
-    Ok(parent.join(PRE_MIGRATION_BACKUP_DIR))
-}
-
-fn pre_migration_backup_relative_label(context: &RuntimeContext, path: &Path) -> String {
-    let Some(parent) = context.store_path.parent() else {
-        return path.display().to_string();
-    };
-    path.strip_prefix(parent)
-        .map_or_else(|_| path.display().to_string(), |relative| relative.display().to_string())
 }
 
 pub(crate) fn ensure_trusted_project_root(

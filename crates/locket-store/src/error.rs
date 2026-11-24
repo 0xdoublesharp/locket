@@ -113,6 +113,18 @@ pub enum StoreError {
         supported: u32,
     },
 
+    /// The database predates this binary's schema. Locket does not migrate
+    /// older stores. `found` is 0 for a store without a schema ledger.
+    #[error(
+        "database schema version {found} is older than supported schema version {supported}; Locket does not migrate older stores"
+    )]
+    OutdatedSchema {
+        /// Older schema version found in the database, or 0 without a ledger.
+        found: i64,
+        /// Schema version this binary supports.
+        supported: u32,
+    },
+
     /// A team-invite acceptance was attempted for an invite that has
     /// already been accepted or revoked. Maps to
     /// [`LocketError::ReplayDetected`] (exit 113) at the CLI boundary.
@@ -148,7 +160,7 @@ impl StoreError {
             | Self::AuditMetadataInvalid { .. }
             | Self::ActiveSecretVersionPurge { .. }
             | Self::InviteNotFound { .. } => LocketError::MetadataInvalid,
-            Self::Json(_) => LocketError::CorruptDb,
+            Self::Json(_) | Self::OutdatedSchema { .. } => LocketError::CorruptDb,
             Self::InviteReplayDetected { .. } => LocketError::ReplayDetected,
         }
     }
