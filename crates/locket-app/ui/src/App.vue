@@ -234,6 +234,9 @@ const primaryItems: ReadonlyArray<{ key: ViewKey; label: string; icon: AppIconNa
   { key: 'team', label: 'Team', icon: 'users' },
   { key: 'settings', label: 'Settings', icon: 'settings' },
 ];
+const overflowItems = primaryItems.slice(3);
+const moreOpen = ref(false);
+const moreTrigger = ref<HTMLButtonElement | null>(null);
 const secondaryItems = computed<Array<{ key: ViewKey; label: string }>>(() => {
   if (['secrets', 'discover', 'secret-editor', 'versions'].includes(currentView.value))
     return [
@@ -261,6 +264,32 @@ const secondaryItems = computed<Array<{ key: ViewKey; label: string }>>(() => {
     ];
   return [];
 });
+const overflowActive = computed(() =>
+  overflowItems.find(
+    ({ key }) => currentView.value === key || secondaryItems.value.some((item) => item.key === key),
+  ),
+);
+
+function closeMore(restoreFocus = false): void {
+  if (!moreOpen.value) return;
+  moreOpen.value = false;
+  if (restoreFocus) moreTrigger.value?.focus();
+}
+
+function onMoreFocusout(event: FocusEvent): void {
+  if (
+    event.relatedTarget &&
+    !(event.currentTarget as HTMLElement).contains(event.relatedTarget as Node)
+  ) {
+    closeMore();
+  }
+}
+
+function onMorePointerdown(event: PointerEvent): void {
+  if (moreOpen.value && !moreTrigger.value?.parentElement?.contains(event.target as Node)) {
+    closeMore();
+  }
+}
 
 const lockLabel = computed<string>(() => {
   if (loading.value && status.value === null && error.value === null) {
@@ -315,6 +344,9 @@ const secretsError = computed(() =>
   secretsLoadError.value ? actionError(secretsLoadError.value) : null,
 );
 const variableViewError = computed(() => error.value ?? secretsLoadError.value);
+const shellAgentError = computed(
+  () => error.value ?? (isAgentUnavailable(secretsLoadError.value) ? secretsLoadError.value : null),
+);
 const secretsLastRefreshed = ref<string | undefined>(undefined);
 const versionsLoading = ref<boolean>(false);
 const versionsError = ref<string | null>(null);
@@ -544,6 +576,17 @@ watch(
 
 function selectView(key: ViewKey): void {
   currentView.value = key;
+}
+
+function selectOverflowView(key: ViewKey): void {
+  selectView(key);
+  closeMore(true);
+}
+
+function submitProjectPath(event: KeyboardEvent): void {
+  if (event.isComposing) return;
+  event.preventDefault();
+  (event.currentTarget as HTMLTextAreaElement).form?.requestSubmit();
 }
 
 async function addVariable(): Promise<void> {
@@ -1742,7 +1785,7 @@ async function startAgent(): Promise<void> {
   else {
     desktopNotice.value = 'Agent started. Refreshing connection…';
     await refresh();
-    if (currentView.value === 'secrets' && secretsLoadError.value) await refreshSecrets();
+    if (!error.value && secretsLoadError.value) await refreshSecrets();
   }
   desktopBusy.value = false;
 }
@@ -1853,6 +1896,7 @@ watch(
 );
 
 onMounted(() => {
+  window.addEventListener('pointerdown', onMorePointerdown);
   void refreshProjectConnections();
   if (previewParams) return;
   void listen<TrayMenuAction>('tray-menu-action', (event) => {
@@ -1865,6 +1909,7 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  window.removeEventListener('pointerdown', onMorePointerdown);
   clearTimeout(desktopNoticeTimer);
   metadataClipboardRequests.dispose();
   copyRequests.dispose();
@@ -1934,9 +1979,13 @@ onUnmounted(() => {
         </button>
       </div>
 
-      <nav aria-label="Primary navigation">
-        <ul>
-          <li v-for="item in primaryItems" :key="item.key">
+      <nav class="shell__primary" aria-label="Primary navigation">
+        <ul class="shell__primary-list">
+          <li
+            v-for="(item, index) in primaryItems"
+            :key="item.key"
+            :class="{ 'shell__wide-destination': index >= 3 }"
+          >
             <button
               type="button"
               class="shell__nav-item"
@@ -1950,6 +1999,36 @@ onUnmounted(() => {
               <AppIcon :name="item.icon" />
               {{ item.label }}
             </button>
+          </li>
+          <li class="shell__more" @focusout="onMoreFocusout" @keydown.esc.stop="closeMore(true)">
+            <button
+              ref="moreTrigger"
+              type="button"
+              class="shell__nav-item"
+              :class="{ 'shell__nav-item--active': overflowActive }"
+              :aria-expanded="moreOpen"
+              :aria-current="overflowActive ? 'location' : undefined"
+              :aria-controls="moreOpen ? 'more-destinations' : undefined"
+              @click="moreOpen = !moreOpen"
+            >
+              <AppIcon v-if="overflowActive" :name="overflowActive.icon" />
+              {{ overflowActive?.label ?? 'More' }}
+              <AppIcon name="chevron-down" :size="12" />
+            </button>
+            <ul v-if="moreOpen" id="more-destinations" class="shell__more-list">
+              <li v-for="item in overflowItems" :key="item.key">
+                <button
+                  type="button"
+                  class="shell__nav-item"
+                  :class="{ 'shell__nav-item--active': overflowActive?.key === item.key }"
+                  :aria-current="overflowActive?.key === item.key ? 'page' : undefined"
+                  @click="selectOverflowView(item.key)"
+                >
+                  <AppIcon :name="item.icon" />
+                  {{ item.label }}
+                </button>
+              </li>
+            </ul>
           </li>
         </ul>
       </nav>
@@ -2004,10 +2083,13 @@ onUnmounted(() => {
         </button>
       </div>
       <AgentUnavailableBanner
-        v-if="error && currentView !== 'secrets'"
-        :error="error"
-        :retrying="loading"
-        @retry="refresh"
+        v-if="shellAgentError && currentView !== 'secrets'"
+        :error="shellAgentError"
+        :retrying="loading || secretsLoading"
+        :can-start="desktopAvailable && !agentOnline"
+        :starting="desktopBusy"
+        @retry="error ? refresh() : retryVariables()"
+        @start="startAgent"
       />
       <p
         v-if="connected && agentStatus && !agentStatus.session_monitoring?.startsWith('active:')"
@@ -2026,21 +2108,11 @@ onUnmounted(() => {
         import values, and run commands.
       </p>
       <div
-        v-if="!agentOnline || (lockLabel !== 'Unlocked' && projectConnected)"
+        v-if="agentOnline && lockLabel !== 'Unlocked' && projectConnected"
         class="shell__toolbar"
         aria-label="Vault actions"
       >
         <button
-          v-if="!agentOnline"
-          type="button"
-          class="companion-button"
-          :disabled="!desktopAvailable || desktopBusy"
-          @click="startAgent"
-        >
-          {{ desktopBusy ? 'Starting…' : 'Start agent' }}
-        </button>
-        <button
-          v-if="lockLabel !== 'Unlocked' && projectConnected"
           type="button"
           class="companion-button icon-label"
           :disabled="!desktopAvailable || unlockBusy"
@@ -2145,14 +2217,17 @@ onUnmounted(() => {
               <div class="shell__project-field">
                 <label for="project-path">Project folder</label>
                 <div class="shell__path-input">
-                  <input
-                    id="project-path"
-                    v-model="projectPath"
-                    type="text"
-                    placeholder="/path/to/project"
-                    autocomplete="off"
-                    :disabled="desktopBusy || !desktopAvailable"
-                  />
+                  <div class="shell__path-field" :data-path="projectPath">
+                    <textarea
+                      id="project-path"
+                      v-model="projectPath"
+                      placeholder="/path/to/project"
+                      autocomplete="off"
+                      rows="1"
+                      :disabled="desktopBusy || !desktopAvailable"
+                      @keydown.enter="submitProjectPath"
+                    />
+                  </div>
                   <PathBrowse
                     title="Browse for a project folder"
                     directory
@@ -2163,7 +2238,8 @@ onUnmounted(() => {
               </div>
               <div class="shell__toolbar">
                 <button
-                  class="companion-button companion-button--primary"
+                  class="companion-button"
+                  :class="{ 'companion-button--primary': agentOnline || !shellAgentError }"
                   type="submit"
                   :disabled="desktopBusy || !desktopAvailable || !projectPath.trim()"
                 >
@@ -2209,8 +2285,13 @@ onUnmounted(() => {
       <SecretMetadataList
         v-else-if="currentView === 'secrets'"
         :rows="secretRows"
+        :versions="versions"
         :profile-name="activeContext?.profile_name"
+        :profile-label="profileLabel"
         :can-access-values="secretAccess.enabled"
+        :connected="agentOnline"
+        :can-start="desktopAvailable && !agentOnline"
+        :starting="desktopBusy"
         :privacy-mode="settings.privacyRedactNames"
         :loading="secretsLoading || loading"
         :load-error="variableViewError"
@@ -2223,6 +2304,7 @@ onUnmounted(() => {
         @reveal-value="handleEditorReveal"
         @refresh="retryVariables"
         @retry="retryVariables"
+        @start="startAgent"
         @add="addVariable"
       />
 
@@ -2230,6 +2312,7 @@ onUnmounted(() => {
         v-else-if="currentView === 'discover'"
         :privacy-mode="settings.privacyRedactNames || settingsLoading"
         :known-project-ids="knownProjects.map((project) => project.project_id)"
+        :current-project-id="selectedProject?.project_id ?? status?.project_id"
         @open-project="openDiscoveredProject"
       />
 
@@ -2587,13 +2670,18 @@ html,
   color: var(--warn);
 }
 
-.shell__nav nav ul {
+.shell__primary-list,
+.shell__more-list {
   list-style: none;
   margin: 0;
   padding: 0;
   display: flex;
   flex-direction: column;
   gap: 0.15rem;
+}
+
+.shell__more {
+  display: none;
 }
 
 .shell__nav-item {
@@ -2665,14 +2753,13 @@ html,
 .shell__segments {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 0.15rem;
   min-width: 0;
   padding: 0.15rem;
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
   background: var(--bg-subtle);
-  overflow: auto;
-  scrollbar-width: thin;
 }
 
 .shell__segments button {
@@ -2793,19 +2880,39 @@ html,
 .shell__path-input {
   position: relative;
   flex-wrap: wrap;
-  gap: 0;
+  gap: 0.35rem;
+  align-items: start;
 }
 
-.shell__path-input input {
+.shell__path-field {
+  display: grid;
   flex: 1;
   min-width: 0;
-  border-radius: var(--radius-sm) 0 0 var(--radius-sm);
 }
 
-.shell__path-input button {
-  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
-  border-left: 0;
-  white-space: nowrap;
+.shell__path-field textarea,
+.shell__path-field::after {
+  grid-area: 1 / 1;
+  min-width: 0;
+  min-height: 2.125rem;
+  box-sizing: border-box;
+  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font: inherit;
+  overflow-wrap: anywhere;
+}
+
+.shell__path-field textarea {
+  resize: none;
+}
+
+.shell__path-field::after {
+  content: attr(data-path) ' ';
+  visibility: hidden;
+  white-space: pre-wrap;
 }
 
 .shell__path-input small {
@@ -2917,7 +3024,6 @@ html,
   }
 
   .shell__connection time,
-  .shell__vault,
   .shell__activity,
   .shell__topbar .shell__palette-button,
   .shell__topbar:not(.shell__topbar--has-sections) {
@@ -2925,7 +3031,17 @@ html,
   }
 
   .shell__agent {
+    flex-direction: row;
+    align-items: center;
+    gap: 0.45rem;
     padding: 0;
+  }
+
+  .shell__vault {
+    padding: 0.2rem 0.4rem;
+    border: 1px solid var(--border-subtle);
+    border-radius: 999px;
+    background: var(--bg-surface);
   }
 
   .shell__masthead .shell__palette-mobile {
@@ -2933,14 +3049,9 @@ html,
     padding-inline: 0.4rem;
   }
 
-  .shell__nav nav {
-    overflow-x: auto;
-    scrollbar-width: none;
-  }
-
-  .shell__nav nav ul {
+  .shell__primary-list {
     flex-direction: row;
-    width: max-content;
+    flex-wrap: wrap;
     gap: 0.2rem;
   }
 
@@ -2950,15 +3061,76 @@ html,
   }
 }
 
-@media (max-width: 399px) {
-  .shell__masthead h1 {
+@media (max-width: 639px) {
+  .shell__masthead {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .shell__context {
+    grid-area: 2 / 1;
+    justify-self: start;
+  }
+
+  .shell__agent {
+    grid-area: 2 / 2;
+  }
+
+  .shell__masthead .shell__palette-mobile {
+    grid-area: 1 / 2;
+    justify-self: end;
+  }
+
+  .shell__primary-list {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(max-content, 1fr));
+  }
+
+  .shell__primary-list > li > .shell__nav-item {
+    justify-content: center;
     gap: 0.2rem;
+    min-width: max-content;
+    padding-inline: 0.1rem;
+    font-size: 0.75rem;
   }
-  .shell__masthead h1 .app-icon {
-    width: 22px;
+
+  .shell__primary-list > li > .shell__nav-item .app-icon {
+    width: 0.8125rem;
   }
-  .shell__palette-mobile .app-icon {
+
+  .shell__primary-list .shell__wide-destination {
     display: none;
+  }
+
+  .shell__more {
+    position: relative;
+    display: block;
+  }
+
+  .shell__more-list {
+    position: absolute;
+    z-index: 2;
+    inset-block-start: calc(100% + 0.25rem);
+    inset-inline-end: 0;
+    min-width: 8.75rem;
+    padding: 0.25rem;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-md);
+    background: var(--bg-elevated);
+    box-shadow: var(--shadow-lg);
+  }
+
+  .shell__known-project {
+    flex-wrap: wrap;
+  }
+
+  .shell__known-project span,
+  .shell__known-project code {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .shell__known-project code {
+    flex: 1 0 100%;
   }
 }
 </style>

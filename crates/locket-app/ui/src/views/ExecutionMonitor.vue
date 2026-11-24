@@ -83,68 +83,76 @@ function refresh(): void {
     <p v-else-if="loading && isEmpty" class="view__empty">Loading runtime sessions…</p>
     <p v-else-if="isEmpty" class="view__empty">No runtime sessions yet.</p>
 
-    <table v-else class="view__table" aria-describedby="execution-monitor-heading">
-      <thead>
-        <tr>
-          <th scope="col">State</th>
-          <th scope="col">Session</th>
-          <th scope="col">Profile</th>
-          <th scope="col">Policy</th>
-          <th scope="col">Process</th>
-          <th scope="col">Started</th>
-          <th scope="col">Ended</th>
-          <th scope="col">Exit</th>
-          <th scope="col">Secrets</th>
-          <th scope="col">Audit</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr v-for="row in rows" :key="row.sessionId">
-          <td>
-            <span class="view__state">
-              <span :class="['view__dot', `view__dot--${row.state}`]" aria-hidden="true"></span>
-              <span class="view__state-label">{{ stateLabel(row.state) }}</span>
-            </span>
-          </td>
-          <td>
-            <code class="view__session-id">{{ row.sessionId }}</code>
-          </td>
-          <td>{{ profileLabel(row) }}</td>
-          <td>{{ policyLabel(row) }}</td>
-          <td>
-            <span class="view__muted">
-              pid {{ row.pid }} ·
-              <time :datetime="row.processStartTime" :title="row.processStartTime">{{
-                formatTime(row.processStartTime, 'timestamp')
+    <div
+      v-else
+      class="companion-table-scroll"
+      role="region"
+      aria-labelledby="execution-monitor-heading"
+      tabindex="0"
+    >
+      <table class="view__table" aria-describedby="execution-monitor-heading">
+        <thead>
+          <tr>
+            <th scope="col">State</th>
+            <th scope="col">Session</th>
+            <th scope="col">Profile</th>
+            <th scope="col">Policy</th>
+            <th scope="col">Process</th>
+            <th scope="col">Started</th>
+            <th scope="col">Ended</th>
+            <th scope="col">Exit</th>
+            <th scope="col">Secrets</th>
+            <th scope="col">Audit</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="row in rows" :key="row.sessionId">
+            <td>
+              <span class="view__state">
+                <span :class="['view__dot', `view__dot--${row.state}`]" aria-hidden="true"></span>
+                <span class="view__state-label">{{ stateLabel(row.state) }}</span>
+              </span>
+            </td>
+            <td>
+              <code class="view__session-id">{{ row.sessionId }}</code>
+            </td>
+            <td>{{ profileLabel(row) }}</td>
+            <td>{{ policyLabel(row) }}</td>
+            <td>
+              <span class="view__muted">
+                pid {{ row.pid }} ·
+                <time :datetime="row.processStartTime" :title="row.processStartTime">{{
+                  formatTime(row.processStartTime, 'timestamp')
+                }}</time>
+              </span>
+            </td>
+            <td>
+              <time :datetime="row.startedAt" :title="row.startedAt">{{
+                formatTime(row.startedAt, 'timestamp')
               }}</time>
-            </span>
-          </td>
-          <td>
-            <time :datetime="row.startedAt" :title="row.startedAt">{{
-              formatTime(row.startedAt, 'timestamp')
-            }}</time>
-          </td>
-          <td>
-            <time v-if="row.endedAt" :datetime="row.endedAt" :title="row.endedAt">{{
-              formatTime(row.endedAt, 'timestamp')
-            }}</time>
-            <span v-else class="view__muted">—</span>
-          </td>
-          <td>
-            <span v-if="typeof row.exitStatus === 'number'" class="view__muted">
-              {{ row.exitStatus }}
-            </span>
-            <span v-else class="view__muted">—</span>
-          </td>
-          <td>
-            <span class="badge badge--count">{{ row.secretNameCount }} secrets</span>
-          </td>
-          <td>
-            <span class="view__muted">{{ auditLabel(row) }}</span>
-          </td>
-        </tr>
-      </tbody>
-    </table>
+            </td>
+            <td>
+              <time v-if="row.endedAt" :datetime="row.endedAt" :title="row.endedAt">{{
+                formatTime(row.endedAt, 'timestamp')
+              }}</time>
+              <span v-else class="view__muted">—</span>
+            </td>
+            <td>
+              <span v-if="typeof row.exitStatus === 'number'" class="view__muted">
+                {{ row.exitStatus }}
+              </span>
+              <span v-else class="view__muted">—</span>
+            </td>
+            <td>
+              <span class="badge badge--count">{{ row.secretNameCount }} secrets</span>
+            </td>
+            <td>
+              <span class="view__muted">{{ auditLabel(row) }}</span>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
   </section>
 </template>
 

@@ -2,6 +2,43 @@ import { expect, it, vi } from 'vitest';
 import { findNode, mountComponent, settle, type TestNode } from '../test/renderer';
 import CommandPalette from './CommandPalette.vue';
 
+it('uses safe navigation for empty-query Enter and runs Lock vault when searched for', async () => {
+  vi.stubGlobal('window', new EventTarget());
+  vi.stubGlobal('Document', class {});
+  vi.stubGlobal('ShadowRoot', class {});
+  const onExecute = vi.fn();
+  const view = mountComponent<{ query: string; searchInput: TestNode }>(CommandPalette, {
+    open: false,
+    onExecute,
+    actions: [
+      { id: 'vault', label: 'Lock vault', group: 'Actions' },
+      { id: 'project', label: 'Project', group: 'Views' },
+      { id: 'workspace', label: 'Workspace', group: 'Projects' },
+      { id: 'database', label: 'DATABASE_URL', group: 'Variables' },
+    ],
+  });
+  try {
+    const dialog = findNode(view.root, (node) => node.tag === 'dialog');
+    const onKey = dialog!.props.onKeydown as (event: Partial<KeyboardEvent>) => void;
+    const enter = {
+      key: 'Enter',
+      target: view.state.searchInput as unknown as EventTarget,
+      preventDefault: vi.fn(),
+    };
+    onKey(enter);
+    expect(onExecute).toHaveBeenCalledExactlyOnceWith('project');
+    onExecute.mockClear();
+
+    view.state.query = 'lock';
+    await settle();
+    onKey(enter);
+    expect(onExecute).toHaveBeenCalledExactlyOnceWith('vault');
+  } finally {
+    view.unmount();
+    vi.unstubAllGlobals();
+  }
+});
+
 it('filters actions, selects by arrow keys, executes with Enter, and closes with Escape', async () => {
   vi.stubGlobal('window', new EventTarget());
   vi.stubGlobal('document', { getElementById: () => null, querySelector: () => null });

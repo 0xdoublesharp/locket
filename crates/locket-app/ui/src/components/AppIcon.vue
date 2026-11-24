@@ -72,6 +72,10 @@ defineProps<{ name: AppIconName; size?: number }>();
       <path d="M2.5 12S5.8 6 12 6s9.5 6 9.5 6-3.3 6-9.5 6S2.5 12 2.5 12Z" />
       <circle cx="12" cy="12" r="2.5" />
     </template>
+    <template v-else-if="name === 'clock'">
+      <circle cx="12" cy="12" r="8.5" />
+      <path d="M12 7.5V12l3 2" />
+    </template>
     <path
       v-else-if="name === 'fingerprint'"
       d="M4 12a8 8 0 1 1 16 0v2m-13.5 3.5A14 14 0 0 0 7 12a5 5 0 0 1 10 0c0 3-.5 5.5-1.5 7.5M9 20a17 17 0 0 0 1-8 2 2 0 1 1 4 0c0 4-.8 7-2 9"

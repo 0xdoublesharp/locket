@@ -81,94 +81,106 @@ function refresh(): void {
     <p v-else-if="loading && isEmpty" class="view__empty">Loading version history…</p>
     <p v-else-if="isEmpty" class="view__empty">No version history available.</p>
 
-    <table v-else class="view__table" aria-describedby="secret-version-history-heading">
-      <thead>
-        <tr>
-          <th scope="col">Secret</th>
-          <th scope="col">Source</th>
-          <th scope="col">Version</th>
-          <th scope="col">State</th>
-          <th scope="col">Deprecated at</th>
-          <th scope="col">Grace until</th>
-          <th scope="col">Pinned eligible</th>
-          <th scope="col">Scan inclusion</th>
-          <th scope="col">Rotation audit</th>
-        </tr>
-      </thead>
-      <tbody>
-        <template v-for="row in rows" :key="rowKey(row)">
+    <div
+      v-else
+      class="companion-table-scroll"
+      role="region"
+      aria-labelledby="secret-version-history-heading"
+      tabindex="0"
+    >
+      <table class="view__table" aria-describedby="secret-version-history-heading">
+        <thead>
           <tr>
-            <td>
-              <span class="view__name">{{ rowLabel(row) }}</span>
-            </td>
-            <td>
-              <span class="view__muted">{{ row.source ?? '—' }}</span>
-            </td>
-            <td>
-              <span class="view__name">v{{ row.version }}</span>
-            </td>
-            <td>
-              <span :class="['badge', `badge--state-${row.state}`]">
-                {{ stateLabel(row.state) }}
-              </span>
-            </td>
-            <td>
-              <time v-if="row.deprecatedAt" :datetime="row.deprecatedAt" :title="row.deprecatedAt">
-                {{ formatTime(row.deprecatedAt) }}
-              </time>
-              <span v-else class="view__muted">—</span>
-            </td>
-            <td>
-              <time v-if="row.graceUntil" :datetime="row.graceUntil" :title="row.graceUntil">{{
-                formatTime(row.graceUntil, 'timestamp')
-              }}</time>
-              <span v-else class="view__muted">—</span>
-            </td>
-            <td>
-              <span
-                v-if="row.pinnedReferenceEligible"
-                class="view__check"
-                aria-label="pinned references eligible"
-              >
-                ✓
-              </span>
-              <span v-else class="view__cross" aria-label="pinned references not eligible">
-                ✗
-              </span>
-            </td>
-            <td>
-              <span v-if="row.scanInclusion" class="view__check" aria-label="included in scans">
-                ✓
-              </span>
-              <span v-else class="view__cross" aria-label="not included in scans">✗</span>
-            </td>
-            <td>
-              <button
-                v-if="row.rotationAuditSummary"
-                type="button"
-                class="view__expand"
-                :aria-expanded="isExpanded(rowKey(row))"
-                :aria-controls="`rotation-audit-${rowKey(row)}`"
-                :aria-label="`Toggle rotation audit summary for version ${row.version}`"
-                @click="toggle(rowKey(row))"
-              >
-                {{ isExpanded(rowKey(row)) ? 'Hide' : 'Show' }}
-              </button>
-              <span v-else class="view__muted">—</span>
-            </td>
+            <th scope="col">Secret</th>
+            <th scope="col">Source</th>
+            <th scope="col">Version</th>
+            <th scope="col">State</th>
+            <th scope="col">Deprecated at</th>
+            <th scope="col">Grace until</th>
+            <th scope="col">Pinned eligible</th>
+            <th scope="col">Scan inclusion</th>
+            <th scope="col">Rotation audit</th>
           </tr>
-          <tr
-            v-if="row.rotationAuditSummary && isExpanded(rowKey(row))"
-            :id="`rotation-audit-${rowKey(row)}`"
-            class="view__detail"
-          >
-            <td colspan="9">
-              <p class="view__detail-text">{{ row.rotationAuditSummary }}</p>
-            </td>
-          </tr>
-        </template>
-      </tbody>
-    </table>
+        </thead>
+        <tbody>
+          <template v-for="row in rows" :key="rowKey(row)">
+            <tr>
+              <td>
+                <span class="view__name">{{ rowLabel(row) }}</span>
+              </td>
+              <td>
+                <span class="view__muted">{{ row.source ?? '—' }}</span>
+              </td>
+              <td>
+                <span class="view__name">v{{ row.version }}</span>
+              </td>
+              <td>
+                <span :class="['badge', `badge--state-${row.state}`]">
+                  {{ stateLabel(row.state) }}
+                </span>
+              </td>
+              <td>
+                <time
+                  v-if="row.deprecatedAt"
+                  :datetime="row.deprecatedAt"
+                  :title="row.deprecatedAt"
+                >
+                  {{ formatTime(row.deprecatedAt) }}
+                </time>
+                <span v-else class="view__muted">—</span>
+              </td>
+              <td>
+                <time v-if="row.graceUntil" :datetime="row.graceUntil" :title="row.graceUntil">{{
+                  formatTime(row.graceUntil, 'timestamp')
+                }}</time>
+                <span v-else class="view__muted">—</span>
+              </td>
+              <td>
+                <span
+                  v-if="row.pinnedReferenceEligible"
+                  class="view__check"
+                  aria-label="pinned references eligible"
+                >
+                  ✓
+                </span>
+                <span v-else class="view__cross" aria-label="pinned references not eligible">
+                  ✗
+                </span>
+              </td>
+              <td>
+                <span v-if="row.scanInclusion" class="view__check" aria-label="included in scans">
+                  ✓
+                </span>
+                <span v-else class="view__cross" aria-label="not included in scans">✗</span>
+              </td>
+              <td>
+                <button
+                  v-if="row.rotationAuditSummary"
+                  type="button"
+                  class="view__expand"
+                  :aria-expanded="isExpanded(rowKey(row))"
+                  :aria-controls="`rotation-audit-${rowKey(row)}`"
+                  :aria-label="`Toggle rotation audit summary for version ${row.version}`"
+                  @click="toggle(rowKey(row))"
+                >
+                  {{ isExpanded(rowKey(row)) ? 'Hide' : 'Show' }}
+                </button>
+                <span v-else class="view__muted">—</span>
+              </td>
+            </tr>
+            <tr
+              v-if="row.rotationAuditSummary && isExpanded(rowKey(row))"
+              :id="`rotation-audit-${rowKey(row)}`"
+              class="view__detail"
+            >
+              <td colspan="9">
+                <p class="view__detail-text">{{ row.rotationAuditSummary }}</p>
+              </td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+    </div>
   </section>
 </template>
 

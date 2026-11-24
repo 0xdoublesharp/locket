@@ -117,14 +117,13 @@
   filter: brightness(1.08);
 }
 
-.companion-button--reference {
-  border-color: var(--accent);
-  background: var(--accent-soft);
-  color: var(--accent);
-  font-weight: 600;
-}
-
 .companion-button:disabled {
   opacity: 0.55;
   cursor: not-allowed;
+}
+
+.companion-table-scroll {
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
 }

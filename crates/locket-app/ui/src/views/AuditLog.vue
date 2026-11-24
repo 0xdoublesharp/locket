@@ -152,47 +152,55 @@ function onVerify(): void {
 
     <p v-else-if="isFilteredEmpty" class="view__empty">No matching audit rows.</p>
 
-    <table v-else class="view__table" aria-describedby="audit-log-heading">
-      <thead>
-        <tr>
-          <th scope="col">Seq</th>
-          <th scope="col">Timestamp</th>
-          <th scope="col">Action</th>
-          <th scope="col">Status</th>
-          <th scope="col">Profile</th>
-          <th scope="col">Secret</th>
-          <th scope="col">Denial reason</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr v-for="row in filteredRows" :key="row.sequence">
-          <td>
-            <span class="view__muted">{{ row.sequence }}</span>
-          </td>
-          <td>
-            <time :datetime="row.timestamp" :title="row.timestamp">{{
-              formatTime(row.timestamp, 'timestamp')
-            }}</time>
-          </td>
-          <td>
-            <span class="view__name">{{ row.action }}</span>
-          </td>
-          <td>
-            <span :class="['badge', `badge--status-${row.status.toLowerCase()}`]">
-              {{ statusLabel(row.status) }}
-            </span>
-          </td>
-          <td>{{ profileLabel(row) }}</td>
-          <td>{{ secretLabel(row) }}</td>
-          <td>
-            <span v-if="row.status === 'DENIED' && row.denialReason" class="badge badge--warning">
-              {{ row.denialReason }}
-            </span>
-            <span v-else class="view__muted">—</span>
-          </td>
-        </tr>
-      </tbody>
-    </table>
+    <div
+      v-else
+      class="companion-table-scroll"
+      role="region"
+      aria-labelledby="audit-log-heading"
+      tabindex="0"
+    >
+      <table class="view__table" aria-describedby="audit-log-heading">
+        <thead>
+          <tr>
+            <th scope="col">Seq</th>
+            <th scope="col">Timestamp</th>
+            <th scope="col">Action</th>
+            <th scope="col">Status</th>
+            <th scope="col">Profile</th>
+            <th scope="col">Secret</th>
+            <th scope="col">Denial reason</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="row in filteredRows" :key="row.sequence">
+            <td>
+              <span class="view__muted">{{ row.sequence }}</span>
+            </td>
+            <td>
+              <time :datetime="row.timestamp" :title="row.timestamp">{{
+                formatTime(row.timestamp, 'timestamp')
+              }}</time>
+            </td>
+            <td>
+              <span class="view__name">{{ row.action }}</span>
+            </td>
+            <td>
+              <span :class="['badge', `badge--status-${row.status.toLowerCase()}`]">
+                {{ statusLabel(row.status) }}
+              </span>
+            </td>
+            <td>{{ profileLabel(row) }}</td>
+            <td>{{ secretLabel(row) }}</td>
+            <td>
+              <span v-if="row.status === 'DENIED' && row.denialReason" class="badge badge--warning">
+                {{ row.denialReason }}
+              </span>
+              <span v-else class="view__muted">—</span>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
   </section>
 </template>
 

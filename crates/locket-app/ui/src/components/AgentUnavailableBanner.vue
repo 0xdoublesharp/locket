@@ -7,8 +7,10 @@ const props = defineProps<{
   error: AgentClientError;
   heading?: string;
   retrying?: boolean;
+  canStart?: boolean;
+  starting?: boolean;
 }>();
-const emit = defineEmits<{ retry: [] }>();
+const emit = defineEmits<{ retry: []; start: [] }>();
 
 const unavailable = computed(
   () =>
@@ -26,6 +28,7 @@ const code = computed(() =>
       : undefined,
 );
 const guidance = computed(() => {
+  if (props.canStart) return 'Start the local Locket agent or retry the connection.';
   if (unavailable.value) return 'Check that the Locket agent is running, then retry.';
   if (props.error.kind === 'rejected') {
     return props.error.next_action || props.error.display_reason || 'Retry the request.';
@@ -43,15 +46,26 @@ const guidance = computed(() => {
       <p>{{ guidance }}</p>
       <code v-if="code">{{ code }}</code>
     </div>
-    <button
-      class="companion-button companion-button--primary icon-label"
-      type="button"
-      :disabled="retrying"
-      @click="emit('retry')"
-    >
-      <AppIcon name="refresh" />
-      {{ retrying ? 'Retrying…' : 'Retry' }}
-    </button>
+    <div class="agent-banner__actions">
+      <button
+        v-if="canStart"
+        class="companion-button companion-button--primary icon-label"
+        type="button"
+        :disabled="starting || retrying"
+        @click="emit('start')"
+      >
+        {{ starting ? 'Starting…' : 'Start agent' }}
+      </button>
+      <button
+        class="companion-button icon-label agent-banner__retry"
+        type="button"
+        :disabled="retrying || starting"
+        @click="emit('retry')"
+      >
+        <AppIcon name="refresh" />
+        {{ retrying ? 'Retrying…' : 'Retry' }}
+      </button>
+    </div>
   </section>
 </template>
 
@@ -93,7 +107,14 @@ const guidance = computed(() => {
   font-size: 0.7rem;
   overflow-wrap: anywhere;
 }
-.agent-banner button {
-  margin-left: auto;
+.agent-banner__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-self: center;
+  margin-inline-start: auto;
+}
+.agent-banner__retry:not(:hover) {
+  background: transparent;
 }
 </style>

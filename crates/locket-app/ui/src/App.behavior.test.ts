@@ -204,12 +204,13 @@ it('shows a retriable variables error and marks the agent offline until recovery
     };
   });
   app.state.selectView('secrets');
-  const clickButton = (label: string) => {
-    const textNode = findNode(app.root, (node) => node.text.trim() === label);
+  const getButton = (label: string, root = app.root) => {
+    const textNode = findNode(root, (node) => node.text.trim() === label);
     const button = textNode?.tag === 'button' ? textNode : textNode?.parent;
     expect(button?.tag).toBe('button');
-    (button?.props.onClick as () => void)();
+    return button!;
   };
+  const clickButton = (label: string) => (getButton(label).props.onClick as () => void)();
   await settle();
   clickButton('Refresh');
   await settle();
@@ -219,6 +220,14 @@ it('shows a retriable variables error and marks the agent offline until recovery
   expect(findNode(status()!, (node) => node.text.trim() === 'Offline')).toBeDefined();
   expect(findNode(app.root, (node) => node.text === "Can't load variables")).toBeDefined();
   expect(findNode(app.root, (node) => node.text === 'AgentUnavailable')).toBeDefined();
+  const recovery = findNode(app.root, (node) => node.props.role === 'alert');
+  expect(recovery).toBeDefined();
+  expect(getButton('Start agent', recovery).props.class).toContain('companion-button--primary');
+  expect(getButton('Retry', recovery).props.class).not.toContain('companion-button--primary');
+  expect(
+    findNode(app.root, (node) => node.props['aria-label'] === 'Refresh variables')?.props.disabled,
+  ).toBe(true);
+  expect(getButton('Add variable').props.disabled).toBe(true);
 
   overrides.delete('agent_list_secrets');
   clickButton('Retry');

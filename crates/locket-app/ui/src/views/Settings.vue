@@ -123,7 +123,7 @@ async function copyMcp(): Promise<void> {
     <div class="settings__columns">
       <div class="settings__stack">
         <section class="settings__card" aria-labelledby="settings-privacy">
-          <h3 id="settings-privacy">Privacy</h3>
+          <h3 id="settings-privacy"><AppIcon name="eye" /> Privacy</h3>
           <label class="settings__switch">
             <input
               type="checkbox"
@@ -136,7 +136,7 @@ async function copyMcp(): Promise<void> {
           <p>Uses aliases in project, variable, and activity views and the menu bar.</p>
         </section>
         <section class="settings__card" aria-labelledby="settings-session">
-          <h3 id="settings-session">Vault session</h3>
+          <h3 id="settings-session"><AppIcon name="clock" /> Vault session</h3>
           <p>Set how long an unlock stays valid.</p>
           <div class="settings__actions" aria-label="Session length presets">
             <button
@@ -184,7 +184,7 @@ async function copyMcp(): Promise<void> {
         </section>
         <section class="settings__card" aria-labelledby="settings-environment">
           <div class="settings__actions">
-            <h3 id="settings-environment">Environment safety</h3>
+            <h3 id="settings-environment"><AppIcon name="alert" /> Environment safety</h3>
             <span v-if="state.dangerousProfileFlag" class="settings__warning">Dangerous</span>
           </div>
           <label class="settings__switch">
@@ -208,7 +208,7 @@ async function copyMcp(): Promise<void> {
       <div class="settings__stack">
         <section class="settings__card" aria-labelledby="settings-verification">
           <h3 id="settings-verification">
-            <AppIcon name="fingerprint" :size="20" /> Touch ID &amp; user verification
+            <AppIcon name="fingerprint" /> Touch ID &amp; user verification
           </h3>
           <p>Require system verification for individual actions.</p>
           <label v-for="option in verificationOptions" :key="option.key" class="settings__switch">
@@ -226,7 +226,7 @@ async function copyMcp(): Promise<void> {
           </label>
         </section>
         <section class="settings__card" aria-labelledby="settings-companion">
-          <h3 id="settings-companion">macOS companion</h3>
+          <h3 id="settings-companion"><AppIcon name="laptop" /> macOS companion</h3>
           <label class="settings__switch">
             <input
               type="checkbox"
@@ -241,7 +241,7 @@ async function copyMcp(): Promise<void> {
         </section>
         <section class="settings__card" aria-labelledby="settings-mcp">
           <header class="settings__card-header">
-            <h3 id="settings-mcp">AI agents &amp; MCP</h3>
+            <h3 id="settings-mcp"><AppIcon name="terminal" /> AI agents &amp; MCP</h3>
             <button
               class="icon-label"
               type="button"
@@ -293,11 +293,6 @@ async function copyMcp(): Promise<void> {
   gap: 0.5rem;
 }
 
-.settings h3 .app-icon {
-  margin-inline-end: 0.2rem;
-  color: var(--info);
-}
-
 .settings h2,
 .settings h3,
 .settings p,
@@ -306,7 +301,14 @@ async function copyMcp(): Promise<void> {
 }
 
 .settings h3 {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
   font-size: 0.95rem;
+}
+
+.settings h3 .app-icon {
+  color: var(--info);
 }
 
 .settings p {

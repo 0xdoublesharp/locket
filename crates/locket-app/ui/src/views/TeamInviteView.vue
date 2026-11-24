@@ -207,55 +207,59 @@ function statusBadge(status: TeamInviteRow['status']): string {
         <p v-else-if="metadataLoaded && filteredRows.length === 0" class="view__empty">
           No matching invites in audit history.
         </p>
-        <table
+        <div
           v-else-if="metadataLoaded"
-          class="view__table"
-          aria-describedby="team-invite-list-heading"
+          class="companion-table-scroll"
+          role="region"
+          aria-labelledby="team-invite-list-heading"
+          tabindex="0"
         >
-          <thead>
-            <tr>
-              <th scope="col">Invite id</th>
-              <th scope="col">Direction</th>
-              <th scope="col">Status</th>
-              <th scope="col">Recipient / Issuer</th>
-              <th scope="col">Role</th>
-              <th scope="col">Profiles</th>
-              <th scope="col">Created</th>
-              <th scope="col">Expires</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="row in filteredRows" :key="row.id">
-              <td>
-                <code>{{ row.id }}</code>
-              </td>
-              <td>{{ row.direction }}</td>
-              <td>
-                <span class="badge" :class="statusBadge(row.status)">{{ row.status }}</span>
-              </td>
-              <td>
-                <span v-if="row.direction === 'issued'">{{ row.recipientLabel ?? '—' }}</span>
-                <span v-else>{{ row.issuerLabel ?? '—' }}</span>
-              </td>
-              <td>{{ row.role ?? '—' }}</td>
-              <td>
-                <span v-if="row.profiles.length > 0">{{ row.profiles.join(', ') }}</span>
-                <span v-else class="view__muted">—</span>
-              </td>
-              <td>
-                <time :datetime="row.createdAt" :title="row.createdAt">{{
-                  formatTime(row.createdAt)
-                }}</time>
-              </td>
-              <td>
-                <time v-if="row.expiresAt" :datetime="row.expiresAt" :title="row.expiresAt">{{
-                  formatTime(row.expiresAt, 'timestamp')
-                }}</time>
-                <span v-else class="view__muted">—</span>
-              </td>
-            </tr>
-          </tbody>
-        </table>
+          <table class="view__table" aria-describedby="team-invite-list-heading">
+            <thead>
+              <tr>
+                <th scope="col">Invite id</th>
+                <th scope="col">Direction</th>
+                <th scope="col">Status</th>
+                <th scope="col">Recipient / Issuer</th>
+                <th scope="col">Role</th>
+                <th scope="col">Profiles</th>
+                <th scope="col">Created</th>
+                <th scope="col">Expires</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="row in filteredRows" :key="row.id">
+                <td>
+                  <code>{{ row.id }}</code>
+                </td>
+                <td>{{ row.direction }}</td>
+                <td>
+                  <span class="badge" :class="statusBadge(row.status)">{{ row.status }}</span>
+                </td>
+                <td>
+                  <span v-if="row.direction === 'issued'">{{ row.recipientLabel ?? '—' }}</span>
+                  <span v-else>{{ row.issuerLabel ?? '—' }}</span>
+                </td>
+                <td>{{ row.role ?? '—' }}</td>
+                <td>
+                  <span v-if="row.profiles.length > 0">{{ row.profiles.join(', ') }}</span>
+                  <span v-else class="view__muted">—</span>
+                </td>
+                <td>
+                  <time :datetime="row.createdAt" :title="row.createdAt">{{
+                    formatTime(row.createdAt)
+                  }}</time>
+                </td>
+                <td>
+                  <time v-if="row.expiresAt" :datetime="row.expiresAt" :title="row.expiresAt">{{
+                    formatTime(row.expiresAt, 'timestamp')
+                  }}</time>
+                  <span v-else class="view__muted">—</span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
       </section>
 
       <section aria-labelledby="team-invite-issue-heading" class="view__panel">

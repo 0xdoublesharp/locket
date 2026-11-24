@@ -57,7 +57,7 @@ it('renders aliases without metadata clipboard or identifying filters in privacy
     });
     expect(findNode(view.root, (node) => node.text === 'Variable 1')).toBeDefined();
     expect(findNode(view.root, (node) => node.text.includes('DATABASE_URL'))).toBeUndefined();
-    expect(findNode(view.root, (node) => node.text.includes('Copy lk://'))).toBeUndefined();
+    expect(findNode(view.root, (node) => node.text.includes('Copy ref'))).toBeUndefined();
     expect(findNode(view.root, (node) => node.tag === 'input')).toBeUndefined();
   } finally {
     view.unmount();

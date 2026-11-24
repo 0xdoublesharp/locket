@@ -643,4 +643,12 @@ function errorLabel(error: AgentClientError): string {
   font-size: 0.75rem;
   letter-spacing: 0.04em;
 }
+
+@media (max-width: 639px) {
+  .view__table th,
+  .view__table td {
+    padding-inline: 0.35rem;
+    overflow-wrap: anywhere;
+  }
+}
 </style>

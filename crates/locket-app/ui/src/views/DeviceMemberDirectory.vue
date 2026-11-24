@@ -126,53 +126,61 @@ function refreshRows(): void {
 
     <p v-else-if="filteredRows.length === 0" class="view__empty">{{ emptyText }}</p>
 
-    <table v-else class="view__table" aria-describedby="device-member-directory-heading">
-      <thead>
-        <tr>
-          <th scope="col">Name</th>
-          <th scope="col">Type</th>
-          <th scope="col">Role</th>
-          <th scope="col">Fingerprint</th>
-          <th scope="col">Devices</th>
-          <th scope="col">Status</th>
-          <th scope="col">Created</th>
-          <th scope="col">Last seen</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr v-for="row in filteredRows" :key="`${row.kind}:${row.id}`">
-          <td>
-            <span class="view__name">{{ displayName(row) }}</span>
-          </td>
-          <td>
-            <span class="badge">{{ row.kind }}</span>
-          </td>
-          <td>
-            <span class="view__muted">{{ row.role ?? '—' }}</span>
-          </td>
-          <td>
-            <code class="view__fingerprint">{{ fingerprintLabel(row) }}</code>
-          </td>
-          <td>
-            <span class="view__muted">{{ memberDeviceCount(row) }}</span>
-          </td>
-          <td>
-            <span :class="['badge', `badge--status-${row.status}`]">{{ row.status }}</span>
-          </td>
-          <td>
-            <time :datetime="row.createdAt" :title="row.createdAt">{{
-              formatTime(row.createdAt)
-            }}</time>
-          </td>
-          <td>
-            <time v-if="row.lastSeenAt" :datetime="row.lastSeenAt" :title="row.lastSeenAt">{{
-              formatTime(row.lastSeenAt)
-            }}</time>
-            <span v-else class="view__muted">—</span>
-          </td>
-        </tr>
-      </tbody>
-    </table>
+    <div
+      v-else
+      class="companion-table-scroll"
+      role="region"
+      aria-labelledby="device-member-directory-heading"
+      tabindex="0"
+    >
+      <table class="view__table" aria-describedby="device-member-directory-heading">
+        <thead>
+          <tr>
+            <th scope="col">Name</th>
+            <th scope="col">Type</th>
+            <th scope="col">Role</th>
+            <th scope="col">Fingerprint</th>
+            <th scope="col">Devices</th>
+            <th scope="col">Status</th>
+            <th scope="col">Created</th>
+            <th scope="col">Last seen</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="row in filteredRows" :key="`${row.kind}:${row.id}`">
+            <td>
+              <span class="view__name">{{ displayName(row) }}</span>
+            </td>
+            <td>
+              <span class="badge">{{ row.kind }}</span>
+            </td>
+            <td>
+              <span class="view__muted">{{ row.role ?? '—' }}</span>
+            </td>
+            <td>
+              <code class="view__fingerprint">{{ fingerprintLabel(row) }}</code>
+            </td>
+            <td>
+              <span class="view__muted">{{ memberDeviceCount(row) }}</span>
+            </td>
+            <td>
+              <span :class="['badge', `badge--status-${row.status}`]">{{ row.status }}</span>
+            </td>
+            <td>
+              <time :datetime="row.createdAt" :title="row.createdAt">{{
+                formatTime(row.createdAt)
+              }}</time>
+            </td>
+            <td>
+              <time v-if="row.lastSeenAt" :datetime="row.lastSeenAt" :title="row.lastSeenAt">{{
+                formatTime(row.lastSeenAt)
+              }}</time>
+              <span v-else class="view__muted">—</span>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
   </section>
 </template>
 

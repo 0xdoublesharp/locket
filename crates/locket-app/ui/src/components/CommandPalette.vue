@@ -17,8 +17,8 @@ const emit = defineEmits<{
 const dialog = ref<HTMLDialogElement | null>(null);
 const searchInput = ref<HTMLInputElement | null>(null);
 const query = ref('');
-const activeIndex = ref(0);
-const groupOrder: PaletteGroup[] = ['Actions', 'Views', 'Projects', 'Variables'];
+const selectedIndex = ref<number | null>(null);
+const groupOrder: PaletteGroup[] = ['Views', 'Projects', 'Variables', 'Actions'];
 const groupedResults = computed(() => {
   const terms = query.value.trim().toLocaleLowerCase().split(/\s+/);
   const groups = new Map(groupOrder.map((group) => [group, [] as PaletteAction[]]));
@@ -36,16 +36,23 @@ const groupedResults = computed(() => {
   })).filter(({ items }) => items.length);
 });
 const results = computed(() => groupedResults.value.flatMap(({ items }) => items));
+const activeIndex = computed(
+  () =>
+    selectedIndex.value ??
+    (groupedResults.value[0]?.group === 'Actions' && !query.value.trim() ? -1 : 0),
+);
 
 watch(
   query,
   () => {
-    activeIndex.value = 0;
+    selectedIndex.value = null;
   },
   { flush: 'sync' },
 );
 watch(results, () => {
-  activeIndex.value = Math.max(0, Math.min(activeIndex.value, results.value.length - 1));
+  if (selectedIndex.value !== null && selectedIndex.value >= results.value.length) {
+    selectedIndex.value = null;
+  }
 });
 
 function syncDialog(): void {
@@ -53,7 +60,7 @@ function syncDialog(): void {
   if (!element) return;
   if (props.open && !element.open) {
     query.value = '';
-    activeIndex.value = 0;
+    selectedIndex.value = null;
     element.showModal();
     searchInput.value?.focus();
   } else if (!props.open && element.open) {
@@ -106,7 +113,8 @@ function onKeys(event: KeyboardEvent): void {
   if (!length || (event.key !== 'ArrowDown' && event.key !== 'ArrowUp')) return;
   event.preventDefault();
   const step = event.key === 'ArrowDown' ? 1 : -1;
-  activeIndex.value = (activeIndex.value + step + length) % length;
+  const previous = activeIndex.value < 0 && step < 0 ? 0 : activeIndex.value;
+  selectedIndex.value = (previous + step + length) % length;
   void nextTick(() => {
     document
       .getElementById(`palette-result-${activeIndex.value}`)
@@ -145,7 +153,9 @@ function onKeys(event: KeyboardEvent): void {
         aria-label="Search quick actions"
         aria-controls="palette-results"
         :aria-expanded="open"
-        :aria-activedescendant="results.length ? `palette-result-${activeIndex}` : undefined"
+        :aria-activedescendant="
+          results.length && activeIndex >= 0 ? `palette-result-${activeIndex}` : undefined
+        "
         placeholder="Search projects, views, or variables"
         autocomplete="off"
         spellcheck="false"
@@ -166,7 +176,7 @@ function onKeys(event: KeyboardEvent): void {
           class="palette__result"
           role="option"
           :aria-selected="index === activeIndex"
-          @pointerenter="activeIndex = index"
+          @pointermove="selectedIndex = index"
           @click="run(action.id)"
         >
           <AppIcon :name="action.icon ?? 'compass'" />

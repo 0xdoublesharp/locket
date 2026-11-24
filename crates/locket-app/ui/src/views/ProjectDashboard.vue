@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, ref } from 'vue';
 import AppIcon from '../components/AppIcon.vue';
 import { formatTime } from '../utils/formatTime';
 import VariableReadinessPanel from '../components/VariableReadinessPanel.vue';
@@ -47,7 +47,14 @@ const emit = defineEmits<{
   navigate: [target: 'secrets' | 'execution' | 'audit' | 'scan' | 'profiles'];
   refresh: [];
 }>();
-const startActions = computed(() => startHereActions(props));
+const startActions = computed(() =>
+  startHereActions(props).filter((action) => action.target !== 'start-agent'),
+);
+const refreshCount = ref(0);
+function refreshDashboard(): void {
+  refreshCount.value += 1;
+  emit('refresh');
+}
 const audit = computed(() => auditHealth(props.auditChainOk));
 const scan = computed(() =>
   scanHealth(props.lastScanAt, props.scanLocked, props.scanError, props.findings.length),
@@ -67,7 +74,7 @@ const failedRuns = computed(
         type="button"
         class="companion-button icon-label"
         :disabled="loading"
-        @click="emit('refresh')"
+        @click="refreshDashboard"
       >
         <AppIcon name="refresh" />
         {{ loading ? 'Refreshing…' : 'Refresh' }}
@@ -98,12 +105,17 @@ const failedRuns = computed(
         </li>
       </ol>
     </section>
-    <p v-else class="dashboard__setup-complete"><AppIcon name="check" /> Setup complete</p>
+    <p v-else-if="connected" class="dashboard__setup-complete">
+      <AppIcon name="check" /> Setup complete
+    </p>
     <VariableReadinessPanel
       :project-id="projectId"
       :profile-id="profileId"
       :privacy-mode="privacyMode"
+      :hide-refresh="true"
       :refresh-key="
+        refreshCount +
+        ':' +
         policies.map((row) => row.updatedAt).join('|') +
         ':' +
         secrets.map((row) => row.id + row.currentVersion).join('|')
@@ -198,6 +210,13 @@ const failedRuns = computed(
   margin: 0;
   font-size: var(--font-page-title);
   letter-spacing: -0.025em;
+}
+.dashboard__header > div {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.dashboard__header > button {
+  flex: none;
 }
 
 .dashboard__setup-complete {
@@ -519,7 +538,6 @@ const failedRuns = computed(
     width: 100%;
   }
 
-  .dashboard__header,
   .dashboard__search-header,
   .dashboard__section-head {
     align-items: stretch;

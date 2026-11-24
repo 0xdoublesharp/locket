@@ -210,56 +210,63 @@ function startDelete(): void {
     <p v-else-if="isFilteredEmpty" class="view__empty">No matching policies.</p>
 
     <div v-else class="policy-layout">
-      <table class="view__table" aria-describedby="policy-editor-heading">
-        <thead>
-          <tr>
-            <th scope="col">Name</th>
-            <th scope="col">Mode</th>
-            <th scope="col">Secrets</th>
-            <th scope="col">TTL</th>
-            <th scope="col">Gates</th>
-            <th scope="col">Updated</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr
-            v-for="row in filteredRows"
-            :key="row.id"
-            :class="['view__row', { 'view__row--selected': selectedPolicy?.id === row.id }]"
-            tabindex="0"
-            :aria-label="`Inspect policy ${policyLabel(row)}`"
-            @click="selectPolicy(row)"
-            @keydown.enter.prevent="selectPolicy(row)"
-            @keydown.space.prevent="selectPolicy(row)"
-          >
-            <td>
-              <span class="view__name">{{ policyLabel(row) }}</span>
-            </td>
-            <td>
-              <span
-                :class="['badge', row.commandKind === 'shell' ? 'badge--warning' : 'badge--ok']"
-              >
-                {{ row.commandKind }}
-              </span>
-            </td>
-            <td>{{ secretCount(row) }}</td>
-            <td>{{ ttlLabel(row.ttlSeconds) }}</td>
-            <td>
-              <span v-if="gateLabels(row).length > 0" class="view__badges">
-                <span v-for="gate in gateLabels(row)" :key="gate" class="badge badge--gate">
-                  {{ gate }}
+      <div
+        class="companion-table-scroll"
+        role="region"
+        aria-labelledby="policy-editor-heading"
+        tabindex="0"
+      >
+        <table class="view__table" aria-describedby="policy-editor-heading">
+          <thead>
+            <tr>
+              <th scope="col">Name</th>
+              <th scope="col">Mode</th>
+              <th scope="col">Secrets</th>
+              <th scope="col">TTL</th>
+              <th scope="col">Gates</th>
+              <th scope="col">Updated</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr
+              v-for="row in filteredRows"
+              :key="row.id"
+              :class="['view__row', { 'view__row--selected': selectedPolicy?.id === row.id }]"
+              tabindex="0"
+              :aria-label="`Inspect policy ${policyLabel(row)}`"
+              @click="selectPolicy(row)"
+              @keydown.enter.prevent="selectPolicy(row)"
+              @keydown.space.prevent="selectPolicy(row)"
+            >
+              <td>
+                <span class="view__name">{{ policyLabel(row) }}</span>
+              </td>
+              <td>
+                <span
+                  :class="['badge', row.commandKind === 'shell' ? 'badge--warning' : 'badge--ok']"
+                >
+                  {{ row.commandKind }}
                 </span>
-              </span>
-              <span v-else class="view__muted">none</span>
-            </td>
-            <td>
-              <time :datetime="row.updatedAt" :title="row.updatedAt">{{
-                formatTime(row.updatedAt)
-              }}</time>
-            </td>
-          </tr>
-        </tbody>
-      </table>
+              </td>
+              <td>{{ secretCount(row) }}</td>
+              <td>{{ ttlLabel(row.ttlSeconds) }}</td>
+              <td>
+                <span v-if="gateLabels(row).length > 0" class="view__badges">
+                  <span v-for="gate in gateLabels(row)" :key="gate" class="badge badge--gate">
+                    {{ gate }}
+                  </span>
+                </span>
+                <span v-else class="view__muted">none</span>
+              </td>
+              <td>
+                <time :datetime="row.updatedAt" :title="row.updatedAt">{{
+                  formatTime(row.updatedAt)
+                }}</time>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
 
       <aside v-if="selectedPolicy" class="policy-detail" aria-labelledby="policy-detail-heading">
         <VariableReadinessPanel

@@ -9,6 +9,7 @@ import { createRequestLifetime } from '../utils/requestLifetime';
 const props = defineProps<{
   privacyMode: boolean;
   knownProjectIds: string[];
+  currentProjectId?: string | null;
 }>();
 const emit = defineEmits<{ openProject: [row: DiscoveredSecretWire] }>();
 
@@ -109,8 +110,11 @@ function canOpenProject(row: DiscoveredSecretWire): boolean {
           </div>
           <div class="discovery__actions">
             <CopyReference :reference="privacyMode ? null : row.reference" />
+            <span v-if="row.project_id === currentProjectId" class="discovery__current">
+              Current project
+            </span>
             <button
-              v-if="canOpenProject(row)"
+              v-else-if="canOpenProject(row)"
               class="companion-button icon-label"
               type="button"
               @click="emit('openProject', row)"
@@ -209,6 +213,13 @@ function canOpenProject(row: DiscoveredSecretWire): boolean {
   border-radius: var(--radius-sm);
   background: var(--warn-soft);
   color: var(--warn);
+}
+.discovery__current {
+  padding: 0.2rem 0.5rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: 999px;
+  color: var(--text-secondary);
+  font-size: 0.75rem;
 }
 @media (max-width: 600px) {
   .discovery__filters {

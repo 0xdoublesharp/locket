@@ -146,6 +146,7 @@ export type AppIconName =
   | 'copy'
   | 'link'
   | 'eye'
+  | 'clock'
   | 'fingerprint'
   | 'refresh'
   | 'alert'

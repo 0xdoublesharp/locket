@@ -41,13 +41,13 @@ async function copyReference(): Promise<void> {
 <template>
   <span v-if="reference" class="copy-reference">
     <button
-      class="companion-button companion-button--reference icon-label"
+      class="companion-button icon-label"
       type="button"
       :title="message || 'Copy variable reference'"
       @click.stop="copyReference"
     >
       <AppIcon :name="copiedReference ? 'check' : failedReference ? 'alert' : 'link'" />
-      Copy lk://
+      Copy ref
     </button>
     <span v-if="message" role="status">{{ message }}</span>
   </span>

@@ -15,6 +15,7 @@ const props = defineProps<{
   policyName?: string;
   privacyMode?: boolean;
   refreshKey?: string;
+  hideRefresh?: boolean;
 }>();
 const emit = defineEmits<{ blocked: [value: boolean] }>();
 const loading = ref(false);
@@ -84,6 +85,7 @@ onBeforeUnmount(() => {
     <header>
       <h3>Configuration checks</h3>
       <button
+        v-if="!hideRefresh"
         class="companion-button icon-label"
         type="button"
         :disabled="loading || !projectId"
