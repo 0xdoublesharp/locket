@@ -187,7 +187,7 @@ Passkey and local user-verification model:
 - Browser-style WebAuthn/passkey ceremonies are not the default path for local CLI/UI user presence because they add browser/RP ceremony without improving the local approval primitive.
 - WebAuthn PRF/hmac-secret is allowed only as an optional key-wrapping factor when a hardware token or platform authenticator supports it. Recovery code support remains mandatory because PRF availability and synced-passkey behavior vary by platform.
 - Local user-verification gates can protect unlock, reveal/copy, dangerous-profile switching, team invite acceptance, device registration, and recovery operations.
-- Genuine authenticators must keep their private material outside Locket. Legacy `platform-keyring` credentials instead use software seeds held in the OS keyring; they are explicitly identified as legacy software recovery factors.
+- Genuine authenticators must keep their private material outside Locket. Locket never stores passkey seeds in the OS keyring.
 - Local user verification does not replace peer-credential checks for the local agent and does not bypass policy, grants, audit, or team roles.
 - Registration, removal, and authentication write audit rows when project context is available.
 
@@ -223,7 +223,6 @@ Rules:
 - New external-key registration uses libfido2 1.17+ tools on macOS/Linux terminals, requiring a PIN, user presence, and hmac-secret support. Desktop/non-terminal and Windows ceremonies fail explicitly. It must not generate software keyring seeds and describe them as WebAuthn PRF credentials.
 - Credential attestation and assertion signatures must verify before accepting credential metadata or PRF output. Assertions bind a fresh challenge, the stored RP ID, and the stored public key, with both UP and UV required. Optional key wrapping uses the WebAuthn PRF salt transformation `SHA-256("WebAuthn PRF" || 0x00 || input)` before requesting CTAP hmac-secret output.
 - Registration completes the PRF ceremony before atomically storing the credential, master-key wrap, and successful audit row. Cancellation, verification failure, or a failed database write must not leave a partially enrolled credential.
-- Existing `platform-keyring` records remain readable through an explicitly labeled legacy recovery path after fresh local verification. Their seed derivation remains compatible; key material is zeroized after use. These credentials are not an independent hardware factor or an RP-bound WebAuthn ceremony.
 - Genuine biometric and authenticator private material must never be stored by Locket.
 - Browser-style WebAuthn/passkey ceremonies are not used for ordinary reveal/copy/unlock approvals. They may be used only for optional PRF/hmac-secret key-wrapping flows that require a WebAuthn-compatible authenticator.
 - For optional WebAuthn PRF credentials, the relying party id must be recorded in `PasskeyCredential.webauthn_relying_party_id` and must never change silently. The default RP ID for that optional path is `locket.localhost`; official signed distributions may define a controlled RP ID only as an explicit migration requiring credential re-registration.

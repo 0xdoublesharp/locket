@@ -1,28 +1,13 @@
 //! Platform passkey/`WebAuthn` registration and PRF evaluation traits.
 //!
 //! External FIDO2 credentials use a terminal-only libfido2 backend where
-//! available. Software keyring credentials retain a separate recovery path.
+//! available.
 
 use std::sync::Mutex;
 
-use data_encoding::BASE64URL_NOPAD;
-use hmac::{Hmac, KeyInit, Mac};
-use keyring_core::Entry;
-use locket_crypto::KEY_LEN;
-#[cfg(test)]
-use sha2::Digest;
-use sha2::Sha256;
 use zeroize::Zeroizing;
 
-use crate::LocketInstance;
 use crate::error::PlatformError;
-
-const PASSKEY_ACCOUNT_PREFIX: &str = "prf:";
-#[cfg(test)]
-const PASSKEY_PUBLIC_KEY_DOMAIN: &[u8] = b"locket-platform-passkey-public-v1";
-const PASSKEY_PRF_DOMAIN: &[u8] = b"locket-platform-passkey-prf-v1";
-
-type HmacSha256 = Hmac<Sha256>;
 
 /// Result of a successful platform-authenticator registration.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -102,23 +87,6 @@ pub trait PlatformPasskeyRegistrar {
         credential: PasskeyAssertionContext<'_>,
         salt: &[u8],
     ) -> Result<Zeroizing<[u8; 32]>, PlatformError>;
-
-    /// Recovers the software keyring factor created by older Locket builds.
-    ///
-    /// This is not `WebAuthn`, FIDO2, or proof of user presence. Callers must
-    /// independently require fresh local user verification and label the
-    /// resulting recovery as a legacy software keyring operation.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PlatformError::PasskeyUnsupported`] by default.
-    fn recover_legacy_keyring_prf(
-        &self,
-        _credential_id: &[u8],
-        _salt: &[u8],
-    ) -> Result<Zeroizing<[u8; 32]>, PlatformError> {
-        Err(PlatformError::PasskeyUnsupported)
-    }
 }
 
 /// Default registrar for builds where platform passkey APIs are not yet wired.
@@ -144,51 +112,6 @@ impl PlatformPasskeyRegistrar for UnavailablePlatformPasskeyRegistrar {
         _salt: &[u8],
     ) -> Result<Zeroizing<[u8; 32]>, PlatformError> {
         Err(PlatformError::PasskeyUnsupported)
-    }
-}
-
-/// Recovery backend for legacy software keyring credentials.
-///
-/// The historical type name is retained for compatibility. New registration
-/// and `WebAuthn` PRF evaluation are unsupported. Previously stored seeds remain
-/// recoverable through the explicitly named legacy method after the caller
-/// performs fresh local verification.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct KeyringPlatformPasskeyRegistrar;
-
-impl PlatformPasskeyRegistrar for KeyringPlatformPasskeyRegistrar {
-    fn supports_registration(&self) -> bool {
-        false
-    }
-
-    fn register_passkey(
-        &self,
-        _label: &str,
-        _relying_party_id: &str,
-    ) -> Result<PasskeyRegistration, PlatformError> {
-        Err(PlatformError::PasskeyUnsupported)
-    }
-
-    fn evaluate_prf(
-        &self,
-        _credential: PasskeyAssertionContext<'_>,
-        _salt: &[u8],
-    ) -> Result<Zeroizing<[u8; 32]>, PlatformError> {
-        Err(PlatformError::PasskeyUnsupported)
-    }
-
-    fn recover_legacy_keyring_prf(
-        &self,
-        credential_id: &[u8],
-        salt: &[u8],
-    ) -> Result<Zeroizing<[u8; 32]>, PlatformError> {
-        let encoded = Zeroizing::new(
-            passkey_entry(credential_id)?
-                .get_password()
-                .map_err(|error| map_passkey_get_error(&error))?,
-        );
-        let secret = decode_passkey_secret(&encoded)?;
-        Ok(Zeroizing::new(derive_passkey_prf(&secret, salt)?))
     }
 }
 
@@ -303,20 +226,9 @@ impl PlatformPasskeyRegistrar for MemoryPlatformPasskeyRegistrar {
             },
         }
     }
-
-    fn recover_legacy_keyring_prf(
-        &self,
-        credential_id: &[u8],
-        salt: &[u8],
-    ) -> Result<Zeroizing<[u8; 32]>, PlatformError> {
-        self.evaluate_prf(
-            PasskeyAssertionContext { credential_id, relying_party_id: "legacy", public_key: &[] },
-            salt,
-        )
-    }
 }
 
-/// Default registrar: external FIDO2 ceremonies and explicit legacy recovery.
+/// Default registrar: external FIDO2 ceremonies where available.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DefaultPlatformPasskeyRegistrar;
 
@@ -363,82 +275,10 @@ impl PlatformPasskeyRegistrar for DefaultPlatformPasskeyRegistrar {
             Err(PlatformError::PasskeyUnsupported)
         }
     }
-
-    fn recover_legacy_keyring_prf(
-        &self,
-        credential_id: &[u8],
-        salt: &[u8],
-    ) -> Result<Zeroizing<[u8; 32]>, PlatformError> {
-        KeyringPlatformPasskeyRegistrar.recover_legacy_keyring_prf(credential_id, salt)
-    }
 }
 
 /// Returns the default passkey registrar for this build.
 #[must_use]
 pub const fn default_platform_passkey_registrar() -> DefaultPlatformPasskeyRegistrar {
     DefaultPlatformPasskeyRegistrar
-}
-
-fn passkey_entry(credential_id: &[u8]) -> Result<Entry, PlatformError> {
-    Entry::new(LocketInstance::current().passkey_keyring_service(), &passkey_account(credential_id))
-        .map_err(|_| PlatformError::PasskeyUnsupported)
-}
-
-pub fn passkey_account(credential_id: &[u8]) -> String {
-    format!("{PASSKEY_ACCOUNT_PREFIX}{}", BASE64URL_NOPAD.encode(credential_id))
-}
-
-fn decode_passkey_secret(encoded: &str) -> Result<Zeroizing<[u8; KEY_LEN]>, PlatformError> {
-    let decoded = Zeroizing::new(
-        BASE64URL_NOPAD.decode(encoded.as_bytes()).map_err(|_| PlatformError::PasskeyAuthFailed)?,
-    );
-    if decoded.len() != KEY_LEN {
-        return Err(PlatformError::PasskeyAuthFailed);
-    }
-    let mut secret = Zeroizing::new([0_u8; KEY_LEN]);
-    secret.copy_from_slice(&decoded);
-    Ok(secret)
-}
-
-#[cfg(test)]
-pub fn public_metadata_key(secret: &[u8; KEY_LEN]) -> Vec<u8> {
-    Sha256::new().chain_update(PASSKEY_PUBLIC_KEY_DOMAIN).chain_update(secret).finalize().to_vec()
-}
-
-pub fn derive_passkey_prf(
-    secret: &[u8; KEY_LEN],
-    salt: &[u8],
-) -> Result<[u8; KEY_LEN], PlatformError> {
-    let mut mac =
-        HmacSha256::new_from_slice(secret).map_err(|_| PlatformError::PasskeyAuthFailed)?;
-    mac.update(PASSKEY_PRF_DOMAIN);
-    mac.update(salt);
-    Ok(mac.finalize().into_bytes().into())
-}
-
-const fn map_passkey_get_error(error: &keyring_core::Error) -> PlatformError {
-    match error {
-        keyring_core::Error::NoEntry => PlatformError::PasskeyNotFound,
-        _ => PlatformError::PasskeyAuthFailed,
-    }
-}
-
-#[cfg(test)]
-pub const fn platform_transport_label() -> &'static str {
-    #[cfg(target_os = "macos")]
-    {
-        "macos-keychain"
-    }
-    #[cfg(target_os = "windows")]
-    {
-        "windows-credential-manager"
-    }
-    #[cfg(target_os = "linux")]
-    {
-        "linux-secret-service"
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-    {
-        "platform-keyring"
-    }
 }

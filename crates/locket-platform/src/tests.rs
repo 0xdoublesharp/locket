@@ -708,23 +708,6 @@ fn memory_passkey_registrar_unsupported_outcome_blocks_register() {
 }
 
 #[test]
-fn keyring_passkey_helpers_are_stable_and_metadata_only() -> Result<(), PlatformError> {
-    let credential_id = [0x42_u8; 32];
-    let secret = [0x7a_u8; KEY_LEN];
-    let public_key = super::passkey::public_metadata_key(&secret);
-    let public_key_again = super::passkey::public_metadata_key(&secret);
-    assert_eq!(public_key, public_key_again);
-    assert_ne!(public_key, secret);
-    assert!(super::passkey::passkey_account(&credential_id).starts_with("prf:"));
-    assert_ne!(super::passkey::platform_transport_label(), "");
-
-    let prf_a = super::passkey::derive_passkey_prf(&secret, b"salt-a")?;
-    let prf_b = super::passkey::derive_passkey_prf(&secret, b"salt-b")?;
-    assert_ne!(prf_a, prf_b);
-    Ok(())
-}
-
-#[test]
 fn signing_storage_is_separate_and_rejects_sealing_envelope_substitution()
 -> Result<(), PlatformError> {
     let directory = tempfile::tempdir()?;

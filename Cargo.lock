@@ -3276,7 +3276,6 @@ dependencies = [
  "data-encoding",
  "directories",
  "futures-util",
- "hmac 0.13.0",
  "keyring-core",
  "locket-core",
  "locket-crypto",

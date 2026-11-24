@@ -91,12 +91,6 @@ pub(crate) fn passkey_register_command(
 
     match context.passkey_registrar.register_passkey(label, relying_party_id) {
         Ok(registration) => {
-            if is_legacy_keyring(&registration.transports) {
-                return Err(unimplemented_in_build_error(
-                    "software keyring credentials cannot be registered as WebAuthn/FIDO2 passkeys; \
-                     existing legacy credentials remain available for recovery",
-                ));
-            }
             let timestamp = now_unix_nanos()?;
             let passkey_id = generate_passkey_id()?;
             let credential = PasskeyCredentialRecord {
@@ -290,11 +284,7 @@ pub fn passkey_unlock_command(
         recover_master_key_via_prf(context, &mut store, &resolved, &credential, &wrap, timestamp)?;
     let source = store_master_key_with_fallback(context, project_id, &master_key, timestamp)?;
     write_passkey_auth_audit(context, &mut store, &resolved, &credential, "success", timestamp)?;
-    if is_legacy_keyring(&credential.transports) {
-        writeln!(output, "passkey: legacy software keyring recovery")?;
-    } else {
-        writeln!(output, "passkey: unlocked")?;
-    }
+    writeln!(output, "passkey: unlocked")?;
     writeln!(output, "passkey_id: {}", credential.id)?;
     writeln!(output, "credential_id_prefix: {}", credential_id_prefix(&credential.credential_id))?;
     writeln!(output, "rp_id: {}", credential.webauthn_relying_party_id)?;
@@ -345,13 +335,8 @@ fn recover_master_key_via_prf(
     wrap: &PasskeyPrfWrapRecord,
     timestamp: i64,
 ) -> Result<Zeroizing<locket_crypto::KeyBytes>, CliError> {
-    let result = if is_legacy_keyring(&credential.transports) {
-        context
-            .passkey_registrar
-            .recover_legacy_keyring_prf(&credential.credential_id, &wrap.prf_salt)
-    } else {
-        context.passkey_registrar.evaluate_prf(assertion_context(credential), &wrap.prf_salt)
-    };
+    let result =
+        context.passkey_registrar.evaluate_prf(assertion_context(credential), &wrap.prf_salt);
     let prf_output = match result {
         Ok(output) => output,
         Err(error) => {
@@ -397,14 +382,13 @@ fn passkey_list_command(
         for credential in credentials {
             writeln!(
                 output,
-                "- {} id={} credential_id_prefix={} kind={} rp_id={} transports={} prf={} backup_eligible={} backup_state={} created_at={} last_used_at={} revoked_at={}",
+                "- {} id={} credential_id_prefix={} rp_id={} transports={} prf={} backup_eligible={} backup_state={} created_at={} last_used_at={} revoked_at={}",
                 credential.label,
                 credential.id,
                 credential_id_prefix(&credential.credential_id),
-                credential_kind(&credential.transports),
                 credential.webauthn_relying_party_id,
                 render_passkey_transports(&credential.transports),
-                displayed_prf_capability(&credential),
+                yes_no(credential.prf_capable),
                 render_optional_bool(credential.backup_eligible),
                 render_optional_bool(credential.backup_state),
                 format_unix_nanos(credential.created_at),
@@ -416,22 +400,6 @@ fn passkey_list_command(
     writeln!(output, "include_revoked: {}", if args.all { "yes" } else { "no" })?;
     writeln!(output, "private_key_material: never displayed")?;
     Ok(())
-}
-
-fn is_legacy_keyring(transports: &[String]) -> bool {
-    transports.iter().any(|transport| transport == "platform-keyring")
-}
-
-fn credential_kind(transports: &[String]) -> &'static str {
-    if is_legacy_keyring(transports) { "legacy-software-keyring" } else { "webauthn" }
-}
-
-fn displayed_prf_capability(credential: &PasskeyCredentialRecord) -> &'static str {
-    if is_legacy_keyring(&credential.transports) {
-        "legacy-keyring-derivation"
-    } else {
-        yes_no(credential.prf_capable)
-    }
 }
 
 fn passkey_remove_command(
@@ -471,8 +439,7 @@ fn passkey_remove_command(
     writeln!(output, "credential_id_prefix: {}", credential_id_prefix(&credential.credential_id))?;
     writeln!(output, "rp_id: {}", credential.webauthn_relying_party_id)?;
     writeln!(output, "transports: {}", render_passkey_transports(&credential.transports))?;
-    writeln!(output, "credential_kind: {}", credential_kind(&credential.transports))?;
-    writeln!(output, "prf: {}", displayed_prf_capability(&credential))?;
+    writeln!(output, "prf: {}", yes_no(credential.prf_capable))?;
     let confirmation = context.confirmation_reader.read_confirmation("passkey remove")?;
     if confirmation.trim_end() != selector {
         return Err(confirmation_failed_error("confirmation did not match passkey identifier"));
@@ -527,7 +494,6 @@ fn write_passkey_register_audit(
         "webauthn_relying_party_id": credential.webauthn_relying_party_id,
         "transports": credential.transports,
         "prf_capable": credential.prf_capable,
-        "credential_kind": credential_kind(&credential.transports),
         "backup_eligible": credential.backup_eligible,
         "backup_state": credential.backup_state,
         "user_verification": user_verification,
@@ -610,7 +576,6 @@ fn write_passkey_auth_audit(
         "auth_result": auth_result,
         "webauthn_relying_party_id": credential.webauthn_relying_party_id,
         "prf_capable": credential.prf_capable,
-        "credential_kind": credential_kind(&credential.transports),
     });
     let audit = AuditWrite {
         project_id: resolved.config.project_id.as_str(),
@@ -647,7 +612,6 @@ fn write_passkey_remove_audit_if_available(
         "webauthn_relying_party_id": credential.webauthn_relying_party_id,
         "transports": credential.transports,
         "prf_capable": credential.prf_capable,
-        "credential_kind": credential_kind(&credential.transports),
         "backup_eligible": credential.backup_eligible,
         "backup_state": credential.backup_state,
         "user_verification": user_verification,

@@ -87,15 +87,6 @@ impl LocketInstance {
         }
     }
 
-    /// Keychain service for platform passkey material.
-    #[must_use]
-    pub const fn passkey_keyring_service(self) -> &'static str {
-        match self {
-            Self::Installed => "dev.0xdoublesharp.locket.passkey",
-            Self::Dev => "dev.0xdoublesharp.locket-dev.passkey",
-        }
-    }
-
     /// Windows named-pipe prefix for the agent endpoint.
     #[must_use]
     pub const fn agent_pipe_prefix(self) -> &'static str {
@@ -179,7 +170,6 @@ mod tests {
         let installed = LocketInstance::Installed;
         assert_eq!(installed.application_name(), "Locket");
         assert_eq!(installed.keyring_service(), "dev.0xdoublesharp.locket");
-        assert_eq!(installed.passkey_keyring_service(), "dev.0xdoublesharp.locket.passkey");
         assert_eq!(installed.agent_pipe_prefix(), r"\\.\pipe\locket-agent-");
         assert_eq!(installed.agent_dir_name(), "locket");
         assert_eq!(installed.home_dir_name(), ".locket");
@@ -190,7 +180,6 @@ mod tests {
         let (installed, dev) = (LocketInstance::Installed, LocketInstance::Dev);
         assert_ne!(installed.application_name(), dev.application_name());
         assert_ne!(installed.keyring_service(), dev.keyring_service());
-        assert_ne!(installed.passkey_keyring_service(), dev.passkey_keyring_service());
         assert_ne!(installed.agent_pipe_prefix(), dev.agent_pipe_prefix());
         assert_ne!(installed.agent_dir_name(), dev.agent_dir_name());
         assert_ne!(installed.home_dir_name(), dev.home_dir_name());
