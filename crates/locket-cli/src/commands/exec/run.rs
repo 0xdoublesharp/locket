@@ -172,6 +172,7 @@ impl RunProtection {
                 EgressProxyConfig {
                     allow_private_destinations_for_allowed_hosts: false,
                     strict_connect_allowlist: !args.egress_allow_unlisted_connect,
+                    ..EgressProxyConfig::default()
                 },
             )
             .map_err(|error| {
@@ -188,8 +189,12 @@ impl RunProtection {
                     known_secrets.push((String::new(), Zeroizing::new(password.to_owned())));
                 }
             }
-            known_secrets
-                .extend(overrides.iter().map(|(name, value)| (name.clone(), value.clone())));
+            known_secrets.extend(
+                overrides
+                    .iter()
+                    .filter(|(name, _)| injected_env_names.contains(*name))
+                    .map(|(name, value)| (name.clone(), value.clone())),
+            );
             policy.prepared.env.extend(overrides);
             Some(broker)
         };
