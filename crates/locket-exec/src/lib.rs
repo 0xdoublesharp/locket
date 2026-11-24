@@ -13,6 +13,7 @@ use thiserror::Error;
 
 mod egress_proxy;
 mod ephemeral_env_file;
+mod network_sandbox;
 mod secret_encoding;
 mod streaming_redactor;
 
@@ -22,6 +23,10 @@ pub use egress_proxy::{
 };
 pub use ephemeral_env_file::{
     EphemeralEnvFile, EphemeralEnvFileError, secure_erase_supported, write_ephemeral_env_file,
+};
+pub use network_sandbox::{
+    NetworkContainmentError, NetworkContainmentPolicy, NetworkContainmentSupport,
+    network_containment_support, wrap_command_with_network_containment,
 };
 pub use streaming_redactor::{
     StreamingRedactionStats, StreamingRedactor, StreamingRedactorConfig, redact_child_output,

@@ -14,11 +14,11 @@ use super::{
 use crate::env_value;
 use crate::secret_encoding::Form;
 
-const SECRET: &str = "synthetic-&echo=\"value\"";
-const WAIT: Duration = Duration::from_secs(5);
-type TestResult = Result<(), Box<dyn std::error::Error>>;
+pub(super) const SECRET: &str = "synthetic-&echo=\"value\"";
+pub(super) const WAIT: Duration = Duration::from_secs(5);
+pub(super) type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-fn binding(name: &str, secret: &str, host: String) -> EgressSecretBinding {
+pub(super) fn binding(name: &str, secret: &str, host: String) -> EgressSecretBinding {
     EgressSecretBinding {
         env_name: name.into(),
         secret_value: env_value(secret),
@@ -26,14 +26,14 @@ fn binding(name: &str, secret: &str, host: String) -> EgressSecretBinding {
     }
 }
 
-fn allow_loopback() -> EgressProxyConfig {
+pub(super) fn allow_loopback() -> EgressProxyConfig {
     EgressProxyConfig {
         allow_private_destinations_for_allowed_hosts: true,
         ..EgressProxyConfig::default()
     }
 }
 
-fn proxy_auth(broker: &EgressProxyBroker) -> Result<String, io::Error> {
+pub(super) fn proxy_auth(broker: &EgressProxyBroker) -> Result<String, io::Error> {
     let env = broker.child_env_overrides();
     let user_password = env
         .get("HTTP_PROXY")
@@ -55,13 +55,13 @@ fn request(broker: &EgressProxyBroker, request: &[u8]) -> io::Result<Vec<u8>> {
     Ok(response)
 }
 
-fn listener() -> io::Result<TcpListener> {
+pub(super) fn listener() -> io::Result<TcpListener> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     listener.set_nonblocking(true)?;
     Ok(listener)
 }
 
-fn accept(listener: &TcpListener) -> io::Result<TcpStream> {
+pub(super) fn accept(listener: &TcpListener) -> io::Result<TcpStream> {
     let deadline = Instant::now() + WAIT;
     loop {
         match listener.accept() {
@@ -81,7 +81,7 @@ fn accept(listener: &TcpListener) -> io::Result<TcpStream> {
     }
 }
 
-fn receive(upstream: &TcpStream) -> io::Result<(String, Vec<u8>)> {
+pub(super) fn receive(upstream: impl Read) -> io::Result<(String, Vec<u8>)> {
     let stop = std::sync::atomic::AtomicBool::new(false);
     let mut input = Wire::new(upstream, &stop, Instant::now() + WAIT);
     let head = input.head()?;
@@ -258,8 +258,9 @@ fn allowed_connect_preserves_buffered_opaque_bytes_and_half_close() -> TestResul
     let upstream = server.local_addr()?;
     let broker = EgressProxyBroker::start(
         vec![binding("API_KEY", SECRET, upstream.to_string())],
-        allow_loopback(),
+        EgressProxyConfig { tls_mitm_enabled: false, ..allow_loopback() },
     )?;
+    assert!(broker.ephemeral_ca_bundle_path().is_none());
     let auth = proxy_auth(&broker)?;
     let backend = thread::spawn(move || -> io::Result<()> {
         let mut stream = accept(&server)?;
@@ -372,5 +373,23 @@ fn embedded_basic_credentials_are_substituted_and_redacted_as_a_unit() -> TestRe
     assert!(response.ends_with("\r\n\r\n[REDACTED:locket]"));
     assert!(!response.contains(&encoded_secret));
     assert!(matches!(&broker.shutdown()[..], [EgressEvent::Allowed { .. }]));
+    Ok(())
+}
+
+#[test]
+fn rejects_line_breaks_in_encoded_header_substitution() -> TestResult {
+    let server = listener()?;
+    let upstream = server.local_addr()?;
+    let broker = EgressProxyBroker::start(
+        vec![binding("API_KEY", "synthetic\r\nX-Injected: yes", upstream.to_string())],
+        allow_loopback(),
+    )?;
+    let auth = proxy_auth(&broker)?;
+    let token = BASE64.encode(broker.child_env_overrides()["API_KEY"].as_bytes());
+    let response = request(&broker, format!(
+        "GET http://{upstream}/ HTTP/1.1\r\nHost: {upstream}\r\nProxy-Authorization: Basic {auth}\r\nX-Key: {token}\r\n\r\n"
+    ).as_bytes())?;
+    assert!(response.starts_with(b"HTTP/1.1 400 "));
+    assert_eq!(server.accept().err().map(|error| error.kind()), Some(io::ErrorKind::WouldBlock));
     Ok(())
 }

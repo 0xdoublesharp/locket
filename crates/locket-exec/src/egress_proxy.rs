@@ -1,8 +1,9 @@
-//! Authenticated loopback broker for domain-scoped HTTP secret delivery.
+//! Authenticated loopback broker for domain-scoped HTTP and HTTPS secret delivery.
 
 use std::collections::BTreeSet;
 use std::io::{self, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -21,11 +22,13 @@ use crate::{EnvMap, StreamingRedactorConfig, env_value};
 mod destination;
 mod http;
 mod substitution;
+mod tls;
 mod wire;
 
 use destination::{Authority, HostRule, Resolver, permitted};
 use http::Request;
 use substitution::Placeholder;
+use tls::Tls;
 use wire::{SocketWriter, Wire};
 
 const SOCKET_POLL: Duration = Duration::from_millis(100);
@@ -35,7 +38,15 @@ const TUNNEL_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_CONNECTIONS: usize = 16;
 
 const PROXY_ENV: [&str; 4] = ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"];
-const NO_PROXY_ENV: [&str; 2] = ["NO_PROXY", "no_proxy"];
+const PROXY_BYPASS_ENV: [&str; 4] = ["ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"];
+const CA_BUNDLE_ENV: [&str; 6] = [
+    "SSL_CERT_FILE",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "NODE_EXTRA_CA_CERTS",
+    "CARGO_HTTP_CAINFO",
+    "GIT_SSL_CAINFO",
+];
 
 /// A child environment variable whose plaintext is scoped to approved HTTP destinations.
 ///
@@ -51,18 +62,27 @@ pub struct EgressSecretBinding {
 }
 
 /// Broker settings. Defaults block private destinations and unlisted CONNECT targets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EgressProxyConfig {
     /// Permit loopback addresses only when an exact host rule authorizes the destination.
     /// Other private and special-use addresses remain blocked.
     pub allow_private_destinations_for_allowed_hosts: bool,
     /// Require a binding's host rule to authorize each CONNECT tunnel.
     pub strict_connect_allowlist: bool,
+    /// Terminate HTTP/1.1 over CONNECT and verify upstream HTTPS. Enabled by default.
+    pub tls_mitm_enabled: bool,
+    /// Additional trusted upstream CA certificates in PEM format.
+    pub extra_upstream_root_pem: Option<Vec<u8>>,
 }
 
 impl Default for EgressProxyConfig {
     fn default() -> Self {
-        Self { allow_private_destinations_for_allowed_hosts: false, strict_connect_allowlist: true }
+        Self {
+            allow_private_destinations_for_allowed_hosts: false,
+            strict_connect_allowlist: true,
+            tls_mitm_enabled: true,
+            extra_upstream_root_pem: None,
+        }
     }
 }
 
@@ -120,13 +140,16 @@ pub enum EgressProxyError {
     /// The loopback listener or its worker could not be started.
     #[error("could not start egress proxy")]
     Start,
+    /// TLS trust, the ephemeral signing key, or the child CA bundle could not be initialized.
+    #[error("could not initialize egress proxy TLS")]
+    TlsSetup,
 }
 
 /// An authenticated, loopback-only HTTP proxy for a single execution session.
 ///
-/// Placeholder substitution applies to plaintext HTTP requests. CONNECT relays
-/// opaque bytes after checking the destination, so it cannot substitute or redact
-/// encrypted HTTPS traffic. The child environment configures proxy-aware clients.
+/// Placeholder substitution and response redaction apply to plaintext HTTP and
+/// intercepted HTTPS. Each intercepted connection serves one HTTP/1.1 request.
+/// Disabling TLS interception allows opaque CONNECT relaying to approved destinations.
 pub struct EgressProxyBroker {
     address: SocketAddr,
     env: EnvMap,
@@ -143,6 +166,7 @@ struct Binding {
 
 struct State {
     config: EgressProxyConfig,
+    tls: Option<Tls>,
     bindings: Vec<Binding>,
     auth: Zeroizing<Vec<u8>>,
     proxy_credentials: Arc<RedactionPatterns>,
@@ -158,10 +182,10 @@ impl EgressProxyBroker {
     /// # Errors
     ///
     /// Returns an error for invalid bindings, unavailable randomness, or an
-    /// operating-system failure while starting the broker.
+    /// error initializing trust, TLS credentials, or the listener.
     pub fn start(
         bindings: Vec<EgressSecretBinding>,
-        config: EgressProxyConfig,
+        mut config: EgressProxyConfig,
     ) -> Result<Self, EgressProxyError> {
         let listener = TcpListener::bind("127.0.0.1:0").map_err(|_| EgressProxyError::Start)?;
         listener.set_nonblocking(true).map_err(|_| EgressProxyError::Start)?;
@@ -174,9 +198,20 @@ impl EgressProxyBroker {
         for name in PROXY_ENV {
             env.insert(name.into(), proxy_url.clone());
         }
-        for name in NO_PROXY_ENV {
+        for name in PROXY_BYPASS_ENV {
             env.insert(name.into(), env_value(""));
         }
+        let extra_root = config.extra_upstream_root_pem.take();
+        let tls = if config.tls_mitm_enabled {
+            let tls = Tls::new(extra_root.as_deref()).map_err(|_| EgressProxyError::TlsSetup)?;
+            let bundle = tls.bundle_path().to_str().ok_or(EgressProxyError::TlsSetup)?;
+            for name in CA_BUNDLE_ENV {
+                env.insert(name.into(), env_value(bundle));
+            }
+            Some(tls)
+        } else {
+            None
+        };
 
         let bindings = prepare_bindings(bindings, &mut env)?;
         let response_secrets =
@@ -184,6 +219,7 @@ impl EgressProxyBroker {
         let credentials = [password, user_password].map(|value| (String::new(), value));
         let state = Arc::new(State {
             config,
+            tls,
             proxy_credentials: make_patterns(credentials.clone()),
             response_patterns: make_patterns(response_secrets.chain(credentials)),
             bindings,
@@ -210,6 +246,12 @@ impl EgressProxyBroker {
     #[must_use]
     pub fn child_env_overrides(&self) -> EnvMap {
         self.env.clone()
+    }
+
+    /// Returns the child trust bundle path for the lifetime of the TLS-enabled broker.
+    #[must_use]
+    pub fn ephemeral_ca_bundle_path(&self) -> Option<&Path> {
+        self.state.tls.as_ref().map(Tls::bundle_path)
     }
 
     /// Stops the broker, waits for managed connections, and returns its audit events.
@@ -359,13 +401,29 @@ impl State {
     }
 
     fn connect(&self, target: &Authority) -> Result<TcpStream, EgressBlockReason> {
+        let addresses = self.pin(target)?;
+        Resolver::connect_pinned(&addresses, &self.stopping)
+    }
+
+    fn pin(&self, target: &Authority) -> Result<Vec<SocketAddr>, EgressBlockReason> {
         let allow_loopback = self.config.allow_private_destinations_for_allowed_hosts
             && self
                 .bindings
                 .iter()
                 .flat_map(|binding| &binding.hosts)
                 .any(|rule| rule.allows_loopback(target));
-        self.resolver.connect(target, allow_loopback, &self.stopping)
+        self.resolver.pin(target, allow_loopback, &self.stopping)
+    }
+
+    fn guard_authority(&self, raw: &str, destination: &Authority) -> Result<(), Rejection> {
+        // Never include secrets, credentials, or placeholders in DNS queries.
+        self.guard_structure(raw.as_bytes(), destination)?;
+        if self.response_patterns.contains(raw.as_bytes())
+            || self.response_patterns.contains(destination.host.as_bytes())
+        {
+            return Err(EgressBlockReason::InvalidRequest.into());
+        }
+        Ok(())
     }
 
     fn audit(
@@ -374,6 +432,11 @@ impl State {
         binding: Option<usize>,
         reason: Option<EgressBlockReason>,
     ) {
+        // Shutdown interrupts pending socket I/O. Completed deliveries still
+        // belong in the audit trail during shutdown.
+        if reason.is_some() && self.stopping.load(Ordering::Relaxed) {
+            return;
+        }
         let safe_metadata = |text: &str| {
             if self.response_patterns.contains(text.as_bytes())
                 || self.contains_placeholder(text.as_bytes())
@@ -430,7 +493,7 @@ fn serve(client: &TcpStream, state: &State) {
 
 fn serve_request(
     state: &State,
-    input: &mut Wire<'_>,
+    input: &mut Wire<'_, &TcpStream>,
     output: &mut SocketWriter<'_>,
     target: &mut Option<Authority>,
 ) -> Result<(), Rejection> {
@@ -443,26 +506,17 @@ fn serve_request(
         return Err(ProxyAuthentication.into());
     }
 
-    let request = Request::parse_line(line).ok_or(InvalidRequest)?;
-    let authority = Authority::parse(request.authority, (!request.connect()).then_some(80))
-        .ok_or(InvalidRequest)?;
+    let request = Request::parse_line(line, false).ok_or(InvalidRequest)?;
+    let raw = request.authority.ok_or(InvalidRequest)?;
+    let authority =
+        Authority::parse(raw, (!request.connect()).then_some(80)).ok_or(InvalidRequest)?;
     let destination = target.insert(authority);
-    let host = wire::singleton(&headers, "Host")
-        .and_then(|host| std::str::from_utf8(host).ok())
-        .and_then(|host| Authority::parse(host, Some(if request.connect() { 443 } else { 80 })));
-    if host.as_ref() != Some(destination) {
+    if !http::host_matches(&headers, destination, if request.connect() { 443 } else { 80 }) {
         return Err(InvalidRequest.into());
     }
     let framing = request.framing(&headers).ok_or(InvalidRequest)?;
 
-    // A hostname is never a substitution location. Do not send a secret or
-    // credential in a DNS query, even if the caller put it into the authority.
-    state.guard_structure(request.authority.as_bytes(), destination)?;
-    if state.response_patterns.contains(request.authority.as_bytes())
-        || state.response_patterns.contains(destination.host.as_bytes())
-    {
-        return Err(InvalidRequest.into());
-    }
+    state.guard_authority(raw, destination)?;
     if let Ok(ip) = destination.host.parse()
         && !permitted(ip, true)
     {
@@ -471,16 +525,24 @@ fn serve_request(
 
     if request.connect() {
         state.check_connect(&request, &headers, destination)?;
+        if let Some(tls) = &state.tls {
+            return tls.serve(state, destination, input, output);
+        }
         let upstream = state.connect(destination)?;
         // Once the tunnel starts, a proxy error must not enter the byte stream.
         tunnel(input, output, &upstream);
         return Ok(());
     }
 
-    http::forward(state, &request, &headers, input, framing, destination, output)
+    let prepared = http::prepare(state, &request, &headers, input, framing, destination)?;
+    let upstream = state.connect(destination)?;
+    let deadline = Instant::now() + RESPONSE_TIMEOUT;
+    let mut upstream = Wire::new(&upstream, &state.stopping, deadline);
+    output.deadline = deadline;
+    http::forward(state, prepared, destination, false, &mut upstream, output)
 }
 
-fn tunnel(input: &mut Wire<'_>, output: &mut SocketWriter<'_>, upstream: &TcpStream) {
+fn tunnel(input: &mut Wire<'_, &TcpStream>, output: &mut SocketWriter<'_>, upstream: &TcpStream) {
     let deadline = Instant::now() + TUNNEL_TIMEOUT;
     output.deadline = deadline;
     input.set_deadline(deadline);

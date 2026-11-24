@@ -150,6 +150,9 @@ impl State {
                 return Err(invalid.into());
             }
             let secret = self.bindings[matched.binding].value.as_bytes();
+            if field == Field::Header && secret.iter().any(|byte| matches!(byte, b'\r' | b'\n')) {
+                return Err(invalid.into());
+            }
             let replacement = match matched.form {
                 Form::Raw if matched.percent_encoded || field == Field::Target => {
                     Form::Url.encode(secret)

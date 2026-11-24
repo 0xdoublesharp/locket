@@ -18,8 +18,13 @@ data-encoding = { workspace = true }
 locket-core = { version = "0.1.1", path = "../locket-core" }
 locket-scan = { version = "0.1.1", path = "../locket-scan" }
 rand = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true }
+rustls-native-certs = { workspace = true }
 subtle = "2.6"
+tempfile = { workspace = true }
 thiserror = { workspace = true }
+time = { workspace = true }
 zeroize = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]

@@ -158,25 +158,31 @@ impl Resolver {
         Err(EgressBlockReason::UpstreamUnavailable)
     }
 
-    pub(super) fn connect(
+    pub(super) fn pin(
         &self,
         target: &Authority,
         allow_loopback: bool,
         stopping: &AtomicBool,
-    ) -> Result<TcpStream, EgressBlockReason> {
+    ) -> Result<Vec<SocketAddr>, EgressBlockReason> {
         let addresses = self.resolve(target, stopping)?;
         // Refuse mixed public/private DNS answers too. Connect directly to one
         // of these exact socket addresses without performing another lookup.
         if addresses.iter().any(|address| !permitted(address.ip(), allow_loopback)) {
             return Err(EgressBlockReason::PrivateDestination);
         }
+        Ok(addresses)
+    }
 
+    pub(super) fn connect_pinned(
+        addresses: &[SocketAddr],
+        stopping: &AtomicBool,
+    ) -> Result<TcpStream, EgressBlockReason> {
         let deadline = Instant::now() + DNS_TIMEOUT;
         for address in addresses {
             if stopping.load(Ordering::Relaxed) || Instant::now() >= deadline {
                 break;
             }
-            if let Ok(socket) = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT) {
+            if let Ok(socket) = TcpStream::connect_timeout(address, CONNECT_TIMEOUT) {
                 super::configure_socket(&socket)
                     .map_err(|_| EgressBlockReason::UpstreamUnavailable)?;
                 return Ok(socket);

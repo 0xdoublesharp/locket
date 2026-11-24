@@ -63,10 +63,13 @@ libc = "0.2"
 passkey = "0.4"
 proptest = "1"
 rand = "0.10"
+rcgen = { version = "0.13.2", default-features = false, features = ["aws_lc_rs", "zeroize"] }
 regex = "1"
 rpassword = "7"
 rusqlite = { version = "0.41", default-features = false, features = ["bundled", "cache"] }
 rustix = { version = "1", features = ["process"] }
+rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls-native-certs = "0.8.5"
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"

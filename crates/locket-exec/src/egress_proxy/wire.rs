@@ -8,8 +8,8 @@ use zeroize::{Zeroize, Zeroizing};
 pub(super) const HEAD_LIMIT: usize = 64 * 1024;
 pub(super) const BODY_LIMIT: usize = 10 * 1024 * 1024;
 
-pub(super) struct Wire<'a> {
-    stream: &'a TcpStream,
+pub(super) struct Wire<'a, T> {
+    stream: T,
     stopping: &'a AtomicBool,
     deadline: Instant,
     buffer: Zeroizing<[u8; 8192]>,
@@ -17,8 +17,8 @@ pub(super) struct Wire<'a> {
     end: usize,
 }
 
-impl<'a> Wire<'a> {
-    pub(super) fn new(stream: &'a TcpStream, stopping: &'a AtomicBool, deadline: Instant) -> Self {
+impl<'a, T> Wire<'a, T> {
+    pub(super) fn new(stream: T, stopping: &'a AtomicBool, deadline: Instant) -> Self {
         Self { stream, stopping, deadline, buffer: Zeroizing::new([0; 8192]), start: 0, end: 0 }
     }
 
@@ -26,6 +26,12 @@ impl<'a> Wire<'a> {
         self.deadline = deadline;
     }
 
+    pub(super) const fn stream_mut(&mut self) -> &mut T {
+        &mut self.stream
+    }
+}
+
+impl<T: Read> Wire<'_, T> {
     fn fill(&mut self) -> io::Result<()> {
         if self.start == self.end {
             self.end = retry(self.stopping, self.deadline, || self.stream.read(&mut *self.buffer))?;
@@ -129,6 +135,29 @@ impl<'a> Wire<'a> {
     fn consume(&mut self, count: usize) {
         self.buffer[self.start..self.start + count].zeroize();
         self.start += count;
+    }
+}
+
+impl<T: Read> Read for Wire<'_, T> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        self.fill()?;
+        let count = output.len().min(self.end - self.start);
+        output[..count].copy_from_slice(&self.buffer[self.start..self.start + count]);
+        self.consume(count);
+        Ok(count)
+    }
+}
+
+impl<T: Write> Write for Wire<'_, T> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        retry(self.stopping, self.deadline, || self.stream.write(bytes))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        retry(self.stopping, self.deadline, || self.stream.flush())
     }
 }
 

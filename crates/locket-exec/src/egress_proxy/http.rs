@@ -1,44 +1,41 @@
 use std::collections::BTreeSet;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::sync::Arc;
-use std::time::Instant;
 
 use zeroize::Zeroizing;
 
 use super::destination::Authority;
 use super::substitution::Field;
-use super::wire::{self, BODY_LIMIT, Framing, HEAD_LIMIT, Header, SocketWriter, Wire};
-use super::{EgressBlockReason, RESPONSE_TIMEOUT, Rejection, State};
+use super::wire::{self, BODY_LIMIT, Framing, HEAD_LIMIT, Header, Wire};
+use super::{EgressBlockReason, Rejection, State};
 use crate::StreamingRedactor;
 use crate::streaming_redactor::RedactionPatterns;
 
 pub(super) struct Request<'a> {
     method: &'a str,
-    pub(super) authority: &'a str,
+    pub(super) authority: Option<&'a str>,
     path: &'a str,
 }
 
 impl<'a> Request<'a> {
-    pub(super) fn parse_line(line: &'a str) -> Option<Self> {
+    pub(super) fn parse_line(line: &'a str, tls: bool) -> Option<Self> {
         let (method, rest) = line.split_once(' ')?;
         let (target, version) = rest.split_once(' ')?;
         if version != "HTTP/1.1"
             || method.is_empty()
             || !method.bytes().all(wire::token_byte)
-            || !target.bytes().all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'#' | b'\\'))
+            || !valid_target(target)
         {
             return None;
         }
         if method == "CONNECT" {
-            return Some(Self { method, authority: target, path: "" });
+            return (!tls).then_some(Self { method, authority: Some(target), path: "" });
         }
-        let uri = target.get(7..)?;
-        if !target.get(..7)?.eq_ignore_ascii_case("http://") {
-            return None;
+        if tls && target.starts_with('/') {
+            return Some(Self { method, authority: None, path: target });
         }
-        let (authority, path) =
-            uri.find(['/', '?']).map_or((uri, ""), |position| uri.split_at(position));
-        Some(Self { method, authority, path })
+        let (authority, path) = split_target(strip_scheme(target, tls)?);
+        Some(Self { method, authority: Some(authority), path })
     }
 
     pub(super) fn connect(&self) -> bool {
@@ -58,6 +55,27 @@ impl<'a> Request<'a> {
             Framing::Length(_) | Framing::Chunked => None,
         }
     }
+}
+
+fn strip_scheme(target: &str, tls: bool) -> Option<&str> {
+    let scheme = if tls { "https://" } else { "http://" };
+    target.get(..scheme.len())?.eq_ignore_ascii_case(scheme).then(|| &target[scheme.len()..])
+}
+
+fn split_target(target: &str) -> (&str, &str) {
+    target.find(['/', '?', '#']).map_or((target, ""), |position| target.split_at(position))
+}
+
+fn valid_target(target: &str) -> bool {
+    !target.is_empty()
+        && target.bytes().all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'#' | b'\\'))
+}
+
+pub(super) fn host_matches(headers: &[Header<'_>], destination: &Authority, port: u16) -> bool {
+    let host = wire::singleton(headers, "Host")
+        .and_then(|host| std::str::from_utf8(host).ok())
+        .and_then(|host| Authority::parse(host, Some(port)));
+    host.as_ref() == Some(destination)
 }
 
 impl State {
@@ -92,15 +110,22 @@ fn is_identity(headers: &[Header<'_>]) -> bool {
         .all(|encoding| encoding.eq_ignore_ascii_case(b"identity"))
 }
 
-pub(super) fn forward(
+pub(super) struct PreparedRequest<'a> {
+    method: &'a str,
+    head: HeadBuffer,
+    body: Zeroizing<Vec<u8>>,
+    used: BTreeSet<usize>,
+    embedded_echoes: Vec<Zeroizing<Vec<u8>>>,
+}
+
+pub(super) fn prepare<'a>(
     state: &State,
-    request: &Request<'_>,
+    request: &Request<'a>,
     headers: &[Header<'_>],
-    client_input: &mut Wire<'_>,
+    client_input: &mut Wire<'_, impl Read>,
     body_len: usize,
     destination: &Authority,
-    client: &mut SocketWriter<'_>,
-) -> Result<(), Rejection> {
+) -> Result<PreparedRequest<'a>, Rejection> {
     let mut used = BTreeSet::new();
     let mut embedded_echoes = Vec::new();
     let mut head =
@@ -109,39 +134,45 @@ pub(super) fn forward(
     client_input
         .copy_body(Framing::Length(body_len), &mut *body)
         .map_err(|_| EgressBlockReason::InvalidRequest)?;
-    let body_rewritten = state.rewrite(&body, Field::Body, BODY_LIMIT, destination, &mut used)?;
-    let final_body = body_rewritten.as_deref().map_or(body.as_slice(), Vec::as_slice);
-    head.finish_request(final_body.len(), wire::named(headers, "Content-Length").next().is_some())
+    let body =
+        state.rewrite(&body, Field::Body, BODY_LIMIT, destination, &mut used)?.unwrap_or(body);
+    head.finish_request(body.len(), wire::named(headers, "Content-Length").next().is_some())
         .map_err(|_| EgressBlockReason::InvalidRequest)?;
+    Ok(PreparedRequest { method: request.method, head, body, used, embedded_echoes })
+}
 
-    let upstream = state.connect(destination)?;
-    let deadline = Instant::now() + RESPONSE_TIMEOUT;
-    let mut upstream_output =
-        SocketWriter { stream: &upstream, stopping: &state.stopping, deadline };
-    upstream_output
+pub(super) fn forward(
+    state: &State,
+    request: PreparedRequest<'_>,
+    destination: &Authority,
+    tls: bool,
+    upstream: &mut Wire<'_, impl Read + Write>,
+    client: &mut impl Write,
+) -> Result<(), Rejection> {
+    let PreparedRequest { method, head, body, used, embedded_echoes } = request;
+    upstream
         .write_all(&head.0)
-        .and_then(|()| upstream_output.write_all(final_body))
+        .and_then(|()| upstream.write_all(&body))
+        .and_then(|()| upstream.flush())
         .map_err(|_| EgressBlockReason::UpstreamUnavailable)?;
+    let redirect_origin = (tls && !used.is_empty()).then_some(destination);
     for index in used {
         state.audit(Some(destination), Some(index), None);
     }
     drop(head);
-    drop(body_rewritten);
     drop(body);
 
-    let mut input = Wire::new(&upstream, &state.stopping, deadline);
-    client.deadline = deadline;
-    let response = Response::read(&mut input, request.method)
-        .map_err(|_| EgressBlockReason::UpstreamUnavailable)?;
+    let response =
+        Response::read(upstream, method).map_err(|_| EgressBlockReason::UpstreamUnavailable)?;
     let response_patterns = state.response_patterns.with_additional_literals(embedded_echoes);
     let redacted_head = response
-        .redacted_head(&response_patterns)
+        .redacted_head(&response_patterns, redirect_origin)
         .map_err(|_| EgressBlockReason::UpstreamUnavailable)?;
 
     // A failure once the response starts must close the socket.
     let _ignored = client.write_all(&redacted_head.0).and_then(|()| {
         let mut redactor = StreamingRedactor::with_patterns(client, response_patterns);
-        input.copy_body(response.framing, &mut redactor)?;
+        upstream.copy_body(response.framing, &mut redactor)?;
         redactor.flush_final()
     });
     Ok(())
@@ -245,7 +276,8 @@ fn write_header(writer: &mut impl Write, name: &[u8], value: &[u8]) -> io::Resul
 pub(super) fn empty_response(writer: &mut impl Write, status: &[u8]) -> io::Result<()> {
     writer.write_all(b"HTTP/1.1 ")?;
     writer.write_all(status)?;
-    writer.write_all(b"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    writer.write_all(b"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
+    writer.flush()
 }
 
 struct Response {
@@ -255,7 +287,7 @@ struct Response {
 }
 
 impl Response {
-    fn read(input: &mut Wire<'_>, method: &str) -> io::Result<Self> {
+    fn read(input: &mut Wire<'_, impl Read>, method: &str) -> io::Result<Self> {
         // A small number of informational responses, such as 103 Early Hints,
         // may precede the final response. They are never sent to the child.
         for _ in 0..8 {
@@ -283,7 +315,11 @@ impl Response {
         Err(wire::invalid())
     }
 
-    fn redacted_head(&self, patterns: &Arc<RedactionPatterns>) -> io::Result<HeadBuffer> {
+    fn redacted_head(
+        &self,
+        patterns: &Arc<RedactionPatterns>,
+        redirect_origin: Option<&Authority>,
+    ) -> io::Result<HeadBuffer> {
         let (_, headers) = wire::parse_head(&self.head).ok_or_else(wire::invalid)?;
         let connection = wire::connection_options(&headers).ok_or_else(wire::invalid)?;
         // Generate the status line locally. Upstream reasons are arbitrary text.
@@ -295,6 +331,9 @@ impl Response {
                     .iter()
                     .any(|name| header.name.eq_ignore_ascii_case(name))
                 || patterns.contains(header.name.as_bytes())
+                || (header.name.eq_ignore_ascii_case("Location")
+                    && redirect_origin
+                        .is_some_and(|origin| !same_https_origin(header.value, origin)))
             {
                 continue;
             }
@@ -308,6 +347,20 @@ impl Response {
         head.write_all(b"\r\n")?;
         Ok(head)
     }
+}
+
+fn same_https_origin(location: &[u8], origin: &Authority) -> bool {
+    // Reject whitespace, backslashes, and non-ASCII bytes that URL parsers may
+    // normalize differently. Relative references retain the request origin.
+    if !location.iter().all(|byte| byte.is_ascii_graphic() && *byte != b'\\') {
+        return false;
+    }
+    let Ok(location) = std::str::from_utf8(location) else { return false };
+    if let Some(target) = location.strip_prefix("//").or_else(|| strip_scheme(location, true)) {
+        let (authority, _) = split_target(target);
+        return Authority::parse(authority, Some(443)).as_ref() == Some(origin);
+    }
+    !location.split(['/', '?', '#']).next().is_some_and(|segment| segment.contains(':'))
 }
 
 fn parse_status(line: &str) -> Option<u16> {
