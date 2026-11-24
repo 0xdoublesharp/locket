@@ -63,3 +63,34 @@ it('renders aliases without metadata clipboard or identifying filters in privacy
     view.unmount();
   }
 });
+
+it('marks the exact active environment and offers to switch to another in the same project', async () => {
+  vi.mocked(invoke).mockImplementation(createMockRuntime(new URLSearchParams()) as typeof invoke);
+  const onSwitchEnvironment = vi.fn();
+  const view = mountComponent(DiscoverSecrets, {
+    privacyMode: false,
+    knownProjectIds: ['acme-api'],
+    currentProjectId: 'acme-api',
+    currentProfileId: 'acme-api-dev',
+    onSwitchEnvironment,
+  });
+  try {
+    await settle();
+    const staging = findNode(view.root, (node) => node.text === 'Switch to staging');
+    expect(staging?.parent?.tag).toBe('button');
+    (staging?.parent?.props.onClick as () => void)();
+    expect(onSwitchEnvironment).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ project_id: 'acme-api', profile_id: 'acme-api-staging' }),
+    );
+    const active = findNode(view.root, (node) => node.props.class === 'discovery__current');
+    expect(active).toBeDefined();
+    expect(
+      findNode(
+        staging!.parent!.parent!.parent!,
+        (node) => node.props.class === 'discovery__current',
+      ),
+    ).toBeUndefined();
+  } finally {
+    view.unmount();
+  }
+});

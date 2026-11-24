@@ -18,6 +18,7 @@ interface Props {
   switching: boolean;
   errorMessage?: string | null;
   lastSwitchedAt?: string;
+  initialTarget?: Pick<ProfileEntry, 'name' | 'dangerous'> | null;
 }
 
 const props = defineProps<Props>();
@@ -29,8 +30,8 @@ const emit = defineEmits<{
   (event: 'select', entry: ProfileEntry): void;
 }>();
 
-const targetName = ref<string>('');
-const targetDangerous = ref<boolean>(false);
+const targetName = ref(props.initialTarget?.name ?? '');
+const targetDangerous = ref(props.initialTarget?.dangerous ?? false);
 const confirmation = ref<string>('');
 
 const entries = computed<ProfileEntry[]>(() => profileEntries(props.state));

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import AppIcon from './AppIcon.vue';
+import VariableSourceBadge from './VariableSourceBadge.vue';
 import { computed, onBeforeUnmount, ref, watch } from 'vue';
 import { desktopVariableReadiness } from '../agent/client';
 import type { VariableReadinessResponse } from '../agent/types';
@@ -16,11 +17,14 @@ const props = defineProps<{
   privacyMode?: boolean;
   refreshKey?: string;
   hideRefresh?: boolean;
+  collapsible?: boolean;
 }>();
 const emit = defineEmits<{ blocked: [value: boolean] }>();
 const loading = ref(false);
 const error = ref<string | null>(null);
 const response = ref<VariableReadinessResponse | null>(null);
+const openByDefault =
+  typeof window !== 'undefined' && window.matchMedia?.('(min-width: 960px)').matches;
 let requestSequence = 0;
 const summary = computed(() =>
   readinessSummary(
@@ -101,12 +105,15 @@ onBeforeUnmount(() => {
       <p role="status">{{ summary.label }}. Values are checked when the command starts.</p>
       <p v-if="!privacyMode" class="readiness__context">Environment: {{ response.profile_name }}</p>
       <p v-if="summary.unverified">External sources will be checked at launch.</p>
-      <section
+      <component
+        :is="collapsible ? 'details' : 'section'"
         v-for="(policy, policyIndex) in policies"
         :key="policyIndex"
+        :open="collapsible && policyIndex === 0 && openByDefault ? true : undefined"
         class="readiness__policy"
       >
-        <h4>{{ policy.name }}</h4>
+        <summary v-if="collapsible">{{ policy.name }}</summary>
+        <h4 v-else>{{ policy.name }}</h4>
         <p v-if="policy.error" role="alert">{{ policy.error }}</p>
         <p v-else-if="policy.rows.length === 0">This command requests no variables.</p>
         <ul v-else>
@@ -114,6 +121,7 @@ onBeforeUnmount(() => {
             <div class="readiness__row">
               <strong>{{ row.name }}</strong>
               <span class="readiness__metadata">
+                <VariableSourceBadge :source="row.source" />
                 {{ row.requirement }} · {{ row.classification }}
                 <span class="readiness__state" :data-state="row.state">
                   <AppIcon :name="row.state === 'ready' ? 'check' : 'alert'" :size="14" />
@@ -121,12 +129,11 @@ onBeforeUnmount(() => {
                 </span>
               </span>
             </div>
-            <p>{{ row.source }}</p>
             <p v-for="(guidance, index) in row.guidance" :key="index">{{ guidance }}</p>
             <p v-if="row.warning" class="readiness__warning" role="status">{{ row.warning }}</p>
           </li>
         </ul>
-      </section>
+      </component>
     </template>
   </section>
 </template>
@@ -167,7 +174,7 @@ li {
   border-top: 1px solid var(--border-subtle);
   padding-top: 0.35rem;
 }
-.readiness__row span,
+.readiness__metadata,
 .readiness__context {
   color: var(--text-secondary);
   font-size: 0.85rem;
@@ -207,5 +214,18 @@ li {
 }
 .readiness__policy {
   margin-top: 1rem;
+}
+details.readiness__policy {
+  margin-top: 0.4rem;
+  padding-inline: 0.65rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+}
+.readiness__policy summary {
+  padding-block: 0.45rem;
+  overflow-wrap: anywhere;
+  font-size: 0.85rem;
+  font-weight: 650;
+  cursor: pointer;
 }
 </style>

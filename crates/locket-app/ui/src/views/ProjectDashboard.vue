@@ -24,6 +24,7 @@ const props = defineProps<{
   loading: boolean;
   setupComplete: boolean;
   projectConnected: boolean;
+  activeProjectFolder?: boolean;
   connected: boolean;
   secretsLoaded: boolean;
   policiesLoaded: boolean;
@@ -62,6 +63,18 @@ const scan = computed(() =>
 const failedRuns = computed(
   () => props.sessions.filter((row) => row.state === 'failed' || row.state === 'stale').length,
 );
+const readiness = computed(() => ({
+  projectId: props.projectId,
+  profileId: props.profileId,
+  privacyMode: props.privacyMode,
+  hideRefresh: true,
+  collapsible: true,
+  refreshKey: [
+    refreshCount.value,
+    props.policies.map((row) => row.updatedAt).join('|'),
+    props.secrets.map((row) => row.id + row.currentVersion).join('|'),
+  ].join(':'),
+}));
 </script>
 <template>
   <section class="dashboard" aria-labelledby="project-dashboard-heading">
@@ -70,16 +83,23 @@ const failedRuns = computed(
         <h2 id="project-dashboard-heading">Project</h2>
         <p class="dashboard__context">{{ projectLabel }} / {{ profileLabel }}</p>
       </div>
-      <button
-        type="button"
-        class="companion-button icon-label"
-        :disabled="loading"
-        @click="refreshDashboard"
-      >
-        <AppIcon name="refresh" />
-        {{ loading ? 'Refreshing…' : 'Refresh' }}
-      </button>
+      <div class="dashboard__header-actions">
+        <slot name="search" />
+        <button
+          type="button"
+          class="companion-button icon-label"
+          :disabled="loading"
+          @click="refreshDashboard"
+        >
+          <AppIcon name="refresh" />
+          {{ loading ? 'Refreshing…' : 'Refresh' }}
+        </button>
+      </div>
     </header>
+    <p v-if="!startActions.length && connected" class="dashboard__setup-complete">
+      <AppIcon name="check" /> Setup complete
+    </p>
+    <VariableReadinessPanel v-if="activeProjectFolder" v-bind="readiness" />
     <slot name="connection" />
     <section
       v-if="startActions.length"
@@ -105,22 +125,7 @@ const failedRuns = computed(
         </li>
       </ol>
     </section>
-    <p v-else-if="connected" class="dashboard__setup-complete">
-      <AppIcon name="check" /> Setup complete
-    </p>
-    <VariableReadinessPanel
-      :project-id="projectId"
-      :profile-id="profileId"
-      :privacy-mode="privacyMode"
-      :hide-refresh="true"
-      :refresh-key="
-        refreshCount +
-        ':' +
-        policies.map((row) => row.updatedAt).join('|') +
-        ':' +
-        secrets.map((row) => row.id + row.currentVersion).join('|')
-      "
-    />
+    <VariableReadinessPanel v-if="!activeProjectFolder" v-bind="readiness" />
     <section class="dashboard__status" aria-label="Agent status">
       <div class="dashboard__lock">
         <span class="dashboard__lock-label">Vault</span><strong>{{ lockLabel }}</strong>
@@ -215,7 +220,9 @@ const failedRuns = computed(
   min-width: 0;
   overflow-wrap: anywhere;
 }
-.dashboard__header > button {
+.dashboard__header .dashboard__header-actions {
+  display: flex;
+  gap: 0.5rem;
   flex: none;
 }
 

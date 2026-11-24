@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import AppIcon from '../components/AppIcon.vue';
-import { onMounted, ref, watch } from 'vue';
+import { computed, onMounted, ref, watch } from 'vue';
 
 import {
   desktopActionsAvailable,
@@ -70,6 +70,15 @@ const launchMessage = ref('');
 const mcpJson = ref(
   JSON.stringify({ mcpServers: { locket: { command: 'locket', args: ['mcp'] } } }, null, 2),
 );
+const mcpTokens = computed(() => {
+  const parts = mcpJson.value.split(/("(?:[^"\\]|\\.)*"|[[\]{},:])/u);
+  return parts.map((text, index) => {
+    if (index % 2 === 0) return { text, kind: 'plain' };
+    if (!text.startsWith('"')) return { text, kind: 'punctuation' };
+    const isKey = !parts[index + 1]?.trim() && parts[index + 2] === ':';
+    return { text, kind: isKey ? 'key' : 'string' };
+  });
+});
 const mcpMessage = ref('');
 
 onMounted(async () => {
@@ -122,19 +131,6 @@ async function copyMcp(): Promise<void> {
 
     <div class="settings__columns">
       <div class="settings__stack">
-        <section class="settings__card" aria-labelledby="settings-privacy">
-          <h3 id="settings-privacy"><AppIcon name="eye" /> Privacy</h3>
-          <label class="settings__switch">
-            <input
-              type="checkbox"
-              :checked="state.privacyRedactNames"
-              :disabled="loading || (projectConnected && !canEditVault)"
-              @change="toggle($event, (checked) => ({ privacy_redact_names: checked }))"
-            />
-            <span>Redact names with local aliases</span>
-          </label>
-          <p>Uses aliases in project, variable, and activity views and the menu bar.</p>
-        </section>
         <section class="settings__card" aria-labelledby="settings-session">
           <h3 id="settings-session"><AppIcon name="clock" /> Vault session</h3>
           <p>Set how long an unlock stays valid.</p>
@@ -182,30 +178,6 @@ async function copyMcp(): Promise<void> {
             }}
           </p>
         </section>
-        <section class="settings__card" aria-labelledby="settings-environment">
-          <div class="settings__actions">
-            <h3 id="settings-environment"><AppIcon name="alert" /> Environment safety</h3>
-            <span v-if="state.dangerousProfileFlag" class="settings__warning">Dangerous</span>
-          </div>
-          <label class="settings__switch">
-            <input
-              type="checkbox"
-              :checked="state.dangerousProfileFlag"
-              :disabled="loading || !canEditVault || !state.dangerousProfile"
-              @change="toggle($event, (checked) => ({ dangerous_profile: checked }))"
-            />
-            <span>
-              Mark
-              <strong>{{
-                state.dangerousProfile?.profile_label ?? 'the active environment'
-              }}</strong>
-              as dangerous
-            </span>
-          </label>
-          <p>Dangerous environments require confirmation for sensitive actions.</p>
-        </section>
-      </div>
-      <div class="settings__stack">
         <section class="settings__card" aria-labelledby="settings-verification">
           <h3 id="settings-verification">
             <AppIcon name="fingerprint" /> Touch ID &amp; user verification
@@ -224,6 +196,48 @@ async function copyMcp(): Promise<void> {
             />
             <span>{{ option.label }}</span>
           </label>
+        </section>
+        <section class="settings__card" aria-labelledby="settings-environment">
+          <div class="settings__actions">
+            <h3 id="settings-environment"><AppIcon name="alert" /> Environment safety</h3>
+            <span v-if="state.dangerousProfileFlag" class="settings__warning">Dangerous</span>
+          </div>
+          <div class="settings__risk">
+            <label class="settings__switch">
+              <input
+                type="checkbox"
+                :checked="state.dangerousProfileFlag"
+                :disabled="loading || !canEditVault || !state.dangerousProfile"
+                aria-describedby="settings-environment-risk"
+                @change="toggle($event, (checked) => ({ dangerous_profile: checked }))"
+              />
+              <span>
+                Mark
+                <strong>{{
+                  state.dangerousProfile?.profile_label ?? 'the active environment'
+                }}</strong>
+                as dangerous
+              </span>
+            </label>
+            <p id="settings-environment-risk">
+              Dangerous environments require confirmation for sensitive actions.
+            </p>
+          </div>
+        </section>
+      </div>
+      <div class="settings__stack">
+        <section class="settings__card" aria-labelledby="settings-privacy">
+          <h3 id="settings-privacy"><AppIcon name="eye" /> Privacy</h3>
+          <label class="settings__switch">
+            <input
+              type="checkbox"
+              :checked="state.privacyRedactNames"
+              :disabled="loading || (projectConnected && !canEditVault)"
+              @change="toggle($event, (checked) => ({ privacy_redact_names: checked }))"
+            />
+            <span>Redact names with local aliases</span>
+          </label>
+          <p>Uses aliases in project, variable, and activity views and the menu bar.</p>
         </section>
         <section class="settings__card" aria-labelledby="settings-companion">
           <h3 id="settings-companion"><AppIcon name="laptop" /> macOS companion</h3>
@@ -257,7 +271,7 @@ async function copyMcp(): Promise<void> {
             Paste this JSON into your MCP client settings. Locket MCP never exposes plaintext
             reveals.
           </p>
-          <pre>{{ mcpJson }}</pre>
+          <pre><code><span v-for="(token, index) in mcpTokens" :key="index" :data-syntax="token.kind">{{ token.text }}</span></code></pre>
           <p v-if="mcpMessage" role="status">{{ mcpMessage }}</p>
         </section>
       </div>
@@ -309,6 +323,9 @@ async function copyMcp(): Promise<void> {
 
 .settings h3 .app-icon {
   color: var(--info);
+}
+#settings-environment .app-icon {
+  color: var(--warn);
 }
 
 .settings p {
@@ -391,6 +408,17 @@ async function copyMcp(): Promise<void> {
   font-size: 0.75rem;
   font-weight: 650;
 }
+.settings__risk {
+  display: grid;
+  gap: 0.35rem;
+  padding: 0.65rem 0.75rem;
+  border: 1px solid color-mix(in srgb, var(--warn), transparent 62%);
+  border-radius: var(--radius-sm);
+  background: var(--warn-soft);
+}
+.settings__risk p {
+  color: var(--warn);
+}
 
 .settings .settings__error {
   color: var(--danger);
@@ -406,6 +434,15 @@ async function copyMcp(): Promise<void> {
   background: var(--bg-subtle);
   border-radius: var(--radius-sm);
   font: 0.8125rem/1.5 var(--font-mono);
+}
+.settings [data-syntax='key'] {
+  color: var(--info);
+}
+.settings [data-syntax='string'] {
+  color: var(--success);
+}
+.settings [data-syntax='punctuation'] {
+  color: var(--text-muted);
 }
 
 @media (max-width: 767px) {

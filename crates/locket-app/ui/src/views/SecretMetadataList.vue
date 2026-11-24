@@ -1,13 +1,14 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, nextTick, ref } from 'vue';
 
 import AppIcon from '../components/AppIcon.vue';
 import AgentUnavailableBanner from '../components/AgentUnavailableBanner.vue';
 import type { AgentClientError } from '../agent/types';
 import { formatTime } from '../utils/formatTime';
 import CopyReference from '../components/CopyReference.vue';
+import VariableSourceBadge from '../components/VariableSourceBadge.vue';
 import { secretReference } from '../secret/reference';
-import type { SecretRowMeta, VersionHistoryRow } from '../types/views';
+import type { SecretDeprecationWarning, SecretRowMeta, VersionHistoryRow } from '../types/views';
 import { defaultSecretFilter, filterSecretRows, type SecretFilterState } from '../secret/filter';
 
 interface Props {
@@ -43,15 +44,44 @@ const inspectedRow = computed(() => props.rows.find(({ id }) => id === inspected
 const inspectedReference = computed(() =>
   secretReference(props.profileName, inspectedRow.value?.name ?? '', props.privacyMode),
 );
-const inspectedGrace = computed(() =>
-  props.versions.filter(
-    (version) =>
-      version.secretName === inspectedRow.value?.name &&
-      version.source === inspectedRow.value?.source &&
+const inspectedGrace = computed(() => {
+  const row = inspectedRow.value;
+  if (!row) return [];
+  const warnings = row.deprecatedReferenceWarnings ?? [];
+  const grace = new Map<number, { until?: string; expired: boolean; references: string[] }>();
+  for (const version of props.versions) {
+    if (
+      version.secretName === row.name &&
+      version.source === row.source &&
       version.state === 'deprecated' &&
-      version.graceUntil,
-  ),
-);
+      version.graceUntil
+    ) {
+      grace.set(version.version, {
+        until: version.graceUntil,
+        expired: !version.pinnedReferenceEligible || Date.parse(version.graceUntil) <= Date.now(),
+        references: [],
+      });
+    }
+  }
+  for (const warning of warnings) {
+    const entry = grace.get(warning.version) ?? {
+      until: warning.graceUntil,
+      expired: warning.status === 'expired-grace',
+      references: [],
+    };
+    entry.references.push(referenceCountLabel(warning));
+    grace.set(warning.version, entry);
+  }
+  return Array.from(grace, ([version, entry]) => ({ version, ...entry }));
+});
+
+async function toggleDetails(row: SecretRowMeta, event: MouseEvent): Promise<void> {
+  const button = event.currentTarget as HTMLButtonElement;
+  inspectedId.value = row.id === inspectedId.value ? null : row.id;
+  if (inspectedId.value !== row.id || !window.matchMedia('(max-width: 959px)').matches) return;
+  await nextTick();
+  button.closest('li')?.querySelector('.variable-inspector')?.scrollIntoView({ block: 'nearest' });
+}
 
 const metadataFilteredRows = computed<SecretRowMeta[]>(() =>
   filterSecretRows(props.rows, filterState.value),
@@ -69,7 +99,6 @@ const filtersOpen = ref(false);
 const filterCount = computed(
   () => Object.values(filterState.value).filter((value) => value !== 'all').length,
 );
-const sourceIcons = { team: 'cloud', 'user-local': 'user', 'machine-local': 'laptop' } as const;
 
 function clearFilters(): void {
   filterState.value = defaultSecretFilter();
@@ -90,19 +119,6 @@ function displayName(row: SecretRowMeta): string {
   return row.name;
 }
 
-function sourceLabel(source: SecretRowMeta['source']): string {
-  switch (source) {
-    case 'team':
-      return 'Shared';
-    case 'user-local':
-      return 'My override';
-    case 'machine-local':
-      return 'This machine';
-    default:
-      return source;
-  }
-}
-
 function searchText(row: SecretRowMeta): string {
   return [
     displayName(row),
@@ -119,18 +135,13 @@ function searchText(row: SecretRowMeta): string {
     .toLowerCase();
 }
 
-function warningLabel(
-  warning: NonNullable<SecretRowMeta['deprecatedReferenceWarnings']>[number],
-): string {
-  const status = warning.status === 'expired-grace' ? 'expired grace' : 'active grace';
+function referenceCountLabel(warning: SecretDeprecationWarning): string {
   const surface = warning.surface === 'command-preview' ? 'command preview' : 'policy';
-  const count = warning.referenceCount > 1 ? ` (${warning.referenceCount.toString()})` : '';
-  return `v${warning.version.toString()} ${status} ${surface}${count}`;
+  const count = warning.referenceCount;
+  return `${count} ${surface} ${count === 1 ? 'reference' : 'references'}`;
 }
 
-function warningSearchText(
-  warning: NonNullable<SecretRowMeta['deprecatedReferenceWarnings']>[number],
-): string {
+function warningSearchText(warning: SecretDeprecationWarning): string {
   return [
     `v${warning.version}`,
     warning.status,
@@ -141,14 +152,11 @@ function warningSearchText(
 
 function graceDetails(row: SecretRowMeta): string {
   return (row.deprecatedReferenceWarnings ?? [])
-    .map((warning) =>
-      [
-        warningLabel(warning),
-        warning.graceUntil && `Until ${formatTime(warning.graceUntil)} (${warning.graceUntil})`,
-      ]
-        .filter(Boolean)
-        .join(' · '),
-    )
+    .map((warning) => {
+      const until = warning.graceUntil && formatTime(warning.graceUntil, 'utc');
+      const status = warning.status === 'expired-grace' ? 'no longer accepted' : 'still accepted';
+      return `v${warning.version} ${status}${until ? ` (${until})` : ''} · ${referenceCountLabel(warning)}`;
+    })
     .join('\n');
 }
 </script>
@@ -157,10 +165,10 @@ function graceDetails(row: SecretRowMeta): string {
   <section class="variables" aria-labelledby="secret-metadata-list-heading">
     <header class="variables__header">
       <h2 id="secret-metadata-list-heading">
-        <template v-if="metadataLoaded">
+        <template v-if="metadataLoaded && !loadError">
           {{ rows.length }} {{ rows.length === 1 ? 'variable' : 'variables' }} · {{ profileLabel }}
         </template>
-        <template v-else>Variable metadata</template>
+        <template v-else>Variables · {{ profileLabel }}</template>
       </h2>
       <div class="variables__actions">
         <span v-if="lastRefreshedAt && !loadError" class="variables__updated">
@@ -230,22 +238,31 @@ function graceDetails(row: SecretRowMeta): string {
           <AppIcon name="chevron-down" :size="13" />
         </button>
         <div id="variable-filters" class="variables__filters" :class="{ 'is-open': filtersOpen }">
-          <select v-model="filterState.source" aria-label="Filter by source">
-            <option value="all">All sources</option>
-            <option value="team">Shared</option>
-            <option value="user-local">My override</option>
-            <option value="machine-local">This machine</option>
-          </select>
-          <select v-model="filterState.required" aria-label="Filter by requirement">
-            <option value="all">Any requirement</option>
-            <option value="required">Required</option>
-            <option value="optional">Optional</option>
-          </select>
-          <select v-model="filterState.deprecation" aria-label="Filter by status">
-            <option value="all">Any status</option>
-            <option value="current">Current</option>
-            <option value="deprecated">Deprecated grace</option>
-          </select>
+          <label class="variables__select">
+            <select v-model="filterState.source" aria-label="Filter by source">
+              <option value="all">All sources</option>
+              <option value="team">Shared</option>
+              <option value="user-local">My override</option>
+              <option value="machine-local">This machine</option>
+            </select>
+            <AppIcon name="chevron-down" :size="13" />
+          </label>
+          <label class="variables__select">
+            <select v-model="filterState.required" aria-label="Filter by requirement">
+              <option value="all">Any requirement</option>
+              <option value="required">Required</option>
+              <option value="optional">Optional</option>
+            </select>
+            <AppIcon name="chevron-down" :size="13" />
+          </label>
+          <label class="variables__select">
+            <select v-model="filterState.deprecation" aria-label="Filter by status">
+              <option value="all">Any status</option>
+              <option value="current">Current</option>
+              <option value="deprecated">Deprecated grace</option>
+            </select>
+            <AppIcon name="chevron-down" :size="13" />
+          </label>
           <button
             v-if="filterCount || searchQuery"
             class="companion-button"
@@ -271,21 +288,30 @@ function graceDetails(row: SecretRowMeta): string {
           class="variables__row"
           :class="{ 'variables__row--inspected': row.id === inspectedId }"
         >
-          <button
-            type="button"
-            class="variables__name"
-            :title="displayName(row)"
-            :aria-label="`Open metadata for ${displayName(row)}`"
-            @click="emit('select', row)"
-          >
-            {{ displayName(row) }}
-          </button>
+          <div class="variables__row-header">
+            <button
+              type="button"
+              class="variables__name"
+              :title="displayName(row)"
+              :aria-label="`Open metadata for ${displayName(row)}`"
+              @click="emit('select', row)"
+            >
+              {{ displayName(row) }}
+            </button>
+            <button
+              class="companion-button icon-label variables__details-button"
+              type="button"
+              :aria-label="`Details for ${displayName(row)}`"
+              :aria-expanded="row.id === inspectedId"
+              :aria-controls="row.id === inspectedId ? 'variable-inspector' : undefined"
+              @click="toggleDetails(row, $event)"
+            >
+              Details <AppIcon name="chevron-down" :size="12" />
+            </button>
+          </div>
 
           <div class="variables__badges">
-            <span :class="['variable-badge', `variable-badge--${row.source}`]">
-              <AppIcon :name="sourceIcons[row.source]" :size="14" />
-              {{ sourceLabel(row.source) }}
-            </span>
+            <VariableSourceBadge :source="row.source" />
             <span
               v-if="row.required || row.optional"
               class="variable-badge"
@@ -336,45 +362,41 @@ function graceDetails(row: SecretRowMeta): string {
 
           <div class="variables__row-actions">
             <CopyReference :reference="secretReference(profileName, row.name, privacyMode)" />
-            <button
+            <div
               v-if="canAccessValues"
-              class="companion-button icon-label"
-              type="button"
-              :aria-description="copyVerification ? 'System verification required' : undefined"
-              :title="
-                copyVerification ? 'Copy value with Touch ID or system verification' : 'Copy value'
-              "
-              @click="emit('copyValue', row)"
+              class="variables__sensitive"
+              role="group"
+              aria-label="Variable value"
             >
-              <AppIcon name="copy" />
-              Copy value
-              <AppIcon
-                v-if="copyVerification"
-                class="variables__verification"
-                name="fingerprint"
-                :size="13"
-              />
-            </button>
-            <button
-              v-if="canAccessValues"
-              class="companion-button icon-label"
-              type="button"
-              @click="emit('revealValue', row)"
-            >
-              <AppIcon name="eye" />
-              Reveal
-            </button>
-            <button
-              class="companion-button icon-label variables__details-button"
-              type="button"
-              :aria-label="`Details for ${displayName(row)}`"
-              :aria-expanded="row.id === inspectedId"
-              :aria-controls="row.id === inspectedId ? 'variable-inspector' : undefined"
-              @click="inspectedId = row.id === inspectedId ? null : row.id"
-            >
-              Details
-              <AppIcon name="chevron-down" :size="12" />
-            </button>
+              <button
+                class="companion-button icon-label"
+                type="button"
+                :aria-description="copyVerification ? 'System verification required' : undefined"
+                :title="
+                  copyVerification
+                    ? 'Copy value with Touch ID or system verification'
+                    : 'Copy value'
+                "
+                @click="emit('copyValue', row)"
+              >
+                <AppIcon name="copy" />
+                Copy value
+                <AppIcon
+                  v-if="copyVerification"
+                  class="variables__verification"
+                  name="fingerprint"
+                  :size="13"
+                />
+              </button>
+              <button
+                class="companion-button icon-label"
+                type="button"
+                @click="emit('revealValue', row)"
+              >
+                <AppIcon name="eye" />
+                Reveal
+              </button>
+            </div>
           </div>
           <section
             v-if="row.id === inspectedId"
@@ -383,18 +405,14 @@ function graceDetails(row: SecretRowMeta): string {
             aria-labelledby="variable-inspector-title"
           >
             <header class="variable-inspector__header">
-              <h3 id="variable-inspector-title">{{ displayName(row) }}</h3>
-              <div class="variables__row-actions">
-                <CopyReference :reference="inspectedReference" />
-                <button
-                  class="companion-button icon-label"
-                  type="button"
-                  @click="emit('select', row)"
-                >
-                  <AppIcon name="clock" />
-                  Variable history
-                </button>
-              </div>
+              <h3 id="variable-inspector-title">Variable details</h3>
+              <button
+                class="companion-button icon-label"
+                type="button"
+                @click="emit('select', row)"
+              >
+                <AppIcon name="clock" /> Version history
+              </button>
             </header>
             <dl class="variable-inspector__metadata">
               <div v-if="inspectedReference" class="variable-inspector__reference">
@@ -404,15 +422,19 @@ function graceDetails(row: SecretRowMeta): string {
                 </dd>
               </div>
               <div>
-                <dt>Created (UTC)</dt>
+                <dt>Created</dt>
                 <dd>
-                  <time :datetime="row.createdAt">{{ row.createdAt }}</time>
+                  <time :datetime="row.createdAt" :title="row.createdAt">{{
+                    formatTime(row.createdAt, 'utc')
+                  }}</time>
                 </dd>
               </div>
               <div>
-                <dt>Rotated (UTC)</dt>
+                <dt>Rotated</dt>
                 <dd>
-                  <time v-if="row.rotatedAt" :datetime="row.rotatedAt">{{ row.rotatedAt }}</time>
+                  <time v-if="row.rotatedAt" :datetime="row.rotatedAt" :title="row.rotatedAt">{{
+                    formatTime(row.rotatedAt, 'utc')
+                  }}</time>
                   <span v-else>Never</span>
                 </dd>
               </div>
@@ -425,21 +447,22 @@ function graceDetails(row: SecretRowMeta): string {
                 <dd>{{ row.tags?.join(' · ') || 'None' }}</dd>
               </div>
             </dl>
-            <div
-              v-if="inspectedGrace.length || row.deprecatedReferenceWarnings?.length"
-              class="variable-inspector__grace"
-            >
-              <h4><AppIcon name="alert" :size="14" /> Deprecation grace</h4>
+            <div v-if="inspectedGrace.length" class="variable-inspector__grace">
+              <h4>Grace periods</h4>
               <ul>
-                <li v-for="version in inspectedGrace" :key="version.id">
-                  v{{ version.version }} · Grace expiry
-                  <time :datetime="version.graceUntil">{{ version.graceUntil }}</time>
-                </li>
-                <li
-                  v-for="warning in row.deprecatedReferenceWarnings"
-                  :key="`${warning.version}:${warning.surface}`"
-                >
-                  {{ warningLabel(warning) }}
+                <li v-for="entry in inspectedGrace" :key="entry.version">
+                  <AppIcon :name="entry.expired ? 'alert' : 'clock'" :size="14" />
+                  <span>
+                    v{{ entry.version }} {{ entry.expired ? 'no longer accepted' : 'still accepted'
+                    }}<template v-if="entry.until">
+                      {{ entry.expired ? ' since ' : ' until ' }}
+                      <time :datetime="entry.until" :title="entry.until">{{
+                        formatTime(entry.until, 'utc-date')
+                      }}</time></template
+                    ><template v-if="entry.references.length">
+                      · {{ entry.references.join(' · ') }}</template
+                    >
+                  </span>
                 </li>
               </ul>
             </div>
@@ -520,8 +543,21 @@ function graceDetails(row: SecretRowMeta): string {
   width: 100%;
   padding: 0.35rem 0.65rem 0.35rem 1.95rem;
 }
-.variables__filters select {
-  padding: 0.3rem;
+.variables__select {
+  position: relative;
+  display: inline-flex;
+}
+.variables__select select {
+  appearance: none;
+  padding: 0.3rem 1.6rem 0.3rem 0.55rem;
+}
+.variables__select .app-icon {
+  position: absolute;
+  inset-inline-end: 0.5rem;
+  top: 50%;
+  transform: translateY(-50%);
+  pointer-events: none;
+  color: var(--text-secondary);
 }
 .variables__filter-toggle {
   display: none;
@@ -545,7 +581,7 @@ function graceDetails(row: SecretRowMeta): string {
 }
 .variables__row {
   display: grid;
-  grid-template-columns: minmax(6rem, 1fr) minmax(7rem, 1.35fr) minmax(0, 0.8fr) 6.25rem auto;
+  grid-template-columns: minmax(10.5rem, 1.25fr) minmax(8rem, 1.25fr) minmax(0, 0.8fr) 6.25rem auto;
   align-items: center;
   gap: 0.6rem;
   min-height: 3.1rem;
@@ -564,7 +600,15 @@ function graceDetails(row: SecretRowMeta): string {
 .variables__row--inspected {
   background: color-mix(in srgb, var(--bg-surface), var(--bg-subtle) 50%);
 }
+.variables__row-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  min-width: 0;
+  gap: 0.35rem;
+}
 .variables__name {
+  min-width: 0;
   overflow: hidden;
   padding: 0.25rem 0;
   border: 0;
@@ -596,20 +640,13 @@ function graceDetails(row: SecretRowMeta): string {
   font-size: 0.7rem;
   white-space: nowrap;
 }
-.variable-badge--team {
-  color: var(--info);
-  background: var(--info-soft);
-}
-.variable-badge--user-local {
-  color: var(--success);
-  background: var(--success-soft);
-}
 .variable-badge--grace {
   color: var(--warn);
   background: var(--warn-soft);
 }
 .variable-badge--required {
-  background: color-mix(in srgb, var(--accent-soft), var(--bg-subtle) 45%);
+  box-shadow: inset 0 0 0 1px var(--border-required);
+  background: var(--accent-soft);
   color: var(--text-primary);
 }
 .variable-badge--optional {
@@ -627,18 +664,40 @@ function graceDetails(row: SecretRowMeta): string {
 }
 .variables__row-actions {
   justify-content: end;
+  flex-wrap: nowrap;
 }
-.variables__row-actions :deep(.companion-button) {
-  min-height: 1.875rem;
-  padding-inline: 0.4rem;
+.variables__sensitive {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.125rem;
+  padding: 0.125rem;
+  border-radius: var(--radius-sm);
+  background: var(--bg-app);
+}
+.variables__row-actions :deep(.companion-button),
+.variables__row-header .variables__details-button {
+  min-height: 2rem;
+  padding: 0.2rem 0.4rem;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-secondary);
   font-size: 0.75rem;
   white-space: nowrap;
+}
+.variables__row-actions :deep(.companion-button:hover:not(:disabled)),
+.variables__row-header .variables__details-button:hover {
+  border-color: transparent;
+  background: var(--bg-subtle);
+  color: var(--text-primary);
+}
+.variables__row-actions :deep(.companion-button:focus-visible),
+.variables__details-button:focus-visible {
+  outline-offset: -2px;
 }
 .variables__verification {
   color: var(--text-secondary);
 }
-.variables__details-button[aria-expanded='true'] {
-  border-color: var(--accent);
+.variables__row-header .variables__details-button[aria-expanded='true'] {
   background: var(--accent-soft);
   color: var(--accent);
 }
@@ -654,9 +713,10 @@ function graceDetails(row: SecretRowMeta): string {
   padding: 0.75rem;
   border: 1px solid var(--border-subtle);
   border-inline-start: 2px solid var(--accent);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-md);
   background: var(--bg-app);
   overflow-wrap: anywhere;
+  scroll-margin-block: 0.75rem;
 }
 .variable-inspector__header {
   display: flex;
@@ -672,11 +732,11 @@ function graceDetails(row: SecretRowMeta): string {
   margin: 0;
 }
 .variable-inspector h3 {
-  font: 650 0.875rem var(--font-mono);
+  font-size: 0.875rem;
 }
 .variable-inspector__metadata {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 13rem), 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 0.65rem 1rem;
   font-size: 0.8rem;
 }
@@ -689,19 +749,34 @@ function graceDetails(row: SecretRowMeta): string {
   font-size: 0.75rem;
 }
 .variable-inspector time {
-  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
 }
 .variable-inspector__grace {
   font-size: 0.8rem;
 }
 .variable-inspector__grace h4 {
-  color: var(--warn);
+  color: var(--text-secondary);
 }
 .variable-inspector__grace ul {
-  margin: 0.25rem 0 0;
-  padding-inline-start: 1.15rem;
+  display: grid;
+  gap: 0.35rem;
+  margin: 0.35rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+.variable-inspector__grace li {
+  display: flex;
+  gap: 0.4rem;
+  align-items: baseline;
+}
+.variable-inspector__grace .app-icon {
+  align-self: start;
+  color: var(--warn);
 }
 @media (max-width: 959px) {
+  .variable-inspector__metadata {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
   .variables__list {
     display: grid;
     gap: 0.5rem;
@@ -709,26 +784,40 @@ function graceDetails(row: SecretRowMeta): string {
     background: transparent;
   }
   .variables__list .variables__row {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
-    gap: 0.45rem 0.75rem;
-    padding: 0.65rem 0.75rem;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 0.35rem 0.65rem;
+    padding: 0.35rem 0.65rem;
     border: 1px solid var(--border-subtle);
     border-radius: var(--radius-md);
     background: var(--bg-surface);
   }
-  .variables__name,
-  .variables__badges {
+  .variables__row-header {
     grid-column: 1 / -1;
   }
   .variables__name {
     white-space: normal;
     overflow-wrap: anywhere;
   }
-  .variables__row-actions :deep(.companion-button) {
-    min-height: 2rem;
+  .variables__attribution:empty {
+    display: none;
+  }
+  .variables__attribution {
+    grid-column: 1 / -1;
+  }
+  .variables__dates {
+    grid-column: 2;
+    grid-row: 2;
+    text-align: end;
+  }
+  .variables__row > .variables__row-actions {
+    grid-column: 1 / -1;
+    justify-content: start;
   }
 }
 @media (max-width: 767px) {
+  .variables {
+    gap: 0.55rem;
+  }
   .variables__updated {
     display: none;
   }
@@ -746,20 +835,40 @@ function graceDetails(row: SecretRowMeta): string {
   .variables__filters.is-open {
     display: flex;
   }
-  .variables__list .variables__row {
-    grid-template-columns: minmax(0, 1fr) auto;
+}
+@media (min-width: 640px) and (max-width: 959px) {
+  .variables__attribution {
+    grid-column: 1;
   }
   .variables__row > .variables__row-actions {
-    grid-column: 1 / -1;
-  }
-  .variables__row-actions {
-    justify-content: start;
-    padding-top: 0.15rem;
+    grid-column: 2;
+    grid-row: 3;
+    justify-content: end;
   }
 }
 @media (max-width: 479px) {
   .variables__refresh-label {
     display: none;
+  }
+}
+@media (min-width: 640px) and (max-width: 767px) and (max-height: 520px) {
+  .variables:has(.variables__toolbar) {
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: start;
+    column-gap: 0.75rem;
+  }
+  .variables__header {
+    gap: 0.65rem;
+  }
+  .variables__refresh-label {
+    display: none;
+  }
+  .variables__search {
+    flex-basis: 0;
+  }
+  .variables__list,
+  .variables__empty {
+    grid-column: 1 / -1;
   }
 }
 </style>

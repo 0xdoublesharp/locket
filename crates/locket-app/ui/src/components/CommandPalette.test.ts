@@ -13,12 +13,20 @@ it('uses safe navigation for empty-query Enter and runs Lock vault when searched
     actions: [
       { id: 'vault', label: 'Lock vault', group: 'Actions' },
       { id: 'project', label: 'Project', group: 'Views' },
+      { id: 'add-variable', label: 'Add variable', group: 'Quick actions' },
       { id: 'workspace', label: 'Workspace', group: 'Projects' },
       { id: 'database', label: 'DATABASE_URL', group: 'Variables' },
     ],
   });
   try {
     const dialog = findNode(view.root, (node) => node.tag === 'dialog');
+    expect(dialog).toBeDefined();
+    const options = findNode(view.root, (node) => node.props.role === 'listbox');
+    expect(
+      options?.children
+        .filter((node) => node.props.role === 'group')
+        .map((node) => node.children[0]?.text),
+    ).toEqual(['Views', 'Quick actions', 'Projects', 'Variables', 'Actions']);
     const onKey = dialog!.props.onKeydown as (event: Partial<KeyboardEvent>) => void;
     const enter = {
       key: 'Enter',

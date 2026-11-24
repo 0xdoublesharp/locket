@@ -11,11 +11,38 @@ const localDateTime = new Intl.DateTimeFormat(undefined, {
   timeStyle: 'medium',
 });
 
-export function formatTime(iso: string, precision: 'compact' | 'timestamp' = 'compact'): string {
+const utcDate = new Intl.DateTimeFormat(undefined, {
+  month: 'short',
+  day: 'numeric',
+  year: 'numeric',
+  timeZone: 'UTC',
+});
+const utcTime = new Intl.DateTimeFormat(undefined, {
+  hour: '2-digit',
+  minute: '2-digit',
+  hourCycle: 'h23',
+  timeZone: 'UTC',
+});
+const utcShortDate = new Intl.DateTimeFormat(undefined, {
+  month: 'short',
+  day: 'numeric',
+  timeZone: 'UTC',
+});
+
+export function formatTime(
+  iso: string,
+  precision: 'compact' | 'timestamp' | 'utc' | 'utc-date' = 'compact',
+): string {
   const date = new Date(iso);
   if (!Number.isFinite(date.getTime())) return 'Unknown date';
 
   if (precision === 'timestamp') return localDateTime.format(date);
+  if (precision === 'utc') return `${utcDate.format(date)} · ${utcTime.format(date)} UTC`;
+  if (precision === 'utc-date') {
+    return (date.getUTCFullYear() === new Date().getUTCFullYear() ? utcShortDate : utcDate).format(
+      date,
+    );
+  }
 
   const now = Date.now();
   const elapsed = now - date.getTime();

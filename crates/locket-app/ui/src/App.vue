@@ -150,6 +150,9 @@ const projectConnected = computed(
   () => selectedProject.value !== null || status.value?.project_id != null,
 );
 const projectPath = ref('');
+const activeProjectFolder = computed(() =>
+  Boolean(selectedProject.value && projectPath.value.trim() === selectedProject.value.root),
+);
 const knownProjects = ref<DesktopProjectContext[]>([]);
 const desktopAvailable = desktopActionsAvailable();
 const desktopBusy = ref(false);
@@ -397,6 +400,7 @@ const backupError = ref<string | null>(null);
 const backupPreviewKey = ref<string | null>(null);
 const backupPreviewMessage = ref<string | null>(null);
 const auditChainOk = ref<boolean | null>(null);
+const compactAudit = computed(() => auditHealth(auditChainOk.value));
 
 function accessFor(loaded: boolean, pending: boolean, requestError: string | null) {
   return actionAvailability({
@@ -583,12 +587,6 @@ function selectOverflowView(key: ViewKey): void {
   closeMore(true);
 }
 
-function submitProjectPath(event: KeyboardEvent): void {
-  if (event.isComposing) return;
-  event.preventDefault();
-  (event.currentTarget as HTMLTextAreaElement).form?.requestSubmit();
-}
-
 async function addVariable(): Promise<void> {
   selectView('secret-editor');
   await nextTick();
@@ -677,7 +675,7 @@ const paletteActions = computed<RunnablePaletteAction[]>(() => {
   }
   actions.push({
     id: 'add-variable',
-    group: 'Actions',
+    group: 'Quick actions',
     icon: 'plus',
     badge: 'Action',
     label: 'Add variable',
@@ -750,6 +748,26 @@ async function openDiscoveredProject(row: DiscoveredSecretWire): Promise<void> {
     knownProjects.value.find((project) => project.project_id === row.project_id)?.root ??
     (settings.value.privacyRedactNames ? undefined : row.trusted_roots[0]);
   if (root && (await connectProject(false, root))) selectView('dashboard');
+}
+
+function switchDiscoveredEnvironment(row: DiscoveredSecretWire): void {
+  if (
+    settings.value.privacyRedactNames ||
+    row.project_id !== activeContext.value?.project_id ||
+    row.profile_id === activeContext.value.profile_id ||
+    profileSwitchInProgress.value
+  )
+    return;
+  if (row.dangerous) {
+    discoverProfileTarget.value = { name: row.profile, dangerous: true };
+    selectView('profiles');
+  } else {
+    void handleProfileSwitch({
+      profileName: row.profile,
+      confirmation: undefined,
+      dangerous: false,
+    });
+  }
 }
 
 function selectSecret(row?: SecretRowMeta): void {
@@ -1198,6 +1216,11 @@ const profileSwitchState = ref<ProfileSwitchState>({
 const profileSwitchInProgress = ref<boolean>(false);
 const profileSwitchError = ref<string | null>(null);
 const profileSwitchLastAt = ref<string | undefined>(undefined);
+const discoverProfileTarget = ref<{ name: string; dangerous: boolean } | null>(null);
+watch(currentView, (view) => {
+  if (view !== 'profiles') discoverProfileTarget.value = null;
+  profileSwitchError.value = null;
+});
 
 watch(
   [currentView, settingsContextKey, () => settings.value.privacyRedactNames],
@@ -1933,23 +1956,24 @@ onUnmounted(() => {
   <div class="shell">
     <aside class="shell__nav" aria-label="Workspace">
       <div class="shell__masthead">
-        <h1><AppIcon name="brand-lock" :size="26" /> Locket</h1>
+        <h1><AppIcon name="brand-lock" :size="26" /> <span>Locket</span></h1>
         <button
           class="companion-button shell__context"
           type="button"
-          :title="`${projectLabel} / ${profileLabel}`"
+          :title="`${projectLabel} · ${profileLabel} — ${connectionLabel} · Vault ${lockLabel}`"
           :aria-label="
             projectConnected
-              ? `Switch environment for ${projectLabel} / ${profileLabel}`
+              ? `Switch environment for ${projectLabel} / ${profileLabel}. Agent ${connectionLabel}. Vault ${lockLabel}.`
               : 'Open project'
           "
           @click="selectView(projectConnected ? 'profiles' : 'dashboard')"
         >
-          <span>{{ projectLabel }} / {{ profileLabel }}</span>
+          <span class="shell__context-dot" :data-online="agentOnline" aria-hidden="true" />
+          <span>{{ projectLabel }} · {{ profileLabel }}</span>
           <AppIcon name="chevron-down" :size="13" />
         </button>
         <div class="shell__agent">
-          <span class="shell__vault">
+          <span class="shell__vault" :data-unlocked="lockLabel === 'Unlocked'">
             <AppIcon :name="lockLabel === 'Unlocked' ? 'unlock' : 'lock'" />
             {{ lockLabel }}
           </span>
@@ -1965,6 +1989,22 @@ onUnmounted(() => {
             </time>
           </span>
         </div>
+        <span
+          v-if="
+            agentOnline &&
+            !auditError &&
+            !auditLoading &&
+            auditChainOk !== null &&
+            activeContext &&
+            lockLabel === 'Unlocked'
+          "
+          class="shell__audit-pill"
+          :data-tone="compactAudit.tone"
+          :title="`Audit · ${compactAudit.label}`"
+        >
+          Audit<span class="shell__audit-label"> · {{ compactAudit.label }}</span>
+          <AppIcon class="shell__audit-icon" :name="auditChainOk ? 'check' : 'alert'" :size="14" />
+        </span>
         <button
           class="companion-button icon-label shell__palette-mobile"
           type="button"
@@ -2058,7 +2098,11 @@ onUnmounted(() => {
     </aside>
 
     <main class="shell__main">
-      <div class="shell__topbar" :class="{ 'shell__topbar--has-sections': secondaryItems.length }">
+      <div
+        v-if="currentView !== 'dashboard'"
+        class="shell__topbar"
+        :class="{ 'shell__topbar--has-sections': secondaryItems.length }"
+      >
         <nav v-if="secondaryItems.length" class="shell__segments" aria-label="Section navigation">
           <button
             v-for="item in secondaryItems"
@@ -2189,6 +2233,7 @@ onUnmounted(() => {
         :profile-label="profileLabel"
         :loading="loading"
         :project-connected="projectConnected"
+        :active-project-folder="activeProjectFolder && agentOnline"
         :setup-complete="setupComplete"
         :connected="agentOnline"
         :secrets-loaded="!!secretsLastRefreshed && !secretsError"
@@ -2209,6 +2254,18 @@ onUnmounted(() => {
         @navigate="selectView"
         @refresh="triggerVerify"
       >
+        <template #search>
+          <button
+            type="button"
+            class="companion-button icon-label shell__palette-button shell__dashboard-search"
+            aria-keyshortcuts="Meta+K Control+K"
+            aria-haspopup="dialog"
+            :disabled="unlockOpen || policyFormMode !== null"
+            @click="paletteOpen = true"
+          >
+            <AppIcon name="search" /> Search <kbd>⌘K</kbd>
+          </button>
+        </template>
         <template #connection>
           <section class="shell__panel" aria-labelledby="connect-heading">
             <h2 id="connect-heading">Project connection</h2>
@@ -2217,17 +2274,15 @@ onUnmounted(() => {
               <div class="shell__project-field">
                 <label for="project-path">Project folder</label>
                 <div class="shell__path-input">
-                  <div class="shell__path-field" :data-path="projectPath">
-                    <textarea
-                      id="project-path"
-                      v-model="projectPath"
-                      placeholder="/path/to/project"
-                      autocomplete="off"
-                      rows="1"
-                      :disabled="desktopBusy || !desktopAvailable"
-                      @keydown.enter="submitProjectPath"
-                    />
-                  </div>
+                  <input
+                    id="project-path"
+                    v-model="projectPath"
+                    type="text"
+                    placeholder="/path/to/project"
+                    autocomplete="off"
+                    spellcheck="false"
+                    :disabled="desktopBusy || !desktopAvailable"
+                  />
                   <PathBrowse
                     title="Browse for a project folder"
                     directory
@@ -2239,7 +2294,10 @@ onUnmounted(() => {
               <div class="shell__toolbar">
                 <button
                   class="companion-button"
-                  :class="{ 'companion-button--primary': agentOnline || !shellAgentError }"
+                  :class="{
+                    'companion-button--primary':
+                      !activeProjectFolder && (agentOnline || !shellAgentError),
+                  }"
                   type="submit"
                   :disabled="desktopBusy || !desktopAvailable || !projectPath.trim()"
                 >
@@ -2267,13 +2325,19 @@ onUnmounted(() => {
                     @click="connectProject(false, project.root)"
                   >
                     <AppIcon name="folder" />
-                    <span>{{
-                      settings.privacyRedactNames ? 'Project' : project.project_name
-                    }}</span>
-                    <code v-if="!settings.privacyRedactNames" :title="project.root">{{
-                      shortenProjectPath(project.root)
-                    }}</code>
-                    <AppIcon v-if="selectedProject?.root === project.root" name="check" />
+                    <span class="shell__known-project-label">
+                      <span>{{
+                        settings.privacyRedactNames ? 'Project' : project.project_name
+                      }}</span>
+                      <code v-if="!settings.privacyRedactNames" :title="project.root">{{
+                        shortenProjectPath(project.root)
+                      }}</code>
+                    </span>
+                    <AppIcon
+                      v-if="selectedProject?.root === project.root"
+                      class="shell__known-project-check"
+                      name="check"
+                    />
                   </button>
                 </li>
               </ul>
@@ -2313,7 +2377,11 @@ onUnmounted(() => {
         :privacy-mode="settings.privacyRedactNames || settingsLoading"
         :known-project-ids="knownProjects.map((project) => project.project_id)"
         :current-project-id="selectedProject?.project_id ?? status?.project_id"
+        :current-profile-id="activeContext?.profile_id"
+        :switching="profileSwitchInProgress"
+        :switch-error="profileSwitchError"
         @open-project="openDiscoveredProject"
+        @switch-environment="switchDiscoveredEnvironment"
       />
 
       <SecretEditorView
@@ -2419,6 +2487,7 @@ onUnmounted(() => {
       <ProfileSwitcherView
         v-else-if="currentView === 'profiles'"
         :state="profileSwitchState"
+        :initial-target="discoverProfileTarget"
         :privacy-mode="settings.privacyRedactNames"
         :switching="profileSwitchInProgress"
         :error-message="profileSwitchError"
@@ -2569,10 +2638,14 @@ html,
   padding-inline: 0.45rem;
 }
 
-.shell__context span {
+.shell__context span:not(.shell__context-dot) {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.shell__context-dot,
+.shell__audit-pill {
+  display: none;
 }
 
 .shell__agent {
@@ -2593,6 +2666,9 @@ html,
 
 .shell__vault {
   color: var(--text-secondary);
+}
+.shell__vault[data-unlocked='true'] {
+  color: var(--status-unlocked);
 }
 
 .shell__vault .app-icon {
@@ -2872,51 +2948,33 @@ html,
 }
 
 .shell__project-field {
-  flex: 1 1 18rem;
+  flex: 1 0 100%;
   min-width: 0;
   max-width: 36rem;
 }
 
 .shell__path-input {
-  position: relative;
-  flex-wrap: wrap;
-  gap: 0.35rem;
-  align-items: start;
-}
-
-.shell__path-field {
   display: grid;
-  flex: 1;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.35rem;
+  align-items: center;
+}
+
+.shell__path-input input {
+  width: 100%;
   min-width: 0;
+  font-size: 0.875rem;
+}
+.shell__path-input input:not(:focus) {
+  text-overflow: ellipsis;
 }
 
-.shell__path-field textarea,
-.shell__path-field::after {
-  grid-area: 1 / 1;
-  min-width: 0;
-  min-height: 2.125rem;
-  box-sizing: border-box;
-  padding: 0.4rem 0.6rem;
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
-  background: var(--bg-surface);
-  color: var(--text-primary);
-  font: inherit;
-  overflow-wrap: anywhere;
-}
-
-.shell__path-field textarea {
-  resize: none;
-}
-
-.shell__path-field::after {
-  content: attr(data-path) ' ';
-  visibility: hidden;
-  white-space: pre-wrap;
+.shell__path-input button {
+  white-space: nowrap;
 }
 
 .shell__path-input small {
-  flex: 1 0 100%;
+  grid-column: 1 / -1;
   margin-top: 0.25rem;
 }
 
@@ -2937,6 +2995,7 @@ html,
 
 .shell__known-project {
   display: flex;
+  justify-content: space-between;
   gap: 0.35rem;
   align-items: center;
   width: 100%;
@@ -2944,7 +3003,15 @@ html,
   text-align: start;
 }
 
-.shell__known-project span,
+.shell__known-project-label {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  gap: 0.15rem;
+}
+
+.shell__known-project-label > span,
 .shell__known-project code {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2952,9 +3019,12 @@ html,
 }
 
 .shell__known-project code {
-  flex: 1;
   color: var(--text-secondary);
   font-size: 0.72rem;
+}
+.shell__known-project-check {
+  flex-shrink: 0;
+  margin-inline-start: auto;
 }
 
 .shell__known-project[aria-current='true'] {
@@ -3000,14 +3070,14 @@ html,
   }
 
   .shell__nav {
-    gap: 0.35rem;
-    padding: 0.45rem 0.7rem 0.3rem;
+    gap: 0.2rem;
+    padding: 0.35rem 0.7rem 0.25rem;
     border-right: 0;
     border-bottom: 1px solid var(--border-subtle);
   }
 
   .shell__masthead {
-    grid-template-columns: auto minmax(0, 1fr) auto auto;
+    display: flex;
     align-items: center;
     gap: 0.35rem;
   }
@@ -3018,15 +3088,50 @@ html,
   }
 
   .shell__context {
-    width: fit-content;
+    margin-inline-end: auto;
     max-width: 100%;
-    justify-self: center;
   }
 
-  .shell__connection time,
+  .shell__connection,
   .shell__activity,
   .shell__topbar .shell__palette-button,
+  .shell__main .shell__dashboard-search,
   .shell__topbar:not(.shell__topbar--has-sections) {
+    display: none;
+  }
+
+  .shell__context-dot {
+    display: inline-block;
+    flex: none;
+    width: 0.375rem;
+    height: 0.375rem;
+    border-radius: 50%;
+    background: var(--danger);
+  }
+
+  .shell__context-dot[data-online='true'] {
+    background: var(--success);
+  }
+
+  .shell__audit-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.2rem;
+    padding: 0.2rem 0.45rem;
+    border-radius: 999px;
+    background: var(--success-soft);
+    color: var(--success);
+    font-size: 0.72rem;
+    font-weight: 650;
+    white-space: nowrap;
+  }
+
+  .shell__audit-pill[data-tone='warn'] {
+    background: var(--warn-soft);
+    color: var(--warn);
+  }
+
+  .shell__audit-icon {
     display: none;
   }
 
@@ -3056,28 +3161,32 @@ html,
   }
 
   .shell__main {
-    gap: 0.7rem;
-    padding: 0.65rem 0.75rem 1rem;
+    gap: 0.55rem;
+    padding: 0.5rem 0.75rem 1rem;
   }
 }
 
 @media (max-width: 639px) {
-  .shell__masthead {
-    grid-template-columns: minmax(0, 1fr) auto;
+  .shell__masthead h1 span,
+  .shell__audit-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
   }
 
-  .shell__context {
-    grid-area: 2 / 1;
-    justify-self: start;
+  .shell__audit-icon {
+    display: block;
   }
 
   .shell__agent {
-    grid-area: 2 / 2;
+    display: none;
   }
 
   .shell__masthead .shell__palette-mobile {
-    grid-area: 1 / 2;
-    justify-self: end;
+    flex: none;
   }
 
   .shell__primary-list {
@@ -3089,6 +3198,7 @@ html,
     justify-content: center;
     gap: 0.2rem;
     min-width: max-content;
+    min-height: 1.9rem;
     padding-inline: 0.1rem;
     font-size: 0.75rem;
   }
@@ -3119,18 +3229,9 @@ html,
     box-shadow: var(--shadow-lg);
   }
 
-  .shell__known-project {
-    flex-wrap: wrap;
-  }
-
-  .shell__known-project span,
-  .shell__known-project code {
-    white-space: normal;
-    overflow-wrap: anywhere;
-  }
-
-  .shell__known-project code {
-    flex: 1 0 100%;
+  .shell__segments button {
+    min-height: 1.65rem;
+    padding-block: 0.2rem;
   }
 }
 </style>

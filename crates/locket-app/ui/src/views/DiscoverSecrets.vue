@@ -10,8 +10,14 @@ const props = defineProps<{
   privacyMode: boolean;
   knownProjectIds: string[];
   currentProjectId?: string | null;
+  currentProfileId?: string | null;
+  switching?: boolean;
+  switchError?: string | null;
 }>();
-const emit = defineEmits<{ openProject: [row: DiscoveredSecretWire] }>();
+const emit = defineEmits<{
+  openProject: [row: DiscoveredSecretWire];
+  switchEnvironment: [row: DiscoveredSecretWire];
+}>();
 
 const query = ref('');
 const tag = ref('');
@@ -63,6 +69,10 @@ function canOpenProject(row: DiscoveredSecretWire): boolean {
     (!props.privacyMode && row.trusted_roots.length > 0)
   );
 }
+
+function isActive(row: DiscoveredSecretWire): boolean {
+  return row.project_id === props.currentProjectId && row.profile_id === props.currentProfileId;
+}
 </script>
 
 <template>
@@ -81,6 +91,8 @@ function canOpenProject(row: DiscoveredSecretWire): boolean {
       </button>
     </form>
     <p v-else>Turn off name redaction in Settings to search by name, tag, or owner.</p>
+
+    <p v-if="switchError" class="discovery__error" role="alert">{{ switchError }}</p>
 
     <p v-if="loading" role="status">Searching projects…</p>
     <div v-else-if="error" class="discovery__error" role="alert">
@@ -110,9 +122,21 @@ function canOpenProject(row: DiscoveredSecretWire): boolean {
           </div>
           <div class="discovery__actions">
             <CopyReference :reference="privacyMode ? null : row.reference" />
-            <span v-if="row.project_id === currentProjectId" class="discovery__current">
-              Current project
+            <span v-if="isActive(row)" class="discovery__current">
+              <AppIcon name="check" :size="14" /> Active
             </span>
+            <template v-else-if="row.project_id === currentProjectId && currentProfileId">
+              <button
+                v-if="!privacyMode"
+                class="companion-button icon-label"
+                type="button"
+                :title="`Switch to ${row.profile}`"
+                :disabled="switching"
+                @click="emit('switchEnvironment', row)"
+              >
+                <span>Switch to {{ row.profile }}</span>
+              </button>
+            </template>
             <button
               v-else-if="canOpenProject(row)"
               class="companion-button icon-label"
@@ -156,10 +180,27 @@ function canOpenProject(row: DiscoveredSecretWire): boolean {
   gap: 0.5rem;
 }
 .discovery__actions {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: 5.5rem minmax(0, 1fr);
   align-items: center;
-  gap: 0.5rem;
+  gap: 0.35rem;
+  text-align: end;
+}
+.discovery__actions > :first-child:not(.copy-reference) {
+  grid-column: 2;
+}
+.discovery__actions .companion-button {
+  min-width: 0;
+  white-space: nowrap;
+}
+.discovery__actions :deep(.copy-reference .companion-button) {
+  width: 100%;
+  padding-inline: 0.35rem;
+  white-space: nowrap;
+}
+.discovery__actions .companion-button span {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .discovery__filters label {
   display: grid;
@@ -179,6 +220,7 @@ function canOpenProject(row: DiscoveredSecretWire): boolean {
   color: var(--text-primary);
   font: inherit;
 }
+.discovery .discovery__error,
 .discovery__error p {
   color: var(--danger);
 }
@@ -190,12 +232,11 @@ function canOpenProject(row: DiscoveredSecretWire): boolean {
   list-style: none;
 }
 .discovery__list li {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 14rem;
   align-items: center;
-  justify-content: space-between;
-  flex-wrap: wrap;
   gap: 0.65rem;
-  padding: 0.75rem;
+  padding: 0.55rem 0.75rem;
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
   background: var(--bg-surface);
@@ -215,11 +256,14 @@ function canOpenProject(row: DiscoveredSecretWire): boolean {
   color: var(--warn);
 }
 .discovery__current {
-  padding: 0.2rem 0.5rem;
-  border: 1px solid var(--border-subtle);
-  border-radius: 999px;
-  color: var(--text-secondary);
+  display: inline-flex;
+  justify-content: end;
+  align-items: center;
+  gap: 0.25rem;
+  padding-inline-end: 0.55rem;
+  color: var(--success);
   font-size: 0.75rem;
+  font-weight: 650;
 }
 @media (max-width: 600px) {
   .discovery__filters {
@@ -231,6 +275,15 @@ function canOpenProject(row: DiscoveredSecretWire): boolean {
   }
   .discovery__filters > button {
     justify-self: start;
+  }
+}
+@media (max-width: 479px) {
+  .discovery__list li {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .discovery__actions {
+    width: min(100%, 14rem);
+    justify-self: end;
   }
 }
 </style>

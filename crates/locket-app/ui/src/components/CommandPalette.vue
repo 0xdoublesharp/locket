@@ -18,7 +18,8 @@ const dialog = ref<HTMLDialogElement | null>(null);
 const searchInput = ref<HTMLInputElement | null>(null);
 const query = ref('');
 const selectedIndex = ref<number | null>(null);
-const groupOrder: PaletteGroup[] = ['Views', 'Projects', 'Variables', 'Actions'];
+const groupOrder: PaletteGroup[] = ['Views', 'Quick actions', 'Projects', 'Variables', 'Actions'];
+const groupId = (group: PaletteGroup) => `palette-group-${group.replaceAll(' ', '-')}`;
 const groupedResults = computed(() => {
   const terms = query.value.trim().toLocaleLowerCase().split(/\s+/);
   const groups = new Map(groupOrder.map((group) => [group, [] as PaletteAction[]]));
@@ -39,7 +40,11 @@ const results = computed(() => groupedResults.value.flatMap(({ items }) => items
 const activeIndex = computed(
   () =>
     selectedIndex.value ??
-    (groupedResults.value[0]?.group === 'Actions' && !query.value.trim() ? -1 : 0),
+    (query.value.trim()
+      ? 0
+      : results.value.findIndex(
+          ({ action }) => action.group === 'Views' || action.group === 'Projects',
+        )),
 );
 
 watch(
@@ -166,9 +171,9 @@ function onKeys(event: KeyboardEvent): void {
         v-for="{ group, items } in groupedResults"
         :key="group"
         role="group"
-        :aria-labelledby="`palette-group-${group}`"
+        :aria-labelledby="groupId(group)"
       >
-        <h3 :id="`palette-group-${group}`">{{ group }}</h3>
+        <h3 :id="groupId(group)">{{ group }}</h3>
         <div
           v-for="{ action, index } in items"
           :id="`palette-result-${index}`"
@@ -252,10 +257,22 @@ function onKeys(event: KeyboardEvent): void {
   font-size: 0.875rem;
 }
 .palette__results {
-  max-height: min(49vh, 27rem);
+  max-height: min(57vh, 31rem);
   overflow: auto;
   margin-top: 0.45rem;
-  padding: 0.1rem;
+  padding: 0.1rem 0.1rem 0.7rem;
+  scroll-padding-block: 0.45rem 0.7rem;
+  scrollbar-gutter: stable;
+}
+.palette__results::after {
+  position: sticky;
+  bottom: -0.7rem;
+  display: block;
+  height: 0.55rem;
+  margin-bottom: -0.55rem;
+  background: linear-gradient(transparent, var(--bg-elevated));
+  content: '';
+  pointer-events: none;
 }
 .palette__results h3 {
   margin: 0.6rem 0.45rem 0.3rem;
@@ -264,6 +281,7 @@ function onKeys(event: KeyboardEvent): void {
   font-weight: 650;
 }
 .palette__result {
+  box-sizing: border-box;
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;

@@ -218,6 +218,7 @@ it('shows a retriable variables error and marks the agent offline until recovery
   const status = () => findNode(app.root, (node) => node.props['aria-label'] === 'Agent status');
   expect(status()?.props['data-connected']).toBe('false');
   expect(findNode(status()!, (node) => node.text.trim() === 'Offline')).toBeDefined();
+  expect(findNode(app.root, (node) => node.text === 'Variables · development')).toBeDefined();
   expect(findNode(app.root, (node) => node.text === "Can't load variables")).toBeDefined();
   expect(findNode(app.root, (node) => node.text === 'AgentUnavailable')).toBeDefined();
   const recovery = findNode(app.root, (node) => node.props.role === 'alert');
