@@ -820,7 +820,7 @@ mod tests {
         let path = directory.path().join("store.db");
         {
             let store = open_sync_store(&path)?;
-            store.connection().execute_batch("DROP TABLE team_sync_pending_profiles; DROP TABLE team_sync_pending_packages; DELETE FROM schema_migrations WHERE version=6;")?;
+            store.connection().execute_batch("DROP TABLE team_sync_pending_profiles; DROP TABLE team_sync_pending_packages; DELETE FROM schema_migrations WHERE version >= 6;")?;
         }
         let store = open_sync_store(&path)?;
         assert!(team_sync::status(&store, "project")?.pending_profiles.is_empty());
@@ -830,7 +830,7 @@ mod tests {
                 [],
                 |row| row.get::<_, i64>(0)
             )?,
-            6
+            i64::from(locket_store::SCHEMA_VERSION)
         );
         Ok(())
     }

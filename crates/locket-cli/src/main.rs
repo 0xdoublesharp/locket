@@ -3337,12 +3337,7 @@ pub(crate) const fn source_arg_to_str(source: SecretSourceArg) -> &'static str {
 }
 
 pub(crate) const fn source_precedence(source: &str) -> u8 {
-    match source.as_bytes() {
-        b"team-managed" => 1,
-        b"user-local" => 2,
-        b"machine-local" => 3,
-        _ => 0,
-    }
+    locket_core::source_precedence(source)
 }
 
 pub(crate) fn fallback_project_name(root: &Path) -> String {
