@@ -761,129 +761,97 @@ pub fn request_project_status_snapshot(
     }
 }
 
-#[cfg(any(unix, target_os = "windows"))]
-/// Decodes a response, waiting only for an incomplete frame. Parser diagnostics
-/// may contain peer-supplied plaintext, so permanent failures use a fixed message.
-pub fn decode_agent_frame(
-    buffer: &[u8],
-) -> Result<Option<locket_agent::ResponseEnvelope>, io::Error> {
-    use locket_agent::{DEFAULT_MAX_MESSAGE_SIZE, ProtocolError, decode_response_frame};
+// Reads one bounded agent response and scrubs the wire bytes before returning.
+#[cfg(any(unix, windows))]
+async fn read_agent_response(
+    stream: &mut (impl tokio::io::AsyncRead + Unpin),
+    chunk: &mut [u8],
+) -> Result<locket_agent::ResponseEnvelope, io::Error> {
+    use locket_agent::{DEFAULT_MAX_MESSAGE_SIZE, decode_response_frame};
+    use tokio::io::AsyncReadExt;
+    use zeroize::Zeroizing;
 
-    match decode_response_frame(buffer, DEFAULT_MAX_MESSAGE_SIZE) {
-        Ok((response, _)) => Ok(Some(response)),
-        Err(ProtocolError::IncompleteFrame) => Ok(None),
-        Err(_) => Err(io::Error::new(io::ErrorKind::InvalidData, "invalid agent response frame")),
+    let mut prefix = [0_u8; 4];
+    stream.read_exact(&mut prefix).await?;
+    let length = u32::from_le_bytes(prefix) as usize;
+    if length > DEFAULT_MAX_MESSAGE_SIZE {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid agent response frame"));
     }
+    let mut frame = Zeroizing::new(Vec::with_capacity(prefix.len() + length));
+    frame.extend_from_slice(&prefix);
+    let mut remaining = length;
+    while remaining != 0 {
+        let size = remaining.min(chunk.len());
+        let read = stream.read(&mut chunk[..size]).await?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "agent closed connection without a response",
+            ));
+        }
+        frame.extend_from_slice(&chunk[..read]);
+        remaining -= read;
+    }
+    // Parser diagnostics can contain peer-supplied plaintext.
+    decode_response_frame(&frame, DEFAULT_MAX_MESSAGE_SIZE)
+        .map(|(response, _)| response)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid agent response frame"))
 }
 
-#[cfg(any(unix, target_os = "windows"))]
-fn decode_agent_response(buffer: &[u8]) -> Option<Result<Value, io::Error>> {
-    use locket_agent::ResponseEnvelope;
+/// Exchanges one request over the local socket or named pipe.
+#[cfg(any(unix, windows))]
+pub fn exchange_agent_request(
+    endpoint: &Path,
+    request: locket_agent::RequestEnvelope,
+    timeout: Option<std::time::Duration>,
+) -> Result<locket_agent::ResponseEnvelope, io::Error> {
+    use locket_agent::{DEFAULT_MAX_MESSAGE_SIZE, encode_frame};
+    use tokio::io::AsyncWriteExt;
+    use zeroize::Zeroizing;
 
-    let response = match decode_agent_frame(buffer) {
-        Ok(Some(response)) => response,
-        Ok(None) => return None,
-        Err(error) => return Some(Err(error)),
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let mut chunk = Zeroizing::new([0_u8; 16 * 1024]);
+    let chunk = &mut chunk[..];
+    let exchange = async move {
+        #[cfg(unix)]
+        let mut stream = tokio::net::UnixStream::connect(endpoint).await?;
+        #[cfg(windows)]
+        let mut stream = locket_agent::connect_named_pipe_client(endpoint).await?;
+        let frame =
+            Zeroizing::new(encode_frame(&request, DEFAULT_MAX_MESSAGE_SIZE).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid agent request frame")
+            })?);
+        stream.write_all(&frame).await?;
+        stream.flush().await?;
+        drop(frame);
+        read_agent_response(&mut stream, chunk).await
     };
-    Some(match response {
-        ResponseEnvelope::Success(success) => Ok(success.payload),
-        ResponseEnvelope::Error(error) => {
-            Err(io::Error::other(format!("agent error: {} ({})", error.error, error.message)))
+    runtime.block_on(async move {
+        if let Some(timeout) = timeout {
+            tokio::time::timeout(timeout, exchange)
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "agent response timed out"))?
+        } else {
+            exchange.await
         }
     })
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn request_agent_endpoint(
     endpoint: &Path,
     method: locket_agent::AgentMethod,
     payload: Value,
 ) -> Result<Value, io::Error> {
-    use locket_agent::{DEFAULT_MAX_MESSAGE_SIZE, RequestEnvelope, encode_frame};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::UnixStream;
+    use locket_agent::{RequestEnvelope, ResponseEnvelope};
 
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    runtime.block_on(async move {
-        tokio::time::timeout(std::time::Duration::from_secs(2), async move {
-            let mut stream = UnixStream::connect(endpoint).await?;
-            let request = RequestEnvelope::new("cli-request-1", method, payload);
-            let frame = encode_frame(&request, DEFAULT_MAX_MESSAGE_SIZE)
-                .map_err(|error| io::Error::other(error.to_string()))?;
-            stream.write_all(&frame).await?;
-            stream.flush().await?;
-
-            let mut buffer = Vec::with_capacity(1024);
-            loop {
-                if let Some(response) = decode_agent_response(&buffer) {
-                    return response;
-                }
-                let mut chunk = [0_u8; 1024];
-                let read = stream.read(&mut chunk).await?;
-                if read == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "agent closed connection without a response",
-                    ));
-                }
-                buffer.extend_from_slice(&chunk[..read]);
-                if buffer.len() > DEFAULT_MAX_MESSAGE_SIZE {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "agent response exceeds message limit",
-                    ));
-                }
-            }
-        })
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "agent response timed out"))?
-    })
-}
-
-#[cfg(target_os = "windows")]
-fn request_agent_endpoint(
-    endpoint: &Path,
-    method: locket_agent::AgentMethod,
-    payload: Value,
-) -> Result<Value, io::Error> {
-    use locket_agent::{DEFAULT_MAX_MESSAGE_SIZE, RequestEnvelope, encode_frame};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    runtime.block_on(async move {
-        tokio::time::timeout(std::time::Duration::from_secs(2), async move {
-            let mut stream = locket_agent::connect_named_pipe_client(endpoint).await?;
-            let request = RequestEnvelope::new("cli-request-1", method, payload);
-            let frame = encode_frame(&request, DEFAULT_MAX_MESSAGE_SIZE)
-                .map_err(|error| io::Error::other(error.to_string()))?;
-            stream.write_all(&frame).await?;
-            stream.flush().await?;
-
-            let mut buffer = Vec::with_capacity(1024);
-            loop {
-                if let Some(response) = decode_agent_response(&buffer) {
-                    return response;
-                }
-                let mut chunk = [0_u8; 1024];
-                let read = stream.read(&mut chunk).await?;
-                if read == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "agent closed connection without a response",
-                    ));
-                }
-                buffer.extend_from_slice(&chunk[..read]);
-                if buffer.len() > DEFAULT_MAX_MESSAGE_SIZE {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "agent response exceeds message limit",
-                    ));
-                }
-            }
-        })
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "agent response timed out"))?
-    })
+    let request = RequestEnvelope::new("cli-request-1", method, payload);
+    match exchange_agent_request(endpoint, request, Some(std::time::Duration::from_secs(2)))? {
+        ResponseEnvelope::Success(success) => Ok(success.payload),
+        ResponseEnvelope::Error(error) => {
+            Err(io::Error::other(format!("agent error: {} ({})", error.error, error.message)))
+        }
+    }
 }
 
 #[cfg(not(any(unix, target_os = "windows")))]

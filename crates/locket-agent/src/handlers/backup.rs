@@ -31,8 +31,10 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use crate::envelope::{ErrorEnvelope, RequestEnvelope, ResponseEnvelope, SuccessEnvelope};
+use crate::grant::{GrantAction, GrantBinding, GrantTable, GrantValidation};
 use crate::keys::{
     KeyError, master_key_array, unwrap_audit_key_with_master, unwrap_profile_key_with_master,
 };
@@ -70,6 +72,15 @@ pub struct ExportBundleRequest {
     /// Return selection metadata without writing a bundle.
     #[serde(default)]
     pub preview_only: bool,
+    /// Live Export grant, when this client uses grant-based authorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_id: Option<String>,
+    /// Process binding of the supplied grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<GrantBinding>,
+    /// Explicit confirmation to export dangerous profiles in the selected scope.
+    #[serde(default)]
+    pub confirm_dangerous: bool,
     /// Optional output path.
     pub output_path: Option<PathBuf>,
 }
@@ -97,6 +108,9 @@ pub struct ImportBundleRequest {
     pub include_audit: bool,
     /// Conflict policy.
     pub conflict_mode: BundleConflictMode,
+    /// Explicit confirmation to apply changes involving dangerous profiles.
+    #[serde(default)]
+    pub confirm_dangerous: bool,
 }
 
 /// Desktop request for non-destructive bundle verification.
@@ -150,7 +164,6 @@ pub struct BackupActionResponse {
     pub message: String,
 }
 
-#[derive(Clone, Debug)]
 struct UnlockedProject {
     store_path: PathBuf,
     profile_id: Option<String>,
@@ -168,7 +181,7 @@ struct DeviceDescriptorV1 {
     safety_words: Vec<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize)]
 struct SealedBundlePayloadV1 {
     profiles: Vec<SealedBundleProfileV1>,
     command_policies: Vec<SealedBundleCommandPolicyV1>,
@@ -256,11 +269,27 @@ struct SealedBundleBlobV1 {
     created_at: i64,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize)]
 struct SealedBundleProfileKeyV1 {
     profile_id: String,
     purpose: String,
-    key_material_b64: String,
+    #[serde(with = "zeroizing_key_material")]
+    key_material_b64: Zeroizing<String>,
+}
+
+mod zeroizing_key_material {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use zeroize::Zeroizing;
+
+    pub fn serialize<S: Serializer>(value: &str, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(value)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Zeroizing<String>, D::Error> {
+        String::deserialize(deserializer).map(Zeroizing::new)
+    }
 }
 
 struct BundleRecipientV1 {
@@ -382,7 +411,8 @@ pub async fn handle_export_bundle(
     if request.recipient_descriptor.trim().is_empty() {
         return error_response(envelope, "InvalidReference", "bundle export requires a recipient");
     }
-    match export_bundle(&request, &unlocked) {
+    let grants = if request.grant_id.is_some() { Some(state.grants.lock().await) } else { None };
+    match export_bundle(&request, &unlocked, grants.as_deref()) {
         Ok(response) => success_response(envelope, response),
         Err((code, message)) => error_response(envelope, code, &message),
     }
@@ -411,39 +441,30 @@ pub async fn handle_import_bundle(
 }
 
 /// Handle desktop bundle verification.
-pub fn handle_verify_bundle(envelope: &RequestEnvelope) -> ResponseEnvelope {
+pub async fn handle_verify_bundle(
+    envelope: &RequestEnvelope,
+    state: &AgentSocketState,
+) -> ResponseEnvelope {
     let request: VerifyBundleRequest = match serde_json::from_value(envelope.payload.clone()) {
         Ok(request) => request,
         Err(_) => return error_response(envelope, "ProtocolError", "invalid VerifyBundle payload"),
     };
-    let bytes = match std::fs::read(&request.bundle_path) {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            return error_response(
-                envelope,
-                "BundleVerificationFailed",
-                "bundle file was not found",
-            );
-        }
-    };
-    let bundle = match BundleContainer::deserialize(&bytes) {
+    let bundle = match read_verified_bundle(&request.bundle_path) {
         Ok(bundle) => bundle,
-        Err(error) => {
-            return error_response(
-                envelope,
-                "BundleVerificationFailed",
-                &format!("bundle verification failed: {error}"),
-            );
-        }
+        Err((code, message)) => return error_response(envelope, code, &message),
     };
-    if let Err(error) = verify_age_payload_structure(&bundle.encrypted_payload) {
-        return error_response(
-            envelope,
-            "BundleVerificationFailed",
-            &format!("bundle verification failed: {error}"),
-        );
+    if request.require_decryptable {
+        let unlocked = match unlocked_project(envelope, state, &bundle.manifest.project_id).await {
+            Ok(unlocked) => unlocked,
+            Err(response) => return response,
+        };
+        let result = Store::open_read_only(&unlocked.store_path)
+            .map_err(|error| ("CorruptDb", format!("could not open store: {error}")))
+            .and_then(|store| decrypt_local_bundle(&bundle, &store, &unlocked, state));
+        if let Err((code, message)) = result {
+            return error_response(envelope, code, &message);
+        }
     }
-    let decryptable_by_this_device = request.require_decryptable.then_some(false);
     let response = VerifyBundleResponse {
         structural_valid: true,
         schema_version: bundle.manifest.schema_version,
@@ -452,13 +473,13 @@ pub fn handle_verify_bundle(envelope: &RequestEnvelope) -> ResponseEnvelope {
         recipient_count: u32::try_from(bundle.manifest.recipient_fingerprints.len())
             .unwrap_or(u32::MAX),
         payload_digest: bundle.manifest.payload_digest,
-        decryptable_by_this_device,
+        decryptable_by_this_device: request.require_decryptable.then_some(true),
         message: if request.require_decryptable {
-            "Bundle is structurally valid; local decryptability requires the CLI bundle core."
-                .to_owned()
+            "Bundle is structurally valid and decryptable by this device."
         } else {
-            "Bundle is structurally valid.".to_owned()
-        },
+            "Bundle is structurally valid."
+        }
+        .to_owned(),
     };
     success_response(envelope, response)
 }
@@ -496,6 +517,7 @@ type BackupResult<T> = Result<T, (&'static str, String)>;
 fn export_bundle(
     request: &ExportBundleRequest,
     unlocked: &UnlockedProject,
+    grants: Option<&GrantTable>,
 ) -> BackupResult<BackupActionResponse> {
     let recipient = bundle_recipient(&request.recipient_descriptor)?;
     let mut store = Store::open(&unlocked.store_path)
@@ -517,6 +539,33 @@ fn export_bundle(
         ));
     }
     let profiles = selected_profiles(&store, &request.project_id, unlocked, &request.scope)?;
+    if let Some(grant_id) = request.grant_id.as_deref() {
+        let [profile] = profiles.as_slice() else {
+            return Err((
+                "GrantRequired",
+                "export grant must cover the selected profile".to_owned(),
+            ));
+        };
+        if !grants.is_some_and(|grants| {
+            grants.validate(
+                grant_id,
+                &request.project_id,
+                &profile.id,
+                GrantAction::Export,
+                current_unix_nanos(),
+                request.binding.as_ref(),
+            ) == GrantValidation::Valid
+        }) {
+            return Err(("GrantRequired", "live profile-scoped Export grant required".to_owned()));
+        }
+    }
+    if !request.preview_only
+        && !request.confirm_dangerous
+        && profiles.iter().any(|profile| profile.dangerous)
+    {
+        return Err(("ConfirmationFailed", "confirm export of dangerous profiles".to_owned()));
+    }
+
     let payload = bundle_payload_with_scope(
         &store,
         &request.project_id,
@@ -555,10 +604,12 @@ fn export_bundle(
             message: preview,
         });
     }
-    let plaintext = zeroize::Zeroizing::new(serde_json::to_vec(&payload).map_err(json_error)?);
+    let mut plaintext = Zeroizing::new(Vec::new());
+    serde_json::to_writer(&mut *plaintext, &payload).map_err(json_error)?;
     let encrypted_payload =
         encrypt_bundle_payload_for_age_recipients(&plaintext, &[recipient.sealing_public_key])
             .map_err(|error| ("MetadataInvalid", format!("bundle encryption failed: {error}")))?;
+    drop(plaintext);
     let timestamp = current_unix_nanos_i64();
     let manifest = BundleManifest {
         recipient_fingerprints: vec![recipient.fingerprint],
@@ -600,30 +651,35 @@ fn export_bundle(
     })
 }
 
-fn import_bundle(
-    request: &ImportBundleRequest,
-    unlocked: &UnlockedProject,
-    state: &AgentSocketState,
-) -> BackupResult<BackupActionResponse> {
-    let bytes = fs::read(&request.bundle_path)
+fn read_verified_bundle(path: &Path) -> BackupResult<BundleContainer> {
+    let bytes = fs::read(path)
         .map_err(|error| ("BundleVerificationFailed", format!("could not read bundle: {error}")))?;
     let bundle = BundleContainer::deserialize(&bytes).map_err(|error| {
         ("BundleVerificationFailed", format!("bundle verification failed: {error}"))
     })?;
-    if let Err(error) = verify_age_payload_structure(&bundle.encrypted_payload) {
-        return Err(("BundleVerificationFailed", format!("bundle verification failed: {error}")));
-    }
-    if bundle.manifest.project_id != request.project_id {
-        return Err((
-            "BundleVerificationFailed",
-            "bundle project id does not match requested project".to_owned(),
-        ));
-    }
     if bundle_encrypted_payload_digest(&bundle.encrypted_payload) != bundle.manifest.payload_digest
     {
         return Err((
             "BundleVerificationFailed",
             "bundle payload digest does not match manifest".to_owned(),
+        ));
+    }
+    verify_age_payload_structure(&bundle.encrypted_payload).map_err(|error| {
+        ("BundleVerificationFailed", format!("bundle verification failed: {error}"))
+    })?;
+    Ok(bundle)
+}
+
+fn import_bundle(
+    request: &ImportBundleRequest,
+    unlocked: &UnlockedProject,
+    state: &AgentSocketState,
+) -> BackupResult<BackupActionResponse> {
+    let bundle = read_verified_bundle(&request.bundle_path)?;
+    if bundle.manifest.project_id != request.project_id {
+        return Err((
+            "BundleVerificationFailed",
+            "bundle project id does not match requested project".to_owned(),
         ));
     }
 
@@ -636,49 +692,7 @@ fn import_bundle(
     {
         return Err(("ProjectNotFound", "project not found".to_owned()));
     }
-    let device = store
-        .get_active_local_device(&request.project_id)
-        .map_err(|error| ("CorruptDb", format!("could not read local device: {error}")))?
-        .ok_or_else(|| {
-            ("BundleVerificationFailed", "local device is not initialized".to_owned())
-        })?;
-    if !bundle
-        .manifest
-        .recipient_fingerprints
-        .iter()
-        .map(|fp| store.device_matches_bundle_recipient(&device, fp))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| ("CorruptDb", error.to_string()))?
-        .into_iter()
-        .any(|matches| matches)
-    {
-        return Err((
-            "BundleVerificationFailed",
-            "bundle is not addressed to this device".to_owned(),
-        ));
-    }
-    let storage = build_device_private_key_storage(unlocked, state, &request.project_id)?;
-    let private_key = storage.load(&device.id).map_err(map_private_key_load_error)?;
-    let plaintext =
-        decrypt_bundle_payload_with_x25519_secret(&bundle.encrypted_payload, &private_key)
-            .map_err(|error| {
-                ("BundleVerificationFailed", format!("bundle verification failed: {error}"))
-            })?;
-    let payload: SealedBundlePayloadV1 = serde_json::from_slice(&plaintext).map_err(|error| {
-        ("BundleVerificationFailed", format!("bundle verification failed: {error}"))
-    })?;
-    if payload.profile_count != payload.profiles.len()
-        || payload.command_policy_count != payload.command_policies.len()
-        || payload.secret_count != payload.secrets.len()
-        || payload.secret_version_count != payload.secret_versions.len()
-        || payload.blob_count != payload.blobs.len()
-        || payload.profile_key_count != payload.profile_keys.len()
-    {
-        return Err((
-            "BundleVerificationFailed",
-            "bundle payload counts do not match row counts".to_owned(),
-        ));
-    }
+    let payload = decrypt_local_bundle(&bundle, &store, unlocked, state)?;
     if request.include_audit && payload.audit_chain.is_some() {
         return Err((
             "PolicyValidationIncomplete",
@@ -714,6 +728,7 @@ fn import_bundle(
         resolution,
         &unlocked.master_key,
         timestamp,
+        request.confirm_dangerous,
     )?;
     let (applied, conflicts) = match outcome {
         ApplyOutcome::Applied { applied, conflicts } => (applied, conflicts),
@@ -754,6 +769,60 @@ fn import_bundle(
             conflicts.rejected,
         ),
     })
+}
+
+fn decrypt_local_bundle(
+    bundle: &BundleContainer,
+    store: &Store,
+    unlocked: &UnlockedProject,
+    state: &AgentSocketState,
+) -> BackupResult<SealedBundlePayloadV1> {
+    let device = store
+        .get_active_local_device(&bundle.manifest.project_id)
+        .map_err(|error| ("CorruptDb", format!("could not read local device: {error}")))?
+        .ok_or_else(|| {
+            ("BundleVerificationFailed", "local device is not initialized".to_owned())
+        })?;
+    if !bundle
+        .manifest
+        .recipient_fingerprints
+        .iter()
+        .map(|fp| store.device_matches_bundle_recipient(&device, fp))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| ("CorruptDb", error.to_string()))?
+        .into_iter()
+        .any(|matches| matches)
+    {
+        return Err((
+            "BundleVerificationFailed",
+            "bundle is not addressed to this device".to_owned(),
+        ));
+    }
+    let storage = build_device_private_key_storage(unlocked, state, &bundle.manifest.project_id)?;
+    let private_key = storage.load(&device.id).map_err(map_private_key_load_error)?;
+    let plaintext = Zeroizing::new(
+        decrypt_bundle_payload_with_x25519_secret(&bundle.encrypted_payload, &private_key)
+            .map_err(|error| {
+                ("BundleVerificationFailed", format!("bundle verification failed: {error}"))
+            })?,
+    );
+    let payload: SealedBundlePayloadV1 = serde_json::from_slice(&plaintext)
+        .map_err(|_| ("BundleVerificationFailed", "invalid decrypted bundle payload".to_owned()))?;
+    drop(plaintext);
+    if usize::try_from(bundle.manifest.profile_count) != Ok(payload.profiles.len())
+        || payload.profile_count != payload.profiles.len()
+        || payload.command_policy_count != payload.command_policies.len()
+        || payload.secret_count != payload.secrets.len()
+        || payload.secret_version_count != payload.secret_versions.len()
+        || payload.blob_count != payload.blobs.len()
+        || payload.profile_key_count != payload.profile_keys.len()
+    {
+        return Err((
+            "BundleVerificationFailed",
+            "bundle payload counts do not match row counts".to_owned(),
+        ));
+    }
+    Ok(payload)
 }
 
 fn selected_profiles(
@@ -957,8 +1026,22 @@ fn validate_bundle_project_scope(
     transaction: &rusqlite::Transaction<'_>,
     project_id: &str,
     payload: &SealedBundlePayloadV1,
+    confirm_dangerous: bool,
 ) -> BackupResult<()> {
     use rusqlite::OptionalExtension as _;
+
+    if !confirm_dangerous {
+        for profile in &payload.profiles {
+            let local_dangerous: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM profiles WHERE project_id = ?1 AND name = ?2 AND dangerous)",
+                params![project_id, profile.name],
+                |row| row.get(0),
+            ).map_err(map_apply_sqlite_error)?;
+            if profile.dangerous || local_dangerous {
+                return Err(dangerous_import_error());
+            }
+        }
+    }
 
     let incoming_profiles: BTreeSet<_> =
         payload.profiles.iter().map(|row| row.profile_id.as_str()).collect();
@@ -969,17 +1052,24 @@ fn validate_bundle_project_scope(
         .chain(payload.secrets.iter().map(|row| row.profile_id.as_str()))
         .collect();
     for profile in profiles {
-        let owner: Option<String> = transaction
-            .query_row("SELECT project_id FROM profiles WHERE id = ?1", [profile], |row| row.get(0))
+        let owner: Option<(String, bool)> = transaction
+            .query_row(
+                "SELECT project_id, dangerous FROM profiles WHERE id = ?1",
+                [profile],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
             .optional()
             .map_err(map_apply_sqlite_error)?;
-        if owner.as_deref().is_some_and(|owner| owner != project_id)
+        if owner.as_ref().is_some_and(|(owner, _)| owner != project_id)
             || (owner.is_none() && !incoming_profiles.contains(profile))
         {
             return Err((
                 "BundleVerificationFailed",
                 "bundle row is outside the requested project".to_owned(),
             ));
+        }
+        if !confirm_dangerous && owner.is_some_and(|(_, dangerous)| dangerous) {
+            return Err(dangerous_import_error());
         }
     }
 
@@ -991,11 +1081,15 @@ fn validate_bundle_project_scope(
         .chain(payload.blobs.iter().map(|row| row.secret_id.as_str()))
         .collect();
     for secret in secrets {
-        let owner: Option<String> = transaction
-            .query_row("SELECT project_id FROM secrets WHERE id = ?1", [secret], |row| row.get(0))
+        let owner: Option<(String, bool)> = transaction
+            .query_row(
+                "SELECT s.project_id, p.dangerous FROM secrets s JOIN profiles p ON p.id = s.profile_id WHERE s.id = ?1",
+                [secret],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
             .optional()
             .map_err(map_apply_sqlite_error)?;
-        if owner.as_deref().is_some_and(|owner| owner != project_id)
+        if owner.as_ref().is_some_and(|(owner, _)| owner != project_id)
             || (owner.is_none() && !incoming_secrets.contains(secret))
         {
             return Err((
@@ -1003,8 +1097,15 @@ fn validate_bundle_project_scope(
                 "bundle row is outside the requested project".to_owned(),
             ));
         }
+        if !confirm_dangerous && owner.is_some_and(|(_, dangerous)| dangerous) {
+            return Err(dangerous_import_error());
+        }
     }
     Ok(())
+}
+
+fn dangerous_import_error() -> (&'static str, String) {
+    ("ConfirmationFailed", "confirm import affecting dangerous profiles".to_owned())
 }
 
 fn apply_bundle_payload(
@@ -1014,6 +1115,7 @@ fn apply_bundle_payload(
     resolution: ConflictResolution,
     receiver_master_key: &locket_crypto::KeyBytes,
     now: i64,
+    confirm_dangerous: bool,
 ) -> BackupResult<ApplyOutcome> {
     for key in &payload.profile_keys {
         let purpose = parse_key_purpose(&key.purpose)?;
@@ -1045,7 +1147,7 @@ fn apply_bundle_payload(
         .transaction()
         .map_err(|error| ("CorruptDb", format!("apply transaction begin failed: {error}")))?;
 
-    validate_bundle_project_scope(&transaction, project_id, payload)?;
+    validate_bundle_project_scope(&transaction, project_id, payload, confirm_dangerous)?;
 
     for profile in &payload.profiles {
         use rusqlite::OptionalExtension as _;
@@ -1770,16 +1872,18 @@ fn parse_key_purpose(value: &str) -> BackupResult<KeyPurpose> {
     }
 }
 
-fn decode_key_material(value: &str, label: &str) -> BackupResult<locket_crypto::KeyBytes> {
-    let bytes = BASE64URL_NOPAD.decode(value.as_bytes()).map_err(|_| {
-        ("BundleVerificationFailed", format!("{label} material is not valid base64url"))
-    })?;
-    let mut out = [0_u8; locket_crypto::KEY_LEN];
-    if bytes.len() != out.len() {
+fn decode_key_material(
+    value: &str,
+    label: &str,
+) -> BackupResult<Zeroizing<locket_crypto::KeyBytes>> {
+    let mut key = Zeroizing::new([0_u8; locket_crypto::KEY_LEN]);
+    if BASE64URL_NOPAD.decode_len(value.len()) != Ok(key.len()) {
         return Err(("BundleVerificationFailed", format!("{label} material has wrong length")));
     }
-    out.copy_from_slice(&bytes);
-    Ok(out)
+    BASE64URL_NOPAD.decode_mut(value.as_bytes(), key.as_mut()).map_err(|_| {
+        ("BundleVerificationFailed", format!("{label} material is not valid base64url"))
+    })?;
+    Ok(key)
 }
 
 fn rewrap_imported_profile_key(
@@ -1825,7 +1929,7 @@ fn bundle_profile_keys(
             Ok(SealedBundleProfileKeyV1 {
                 profile_id: profile_id.to_owned(),
                 purpose: purpose.as_str().to_owned(),
-                key_material_b64: BASE64URL_NOPAD.encode(key.as_ref()),
+                key_material_b64: Zeroizing::new(BASE64URL_NOPAD.encode(key.as_ref())),
             })
         })
         .collect()
@@ -2164,7 +2268,7 @@ async fn unlocked_project(
         return Err(error_response(
             envelope,
             "MetadataInvalid",
-            "bundle export requires unlock audit context with store_path",
+            "bundle operation requires unlock audit context with store_path",
         ));
     };
     let master_key = master_key_array(entry.key_bytes()).map_err(|_| {
@@ -2216,13 +2320,126 @@ fn error_response(envelope: &RequestEnvelope, error: &str, message: &str) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn verify_bundle_rejects_digest_mismatch() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("test.locket");
+        let encrypted = encrypt_bundle_payload_for_age_recipients(b"test payload", &[[19; 32]])?;
+        let manifest = BundleManifest {
+            schema_version: BUNDLE_SCHEMA_V1,
+            project_id: "test-project".to_owned(),
+            recipient_fingerprints: vec!["11".repeat(32)],
+            created_at: 1,
+            profile_count: 1,
+            payload_digest: "22".repeat(32),
+        };
+        let mut bundle = BundleContainer::new(manifest, encrypted)?;
+        fs::write(&path, bundle.serialize()?)?;
+        let state = AgentSocketState::locked("bundle-test");
+        let request = RequestEnvelope::new(
+            "verify",
+            crate::AgentMethod::VerifyBundle,
+            json!({
+                "bundle_path": path,
+            }),
+        );
+        let response = crate::dispatch(&request, &state).await;
+        assert!(matches!(response, ResponseEnvelope::Error(error)
+            if error.error == "BundleVerificationFailed" && error.message.contains("digest")));
+        bundle.manifest.payload_digest = bundle_encrypted_payload_digest(&bundle.encrypted_payload);
+        fs::write(&path, bundle.serialize()?)?;
+        assert!(matches!(crate::dispatch(&request, &state).await, ResponseEnvelope::Success(_)));
+        let require_decryption = RequestEnvelope::new(
+            "verify-decrypt",
+            crate::AgentMethod::VerifyBundle,
+            json!({"bundle_path": path, "require_decryptable": true}),
+        );
+        assert!(matches!(crate::dispatch(&require_decryption, &state).await,
+            ResponseEnvelope::Error(error) if error.error == "UnlockRequired"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verify_bundle_proves_local_decryptability() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let store_path = directory.path().join("store.db");
+        let mut store = Store::open(&store_path)?;
+        store.initialize_schema()?;
+        store.insert_project_if_absent(PROJECT_ID, "verify test", 100)?;
+        let state = AgentSocketState::locked("bundle-test");
+        let master_key = Zeroizing::new([42; 32]);
+        state.seed_master_key(PROJECT_ID, &master_key)?;
+        let unlocked = UnlockedProject { store_path, profile_id: None, master_key };
+        let unlock = RequestEnvelope::new(
+            "unlock",
+            crate::AgentMethod::Unlock,
+            json!({
+                "project_id": PROJECT_ID, "ttl_seconds": 60,
+                "audit": {"store_path": unlocked.store_path},
+            }),
+        );
+        assert!(matches!(crate::dispatch(&unlock, &state).await, ResponseEnvelope::Success(_)));
+
+        let signing = [3_u8; 32];
+        let private_key = Zeroizing::new([4_u8; 32]);
+        let sealing =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*private_key))
+                .to_bytes();
+        let fingerprint = device_fingerprint_hex(&signing, &sealing);
+        let device = locket_store::DeviceRecord {
+            id: "lk_dev_verify".to_owned(),
+            project_id: PROJECT_ID.to_owned(),
+            member_id: None,
+            name: "test".to_owned(),
+            label: "test".to_owned(),
+            signing_public_key: signing.to_vec(),
+            sealing_public_key: sealing.to_vec(),
+            fingerprint: fingerprint.clone(),
+            safety_words: Vec::new(),
+            local: true,
+            created_at: 100,
+            last_seen_at: None,
+            revoked_at: None,
+        };
+        store.insert_device(&device)?;
+        build_device_private_key_storage(&unlocked, &state, PROJECT_ID)
+            .map_err(|(_, message)| message)?
+            .store(&device.id, &private_key)?;
+
+        let payload = minimal_import_payload("dev", "deploy");
+        let plaintext = Zeroizing::new(serde_json::to_vec(&payload)?);
+        let encrypted = encrypt_bundle_payload_for_age_recipients(&plaintext, &[sealing])?;
+        let manifest = BundleManifest {
+            schema_version: BUNDLE_SCHEMA_V1,
+            project_id: PROJECT_ID.to_owned(),
+            recipient_fingerprints: vec![fingerprint],
+            created_at: 100,
+            profile_count: 1,
+            payload_digest: bundle_encrypted_payload_digest(&encrypted),
+        };
+        let path = directory.path().join("verify.locket-bundle");
+        fs::write(&path, BundleContainer::new(manifest, encrypted)?.serialize()?)?;
+        let request = RequestEnvelope::new(
+            "verify",
+            crate::AgentMethod::VerifyBundle,
+            json!({"bundle_path": path, "require_decryptable": true}),
+        );
+        let response = crate::dispatch(&request, &state).await;
+        assert!(
+            matches!(response, ResponseEnvelope::Success(ref result)
+                if result.payload["decryptable_by_this_device"] == true),
+            "{response:?}"
+        );
+        Ok(())
+    }
+
     fn import_apply(
         store: &mut Store,
         project: &str,
         payload: &SealedBundlePayloadV1,
         resolution: ConflictResolution,
     ) -> Result<ApplyOutcome, Box<dyn std::error::Error>> {
-        apply_bundle_payload(store, project, payload, resolution, &[42; 32], 300)
+        apply_bundle_payload(store, project, payload, resolution, &[42; 32], 300, false)
             .map_err(|(_, message)| message.into())
     }
 
@@ -2433,6 +2650,39 @@ mod tests {
     }
 
     #[test]
+    fn import_requires_confirmation_for_existing_dangerous_profile()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path().join("store.db"))?;
+        store.initialize_schema()?;
+        store.insert_project_if_absent("project", "project", 100)?;
+        store.insert_profile_if_absent("profile", "project", "dev", true, 100)?;
+        let payload = import_fixture("profile", "secret", 1)?;
+        let outcome = apply_bundle_payload(
+            &mut store,
+            "project",
+            &payload,
+            ConflictResolution::AcceptIncoming,
+            &[42; 32],
+            300,
+            false,
+        );
+        assert!(matches!(outcome, Err(("ConfirmationFailed", _))));
+        let outcome = apply_bundle_payload(
+            &mut store,
+            "project",
+            &payload,
+            ConflictResolution::AcceptIncoming,
+            &[42; 32],
+            300,
+            true,
+        )
+        .map_err(|(_, message)| message)?;
+        assert!(matches!(outcome, ApplyOutcome::Applied { .. }));
+        Ok(())
+    }
+
+    #[test]
     fn import_profile_keys_are_rewrapped_for_receiver_and_idempotent()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
@@ -2444,7 +2694,7 @@ mod tests {
             payload.profile_keys.push(SealedBundleProfileKeyV1 {
                 profile_id: "profile".to_owned(),
                 purpose: purpose.as_str().to_owned(),
-                key_material_b64: BASE64URL_NOPAD.encode(&[7; 32]),
+                key_material_b64: Zeroizing::new(BASE64URL_NOPAD.encode(&[7; 32])),
             });
         }
         refresh_fixture_counts(&mut payload);
@@ -2578,7 +2828,7 @@ mod tests {
                     }
                     .to_owned(),
                     purpose: KeyPurpose::ProfileSecret.as_str().to_owned(),
-                    key_material_b64: BASE64URL_NOPAD.encode(&[42; 32]),
+                    key_material_b64: Zeroizing::new(BASE64URL_NOPAD.encode(&[42; 32])),
                 }),
             }
             refresh_fixture_counts(&mut incoming);
@@ -2661,7 +2911,7 @@ mod tests {
         )?;
         drop(store);
 
-        let request = ExportBundleRequest {
+        let mut request = ExportBundleRequest {
             project_id: PROJECT_ID.to_owned(),
             profile_id: Some(PROFILE_ID.to_owned()),
             recipient_descriptor: test_device_descriptor()?,
@@ -2670,6 +2920,9 @@ mod tests {
             include_personal: false,
             include_history: false,
             preview_only: false,
+            grant_id: None,
+            binding: None,
+            confirm_dangerous: false,
             output_path: Some(output_path.clone()),
         };
         let unlocked = UnlockedProject {
@@ -2680,11 +2933,42 @@ mod tests {
 
         let mut preview_request = request.clone();
         preview_request.preview_only = true;
-        let preview = export_bundle(&preview_request, &unlocked).map_err(|(_, message)| message)?;
+        let preview =
+            export_bundle(&preview_request, &unlocked, None).map_err(|(_, message)| message)?;
         assert_eq!(preview.status, "preview");
         assert!(preview.message.contains("No team-managed values"));
         assert!(!output_path.exists());
-        let response = export_bundle(&request, &unlocked).map_err(|(_, message)| message)?;
+        let store = Store::open(&store_path)?;
+        store
+            .connection()
+            .execute("UPDATE profiles SET dangerous = 1 WHERE id = ?1", [PROFILE_ID])?;
+        drop(store);
+        assert!(matches!(export_bundle(&request, &unlocked, None), Err(("ConfirmationFailed", _))));
+
+        request.confirm_dangerous = true;
+        let mut grants = GrantTable::default();
+        let binding = GrantBinding::new(42, "fixture");
+        let mut grant_request = crate::RequestGrantPayload {
+            project_id: PROJECT_ID.to_owned(),
+            profile_id: PROFILE_ID.to_owned(),
+            policy_name: None,
+            action: GrantAction::Copy,
+            ttl_seconds: 60,
+            binding: binding.clone(),
+        };
+        request.binding = Some(binding);
+        let now = current_unix_nanos();
+        let expiry = now + 60_000_000_000;
+        request.grant_id = Some(grants.issue(grant_request.clone(), now, expiry)?.grant_id);
+        assert!(matches!(
+            export_bundle(&request, &unlocked, Some(&grants)),
+            Err(("GrantRequired", _))
+        ));
+        assert!(!output_path.exists());
+        grant_request.action = GrantAction::Export;
+        request.grant_id = Some(grants.issue(grant_request, now, expiry)?.grant_id);
+        let response =
+            export_bundle(&request, &unlocked, Some(&grants)).map_err(|(_, message)| message)?;
         assert_eq!(response.status, "exported");
         let bytes = fs::read(&output_path)?;
         let bundle = BundleContainer::deserialize(&bytes)?;
@@ -2771,6 +3055,7 @@ ttl = "30s"
             ConflictResolution::Review,
             &master_key,
             200,
+            false,
         )
         .map_err(|(_, message)| message)?;
         assert!(matches!(outcome, ApplyOutcome::Applied { .. }));
@@ -2789,6 +3074,7 @@ ttl = "30s"
             ConflictResolution::Review,
             &master_key,
             300,
+            false,
         )
         .map_err(|(_, message)| message)?;
         assert!(matches!(outcome, ApplyOutcome::ReviewRequired { .. }));

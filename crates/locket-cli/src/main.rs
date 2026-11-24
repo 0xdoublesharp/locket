@@ -592,13 +592,22 @@ pub struct ExecArgs {
 }
 
 /// Arguments for the `locket run` command.
-#[derive(Debug, Args)]
+#[derive(Debug, Default, Args)]
 #[command(after_help = "With one argument, runs [commands.<policy>] from locket.toml.\n\
                         With a supported runner and target, such as `locket run npm dev`,\n\
                         Locket expands the runner command and applies any matching path scope.\n\
                         Secret ACLs in [secrets.<NAME>] can further limit delivery by command identity,\n\
                         structured argv pattern, and project-relative path.")]
 pub struct RunArgs {
+    /// Redact resolved secrets and recognized provider tokens from child output.
+    #[arg(long, env = "LOCKET_REDACT_OUTPUT", value_parser = clap::builder::BoolishValueParser::new())]
+    pub redact_output: bool,
+    /// Replace a secret env value with a host-bound HTTP proxy token. Repeat for more hosts.
+    #[arg(long, value_name = "SECRET_NAME=HOST_PATTERN")]
+    pub egress_host: Vec<String>,
+    /// Permit CONNECT tunnels to hosts outside the binding allowlist.
+    #[arg(long, requires = "egress_host")]
+    pub egress_allow_unlisted_connect: bool,
     /// Command policy name, or a runner adapter such as npm, pnpm, yarn, bun, cargo, make, just, task, poetry, uv, or python.
     #[arg(default_value = "")]
     pub policy: String,

@@ -291,7 +291,7 @@ pub struct AgentSocketState {
     /// `RegisterIdeEnvSession` and consumed by `IdeEnvSession` lookups.
     /// Values never enter this map: only the env-name allow-list and
     /// TTL.
-    pub ide_env_sessions: crate::ide_env_session::IdeEnvSessionRegistry,
+    pub ide_env_sessions: Arc<Mutex<crate::ide_env_session::IdeEnvSessionRegistry>>,
     /// OS keychain (or test-injected) master-key store. The agent
     /// unwraps client-less unlocks against this store; the unwrapped
     /// key is then cached via `unlock_cache`.
@@ -563,7 +563,7 @@ impl AgentSocketState {
         metrics.recent_audit_status = RecentAuditStatus::Ok;
     }
 
-    /// Clears unlocked key material and live grants for a session-lock event.
+    /// Clears unlocked key material, grants, and IDE sessions for a lock event.
     ///
     /// # Errors
     ///
@@ -574,23 +574,56 @@ impl AgentSocketState {
         source: SessionLockSource,
         now_unix_nanos: i128,
     ) -> Result<SessionLockOutcome, StoreError> {
-        let cleared_entries = {
+        let gate = self.session_gate.lock().await;
+        let outcome = self.lock_projects(None, source, now_unix_nanos).await;
+        drop(gate);
+        outcome
+    }
+
+    // Called while holding the session gate to serialize eviction with unlock
+    // and IDE session registration.
+    async fn lock_projects(
+        &self,
+        project: Option<&str>,
+        source: SessionLockSource,
+        now: i128,
+    ) -> Result<SessionLockOutcome, StoreError> {
+        let entries = {
             let mut cache = self.unlock_cache.lock().await;
-            cache.drain()
+            match project {
+                Some(project) => cache
+                    .evict(project)
+                    .map(|entry| (project.to_owned(), entry))
+                    .into_iter()
+                    .collect(),
+                None => cache.drain(),
+            }
         };
-        let cached_keys_cleared = cleared_entries.len();
-        let audit_material = lock_audit_material(&cleared_entries);
+        let cached_keys_cleared = entries.len();
+        let material = lock_audit_material(&entries);
+        drop(entries);
         let live_grants_revoked = {
             let mut grants = self.grants.lock().await;
-            let count = grants.len();
-            grants.clear();
-            count
+            if let Some(project) = project {
+                grants.revoke_for_project(project)
+            } else {
+                let count = grants.len();
+                grants.clear();
+                count
+            }
         };
+        {
+            let mut sessions = self.ide_env_sessions.lock().await;
+            match project {
+                Some(project) => sessions.revoke_project(project),
+                None => sessions.clear(),
+            };
+        }
         let outcome = SessionLockOutcome { cached_keys_cleared, live_grants_revoked };
         if outcome.changed() {
-            self.publish_status_snapshot(now_unix_nanos).await;
+            self.publish_status_snapshot(now).await;
         }
-        append_lock_audits(source, now_unix_nanos, outcome, &audit_material)?;
+        append_lock_audits(source, now, outcome, &material)?;
         Ok(outcome)
     }
 
@@ -611,7 +644,7 @@ impl AgentSocketState {
         } else {
             gate.remove(source.as_str());
         }
-        let outcome = self.lock_for_session_event(source, now).await;
+        let outcome = self.lock_projects(None, source, now).await;
         drop(gate);
         outcome
     }
@@ -628,27 +661,10 @@ impl AgentSocketState {
         now: i128,
     ) -> Result<SessionLockOutcome, StoreError> {
         let gate = self.session_gate.lock().await;
-        let entries: Vec<_> = self
-            .unlock_cache
-            .lock()
-            .await
-            .evict(project)
-            .map(|entry| (project.to_owned(), entry))
-            .into_iter()
-            .collect();
-        let cached_keys_cleared = entries.len();
-        let material = lock_audit_material(&entries);
-        drop(entries);
-        let live_grants_revoked = self.grants.lock().await.revoke_for_project(project);
-        let outcome = SessionLockOutcome { cached_keys_cleared, live_grants_revoked };
-        if outcome.changed() {
-            self.publish_status_snapshot(now).await;
-        }
-        let result =
-            append_lock_audits(SessionLockSource::TeamSyncInvalidated, now, outcome, &material);
+        let outcome =
+            self.lock_projects(Some(project), SessionLockSource::TeamSyncInvalidated, now).await;
         drop(gate);
-        result?;
-        Ok(outcome)
+        outcome
     }
 
     // Production reads wall time; unit tests inject a per-agent clock jump.
@@ -992,8 +1008,8 @@ pub(super) async fn read_one_frame<R: tokio::io::AsyncRead + Unpin>(
 #[derive(serde::Deserialize)]
 struct UnlockPayload {
     project_id: String,
-    #[serde(default)]
-    passphrase: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_unlock_passphrase")]
+    passphrase: Option<Zeroizing<String>>,
     #[serde(default)]
     reuse_cached: bool,
     ttl_seconds: u64,
@@ -1007,6 +1023,18 @@ struct UnlockPayload {
     audit: Option<UnlockAuditPayload>,
 }
 
+fn deserialize_unlock_passphrase<'de, D>(
+    deserializer: D,
+) -> Result<Option<Zeroizing<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+
+    Option::<&str>::deserialize(deserializer)
+        .map(|value| value.map(|value| Zeroizing::new(value.to_owned())))
+}
+
 #[derive(serde::Deserialize)]
 struct UnlockAuditPayload {
     store_path: PathBuf,
@@ -1018,6 +1046,8 @@ struct UnlockAuditPayload {
 struct LockPayload {
     #[serde(default)]
     source: SessionLockSource,
+    #[serde(default)]
+    project_id: Option<String>,
 }
 
 /// Returns the current Unix wall-clock time in nanoseconds, clamped to
@@ -1071,14 +1101,20 @@ pub async fn dispatch(envelope: &RequestEnvelope, state: &AgentSocketState) -> R
         }
         Ok(AgentMethod::Unlock) => handle_unlock(envelope, state).await,
         Ok(AgentMethod::Lock) => {
-            let payload: LockPayload = match serde_json::from_value(envelope.payload.clone()) {
-                Ok(payload) => payload,
-                Err(_) => {
-                    return error_response(envelope, "ProtocolError", "invalid Lock payload");
-                }
+            let payload = match serde::Deserialize::deserialize(&envelope.payload) {
+                Ok(Some(payload)) => payload,
+                Ok(None) => LockPayload::default(),
+                Err(_) => return error_response(envelope, "ProtocolError", "invalid Lock payload"),
             };
-            let now = current_unix_nanos();
-            if state.lock_for_session_event(payload.source, now).await.is_err() {
+            if payload.project_id.as_deref().is_some_and(|project| project.trim().is_empty()) {
+                return error_response(envelope, "MetadataInvalid", "project_id must not be empty");
+            }
+            let gate = state.session_gate.lock().await;
+            let result = state
+                .lock_projects(payload.project_id.as_deref(), payload.source, current_unix_nanos())
+                .await;
+            drop(gate);
+            if result.is_err() {
                 return error_response(envelope, "CorruptDb", "failed to append LOCK audit row");
             }
             ResponseEnvelope::Success(SuccessEnvelope::new(
@@ -1127,7 +1163,7 @@ pub async fn dispatch(envelope: &RequestEnvelope, state: &AgentSocketState) -> R
         }
         Ok(AgentMethod::ExportBundle) => crate::backup::handle_export_bundle(envelope, state).await,
         Ok(AgentMethod::ImportBundle) => crate::backup::handle_import_bundle(envelope, state).await,
-        Ok(AgentMethod::VerifyBundle) => crate::backup::handle_verify_bundle(envelope),
+        Ok(AgentMethod::VerifyBundle) => crate::backup::handle_verify_bundle(envelope, state).await,
         Ok(AgentMethod::RecoveryRotate) => {
             crate::backup::handle_recovery_rotate(envelope, state).await
         }
@@ -1200,7 +1236,18 @@ async fn ide_env_session_dispatch(
 ) -> ResponseEnvelope {
     let now = current_unix_nanos();
     if matches!(method, AgentMethod::RegisterIdeEnvSession) {
-        crate::ide_env_session::handle_register_ide_env_session(envelope, state, now).await
+        let session = state.session_gate.lock().await;
+        if !session.is_empty() {
+            return error_response(envelope, "UnlockRequired", "OS session is locked or suspended");
+        }
+        let response = crate::ide_env_session::handle_register_ide_env_session(
+            envelope,
+            state,
+            current_unix_nanos(),
+        )
+        .await;
+        drop(session);
+        response
     } else {
         crate::ide_env_session::handle_ide_env_session(envelope, state, now).await
     }
@@ -1208,6 +1255,7 @@ async fn ide_env_session_dispatch(
 
 const AGENT_UNLOCK_CLIENT_KIND: &str = "agent";
 const AGENT_UNLOCK_COMMAND: &str = "unlock";
+const MAX_UNLOCK_TTL_SECONDS: u64 = 86_400;
 
 /// Server-side `Unlock` handler. The agent never trusts the client to
 /// supply key bytes; it pulls the master key from the OS keychain or
@@ -1225,10 +1273,18 @@ async fn handle_unlock(envelope: &RequestEnvelope, state: &AgentSocketState) -> 
     if state.expire_unlocks(now).await.is_err() {
         return error_response(envelope, "CorruptDb", "failed to audit expired unlock");
     }
-    let payload: UnlockPayload = match serde_json::from_value(envelope.payload.clone()) {
+    let payload: UnlockPayload = match serde::Deserialize::deserialize(&envelope.payload) {
         Ok(payload) => payload,
         Err(_) => return error_response(envelope, "ProtocolError", "invalid Unlock payload"),
     };
+
+    if !(1..=MAX_UNLOCK_TTL_SECONDS).contains(&payload.ttl_seconds) {
+        return error_response(
+            envelope,
+            "MetadataInvalid",
+            "unlock TTL must be between 1 and 86400 seconds",
+        );
+    }
 
     // Execution reuses an existing authorization without re-prompting or extending
     // its lifetime. An explicit unlock still authenticates through the key store.
@@ -1245,7 +1301,7 @@ async fn handle_unlock(envelope: &RequestEnvelope, state: &AgentSocketState) -> 
     let (master_key_bytes, resolved_method) = match resolve_master_key(
         envelope,
         state,
-        payload.passphrase.as_deref(),
+        payload.passphrase.as_ref().map(|passphrase| passphrase.as_str()),
         &payload.project_id,
     ) {
         Ok(resolved) => resolved,
@@ -1624,6 +1680,13 @@ async fn handle_request_grant(
                 return error_response(envelope, "ProtocolError", "invalid RequestGrant payload");
             }
         };
+    if !crate::grant::valid_grant_ttl(payload.ttl_seconds) {
+        return error_response(
+            envelope,
+            "MetadataInvalid",
+            "grant TTL must be between 1 and 3600 seconds",
+        );
+    }
     if let Some(policy_name) = payload.policy_name.clone() {
         let policy_ttl_seconds = {
             let policies = state.command_policies.lock().await;
@@ -1637,6 +1700,13 @@ async fn handle_request_grant(
         let Some(policy_ttl_seconds) = policy_ttl_seconds else {
             return error_response(envelope, "PolicyNotFound", "command policy not found");
         };
+        if !crate::grant::valid_grant_ttl(policy_ttl_seconds) {
+            return error_response(
+                envelope,
+                "MetadataInvalid",
+                "policy grant TTL must be between 1 and 3600 seconds",
+            );
+        }
         payload.ttl_seconds = policy_ttl_seconds;
     }
     let now = current_unix_nanos();

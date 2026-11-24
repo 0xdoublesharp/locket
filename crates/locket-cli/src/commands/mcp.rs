@@ -402,10 +402,14 @@ fn list_policies(context: &RuntimeContext, selector: &str) -> Result<Value, CliE
             "optional_secrets": policy.optional_secrets.iter().map(SecretName::as_str).collect::<Vec<_>>(),
             "require_user_verification": policy.require_user_verification,
             "confirm": policy.confirm, "require_agent": policy.require_agent,
-            "invocation": ["locket", "run", &policy.name],
+            "invocation": ["locket", "run", "--redact-output", &policy.name],
         })));
     }
-    Ok(json!({"project_id": project.id, "policies": policies}))
+    Ok(json!({
+        "project_id": project.id,
+        "policies": policies,
+        "execution_guidance": "Use locket run --redact-output POLICY. For a client that sends plaintext HTTP requests through a proxy, add --egress-host SECRET=host before POLICY to replace the environment value with a host-bound token.",
+    }))
 }
 
 fn tool(name: &str, description: &str, properties: &Value, required: &[&str]) -> Value {

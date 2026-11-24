@@ -1,22 +1,27 @@
 //! Implementation of the `locket run` command and runtime session helpers
 //! shared with the `exec` command.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
-use std::process::{Command as ProcessCommand, ExitStatus};
+use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
 use std::str::FromStr;
 
 use locket_core::{
     CommandPolicy, CommandSpec, ExternalEnvSource, LkReferenceUri, LocketError, SecretName,
     SessionId,
 };
+use locket_exec::{
+    EgressEvent, EgressProxyBroker, EgressProxyConfig, EgressSecretBinding,
+    StreamingRedactorConfig, redact_child_output,
+};
 use locket_platform::{LocalUserVerificationRequest, PlatformError};
 use locket_store::{ProfileRecord, RuntimeSessionRecord, RuntimeSessionSecretNameRetention, Store};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use zeroize::Zeroizing;
 
 use crate::commands::agent::ensure_agent_running_for_execution;
 #[cfg(all(any(unix, windows), not(test)))]
@@ -99,7 +104,152 @@ struct PreparedPolicyExecution {
     /// Recorded as metadata-only `external_env_names` in the `RUN_POLICY`
     /// audit row; never includes values.
     external_env_names: Vec<String>,
+    protection_inputs: Option<ProtectionInputs>,
     prepared: locket_exec::PreparedExecution,
+}
+
+struct ProtectionInputs {
+    injected_env_names: BTreeSet<String>,
+    known_secrets: Vec<(String, Zeroizing<String>)>,
+}
+
+impl ProtectionInputs {
+    fn collect(
+        request: &locket_exec::ExecutionRequest,
+        prepared: &locket_exec::PreparedExecution,
+        policy: &CommandPolicy,
+    ) -> Self {
+        let mut known_secrets = request
+            .locket_env
+            .iter()
+            .chain(&request.external_env)
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        if let CommandSpec::Argv(arguments) = &policy.command {
+            known_secrets.extend(
+                arguments
+                    .iter()
+                    .zip(&request.argv)
+                    .filter(|(original, _)| original.contains("lk://"))
+                    .map(|(_, value)| (String::new(), Zeroizing::new(value.clone()))),
+            );
+        }
+        let mut injected_env_names = BTreeSet::new();
+        for (name, value) in &prepared.env {
+            let locket = request.locket_env.get(name);
+            let external = request.external_env.get(name);
+            if locket.is_some() || external.is_some() {
+                injected_env_names.insert(name.clone());
+                if locket != Some(value) && external != Some(value) {
+                    known_secrets.push((name.clone(), value.clone()));
+                }
+            }
+        }
+        Self { injected_env_names, known_secrets }
+    }
+}
+
+struct RunProtection {
+    redactor: StreamingRedactorConfig,
+    broker: Option<EgressProxyBroker>,
+}
+
+impl RunProtection {
+    fn configure(
+        args: &RunArgs,
+        policy: &mut PreparedPolicyExecution,
+    ) -> Result<Option<Self>, CliError> {
+        let Some(ProtectionInputs { injected_env_names, mut known_secrets }) =
+            policy.protection_inputs.take()
+        else {
+            return Ok(None);
+        };
+        let broker = if args.egress_host.is_empty() {
+            None
+        } else {
+            let broker = EgressProxyBroker::start(
+                egress_bindings(&args.egress_host, &policy.prepared, &injected_env_names)?,
+                EgressProxyConfig {
+                    allow_private_destinations_for_allowed_hosts: false,
+                    strict_connect_allowlist: !args.egress_allow_unlisted_connect,
+                },
+            )
+            .map_err(|error| {
+                metadata_invalid_error(format!("could not start egress broker: {error}"))
+            })?;
+            let overrides = broker.child_env_overrides();
+            // Redact the broker's credentials and placeholders from child output as well.
+            if let Some(proxy) = overrides.get("HTTP_PROXY")
+                && let Some((credentials, _)) =
+                    proxy.strip_prefix("http://").and_then(|url| url.split_once('@'))
+            {
+                known_secrets.push((String::new(), Zeroizing::new(credentials.to_owned())));
+                if let Some((_, password)) = credentials.split_once(':') {
+                    known_secrets.push((String::new(), Zeroizing::new(password.to_owned())));
+                }
+            }
+            known_secrets
+                .extend(overrides.iter().map(|(name, value)| (name.clone(), value.clone())));
+            policy.prepared.env.extend(overrides);
+            Some(broker)
+        };
+        Ok(Some(Self {
+            redactor: StreamingRedactorConfig {
+                known_secrets,
+                include_encoded_variants: true,
+                redact_generic_patterns: true,
+                min_secret_len: 1,
+                ..StreamingRedactorConfig::default()
+            },
+            broker,
+        }))
+    }
+}
+
+fn egress_bindings(
+    specs: &[String],
+    prepared: &locket_exec::PreparedExecution,
+    injected_env_names: &BTreeSet<String>,
+) -> Result<Vec<EgressSecretBinding>, CliError> {
+    let mut hosts_by_name = BTreeMap::<&str, Vec<String>>::new();
+    for spec in specs {
+        let (name, host) = spec.split_once('=').ok_or_else(|| {
+            metadata_invalid_error("--egress-host requires SECRET_NAME=HOST_PATTERN")
+        })?;
+        if SecretName::new(name).is_err() || host.is_empty() || host.contains('=') {
+            return Err(metadata_invalid_error("--egress-host requires SECRET_NAME=HOST_PATTERN"));
+        }
+        hosts_by_name.entry(name).or_default().push(host.to_owned());
+    }
+    let bound_names: BTreeSet<_> = hosts_by_name.keys().copied().collect();
+    hosts_by_name
+        .into_iter()
+        .map(|(name, allowed_hosts)| {
+            let Some(value) = prepared.env.get(name).filter(|_| injected_env_names.contains(name))
+            else {
+                return Err(metadata_invalid_error(
+                    "--egress-host must name a secret injected by the run policy",
+                ));
+            };
+            if !value.is_empty()
+                && (prepared.program == value.as_str()
+                    || prepared.args.iter().any(|arg| arg == value.as_str())
+                    || prepared.env.iter().any(|(other_name, other_value)| {
+                        other_value.as_str() == value.as_str()
+                            && !bound_names.contains(other_name.as_str())
+                    }))
+            {
+                return Err(metadata_invalid_error(
+                    "egress-bound secret would also be delivered outside its binding",
+                ));
+            }
+            Ok(EgressSecretBinding {
+                env_name: name.to_owned(),
+                secret_value: value.clone(),
+                allowed_hosts,
+            })
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -164,24 +314,32 @@ pub fn run_command(
         None
     };
     ensure_agent_running_for_execution(context)?;
-    let prepared_policy =
-        match prepare_policy_execution(context, output, &store, &resolved, &profile, policy) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                let failure_reason = denial_failure_reason(&error);
-                let _ignored = write_runtime_policy_denial_audit_if_available(
-                    context,
-                    &mut store,
-                    &resolved,
-                    Some(&profile),
-                    Some(policy),
-                    &policy.name,
-                    failure_reason,
-                );
-                return Err(error);
-            }
-        };
-    let outcome = execute_prepared_with_runtime_session(
+    let mut prepared_policy = match prepare_policy_execution(
+        context,
+        output,
+        &store,
+        &resolved,
+        &profile,
+        policy,
+        run_args.redact_output || !run_args.egress_host.is_empty(),
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let failure_reason = denial_failure_reason(&error);
+            let _ignored = write_runtime_policy_denial_audit_if_available(
+                context,
+                &mut store,
+                &resolved,
+                Some(&profile),
+                Some(policy),
+                &policy.name,
+                failure_reason,
+            );
+            return Err(error);
+        }
+    };
+    let protection = RunProtection::configure(run_args, &mut prepared_policy)?;
+    let outcome = execute_runtime_child(
         context,
         &RuntimeExecutionRequest {
             store: &store,
@@ -193,6 +351,7 @@ pub fn run_command(
             current_dir: Some(&context.cwd),
             run_policy_grant: Some(RunPolicyGrantRequest { ttl_seconds: policy.ttl.as_secs() }),
         },
+        protection,
     )?;
     let status = outcome.status;
     let audit_status = if status.success() { "SUCCESS" } else { "FAILED" };
@@ -225,12 +384,7 @@ pub fn approve_project_command(
     resolved: &ResolvedProject,
     argv: Vec<String>,
 ) -> Result<(), CliError> {
-    resolve_run_policy(
-        context,
-        output,
-        resolved,
-        &RunArgs { policy: String::new(), runner_args: Vec::new(), argv },
-    )?;
+    resolve_run_policy(context, output, resolved, &RunArgs { argv, ..RunArgs::default() })?;
     Ok(())
 }
 
@@ -560,6 +714,7 @@ fn prepare_policy_execution(
     resolved: &ResolvedProject,
     profile: &ProfileRecord,
     policy: &CommandPolicy,
+    protect_output: bool,
 ) -> Result<PreparedPolicyExecution, CliError> {
     let selections = policy_secret_selections(store, resolved, profile, policy)?;
     let parent_env = std::env::vars()
@@ -649,7 +804,15 @@ fn prepare_policy_execution(
     );
     let external_env_names = unique_secret_names(external_env_names.iter().map(String::as_str));
 
-    Ok(PreparedPolicyExecution { selections, secret_names, external_env_names, prepared })
+    let protection_inputs =
+        protect_output.then(|| ProtectionInputs::collect(&request, &prepared, policy));
+    Ok(PreparedPolicyExecution {
+        selections,
+        secret_names,
+        external_env_names,
+        protection_inputs,
+        prepared,
+    })
 }
 
 pub fn resolve_policy_external_env(
@@ -831,30 +994,56 @@ pub(crate) fn prepare_agent_policy_access_for_tests(
     prepare_agent_policy_access(context, resolved, profile, policy, &[])
 }
 
+const COMPOSE_ROUTING_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "TMPDIR",
+    "DOCKER_HOST",
+    "DOCKER_CONTEXT",
+    "DOCKER_CONFIG",
+    "DOCKER_TLS_VERIFY",
+    "DOCKER_CERT_PATH",
+    "COMPOSE_PROJECT_NAME",
+    "COMPOSE_FILE",
+    "COMPOSE_PROFILES",
+    "COMPOSE_ENV_FILES",
+    "COMPOSE_PATH_SEPARATOR",
+    "XDG_RUNTIME_DIR",
+    "XDG_CONFIG_HOME",
+];
+
 fn resolve_external_env_compose(
     compose_config_command: &ComposeConfigCommand<'_>,
     parent_env: &locket_exec::EnvMap,
     project_root: &Path,
     policy: &CommandPolicy,
 ) -> Result<locket_exec::EnvMap, CliError> {
+    let compose_env = parent_env.iter().filter(|(name, _)| {
+        COMPOSE_ROUTING_ENV.contains(&name.as_str())
+            || policy.inherit_env.contains(name)
+            || policy.allowed_secrets.iter().any(|allowed| allowed.as_str() == name.as_str())
+    });
     let output = ProcessCommand::new(compose_config_command.program)
         .args(compose_config_command.args)
         .current_dir(project_root)
         .env_clear()
-        .envs(parent_env.iter().map(|(name, value)| (name, value.as_str())))
+        .envs(compose_env.map(|(name, value)| (name, value.as_str())))
         .output()
         .map_err(|error| {
             external_source_unavailable_error(format!(
                 "ExternalSourceUnavailable: docker compose config could not be started: {error}"
             ))
         })?;
+    let stdout = Zeroizing::new(output.stdout);
+    drop(Zeroizing::new(output.stderr));
     if !output.status.success() {
         return Err(external_source_unavailable_error(format!(
             "ExternalSourceUnavailable: docker compose config failed with status {}",
             output.status
         )));
     }
-    resolve_external_env_compose_json(policy, &output.stdout)
+    resolve_external_env_compose_json(policy, &stdout)
 }
 
 fn warn_implicit_locket_override_conflicts(
@@ -1277,51 +1466,15 @@ fn agent_invoke_endpoint_value(
     payload: serde_json::Value,
     operation: &'static str,
 ) -> Result<serde_json::Value, CliError> {
-    use locket_agent::{DEFAULT_MAX_MESSAGE_SIZE, RequestEnvelope, ResponseEnvelope, encode_frame};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    #[cfg(unix)]
-    use tokio::net::UnixStream;
+    use locket_agent::{RequestEnvelope, ResponseEnvelope};
 
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    runtime.block_on(async move {
-        #[cfg(unix)]
-        let mut stream = UnixStream::connect(socket_path)
-            .await
-            .map_err(|error| agent_unavailable(operation, &error))?;
-        #[cfg(windows)]
-        let mut stream = locket_agent::connect_named_pipe_client(socket_path)
-            .await
-            .map_err(|error| agent_unavailable(operation, &error))?;
-        let request = RequestEnvelope::new(format!("run-{operation}"), method, payload);
-        let frame = encode_frame(&request, DEFAULT_MAX_MESSAGE_SIZE)
-            .map_err(|error| agent_unavailable(operation, &io::Error::other(error.to_string())))?;
-        stream.write_all(&frame).await.map_err(|error| agent_unavailable(operation, &error))?;
-        stream.flush().await.map_err(|error| agent_unavailable(operation, &error))?;
-
-        let mut buffer = Vec::with_capacity(1024);
-        loop {
-            if let Some(response) = crate::commands::agent::decode_agent_frame(&buffer)
-                .map_err(|error| agent_unavailable(operation, &error))?
-            {
-                return match response {
-                    ResponseEnvelope::Success(success) => Ok(success.payload),
-                    ResponseEnvelope::Error(error) => Err(agent_error_to_cli(&error)),
-                };
-            }
-            let mut chunk = [0_u8; 1024];
-            let read = stream
-                .read(&mut chunk)
-                .await
-                .map_err(|error| agent_unavailable(operation, &error))?;
-            if read == 0 {
-                return Err(agent_unavailable(
-                    operation,
-                    &io::Error::new(io::ErrorKind::UnexpectedEof, "agent closed connection"),
-                ));
-            }
-            buffer.extend_from_slice(&chunk[..read]);
-        }
-    })
+    let request = RequestEnvelope::new(format!("run-{operation}"), method, payload);
+    match crate::commands::agent::exchange_agent_request(socket_path, request, None)
+        .map_err(|error| agent_unavailable(operation, &error))?
+    {
+        ResponseEnvelope::Success(success) => Ok(success.payload),
+        ResponseEnvelope::Error(error) => Err(agent_error_to_cli(&error)),
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1500,12 +1653,29 @@ pub fn execute_prepared_with_runtime_session(
     context: &RuntimeContext,
     request: &RuntimeExecutionRequest<'_>,
 ) -> Result<RuntimeExecutionOutcome, CliError> {
+    execute_runtime_child(context, request, None)
+}
+
+fn execute_runtime_child(
+    context: &RuntimeContext,
+    request: &RuntimeExecutionRequest<'_>,
+    protection: Option<RunProtection>,
+) -> Result<RuntimeExecutionOutcome, CliError> {
     let started_at = now_unix_nanos()?;
+    let session_id = SessionId::generate()
+        .map_err(|_| corrupt_db_error("runtime session id generation failed"))?
+        .into_string();
+    let secret_names =
+        runtime_session_retention(context)?.secret_names_for_storage(request.secret_names);
     let mut command = request.prepared.command();
     if let Some(current_dir) = request.current_dir {
         command.current_dir(current_dir);
     }
+    if protection.is_some() {
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    }
     let mut child = command.spawn()?;
+    drop(command);
     let process_id = child.id();
     let run_policy_grant = match request.run_policy_grant {
         Some(grant_request) => {
@@ -1529,9 +1699,7 @@ pub fn execute_prepared_with_runtime_session(
         None => None,
     };
     let session = RuntimeSessionRecord {
-        id: SessionId::generate()
-            .map_err(|_| corrupt_db_error("runtime session id generation failed"))?
-            .into_string(),
+        id: session_id,
         project_id: request.resolved.config.project_id.to_string(),
         profile_id: request.profile.id.clone(),
         policy_name: request.policy_name.map(ToOwned::to_owned),
@@ -1540,8 +1708,7 @@ pub fn execute_prepared_with_runtime_session(
         started_at,
         ended_at: None,
         exit_status: None,
-        secret_names: runtime_session_retention(context)?
-            .secret_names_for_storage(request.secret_names),
+        secret_names,
         spawn_audit_sequence: None,
         completion_audit_sequence: None,
     };
@@ -1553,14 +1720,37 @@ pub fn execute_prepared_with_runtime_session(
         return Err(error.into());
     }
 
-    let status = child.wait()?;
+    let (redaction, broker) = protection.map_or((Ok(()), None), |protection| {
+        (
+            redact_child_output(&mut child, io::stdout(), io::stderr(), protection.redactor)
+                .map(|_| ()),
+            protection.broker,
+        )
+    });
+    if redaction.is_err() {
+        let _ignored = child.kill();
+    }
+    let status = child.wait();
+    let blocked = broker.map_or(0, |broker| {
+        broker
+            .shutdown()
+            .into_iter()
+            .filter(|event| matches!(event, EgressEvent::Blocked { .. }))
+            .count()
+    });
     revoke_run_policy_grant(context, run_policy_grant.as_ref());
+    let status = status?;
     request.store.mark_runtime_session_completed(
         &session.id,
         now_unix_nanos()?,
         status.code(),
         None,
     )?;
+    redaction?;
+    if blocked > 0 {
+        let _ignored =
+            writeln!(io::stderr(), "warning: Locket blocked {blocked} egress request(s)");
+    }
     Ok(RuntimeExecutionOutcome {
         status,
         run_policy_grant: run_policy_grant.map(|grant| grant.metadata),
@@ -1877,6 +2067,7 @@ mod approval_tests {
                 policy: String::new(),
                 runner_args: Vec::new(),
                 argv: vec!["true".into()],
+                ..crate::RunArgs::default()
             },
         )?;
         assert!(
@@ -1933,7 +2124,7 @@ mod approval_tests {
         let result = super::run_command(
             &context,
             &mut Vec::new(),
-            &crate::RunArgs { policy: "dev".into(), runner_args: Vec::new(), argv: Vec::new() },
+            &crate::RunArgs { policy: "dev".into(), ..crate::RunArgs::default() },
         );
         assert!(matches!(result,Err(error) if error.exit_code()==68));
         Ok(())
@@ -1967,6 +2158,7 @@ mod approval_tests {
                 policy: String::new(),
                 runner_args: Vec::new(),
                 argv: vec!["/usr/bin/true".to_owned()],
+                ..crate::RunArgs::default()
             },
         )?;
         assert!(effective.policy.confirm);
@@ -1999,6 +2191,7 @@ mod approval_tests {
                 policy: "npm".to_owned(),
                 runner_args: vec!["dev".to_owned()],
                 argv: Vec::new(),
+                ..crate::RunArgs::default()
             },
         )?;
         assert_eq!(effective.policy.name, "dev");
@@ -2065,8 +2258,15 @@ default='must-not-inject'
         let policy = load_effective_command_policy(&resolved, "check", &context.cwd)?.policy;
         let profile = default_profile(&store, &resolved.config)?;
         let mut output = Vec::new();
-        let prepared =
-            prepare_policy_execution(&context, &mut output, &store, &resolved, &profile, &policy)?;
+        let prepared = prepare_policy_execution(
+            &context,
+            &mut output,
+            &store,
+            &resolved,
+            &profile,
+            &policy,
+            false,
+        )?;
         assert_eq!(prepared.prepared.env.get("PORT").map(|value| value.as_str()), Some("3001"));
         assert_eq!(
             prepared.prepared.env.get("API_URL").map(|value| value.as_str()),
@@ -2130,6 +2330,7 @@ default='must-not-inject'
             &resolved,
             &profile,
             &keep,
+            false,
         )?;
         assert_eq!(prepared.prepared.env["PORT"].as_str(), "4000");
         let policy = load_effective_command_policy(&resolved, "use_vault", &context.cwd)?.policy;
@@ -2140,6 +2341,7 @@ default='must-not-inject'
             &resolved,
             &profile,
             &policy,
+            false,
         );
         let Err(error) = result else {
             return Err("invalid selected value must fail before spawn".into());

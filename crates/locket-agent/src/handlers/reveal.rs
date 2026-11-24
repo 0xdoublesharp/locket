@@ -67,12 +67,22 @@ pub struct RevealRequest {
 }
 
 /// Response payload for an authorized `Reveal` with a live unlock and grant.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RevealResponse {
     /// Plaintext secret value. Callers must limit its display lifetime.
     pub value: String,
     /// Time-to-live hint for any caller-side caching, in seconds.
     pub ttl_seconds: u32,
+}
+
+impl std::fmt::Debug for RevealResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RevealResponse")
+            .field("value", &"[REDACTED]")
+            .field("ttl_seconds", &self.ttl_seconds)
+            .finish()
+    }
 }
 
 /// Request payload for `Copy`.
@@ -101,12 +111,22 @@ pub struct CopyRequest {
 }
 
 /// Response payload for `Copy` once the unlock cache is wired.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CopyResponse {
     /// Resolved secret value. Treated as a redacted token by the UI.
     pub value: String,
     /// Time-to-live hint for any caller-side caching, in seconds.
     pub ttl_seconds: u32,
+}
+
+impl std::fmt::Debug for CopyResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CopyResponse")
+            .field("value", &"[REDACTED]")
+            .field("ttl_seconds", &self.ttl_seconds)
+            .finish()
+    }
 }
 
 /// Handler for `Reveal`.
@@ -916,6 +936,17 @@ mod tests {
             return Err("expected error envelope".into());
         };
         Ok(error.error)
+    }
+
+    #[test]
+    fn plaintext_responses_redact_debug() {
+        let secret = "fixture-plaintext-never-in-debug";
+        let reveal = RevealResponse { value: secret.to_owned(), ttl_seconds: 30 };
+        let copy = CopyResponse { value: secret.to_owned(), ttl_seconds: 30 };
+        for formatted in [format!("{reveal:?}"), format!("{copy:?}")] {
+            assert!(!formatted.contains(secret));
+            assert!(formatted.contains("[REDACTED]"));
+        }
     }
 
     #[test]

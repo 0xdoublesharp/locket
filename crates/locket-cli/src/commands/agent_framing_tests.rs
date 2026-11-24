@@ -110,11 +110,15 @@ fn agent_reader_accepts_fragmented_frame_while_peer_stays_open() {
 }
 
 #[test]
-fn agent_decoder_waits_for_every_incomplete_valid_prefix() {
-    let frame =
-        encode_frame(&SuccessEnvelope::new("test", Value::Null), DEFAULT_MAX_MESSAGE_SIZE).unwrap();
+fn agent_reader_rejects_incomplete_frames_at_eof() -> Result<(), Box<dyn std::error::Error>> {
+    let frame = encode_frame(&SuccessEnvelope::new("test", Value::Null), DEFAULT_MAX_MESSAGE_SIZE)?;
+    let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+    let mut scratch = zeroize::Zeroizing::new([0_u8; 16 * 1024]);
     for end in 0..frame.len() {
-        assert!(super::decode_agent_response(&frame[..end]).is_none());
+        let error = runtime
+            .block_on(super::read_agent_response(&mut &frame[..end], &mut scratch[..]))
+            .expect_err("incomplete frame must fail at EOF");
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
     }
-    assert_eq!(super::decode_agent_response(&frame).unwrap().unwrap(), Value::Null);
+    Ok(())
 }

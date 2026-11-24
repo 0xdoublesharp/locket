@@ -4716,6 +4716,87 @@ impl AgentAuditFixture {
 }
 
 #[tokio::test]
+async fn lock_evicts_registered_ide_sessions() -> Result<(), Box<dyn std::error::Error>> {
+    for source in ["project", "all", "sleep"] {
+        let fixture = AgentAuditFixture::unlocked().await?;
+        fixture.success(AgentMethod::RegisterIdeEnvSession, AgentAuditFixture::ide_session()).await;
+        let lookup = json!({"session_id": "ide-test"});
+        fixture.success(AgentMethod::IdeEnvSession, lookup.clone()).await;
+        fixture.state.ide_env_sessions.lock().await.insert(
+            "other-session".to_owned(),
+            crate::IdeEnvSessionEntry {
+                project_id: "other-project".to_owned(),
+                env_names: Vec::new(),
+                expires_at_unix_nanos: i128::MAX,
+            },
+        );
+        match source {
+            "sleep" => {
+                fixture
+                    .state
+                    .lock_for_native_session_event(
+                        crate::session_lock::SessionLockSource::SystemSleep,
+                        true,
+                        crate::server::current_unix_nanos(),
+                    )
+                    .await?;
+            }
+            "project" => {
+                fixture.success(AgentMethod::Lock, json!({})).await;
+            }
+            _ => {
+                let lock =
+                    RequestEnvelope::new("lock-all", AgentMethod::Lock, serde_json::Value::Null);
+                assert!(matches!(
+                    crate::dispatch(&lock, &fixture.state).await,
+                    ResponseEnvelope::Success(_)
+                ));
+            }
+        }
+        assert_eq!(fixture.state.ide_env_sessions.lock().await.is_empty(), source != "project");
+        let response =
+            crate::dispatch(&fixture.request(AgentMethod::IdeEnvSession, lookup), &fixture.state)
+                .await;
+        assert!(
+            matches!(response, ResponseEnvelope::Error(error) if error.error == "IdeEnvSessionUnavailable")
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn unlock_and_grant_reject_invalid_ttls() -> Result<(), Box<dyn std::error::Error>> {
+    let state = crate::server::AgentSocketState::locked("ttl-test");
+    state.seed_master_key("ttl-project", &[42; 32])?;
+    for (method, invalid, maximum) in
+        [(AgentMethod::Unlock, 86_401, 86_400), (AgentMethod::RequestGrant, 3_601, 3_600)]
+    {
+        for ttl in [0, invalid, u64::MAX, maximum] {
+            let request = RequestEnvelope::new(
+                method.as_str(),
+                method,
+                json!({
+                    "project_id": "ttl-project",
+                    "profile_id": "ttl-profile",
+                    "action": "Reveal",
+                    "binding": {"pid": 42, "process_start_time": "test"},
+                    "ttl_seconds": ttl,
+                }),
+            );
+            let response = crate::dispatch(&request, &state).await;
+            if ttl == maximum {
+                assert!(matches!(response, ResponseEnvelope::Success(_)), "{response:?}");
+            } else {
+                assert!(
+                    matches!(response, ResponseEnvelope::Error(error) if error.error == "MetadataInvalid")
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn audit_rpcs_share_the_wrapped_project_audit_key() -> Result<(), Box<dyn std::error::Error>>
 {
     let fixture = AgentAuditFixture::unlocked().await?;

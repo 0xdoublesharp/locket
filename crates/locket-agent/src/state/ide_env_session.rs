@@ -87,13 +87,43 @@ impl IdeEnvSessionEntry {
     }
 }
 
-/// Type alias for the shared registry held on `AgentSocketState`.
-pub type IdeEnvSessionRegistry = Arc<Mutex<HashMap<String, IdeEnvSessionEntry>>>;
+/// In-memory IDE environment sessions indexed by session id.
+#[derive(Default)]
+pub struct IdeEnvSessionRegistry {
+    entries: HashMap<String, IdeEnvSessionEntry>,
+}
 
-/// Constructs an empty registry suitable for `AgentSocketState`.
+impl IdeEnvSessionRegistry {
+    /// Registers a session under its IDE-provided id.
+    pub fn insert(&mut self, id: String, entry: IdeEnvSessionEntry) -> Option<IdeEnvSessionEntry> {
+        self.entries.insert(id, entry)
+    }
+
+    /// Returns whether the registry has no entries.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Revokes every session for a project and returns the number removed.
+    pub fn revoke_project(&mut self, project_id: &str) -> usize {
+        let count = self.entries.len();
+        self.entries.retain(|_, entry| entry.project_id != project_id);
+        count - self.entries.len()
+    }
+
+    /// Revokes all sessions and returns the number removed.
+    pub fn clear(&mut self) -> usize {
+        let count = self.entries.len();
+        self.entries.clear();
+        count
+    }
+}
+
+/// Constructs an empty shared registry suitable for `AgentSocketState`.
 #[must_use]
-pub fn new_registry() -> IdeEnvSessionRegistry {
-    Arc::new(Mutex::new(HashMap::new()))
+pub fn new_registry() -> Arc<Mutex<IdeEnvSessionRegistry>> {
+    Arc::new(Mutex::new(IdeEnvSessionRegistry::default()))
 }
 
 /// Request payload for `RegisterIdeEnvSession`.
@@ -221,7 +251,7 @@ pub async fn handle_register_ide_env_session(
         let mut registry = state.ide_env_sessions.lock().await;
         // Drop expired siblings opportunistically so the registry does
         // not grow unbounded across IDE reloads.
-        registry.retain(|_, existing| !existing.is_expired(now_unix_nanos));
+        registry.entries.retain(|_, existing| !existing.is_expired(now_unix_nanos));
         registry.insert(payload.session_id.clone(), entry);
     }
 
@@ -252,10 +282,10 @@ pub async fn handle_ide_env_session(
 
     let lookup = {
         let mut registry = state.ide_env_sessions.lock().await;
-        match registry.get(&payload.session_id) {
+        match registry.entries.get(&payload.session_id) {
             None => SessionLookup::NotRegistered,
             Some(entry) if entry.is_expired(now_unix_nanos) => {
-                registry.remove(&payload.session_id);
+                registry.entries.remove(&payload.session_id);
                 SessionLookup::Expired
             }
             Some(entry) if entry.project_id != payload.project_id => SessionLookup::ProjectMismatch,

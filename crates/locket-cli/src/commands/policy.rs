@@ -1279,12 +1279,7 @@ fn pump_policies_endpoint(
     context: &RuntimeContext,
     payload: serde_json::Value,
 ) -> Result<(), io::Error> {
-    use locket_agent::{
-        AgentMethod, DEFAULT_MAX_MESSAGE_SIZE, RequestEnvelope, ResponseEnvelope, encode_frame,
-    };
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    #[cfg(unix)]
-    use tokio::net::UnixStream;
+    use locket_agent::{AgentMethod, RequestEnvelope, ResponseEnvelope};
 
     let socket_path = crate::agent_socket_path(context);
     #[cfg(unix)]
@@ -1295,45 +1290,14 @@ fn pump_policies_endpoint(
         ));
     }
 
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    runtime.block_on(async move {
-        #[cfg(unix)]
-        let mut stream = UnixStream::connect(&socket_path).await?;
-        #[cfg(windows)]
-        let mut stream = locket_agent::connect_named_pipe_client(&socket_path).await?;
-        let request = RequestEnvelope::new(
-            "cli-pump-policies",
-            AgentMethod::RegisterCommandPolicies,
-            payload,
-        );
-        let frame = encode_frame(&request, DEFAULT_MAX_MESSAGE_SIZE).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "invalid agent request frame")
-        })?;
-        stream.write_all(&frame).await?;
-        stream.flush().await?;
-
-        let mut buffer = Vec::with_capacity(1024);
-        loop {
-            if let Some(response) = crate::commands::agent::decode_agent_frame(&buffer)? {
-                return match response {
-                    ResponseEnvelope::Success(_) => Ok(()),
-                    ResponseEnvelope::Error(error) => Err(io::Error::other(format!(
-                        "agent error {}: {}",
-                        error.error, error.message
-                    ))),
-                };
-            }
-            let mut chunk = [0_u8; 1024];
-            let read = stream.read(&mut chunk).await?;
-            if read == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "agent closed connection without a response",
-                ));
-            }
-            buffer.extend_from_slice(&chunk[..read]);
+    let request =
+        RequestEnvelope::new("cli-pump-policies", AgentMethod::RegisterCommandPolicies, payload);
+    match crate::commands::agent::exchange_agent_request(&socket_path, request, None)? {
+        ResponseEnvelope::Success(_) => Ok(()),
+        ResponseEnvelope::Error(error) => {
+            Err(io::Error::other(format!("agent error {}: {}", error.error, error.message)))
         }
-    })
+    }
 }
 
 #[cfg(all(test, unix))]

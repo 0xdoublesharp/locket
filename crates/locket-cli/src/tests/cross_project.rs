@@ -494,7 +494,9 @@ fn mcp_roundtrip_has_seven_tools_and_never_returns_values() -> Result<(), Box<dy
     assert_eq!(payload(6)?["required"], true);
     assert_eq!(payload(6)?["versions"].as_array().ok_or("expected versions")?.len(), 2);
     assert_eq!(payload(7)?["tags"], json!(["service"]));
-    assert_eq!(payload(8)?["policies"][0]["invocation"], json!(["locket", "run", "check"]));
+    let invocation = &payload(8)?["policies"][0]["invocation"];
+    assert_eq!(invocation, &json!(["locket", "run", "--redact-output", "check"]));
+    assert!(payload(8)?["execution_guidance"].to_string().contains("--egress-host SECRET=host"));
     assert_eq!(replies[9]["result"]["isError"], true);
     let generated = payload(10)?;
     assert_eq!(generated["reference"], "lk://prod/RANDOM", "{generated}");
