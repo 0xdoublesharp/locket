@@ -147,8 +147,8 @@ Rules:
 
 Schema versions:
 
-- Locket does not migrate stores. A new store is created at the current schema version, and only a store already at that version opens.
-- A store without a schema ledger, or with an older version, fails with `OutdatedSchema` and is left unchanged. Move it aside and run `locket init`.
+- A new store is created at the current schema version. A store at the current version opens, and a version 6 store is upgraded in place by adding the version 7 `secrets.expires_at` and `secrets.rotate_after_days` columns and the `audit_witness_receipts` table. Locket keeps no other migrations.
+- A store without a schema ledger, or older than version 6, fails with `OutdatedSchema` and is left unchanged. Move it aside and run `locket init`.
 - A store with a newer version fails closed with `UnsupportedSchema`.
 - Opening an existing store at the current version may create missing tables and indexes with `CREATE ... IF NOT EXISTS`; it never alters existing columns.
 

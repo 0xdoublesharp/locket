@@ -18,19 +18,26 @@ pub fn configure_connection(connection: &Connection) -> Result<(), rusqlite::Err
     Ok(())
 }
 
-/// Creates a fresh store at [`SCHEMA_VERSION`] or opens one already at it.
+/// Oldest schema version Locket still upgrades in place.
+const OLDEST_UPGRADABLE_SCHEMA_VERSION: u32 = 6;
+
+/// Creates a fresh store at [`SCHEMA_VERSION`], opens one already at it, or
+/// upgrades a version 6 store by adding the version 7 columns and tables.
 ///
-/// Locket does not migrate older stores. A store from an older or newer
-/// schema, or one without a schema ledger, is rejected.
+/// Older stores, newer stores, and stores without a schema ledger are rejected.
 pub fn initialize_schema(connection: &mut Connection) -> Result<(), StoreError> {
-    match current_schema_version(connection)? {
-        Some(version) => require_current_schema(version)?,
+    let version = match current_schema_version(connection)? {
+        Some(version) => require_supported_schema(version)?,
         None if store_has_tables(connection)? => {
             return Err(StoreError::OutdatedSchema { found: 0, supported: SCHEMA_VERSION });
         }
-        None => {}
-    }
+        None => SCHEMA_VERSION,
+    };
     let transaction = connection.transaction()?;
+    if version == 6 {
+        add_column_if_missing(&transaction, "secrets", "expires_at INTEGER")?;
+        add_column_if_missing(&transaction, "secrets", "rotate_after_days INTEGER")?;
+    }
     transaction.execute_batch(SCHEMA_SQL)?;
     transaction.execute(
         "INSERT OR IGNORE INTO schema_migrations(version, applied_at)
@@ -63,12 +70,29 @@ pub fn current_schema_version(connection: &Connection) -> Result<Option<i64>, St
     Ok(version)
 }
 
-const fn require_current_schema(version: i64) -> Result<(), StoreError> {
+const fn require_supported_schema(version: i64) -> Result<u32, StoreError> {
     if version > SCHEMA_VERSION as i64 {
         return Err(StoreError::UnsupportedSchema { found: version, supported: SCHEMA_VERSION });
     }
-    if version < SCHEMA_VERSION as i64 {
+    if version < OLDEST_UPGRADABLE_SCHEMA_VERSION as i64 {
         return Err(StoreError::OutdatedSchema { found: version, supported: SCHEMA_VERSION });
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Ok(version as u32)
+}
+
+/// Adds `definition` (`<column> <type>`) to `table` unless the column exists.
+fn add_column_if_missing(
+    connection: &Connection,
+    table: &'static str,
+    definition: &'static str,
+) -> Result<(), StoreError> {
+    let column = definition.split_whitespace().next().unwrap_or(definition);
+    let exists = connection
+        .prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"))?
+        .exists([column])?;
+    if !exists {
+        connection.execute(&format!("ALTER TABLE {table} ADD COLUMN {definition}"), [])?;
     }
     Ok(())
 }

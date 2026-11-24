@@ -4,7 +4,7 @@ use tempfile::tempdir;
 
 use crate::{SCHEMA_VERSION, Store, StoreError};
 
-use super::{insert_project_profile, open_initialized_store};
+use super::{insert_project_profile, insert_project_profile_secret, open_initialized_store};
 
 #[test]
 fn creates_schema_and_records_migration() -> Result<(), Box<dyn Error>> {
@@ -342,19 +342,41 @@ fn older_schema_version_is_rejected_unchanged() -> Result<(), Box<dyn Error>> {
     store
         .connection()
         .execute("DELETE FROM schema_migrations WHERE version = ?1", [i64::from(SCHEMA_VERSION)])?;
-    store.connection().execute(
-        "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, 1)",
-        [i64::from(SCHEMA_VERSION) - 1],
-    )?;
+    store
+        .connection()
+        .execute("INSERT INTO schema_migrations(version, applied_at) VALUES (?1, 1)", [5_i64])?;
 
     match store.initialize_schema() {
         Err(StoreError::OutdatedSchema { found, supported }) => {
-            assert_eq!(found, i64::from(SCHEMA_VERSION) - 1);
+            assert_eq!(found, 5);
             assert_eq!(supported, SCHEMA_VERSION);
         }
         other => return Err(format!("unexpected schema result: {other:?}").into()),
     }
-    assert_eq!(store.current_schema_version()?, Some(i64::from(SCHEMA_VERSION) - 1));
+    assert_eq!(store.current_schema_version()?, Some(5));
+    Ok(())
+}
+
+#[test]
+fn schema_six_store_upgrades_to_current_with_existing_secrets() -> Result<(), Box<dyn Error>> {
+    let mut test_store = open_initialized_store()?;
+    insert_project_profile_secret(&test_store.store)?;
+    test_store.store.connection().execute_batch(
+        "DROP TABLE audit_witness_receipts;
+         ALTER TABLE secrets DROP COLUMN expires_at;
+         ALTER TABLE secrets DROP COLUMN rotate_after_days;
+         DELETE FROM schema_migrations;
+         INSERT INTO schema_migrations(version, applied_at) VALUES (6, 1);",
+    )?;
+
+    test_store.store.initialize_schema()?;
+    assert_eq!(test_store.store.current_schema_version()?, Some(i64::from(SCHEMA_VERSION)));
+    assert_eq!(
+        test_store.store.get_secret_expiry_policy("lk_sec_test")?,
+        Some(crate::SecretExpiryPolicy::default())
+    );
+    assert_eq!(test_store.store.list_audit_witness_receipts("lk_proj_test")?, []);
+    test_store.store.initialize_schema()?;
     Ok(())
 }
 
