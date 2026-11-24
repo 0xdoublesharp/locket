@@ -55,7 +55,8 @@ const CA_BUNDLE_ENV: [&str; 6] = [
 pub struct EgressSecretBinding {
     /// Child environment variable receiving the placeholder.
     pub env_name: String,
-    /// Plaintext inserted into approved requests only.
+    /// Plaintext inserted into approved requests only. Must be nonempty and
+    /// contain no carriage returns, line feeds, or NUL bytes.
     pub secret_value: Zeroizing<String>,
     /// Nonempty set of host rules authorized to receive the plaintext.
     pub allowed_hosts: Vec<String>,
@@ -131,7 +132,7 @@ pub enum EgressEvent {
 /// Broker startup failure. Error messages contain no request or binding values.
 #[derive(Debug, Error)]
 pub enum EgressProxyError {
-    /// A binding has an invalid or reserved name, no secret, or invalid host rules.
+    /// A binding has an invalid or reserved name, invalid secret, or invalid host rules.
     #[error("invalid egress binding")]
     InvalidBinding,
     /// The operating system could not provide cryptographic randomness.
@@ -187,6 +188,11 @@ impl EgressProxyBroker {
         bindings: Vec<EgressSecretBinding>,
         mut config: EgressProxyConfig,
     ) -> Result<Self, EgressProxyError> {
+        if bindings.iter().any(|binding| {
+            binding.secret_value.is_empty() || binding.secret_value.contains(['\r', '\n', '\0'])
+        }) {
+            return Err(EgressProxyError::InvalidBinding);
+        }
         let listener = TcpListener::bind("127.0.0.1:0").map_err(|_| EgressProxyError::Start)?;
         listener.set_nonblocking(true).map_err(|_| EgressProxyError::Start)?;
         let address = listener.local_addr().map_err(|_| EgressProxyError::Start)?;
@@ -307,7 +313,6 @@ fn prepare_bindings(
     for binding in bindings {
         let name = &binding.env_name;
         if name.is_empty()
-            || binding.secret_value.is_empty()
             || binding.allowed_hosts.is_empty()
             || !name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
             || name.as_bytes()[0].is_ascii_digit()

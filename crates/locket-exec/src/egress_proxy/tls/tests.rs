@@ -170,10 +170,10 @@ fn https_rejects_host_mismatch_and_ambiguous_framing() -> TestResult {
 }
 
 #[test]
-fn https_rejects_secret_with_header_line_breaks() -> TestResult {
+fn https_rejects_header_substitution_with_invalid_control_bytes() -> TestResult {
     let server = listener()?;
     let target = server.local_addr()?.to_string();
-    for secret in ["fake\rX-Injected: yes", "fake\nX-Injected: yes"] {
+    for secret in ["synthetic\x0bvalue", "synthetic\x7fvalue"] {
         let broker = EgressProxyBroker::start(
             vec![binding("API_KEY", secret, target.clone())],
             allow_loopback(),

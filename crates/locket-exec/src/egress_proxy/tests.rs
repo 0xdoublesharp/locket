@@ -377,19 +377,15 @@ fn embedded_basic_credentials_are_substituted_and_redacted_as_a_unit() -> TestRe
 }
 
 #[test]
-fn rejects_line_breaks_in_encoded_header_substitution() -> TestResult {
-    let server = listener()?;
-    let upstream = server.local_addr()?;
-    let broker = EgressProxyBroker::start(
-        vec![binding("API_KEY", "synthetic\r\nX-Injected: yes", upstream.to_string())],
-        allow_loopback(),
-    )?;
-    let auth = proxy_auth(&broker)?;
-    let token = BASE64.encode(broker.child_env_overrides()["API_KEY"].as_bytes());
-    let response = request(&broker, format!(
-        "GET http://{upstream}/ HTTP/1.1\r\nHost: {upstream}\r\nProxy-Authorization: Basic {auth}\r\nX-Key: {token}\r\n\r\n"
-    ).as_bytes())?;
-    assert!(response.starts_with(b"HTTP/1.1 400 "));
-    assert_eq!(server.accept().err().map(|error| error.kind()), Some(io::ErrorKind::WouldBlock));
-    Ok(())
+fn rejects_line_breaks_and_nul_in_secret_bindings_at_startup() {
+    for tls_mitm_enabled in [false, true] {
+        let config = EgressProxyConfig { tls_mitm_enabled, ..EgressProxyConfig::default() };
+        for secret in ["foo\rbar", "foo\nbar", "foo\0bar", "foo\r\n\r\nbar"] {
+            let secret_binding = binding("API_KEY", secret, "example.com".into());
+            assert!(matches!(
+                EgressProxyBroker::start(vec![secret_binding], config.clone()),
+                Err(EgressProxyError::InvalidBinding)
+            ));
+        }
+    }
 }

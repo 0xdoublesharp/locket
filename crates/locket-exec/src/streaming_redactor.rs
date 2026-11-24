@@ -14,13 +14,17 @@ use crate::secret_encoding::Form;
 
 const BLOCK_SIZE: usize = 8192;
 const MAX_GENERIC_LINE: usize = 64 * 1024;
+const DEFAULT_REPLACEMENT: &str = "[REDACTED:locket]";
+const FALLBACK_MARKERS: [&str; 4] = [DEFAULT_REPLACEMENT, "[REDACTED]", "[***]", "███"];
+const BINARY_REPLACEMENT_BYTE: u8 = 0xff;
 
 /// Settings for streaming redaction. Labels are non-secret metadata.
 #[derive(Clone)]
 pub struct StreamingRedactorConfig {
     /// Labels and plaintext values to match.
     pub known_secrets: Vec<(String, Zeroizing<String>)>,
-    /// Marker emitted instead of a matching span.
+    /// Preferred marker emitted instead of a matching span. An empty marker or
+    /// one that could recreate a known secret is replaced with a safe marker.
     pub replacement: String,
     /// Use a marker containing the primary matching label when safe.
     pub label_replacements: bool,
@@ -37,7 +41,7 @@ impl Default for StreamingRedactorConfig {
     fn default() -> Self {
         Self {
             known_secrets: Vec::new(),
-            replacement: "[REDACTED:locket]".into(),
+            replacement: DEFAULT_REPLACEMENT.into(),
             label_replacements: false,
             include_encoded_variants: true,
             redact_generic_patterns: false,
@@ -78,22 +82,17 @@ struct Pattern {
 pub struct RedactionPatterns {
     by_first_byte: [Vec<Pattern>; 256],
     max_len: usize,
-    replacement: Zeroizing<String>,
+    replacement: Zeroizing<Vec<u8>>,
     label_replacements: bool,
     generic: bool,
 }
 
 impl RedactionPatterns {
     pub(super) fn new(config: StreamingRedactorConfig) -> Arc<Self> {
-        let replacement = if config.replacement.is_empty() {
-            "[REDACTED:locket]".into()
-        } else {
-            config.replacement
-        };
         let mut patterns = Self {
             by_first_byte: std::array::from_fn(|_| Vec::new()),
             max_len: 0,
-            replacement: Zeroizing::new(replacement),
+            replacement: Zeroizing::new(config.replacement.into_bytes()),
             label_replacements: config.label_replacements,
             generic: config.redact_generic_patterns,
         };
@@ -130,16 +129,13 @@ impl RedactionPatterns {
         for bucket in &mut patterns.by_first_byte {
             bucket.sort_unstable_by_key(|pattern| std::cmp::Reverse(pattern.bytes.len()));
         }
-        if patterns.contains(patterns.replacement.as_bytes()) {
-            // No universal fallback marker is safe for arbitrary configured secrets.
-            patterns.replacement.zeroize();
-        }
+        patterns.select_replacement();
         Arc::new(patterns)
     }
 
     pub(super) fn with_additional_literals(
         self: &Arc<Self>,
-        literals: Vec<Zeroizing<Vec<u8>>>,
+        literals: Vec<Zeroizing<String>>,
     ) -> Arc<Self> {
         if literals.is_empty() {
             return Arc::clone(self);
@@ -151,7 +147,8 @@ impl RedactionPatterns {
             label_replacements: self.label_replacements,
             generic: self.generic,
         };
-        for bytes in literals {
+        for mut literal in literals {
+            let bytes = Zeroizing::new(std::mem::take(&mut *literal).into_bytes());
             if let Some(first) = bytes.first() {
                 patterns.max_len = patterns.max_len.max(bytes.len());
                 let bucket = &mut patterns.by_first_byte[usize::from(*first)];
@@ -159,10 +156,47 @@ impl RedactionPatterns {
                 bucket.sort_unstable_by_key(|pattern| std::cmp::Reverse(pattern.bytes.len()));
             }
         }
-        if patterns.contains(patterns.replacement.as_bytes()) {
-            patterns.replacement.zeroize();
-        }
+        patterns.select_replacement();
         Arc::new(patterns)
+    }
+
+    fn select_replacement(&mut self) {
+        if self.marker_is_safe(&self.replacement) {
+            return;
+        }
+        let marker =
+            FALLBACK_MARKERS.into_iter().find(|marker| self.marker_is_safe(marker.as_bytes()));
+        self.replacement = Zeroizing::new(marker.map_or_else(
+            || vec![self.disjoint_marker_byte()],
+            |marker| marker.as_bytes().to_vec(),
+        ));
+    }
+
+    fn marker_is_safe(&self, marker: &[u8]) -> bool {
+        if marker.is_empty() || self.contains(marker) {
+            return false;
+        }
+        self.by_first_byte.iter().flatten().all(|pattern| {
+            let bytes = pattern.bytes.as_slice();
+            // A match can span the whole marker or cross just one boundary.
+            !bytes.windows(marker.len()).any(|window| window == marker)
+                && (1..marker.len().min(bytes.len())).all(|overlap| {
+                    !marker.starts_with(&bytes[bytes.len() - overlap..])
+                        && !marker.ends_with(&bytes[..overlap])
+                })
+        })
+    }
+
+    fn disjoint_marker_byte(&self) -> u8 {
+        let mut used = [false; 256];
+        for pattern in self.by_first_byte.iter().flatten() {
+            for &byte in pattern.bytes.iter() {
+                used[usize::from(byte)] = true;
+            }
+        }
+        // Patterns come from UTF-8 strings or their encodings, so 0xff is
+        // always available to this byte-oriented writer.
+        (b'!'..=b'~').find(|&byte| !used[usize::from(byte)]).unwrap_or(BINARY_REPLACEMENT_BYTE)
     }
 
     pub(super) fn contains(&self, input: &[u8]) -> bool {
@@ -279,13 +313,13 @@ impl<W: Write> StreamingRedactor<W> {
                 && label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
         }) {
             let marker = Zeroizing::new(format!("[REDACTED:{label}]"));
-            if !patterns.contains(marker.as_bytes()) {
+            if patterns.marker_is_safe(marker.as_bytes()) {
                 self.emit(marker.as_bytes())?;
                 self.stats.redaction_count = self.stats.redaction_count.saturating_add(1);
                 return Ok(());
             }
         }
-        self.emit(patterns.replacement.as_bytes())?;
+        self.emit(&patterns.replacement)?;
         self.stats.redaction_count = self.stats.redaction_count.saturating_add(1);
         Ok(())
     }
@@ -315,7 +349,7 @@ impl<W: Write> StreamingRedactor<W> {
     }
 
     fn emit_line(&mut self) -> io::Result<()> {
-        let marker = self.patterns.replacement.as_bytes();
+        let marker = self.patterns.replacement.as_slice();
         if self.overlong_line {
             self.writer.write_all(marker)?;
             self.stats.redaction_count = self.stats.redaction_count.saturating_add(1);
@@ -323,7 +357,20 @@ impl<W: Write> StreamingRedactor<W> {
             return Ok(());
         }
         let mut cursor = 0;
-        if let Ok(text) = std::str::from_utf8(&self.line) {
+        // Treat binary markers as spaces for provider scanning. Both are one
+        // byte, so scan offsets still refer to the original output buffer.
+        let scan_line = (marker == [BINARY_REPLACEMENT_BYTE]
+            && self.line.contains(&BINARY_REPLACEMENT_BYTE))
+        .then(|| {
+            Zeroizing::new(
+                self.line
+                    .iter()
+                    .map(|&byte| if byte == BINARY_REPLACEMENT_BYTE { b' ' } else { byte })
+                    .collect::<Vec<_>>(),
+            )
+        });
+        let scan_bytes = scan_line.as_deref().map_or(self.line.as_slice(), Vec::as_slice);
+        if let Ok(text) = std::str::from_utf8(scan_bytes) {
             let mut chars = text.char_indices();
             let mut column = 1;
             for finding in scan_text("", text) {

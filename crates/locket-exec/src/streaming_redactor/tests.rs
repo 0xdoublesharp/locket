@@ -112,8 +112,117 @@ fn configurable_markers_cannot_contain_a_secret() -> io::Result<()> {
     config.label_replacements = true;
     config.replacement = "marker:secret".into();
     let (output, stats) = redact(&[b"secret"], config)?;
-    assert_eq!(output, b"");
+    assert_eq!(output, b"[REDACTED:locket]");
     assert!(stats.redacted_labels.is_empty());
+    assert_eq!(stats.redaction_count, 1);
+    Ok(())
+}
+
+#[test]
+fn marker_collision_cannot_splice_surrounding_bytes_into_a_secret() -> io::Result<()> {
+    let cfg = StreamingRedactorConfig { min_secret_len: 1, ..config(&[("TOKEN", "locket")]) };
+    let (output, stats) = redact(&[b"loc", b"locket", b"ket"], cfg)?;
+    assert_eq!(output, b"loc[REDACTED]ket");
+    assert_eq!(stats.redaction_count, 1);
+    Ok(())
+}
+
+#[test]
+fn multiple_marker_collisions_skip_each_unsafe_candidate() -> io::Result<()> {
+    let cfg = StreamingRedactorConfig {
+        min_secret_len: 1,
+        ..config(&[("TOKEN", "locket"), ("MARKER", "[REDACTED]")])
+    };
+    let (output, stats) = redact(&[b"loclocketket [REDACTED]"], cfg)?;
+    assert_eq!(output, b"loc[***]ket [***]");
+    assert_eq!(stats.redaction_count, 2);
+    Ok(())
+}
+
+#[test]
+fn synthesized_marker_avoids_single_character_secrets() -> io::Result<()> {
+    let covered = "[REDACTED:locket]*\u{2588}";
+    let cfg = StreamingRedactorConfig {
+        min_secret_len: 1,
+        known_secrets: covered
+            .chars()
+            .map(|ch| (String::new(), env_value(ch.to_string())))
+            .collect(),
+        ..StreamingRedactorConfig::default()
+    };
+    let patterns = super::RedactionPatterns::new(cfg.clone());
+    let (output, stats) = redact(&[b"l"], cfg)?;
+    assert_eq!(output.len(), 1);
+    assert!(
+        patterns
+            .by_first_byte
+            .iter()
+            .flatten()
+            .all(|pattern| { output.iter().all(|byte| !pattern.bytes.contains(byte)) })
+    );
+    assert_eq!(stats.redaction_count, 1);
+    Ok(())
+}
+
+#[test]
+fn binary_marker_preserves_provider_scanning() -> io::Result<()> {
+    let printable_ascii: String = (b'!'..=b'~').map(char::from).collect();
+    let cfg = StreamingRedactorConfig {
+        min_secret_len: 1,
+        redact_generic_patterns: true,
+        ..config(&[
+            ("ASCII", &printable_ascii),
+            ("BRACKET", "["),
+            ("BLOCK", "█"),
+            ("TOKEN", "synthetic-secret"),
+        ])
+    };
+    let (output, stats) =
+        redact(&[b"synthetic-secret ghp_abcdef1234567890ABCDEF1234567890abcd"], cfg)?;
+    assert_eq!(output, b"\xff \xff");
+    assert_eq!(stats.redaction_count, 2);
+    Ok(())
+}
+
+#[test]
+fn additional_literals_can_invalidate_the_selected_marker() -> io::Result<()> {
+    let patterns = super::RedactionPatterns::new(config(&[("TOKEN", "synthetic-secret")]));
+    let patterns = patterns.with_additional_literals(vec![env_value("REDACTED")]);
+    let mut output = Vec::new();
+    let mut redactor = StreamingRedactor::with_patterns(&mut output, patterns);
+    redactor.write_all(b"synthetic-secret REDACTED")?;
+    redactor.flush_final()?;
+    assert_eq!(output, b"[***] [***]");
+    Ok(())
+}
+
+#[test]
+fn custom_marker_must_not_overlap_a_secret() -> io::Result<()> {
+    for (secret, input, expected) in [
+        ("leftx", "lefttrigger", "left[REDACTED:locket]"),
+        ("yright", "triggerright", "[REDACTED:locket]right"),
+        ("lefxyght", "leftriggerght", "lef[REDACTED:locket]ght"),
+    ] {
+        let cfg = StreamingRedactorConfig {
+            replacement: "xy".into(),
+            include_encoded_variants: false,
+            ..config(&[("OTHER", secret), ("TOKEN", "trigger")])
+        };
+        let (output, stats) = redact(&[input.as_bytes()], cfg)?;
+        assert_eq!(output, expected.as_bytes());
+        assert_eq!(stats.redaction_count, 1);
+    }
+    Ok(())
+}
+
+#[test]
+fn label_marker_cannot_recreate_a_secret_at_its_boundary() -> io::Result<()> {
+    let cfg = StreamingRedactorConfig {
+        label_replacements: true,
+        ..config(&[("OTHER", "left["), ("TOKEN", "trigger")])
+    };
+    let (output, stats) = redact(&[b"lefttrigger"], cfg)?;
+    assert_eq!(output, "left███".as_bytes());
     assert_eq!(stats.redaction_count, 1);
     Ok(())
 }

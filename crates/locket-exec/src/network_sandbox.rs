@@ -6,18 +6,14 @@ use crate::PreparedExecution;
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
 /// Limits the outbound sockets that a child and its descendants may open.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct NetworkContainmentPolicy {
     /// Destination ports on loopback, such as the egress broker port.
     pub allowed_loopback_ports: Vec<u16>,
-    /// Allow Unix-domain sockets for local IPC.
+    /// Allow outbound Unix-domain socket connections. Defaults to `false`.
+    /// Setting this to `true` weakens containment by allowing access to local
+    /// agents, proxies, and other services that listen on Unix-domain sockets.
     pub allow_unix_sockets: bool,
-}
-
-impl Default for NetworkContainmentPolicy {
-    fn default() -> Self {
-        Self { allowed_loopback_ports: Vec::new(), allow_unix_sockets: true }
-    }
 }
 
 /// Availability of kernel-enforced network containment.
@@ -103,14 +99,64 @@ pub fn wrap_command_with_network_containment(
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
+    use std::io;
     use std::net::{TcpListener, TcpStream, UdpSocket};
+    use std::os::unix::net::{UnixListener, UnixStream};
 
     use super::*;
-    use crate::env_value;
+    use crate::{EnvMap, env_value};
 
     const ALLOWED: &str = "LOCKET_TEST_SEATBELT_ALLOWED";
     const DENIED: &str = "LOCKET_TEST_SEATBELT_DENIED";
+    const UNIX_SOCKET: &str = "LOCKET_TEST_SEATBELT_UNIX_SOCKET";
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn probe_command(probe: &str, env: EnvMap) -> io::Result<PreparedExecution> {
+        let program = std::env::current_exe()?
+            .into_os_string()
+            .into_string()
+            .map_err(|_| io::Error::other("test executable path is not UTF-8"))?;
+        Ok(PreparedExecution {
+            program,
+            args: ["--exact", probe, "--nocapture"].map(str::to_owned).to_vec(),
+            env,
+        })
+    }
+
+    fn run_probe(prepared: &PreparedExecution, policy: &NetworkContainmentPolicy) -> TestResult {
+        let wrapped = wrap_command_with_network_containment(prepared, policy)?;
+        let output = wrapped.command().output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+        assert!(stdout.contains("1 passed"), "{stdout}");
+        Ok(())
+    }
+
+    #[test]
+    fn seatbelt_denies_unix_domain_connections_by_default() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let socket_path = directory.path().join("agent.sock");
+        let _listener = UnixListener::bind(&socket_path)?;
+        drop(UnixStream::connect(&socket_path)?);
+        let socket_path = socket_path.to_str().ok_or("test socket path is not UTF-8")?;
+        let prepared = probe_command(
+            "network_sandbox::tests::seatbelt_unix_child_probe",
+            EnvMap::from([(UNIX_SOCKET.into(), env_value(socket_path))]),
+        )?;
+        let policy = NetworkContainmentPolicy::default();
+        assert!(!policy.allow_unix_sockets);
+        run_probe(&prepared, &policy)
+    }
+
+    #[test]
+    fn seatbelt_unix_child_probe() -> TestResult {
+        let Some(socket_path) = std::env::var_os(UNIX_SOCKET) else { return Ok(()) };
+        let error =
+            UnixStream::connect(socket_path).err().ok_or("sandbox allowed the Unix socket")?;
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.raw_os_error(), Some(1)); // Darwin EPERM
+        Ok(())
+    }
 
     #[test]
     fn seatbelt_enforces_loopback_ports_in_the_kernel() -> TestResult {
@@ -118,36 +164,21 @@ mod tests {
         let denied = TcpListener::bind("127.0.0.1:0")?;
         let address = allowed.local_addr()?;
         let denied_address = denied.local_addr()?;
-        let program = std::env::current_exe()?
-            .into_os_string()
-            .into_string()
-            .map_err(|_| std::io::Error::other("test executable path is not UTF-8"))?;
-        let prepared = PreparedExecution {
-            program,
-            args: ["--exact", "network_sandbox::tests::seatbelt_child_probe", "--nocapture"]
-                .map(str::to_owned)
-                .to_vec(),
-            env: [
+        let prepared = probe_command(
+            "network_sandbox::tests::seatbelt_child_probe",
+            [
                 (ALLOWED.into(), env_value(address.to_string())),
                 (DENIED.into(), env_value(denied_address.to_string())),
             ]
             .into_iter()
             .collect(),
-        };
+        )?;
         for allow_unix_sockets in [true, false] {
             let policy = NetworkContainmentPolicy {
                 allowed_loopback_ports: vec![address.port()],
                 allow_unix_sockets,
             };
-            let wrapped = wrap_command_with_network_containment(&prepared, &policy)?;
-            let output = wrapped.command().output()?;
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                output.status.success(),
-                "{stdout}\n{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert!(stdout.contains("1 passed"), "{stdout}");
+            run_probe(&prepared, &policy)?;
         }
         assert_eq!(
             wrap_command_with_network_containment(

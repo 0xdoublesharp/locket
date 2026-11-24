@@ -115,7 +115,7 @@ pub(super) struct PreparedRequest<'a> {
     head: HeadBuffer,
     body: Zeroizing<Vec<u8>>,
     used: BTreeSet<usize>,
-    embedded_echoes: Vec<Zeroizing<Vec<u8>>>,
+    embedded_echoes: Vec<Zeroizing<String>>,
 }
 
 pub(super) fn prepare<'a>(
@@ -184,7 +184,7 @@ fn build_request_head(
     headers: &[Header<'_>],
     destination: &Authority,
     used: &mut BTreeSet<usize>,
-    embedded_echoes: &mut Vec<Zeroizing<Vec<u8>>>,
+    embedded_echoes: &mut Vec<Zeroizing<String>>,
 ) -> Result<HeadBuffer, Rejection> {
     let invalid = EgressBlockReason::InvalidRequest;
     state.guard_structure(request.method.as_bytes(), destination)?;
@@ -225,9 +225,9 @@ fn build_request_head(
         };
         let rewritten = if let Some(value) = rewritten {
             // Base64 encodes the surrounding Basic user as well as the value.
-            if let Some(payload) = wire::basic_payload(&value) {
-                embedded_echoes.push(Zeroizing::new(payload.to_vec()));
-            }
+            let payload = wire::basic_payload(&value).ok_or(invalid)?;
+            let payload = std::str::from_utf8(payload).map_err(|_| invalid)?;
+            embedded_echoes.push(Zeroizing::new(payload.to_owned()));
             Some(value)
         } else {
             state.rewrite(header.value, Field::Header, HEAD_LIMIT, destination, used)?
