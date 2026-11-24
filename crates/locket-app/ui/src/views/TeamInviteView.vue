@@ -179,9 +179,9 @@ function statusBadge(status: TeamInviteRow['status']): string {
 
     <TeamSharingPanel :project-id="projectId" :privacy-mode="privacyMode" />
     <details v-if="!privacyMode">
-      <summary>Legacy invite history and advanced commands</summary>
+      <summary>Invite history and advanced commands</summary>
       <p class="view__notice">
-        Legacy invites require local pending invite state. Use signed team updates above for a fresh
+        Invites require local pending invite state. Use signed team updates above for a fresh
         machine.
       </p>
       <p v-if="errorMessage" class="view__error">{{ errorMessage }}</p>

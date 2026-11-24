@@ -9,38 +9,7 @@ use crate::error::StoreError;
 /// Current storage schema version.
 pub const SCHEMA_VERSION: u32 = 7;
 
-/// Audit action written for each schema migration step when project context is available.
-pub const AUDIT_ACTION_SCHEMA_MIGRATE: &str = "SCHEMA_MIGRATE";
-
 const BUSY_TIMEOUT_MS: u64 = 5_000;
-
-/// Result of running [`initialize_schema`], capturing the prior schema state and
-/// the migration steps that actually advanced the ledger.
-///
-/// Callers feed the outcome into
-/// [`Store::record_schema_migrate_audit`](crate::Store::record_schema_migrate_audit)
-/// once a project audit key is available. A no-op re-initialization records no
-/// applied steps and must not produce an audit row.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SchemaMigrationOutcome {
-    /// Highest schema version recorded prior to this run, or `None` for a
-    /// store with no migration ledger.
-    pub before: Option<u32>,
-    /// Highest schema version recorded after this run.
-    pub after: u32,
-    /// Names of the migration steps that actually advanced the ledger during
-    /// this run, in execution order. Empty when the store was already at the
-    /// target version.
-    pub applied_steps: Vec<&'static str>,
-}
-
-impl SchemaMigrationOutcome {
-    /// Returns `true` when the run actually advanced the schema ledger.
-    #[must_use]
-    pub const fn advanced(&self) -> bool {
-        !self.applied_steps.is_empty()
-    }
-}
 
 pub fn configure_connection(connection: &Connection) -> Result<(), rusqlite::Error> {
     connection.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))?;
@@ -49,103 +18,34 @@ pub fn configure_connection(connection: &Connection) -> Result<(), rusqlite::Err
     Ok(())
 }
 
-pub fn initialize_schema(
-    connection: &mut Connection,
-) -> Result<SchemaMigrationOutcome, StoreError> {
-    let before = match current_schema_version(connection)? {
-        Some(version) => {
-            fail_on_newer_schema(version)?;
-            Some(u32::try_from(version).map_err(|_| StoreError::UnsupportedSchema {
-                found: version,
-                supported: SCHEMA_VERSION,
-            })?)
-        }
-        None if existing_store_without_migration_ledger(connection)? => Some(1),
-        None => None,
-    };
+/// Oldest schema version Locket still upgrades in place.
+const OLDEST_UPGRADABLE_SCHEMA_VERSION: u32 = 6;
 
-    let transaction = connection.transaction()?;
-    let mut applied_steps = Vec::new();
-    match before {
-        None => {
-            transaction.execute_batch(SCHEMA_SQL)?;
-            for version in 1..=SCHEMA_VERSION {
-                insert_schema_migration_row(&transaction, version)?;
-            }
-            applied_steps.push("schema.bootstrap_v7");
-        }
-        Some(version) => {
-            transaction.execute_batch(SCHEMA_MIGRATIONS_SQL)?;
-            if version < 2 {
-                migrate_v2_recent_schema_alignment(&transaction)?;
-                insert_schema_migration_row(&transaction, 2)?;
-                applied_steps.push("schema.migrate_v2_recent_schema_alignment");
-            }
-            if version < 3 {
-                migrate_v3_team_member_profiles(&transaction)?;
-                insert_schema_migration_row(&transaction, 3)?;
-                applied_steps.push("schema.migrate_v3_team_member_profiles");
-            }
-            transaction.execute_batch(SCHEMA_SQL)?;
-            if version < 4 {
-                // Legacy issuers disclosed their seeds. Pending signatures cannot be trusted.
-                transaction.execute("UPDATE team_invites SET revoked_at = CAST(strftime('%s','now') AS INTEGER) * 1000000000 WHERE accepted_at IS NULL AND revoked_at IS NULL", [])?;
-                insert_schema_migration_row(&transaction, 4)?;
-                applied_steps.push("schema.migrate_v4_device_signing");
-            }
-            if version < 5 {
-                insert_schema_migration_row(&transaction, 5)?;
-                applied_steps.push("schema.migrate_v5_authenticated_team_sync");
-            }
-            if version < 6 {
-                add_column_if_missing(
-                    &transaction,
-                    "team_sync_folders",
-                    "scan_after",
-                    "scan_after TEXT",
-                )?;
-                add_column_if_missing(
-                    &transaction,
-                    "team_sync_folders",
-                    "last_error",
-                    "last_error TEXT",
-                )?;
-                transaction.execute("INSERT OR IGNORE INTO team_sync_join_checkpoints(project_id,epoch) SELECT h.project_id,COALESCE((SELECT MIN(s.epoch) FROM team_sync_seen s WHERE s.project_id=h.project_id AND s.outcome='applied'),h.epoch) FROM team_sync_heads h",[])?;
-                insert_schema_migration_row(&transaction, 6)?;
-                applied_steps.push("schema.migrate_v6_pending_team_profiles");
-            }
-            if version < 7 {
-                add_column_if_missing(&transaction, "secrets", "expires_at", "expires_at INTEGER")?;
-                add_column_if_missing(
-                    &transaction,
-                    "secrets",
-                    "rotate_after_days",
-                    "rotate_after_days INTEGER",
-                )?;
-                insert_schema_migration_row(&transaction, 7)?;
-                applied_steps.push("schema.migrate_v7_expiry_and_witnesses");
-            }
-            transaction.execute_batch(SCHEMA_SQL)?;
-        }
-    }
-    transaction.commit()?;
-
-    let after = match current_schema_version(connection)? {
-        Some(version) => {
-            fail_on_newer_schema(version)?;
-            u32::try_from(version).map_err(|_| StoreError::UnsupportedSchema {
-                found: version,
-                supported: SCHEMA_VERSION,
-            })?
+/// Creates a fresh store at [`SCHEMA_VERSION`], opens one already at it, or
+/// upgrades a version 6 store by adding the version 7 columns and tables.
+///
+/// Older stores, newer stores, and stores without a schema ledger are rejected.
+pub fn initialize_schema(connection: &mut Connection) -> Result<(), StoreError> {
+    let version = match current_schema_version(connection)? {
+        Some(version) => require_supported_schema(version)?,
+        None if store_has_tables(connection)? => {
+            return Err(StoreError::OutdatedSchema { found: 0, supported: SCHEMA_VERSION });
         }
         None => SCHEMA_VERSION,
     };
-
-    if before == Some(after) {
-        applied_steps.clear();
+    let transaction = connection.transaction()?;
+    if version == 6 {
+        add_column_if_missing(&transaction, "secrets", "expires_at INTEGER")?;
+        add_column_if_missing(&transaction, "secrets", "rotate_after_days INTEGER")?;
     }
-
-    Ok(SchemaMigrationOutcome { before, after, applied_steps })
+    transaction.execute_batch(SCHEMA_SQL)?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+         VALUES (?1, CAST(strftime('%s', 'now') AS INTEGER) * 1000000000)",
+        [i64::from(SCHEMA_VERSION)],
+    )?;
+    transaction.commit()?;
+    Ok(())
 }
 
 pub fn current_schema_version(connection: &Connection) -> Result<Option<i64>, StoreError> {
@@ -170,15 +70,34 @@ pub fn current_schema_version(connection: &Connection) -> Result<Option<i64>, St
     Ok(version)
 }
 
-const fn fail_on_newer_schema(version: i64) -> Result<(), StoreError> {
+const fn require_supported_schema(version: i64) -> Result<u32, StoreError> {
     if version > SCHEMA_VERSION as i64 {
         return Err(StoreError::UnsupportedSchema { found: version, supported: SCHEMA_VERSION });
     }
+    if version < OLDEST_UPGRADABLE_SCHEMA_VERSION as i64 {
+        return Err(StoreError::OutdatedSchema { found: version, supported: SCHEMA_VERSION });
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Ok(version as u32)
+}
 
+/// Adds `definition` (`<column> <type>`) to `table` unless the column exists.
+fn add_column_if_missing(
+    connection: &Connection,
+    table: &'static str,
+    definition: &'static str,
+) -> Result<(), StoreError> {
+    let column = definition.split_whitespace().next().unwrap_or(definition);
+    let exists = connection
+        .prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"))?
+        .exists([column])?;
+    if !exists {
+        connection.execute(&format!("ALTER TABLE {table} ADD COLUMN {definition}"), [])?;
+    }
     Ok(())
 }
 
-fn existing_store_without_migration_ledger(connection: &Connection) -> Result<bool, StoreError> {
+fn store_has_tables(connection: &Connection) -> Result<bool, StoreError> {
     let table_count = connection.query_row(
         "SELECT COUNT(*) FROM sqlite_master
          WHERE type = 'table'
@@ -188,112 +107,6 @@ fn existing_store_without_migration_ledger(connection: &Connection) -> Result<bo
         |row| row.get::<_, i64>(0),
     )?;
     Ok(table_count > 0)
-}
-
-fn insert_schema_migration_row(connection: &Connection, version: u32) -> Result<(), StoreError> {
-    connection.execute(
-        "INSERT OR IGNORE INTO schema_migrations(version, applied_at)
-         VALUES (?1, CAST(strftime('%s', 'now') AS INTEGER) * 1000000000)",
-        [i64::from(version)],
-    )?;
-    Ok(())
-}
-
-fn migrate_v2_recent_schema_alignment(connection: &Connection) -> Result<(), StoreError> {
-    add_column_if_missing(
-        connection,
-        "directory_grants",
-        "granted_by",
-        "granted_by TEXT REFERENCES team_members(id) ON DELETE SET NULL",
-    )?;
-    add_column_if_missing(connection, "directory_grants", "revoked_at", "revoked_at INTEGER")?;
-    add_column_if_missing(
-        connection,
-        "devices",
-        "member_id",
-        "member_id TEXT REFERENCES team_members(id) ON DELETE SET NULL",
-    )?;
-    add_column_if_missing(connection, "devices", "label", "label TEXT NOT NULL DEFAULT ''")?;
-
-    migrate_empty_legacy_passkey_credentials(connection)?;
-    Ok(())
-}
-
-fn migrate_v3_team_member_profiles(connection: &Connection) -> Result<(), StoreError> {
-    add_column_if_missing(
-        connection,
-        "team_members",
-        "profiles_json",
-        "profiles_json TEXT CHECK (profiles_json IS NULL OR (json_valid(profiles_json) AND json_type(profiles_json) = 'array'))",
-    )?;
-    Ok(())
-}
-
-fn add_column_if_missing(
-    connection: &Connection,
-    table: &'static str,
-    column: &'static str,
-    definition: &'static str,
-) -> Result<(), StoreError> {
-    if !table_exists(connection, table)? || column_exists(connection, table, column)? {
-        return Ok(());
-    }
-    connection.execute(&format!("ALTER TABLE {table} ADD COLUMN {definition}"), [])?;
-    Ok(())
-}
-
-fn table_exists(connection: &Connection, table: &'static str) -> Result<bool, StoreError> {
-    let exists = connection
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
-            [table],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some();
-    Ok(exists)
-}
-
-fn column_exists(
-    connection: &Connection,
-    table: &'static str,
-    column: &'static str,
-) -> Result<bool, StoreError> {
-    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
-    let mut rows = statement.query([])?;
-    while let Some(row) = rows.next()? {
-        let name: String = row.get(1)?;
-        if name == column {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn migrate_empty_legacy_passkey_credentials(connection: &Connection) -> Result<(), StoreError> {
-    if !table_exists(connection, "passkey_credentials")? {
-        return Ok(());
-    }
-    let required_columns = ["device_id", "member_id", "public_key", "user_handle"];
-    let mut already_current = true;
-    for column in required_columns {
-        already_current =
-            already_current && column_exists(connection, "passkey_credentials", column)?;
-    }
-    if already_current {
-        return Ok(());
-    }
-
-    let row_count =
-        connection.query_row("SELECT COUNT(*) FROM passkey_credentials", [], |row| {
-            row.get::<_, i64>(0)
-        })?;
-    if row_count > 0 {
-        return Err(rusqlite::Error::InvalidQuery.into());
-    }
-
-    connection.execute("DROP TABLE passkey_credentials", [])?;
-    Ok(())
 }
 
 const SCHEMA_SQL: &str = r"
@@ -836,22 +649,6 @@ CREATE TABLE IF NOT EXISTS team_sync_publications (
  project_id TEXT PRIMARY KEY, members_json TEXT NOT NULL, keys_json TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS device_signing_versions (
-  device_id TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
-  version INTEGER NOT NULL CHECK(version = 2)
-);
-CREATE TABLE IF NOT EXISTS device_fingerprint_aliases (
-  device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
-  fingerprint TEXT NOT NULL,
-  PRIMARY KEY(device_id, fingerprint)
-);
-CREATE TABLE IF NOT EXISTS schema_migrations (
-  version INTEGER PRIMARY KEY CHECK (version >= 1 AND version <= 4294967295),
-  applied_at INTEGER NOT NULL
-);
-";
-
-const SCHEMA_MIGRATIONS_SQL: &str = r"
 CREATE TABLE IF NOT EXISTS schema_migrations (
   version INTEGER PRIMARY KEY CHECK (version >= 1 AND version <= 4294967295),
   applied_at INTEGER NOT NULL

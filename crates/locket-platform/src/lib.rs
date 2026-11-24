@@ -53,10 +53,9 @@ pub use master_key::{
 };
 pub use memory_lock::{MemoryLockHardening, lock_process_memory, memory_lock_hardening_state};
 pub use passkey::{
-    DefaultPlatformPasskeyRegistrar, KeyringPlatformPasskeyRegistrar, MemoryPlatformPasskeyOutcome,
-    MemoryPlatformPasskeyRegistrar, PasskeyAssertionContext, PasskeyRegistration,
-    PlatformPasskeyRegistrar, UnavailablePlatformPasskeyRegistrar,
-    default_platform_passkey_registrar,
+    DefaultPlatformPasskeyRegistrar, MemoryPlatformPasskeyOutcome, MemoryPlatformPasskeyRegistrar,
+    PasskeyAssertionContext, PasskeyRegistration, PlatformPasskeyRegistrar,
+    UnavailablePlatformPasskeyRegistrar, default_platform_passkey_registrar,
 };
 pub use passphrase::PassphraseFallbackMasterKeyStore;
 pub use process::{
@@ -67,8 +66,8 @@ pub use process::{
 pub use process::{terminate_windows_process, windows_process_is_live};
 pub use recovery::{
     RECOVERY_KDF_TOML_VERSION, RecoveryEnvelope, RecoveryEnvelopeEntry, RecoveryKdfToml,
-    decode_recovery_state, load_recovery_envelope, load_recovery_kdf_toml, save_recovery_envelope,
-    save_recovery_kdf_toml, save_recovery_state,
+    decode_recovery_state, load_recovery_envelope, load_recovery_kdf_toml, load_recovery_state,
+    save_recovery_envelope, save_recovery_state,
 };
 pub use session::{
     NativeSessionEvent, NativeSessionNotification, SessionObserver, run_with_native_session_loop,

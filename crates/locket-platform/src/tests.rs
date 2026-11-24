@@ -10,7 +10,7 @@ use super::{
     UnavailablePlatformPasskeyRegistrar, WrappedLocalFileDevicePrivateKeyStorage,
     current_process_binding, decode_key, encode_key, load_recovery_envelope,
     load_recovery_kdf_toml, master_key_account, platform_name,
-    process_binding_matches_live_process, save_recovery_envelope, save_recovery_kdf_toml,
+    process_binding_matches_live_process, save_recovery_envelope, save_recovery_state,
 };
 
 const PROJECT_ID: &str = "lk_proj_test";
@@ -378,12 +378,17 @@ fn passphrase_fallback_uses_user_only_permissions() -> Result<(), PlatformError>
 }
 
 #[test]
-fn recovery_kdf_toml_round_trips_and_rejects_tampering() -> Result<(), PlatformError> {
+fn recovery_kdf_round_trips_and_rejects_tampering() -> Result<(), PlatformError> {
     let directory = tempfile::tempdir()?;
     let salt = [3_u8; locket_crypto::RECOVERY_SALT_LEN];
     let kdf = RecoveryKdfToml::new_v1("lk_kdf_test".to_owned(), &salt, 456);
+    let envelope = RecoveryEnvelope {
+        kdf_profile_id: kdf.kdf_profile_id.clone(),
+        created_at_unix_nanos: 456,
+        entries: Vec::new(),
+    };
 
-    save_recovery_kdf_toml(directory.path(), &kdf)?;
+    save_recovery_state(directory.path(), &kdf, &envelope)?;
     let loaded = load_recovery_kdf_toml(directory.path())?;
 
     assert_eq!(loaded.kdf_profile_id, "lk_kdf_test");
@@ -392,7 +397,7 @@ fn recovery_kdf_toml_round_trips_and_rejects_tampering() -> Result<(), PlatformE
     let mut tampered = loaded;
     tampered.m_cost = locket_crypto::RECOVERY_M_COST + 1;
     assert!(matches!(
-        save_recovery_kdf_toml(directory.path(), &tampered),
+        save_recovery_state(directory.path(), &tampered, &envelope),
         Err(PlatformError::InvalidRecoveryEnvelope(_))
     ));
     Ok(())
@@ -412,7 +417,9 @@ fn recovery_envelope_round_trips_and_rejects_tampering() -> Result<(), PlatformE
         }],
     };
 
-    save_recovery_envelope(directory.path(), &envelope)?;
+    let salt = [3_u8; locket_crypto::RECOVERY_SALT_LEN];
+    let kdf = RecoveryKdfToml::new_v1("lk_kdf_test".to_owned(), &salt, 123);
+    save_recovery_state(directory.path(), &kdf, &envelope)?;
     let loaded = load_recovery_envelope(directory.path())?;
 
     assert_eq!(loaded.kdf_profile_id, envelope.kdf_profile_id);
@@ -467,15 +474,12 @@ fn recovery_files_use_user_only_permissions() -> Result<(), PlatformError> {
         }],
     };
 
-    save_recovery_kdf_toml(&recovery_dir, &kdf)?;
-    save_recovery_envelope(&recovery_dir, &envelope)?;
+    save_recovery_state(&recovery_dir, &kdf, &envelope)?;
 
     let dir_mode = std::fs::metadata(&recovery_dir)?.permissions().mode() & 0o777;
-    let kdf_mode = std::fs::metadata(recovery_dir.join("kdf.toml"))?.permissions().mode() & 0o777;
     let envelope_mode =
         std::fs::metadata(recovery_dir.join("envelope.bin"))?.permissions().mode() & 0o777;
     assert_eq!(dir_mode, 0o700);
-    assert_eq!(kdf_mode, 0o600);
     assert_eq!(envelope_mode, 0o600);
     Ok(())
 }
@@ -708,23 +712,6 @@ fn memory_passkey_registrar_unsupported_outcome_blocks_register() {
 }
 
 #[test]
-fn keyring_passkey_helpers_are_stable_and_metadata_only() -> Result<(), PlatformError> {
-    let credential_id = [0x42_u8; 32];
-    let secret = [0x7a_u8; KEY_LEN];
-    let public_key = super::passkey::public_metadata_key(&secret);
-    let public_key_again = super::passkey::public_metadata_key(&secret);
-    assert_eq!(public_key, public_key_again);
-    assert_ne!(public_key, secret);
-    assert!(super::passkey::passkey_account(&credential_id).starts_with("prf:"));
-    assert_ne!(super::passkey::platform_transport_label(), "");
-
-    let prf_a = super::passkey::derive_passkey_prf(&secret, b"salt-a")?;
-    let prf_b = super::passkey::derive_passkey_prf(&secret, b"salt-b")?;
-    assert_ne!(prf_a, prf_b);
-    Ok(())
-}
-
-#[test]
 fn signing_storage_is_separate_and_rejects_sealing_envelope_substitution()
 -> Result<(), PlatformError> {
     let directory = tempfile::tempdir()?;
@@ -741,8 +728,8 @@ fn signing_storage_is_separate_and_rejects_sealing_envelope_substitution()
 }
 
 #[test]
-fn recovery_state_keeps_embedded_kdf_authoritative_until_atomic_replacement()
--> Result<(), PlatformError> {
+fn recovery_entry_updates_keep_the_stored_kdf_until_atomic_replacement() -> Result<(), PlatformError>
+{
     let directory = tempfile::tempdir()?;
     let original_kdf =
         RecoveryKdfToml::new_v1("lk_kdf_old".into(), &[3; locket_crypto::RECOVERY_SALT_LEN], 1);
@@ -751,19 +738,9 @@ fn recovery_state_keeps_embedded_kdf_authoritative_until_atomic_replacement()
         created_at_unix_nanos: 1,
         entries: vec![],
     };
-    // Exercise compatibility with an actual legacy pair before migration.
-    save_recovery_kdf_toml(directory.path(), &original_kdf)?;
-    std::fs::write(directory.path().join("envelope.bin"), original.serialize()?)?;
-    assert_eq!(load_recovery_envelope(directory.path())?.kdf_profile_id, "lk_kdf_old");
-    crate::save_recovery_state(directory.path(), &original_kdf, &original)?;
-    // Updating encrypted entries must not promote a stale/tampered loose KDF
-    // into the authoritative container, even if its identifier still matches.
-    let tampered = RecoveryKdfToml::new_v1(
-        original_kdf.kdf_profile_id.clone(),
-        &[9; locket_crypto::RECOVERY_SALT_LEN],
-        1,
-    );
-    save_recovery_kdf_toml(directory.path(), &tampered)?;
+    // Entry updates need an existing container to take the KDF from.
+    assert!(save_recovery_envelope(directory.path(), &original).is_err());
+    save_recovery_state(directory.path(), &original_kdf, &original)?;
     save_recovery_envelope(directory.path(), &original)?;
     assert_eq!(
         load_recovery_kdf_toml(directory.path())?.decode_salt()?,
@@ -771,20 +748,17 @@ fn recovery_state_keeps_embedded_kdf_authoritative_until_atomic_replacement()
     );
     let next_kdf =
         RecoveryKdfToml::new_v1("lk_kdf_next".into(), &[4; locket_crypto::RECOVERY_SALT_LEN], 2);
-    save_recovery_kdf_toml(directory.path(), &next_kdf)?;
-    // A crash after staging a loose KDF cannot corrupt the committed pair.
-    assert_eq!(load_recovery_kdf_toml(directory.path())?.kdf_profile_id, "lk_kdf_old");
-    assert_eq!(load_recovery_envelope(directory.path())?.kdf_profile_id, "lk_kdf_old");
-    assert!(crate::save_recovery_state(directory.path(), &next_kdf, &original).is_err());
+    assert!(save_recovery_state(directory.path(), &next_kdf, &original).is_err());
     assert_eq!(load_recovery_kdf_toml(directory.path())?.kdf_profile_id, "lk_kdf_old");
     let next = RecoveryEnvelope { kdf_profile_id: next_kdf.kdf_profile_id.clone(), ..original };
-    crate::save_recovery_state(directory.path(), &next_kdf, &next)?;
-    // Modern recovery needs no separate file and cannot silently fall back to it.
-    std::fs::remove_file(directory.path().join("kdf.toml"))?;
+    save_recovery_state(directory.path(), &next_kdf, &next)?;
     assert_eq!(load_recovery_kdf_toml(directory.path())?.kdf_profile_id, "lk_kdf_next");
     assert_eq!(load_recovery_envelope(directory.path())?.kdf_profile_id, "lk_kdf_next");
+    // Neither a header alone nor an envelope without the header is a recovery file.
     std::fs::write(directory.path().join("envelope.bin"), b"LOCKET-RECOVERY-STATE-V1\0")?;
     assert!(load_recovery_kdf_toml(directory.path()).is_err());
+    std::fs::write(directory.path().join("envelope.bin"), next.serialize()?)?;
+    assert!(load_recovery_envelope(directory.path()).is_err());
     Ok(())
 }
 
@@ -817,7 +791,7 @@ fn recovery_atomic_container_rejects_truncation_lengths_and_mismatched_metadata(
         .ok_or_else(|| PlatformError::InvalidRecoveryEnvelope("missing test id".into()))?;
     mismatched[at + b"lk_kdf_".len()] = b'X';
     assert!(crate::decode_recovery_state(&mismatched).is_err());
-    assert!(crate::decode_recovery_state(&encoded)?.is_some());
-    assert!(crate::decode_recovery_state(&envelope.serialize()?)?.is_none());
+    assert!(crate::decode_recovery_state(&encoded).is_ok());
+    assert!(crate::decode_recovery_state(&envelope.serialize()?).is_err());
     Ok(())
 }

@@ -34,7 +34,7 @@ pub fn recover_command(
     let resolved = require_project(context)?;
     let recovery_dir = recovery_dir(&resolved);
     let kdf = load_recovery_kdf_toml(&recovery_dir)
-        .map_err(|error| metadata_invalid_error(format!("recovery/kdf.toml: {error}")))?;
+        .map_err(|error| metadata_invalid_error(format!("recovery/envelope.bin: {error}")))?;
     let envelope = load_recovery_envelope(&recovery_dir)
         .map_err(|error| metadata_invalid_error(format!("recovery/envelope.bin: {error}")))?;
     let code = context.recovery_code_reader.read_recovery_code("recovery code")?;
@@ -70,7 +70,7 @@ pub fn recovery_rotate_command(
 
     let entries = if recovery_dir.join("envelope.bin").exists() {
         let old_kdf = load_recovery_kdf_toml(&recovery_dir)
-            .map_err(|error| metadata_invalid_error(format!("recovery/kdf.toml: {error}")))?;
+            .map_err(|error| metadata_invalid_error(format!("recovery/envelope.bin: {error}")))?;
         let old_envelope = load_recovery_envelope(&recovery_dir)
             .map_err(|error| metadata_invalid_error(format!("recovery/envelope.bin: {error}")))?;
         validate_recovery_metadata(project_id, &old_kdf, &old_envelope)?;
@@ -233,7 +233,7 @@ fn restore_device_private_keys(
     restored: &mut RecoveryRestoreSummary,
 ) -> Result<(), CliError> {
     let project_id = resolved.config.project_id.as_str();
-    let mut store = open_store(context)?;
+    let store = open_store(context)?;
     let Some(device) = store.get_active_local_device(project_id)? else {
         return Ok(());
     };
@@ -251,26 +251,8 @@ fn restore_device_private_keys(
     signing_key.copy_from_slice(&signing);
     let signing_public =
         ed25519_dalek::SigningKey::from_bytes(&signing_key).verifying_key().to_bytes();
-    let legacy = !store.device_signing_is_v2(&device.id)?;
-    if (legacy && signing.as_slice() != device.signing_public_key.as_slice())
-        || (!legacy && signing_public.as_slice() != device.signing_public_key.as_slice())
-    {
-        // A recovery envelope from before explicit rotation may contain the disclosed seed.
-        // It proves sealing-key ownership only; never restore that seed as an active signer.
-        let sealing_public: [u8; 32] = device
-            .sealing_public_key
-            .as_slice()
-            .try_into()
-            .map_err(|_| metadata_invalid_error("invalid sealing key"))?;
-        let old_fingerprint =
-            crate::commands::team::device::device_fingerprint_hex(&signing_key, &sealing_public);
-        let old_public_fingerprint =
-            crate::commands::team::device::device_fingerprint_hex(&signing_public, &sealing_public);
-        if !store.device_matches_bundle_recipient(&device, &old_fingerprint)?
-            && !store.device_matches_bundle_recipient(&device, &old_public_fingerprint)?
-        {
-            return Err(metadata_invalid_error("recovery envelope device signing key mismatch"));
-        }
+    if signing_public.as_slice() != device.signing_public_key.as_slice() {
+        return Err(metadata_invalid_error("recovery envelope device signing key mismatch"));
     }
 
     let sealing = open_required_device_recovery_entry(
@@ -292,11 +274,7 @@ fn restore_device_private_keys(
         return Err(metadata_invalid_error("recovery envelope device sealing key mismatch"));
     }
     storage.store(&device.id, &sealing_key)?;
-    if legacy || signing_public.as_slice() != device.signing_public_key.as_slice() {
-        crate::commands::team::device::rotate_signing_identity(context, &mut store, &device)?;
-    } else {
-        storage.for_signing().store(&device.fingerprint, &signing_key)?;
-    }
+    storage.for_signing().store(&device.fingerprint, &signing_key)?;
     restored.device_signing_private += 1;
     restored.device_sealing_private += 1;
     Ok(())
@@ -562,8 +540,7 @@ pub fn replace_device_recovery_entries(
         return Ok(());
     }
     let signing_private_key = zeroize::Zeroizing::new(
-        crate::commands::team::device::load_device_signing_key(context, &store, &device)?
-            .to_bytes(),
+        crate::commands::team::device::load_device_signing_key(context, &device)?.to_bytes(),
     );
     let storage =
         crate::commands::team::device::build_device_private_key_storage(context, project_id)?;

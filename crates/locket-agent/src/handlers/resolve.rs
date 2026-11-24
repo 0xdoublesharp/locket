@@ -1596,7 +1596,7 @@ mod tests {
         let prepare_request = PrepareExecRequest {
             policy_name: POLICY_NAME.to_owned(),
             profile_id: PROFILE_ID.to_owned(),
-            project_id: Some(PROJECT_ID.to_owned()),
+            project_id: PROJECT_ID.to_owned(),
             binding: Some(GrantBinding::new(std::process::id(), "0")),
         };
         let prepare_envelope = RequestEnvelope::new(

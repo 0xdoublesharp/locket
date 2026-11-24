@@ -2,8 +2,8 @@
 #![allow(unused_crate_dependencies)]
 
 use locket_platform::{
-    KeyringPlatformPasskeyRegistrar, PasskeyAssertionContext, PlatformError,
-    PlatformPasskeyRegistrar, default_platform_passkey_registrar,
+    PasskeyAssertionContext, PlatformError, PlatformPasskeyRegistrar,
+    default_platform_passkey_registrar,
 };
 
 #[test]
@@ -20,27 +20,6 @@ fn production_auth_ignores_test_environment() -> Result<(), Box<dyn std::error::
         .output()?;
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));
     Ok(())
-}
-
-#[test]
-fn production_does_not_offer_software_keyring_seeds_as_passkeys() {
-    let registrar = KeyringPlatformPasskeyRegistrar;
-    assert!(!registrar.supports_registration());
-    assert!(matches!(
-        registrar.register_passkey("test", "locket.localhost"),
-        Err(PlatformError::PasskeyUnsupported)
-    ));
-    assert!(matches!(
-        registrar.evaluate_prf(
-            PasskeyAssertionContext {
-                credential_id: &[1; 32],
-                relying_party_id: "locket.localhost",
-                public_key: &[],
-            },
-            &[2; 32]
-        ),
-        Err(PlatformError::PasskeyUnsupported)
-    ));
 }
 
 #[test]

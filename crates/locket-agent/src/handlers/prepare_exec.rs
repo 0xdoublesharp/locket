@@ -69,11 +69,8 @@ pub struct PrepareExecRequest {
     pub policy_name: String,
     /// Profile id whose secrets the policy should resolve against.
     pub profile_id: String,
-    /// Project id whose policy registry should be consulted. Optional
-    /// for backwards compatibility with stub clients; future callers
-    /// should always supply it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
+    /// Project id whose policy registry should be consulted.
+    pub project_id: String,
     /// Caller's process binding for the issued grant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding: Option<GrantBinding>,
@@ -90,11 +87,7 @@ pub struct PrepareExecResponse {
     /// Time-to-live hint, in seconds, for the prepared invocation.
     pub ttl_seconds: u32,
     /// Opaque id of the live [`GrantAction::PrepareExec`] grant the
-    /// agent issued for this prepare. Empty when the response is
-    /// produced by an older agent build that did not surface the grant
-    /// id; clients must treat empty as "fall back to the legacy
-    /// `RequestGrant` path".
-    #[serde(default)]
+    /// agent issued for this prepare.
     pub grant_id: String,
 }
 
@@ -112,9 +105,7 @@ pub async fn handle_prepare_exec(
     let Ok(typed) = serde_json::from_value::<PrepareExecRequest>(request.payload.clone()) else {
         return protocol_error(request, "invalid PrepareExec payload");
     };
-    let Some(project_id) = typed.project_id.as_deref() else {
-        return protocol_error(request, "PrepareExec requires project_id");
-    };
+    let project_id = typed.project_id.as_str();
 
     // Look up the named policy from the in-memory registry. Cloning
     // the snapshot lets us drop the lock before we touch the unlock
@@ -299,7 +290,7 @@ mod tests {
         let request = PrepareExecRequest {
             policy_name: "deploy-staging".to_owned(),
             profile_id: "profile-staging".to_owned(),
-            project_id: Some(PROJECT_ID.to_owned()),
+            project_id: PROJECT_ID.to_owned(),
             binding: Some(GrantBinding::new(123, "start")),
         };
 
@@ -329,24 +320,6 @@ mod tests {
         assert_eq!(value["command_kind"], "argv");
         assert_eq!(value["ttl_seconds"], 60);
         assert_eq!(value["grant_id"], "lk_grant_0123456789abcdef0123456789abcdef");
-        Ok(())
-    }
-
-    #[test]
-    fn prepare_exec_response_defaults_grant_id_when_field_missing() -> Result<(), serde_json::Error>
-    {
-        // A response from an older agent that does not yet surface the
-        // grant id must still decode cleanly. The CLI relies on the
-        // empty-string default to fall through to the legacy
-        // `RequestGrant(ResolveReference)` path.
-        let value = json!({
-            "allowed_env_names": ["DATABASE_URL"],
-            "command_kind": "argv",
-            "ttl_seconds": 30,
-        });
-        let decoded: PrepareExecResponse = serde_json::from_value(value)?;
-        assert_eq!(decoded.grant_id, "");
-        assert_eq!(decoded.allowed_env_names, vec!["DATABASE_URL"]);
         Ok(())
     }
 

@@ -45,7 +45,7 @@ pub use runtime_session::{
     InvalidRuntimeSessionSecretNameRetention, RuntimeSessionRecord,
     RuntimeSessionSecretNameRetention,
 };
-pub use schema::{AUDIT_ACTION_SCHEMA_MIGRATE, SCHEMA_VERSION, SchemaMigrationOutcome};
+pub use schema::SCHEMA_VERSION;
 pub use secret::{
     DiscoveredSecretRecord, SecretBlobRecord, SecretCopyTarget, SecretDiscoveryFilter,
     SecretExpirationNotice, SecretExpiryPolicy, SecretExpiryStatus, SecretFingerprintRecord,
@@ -93,21 +93,16 @@ impl Store {
         Ok(Self { connection })
     }
 
-    /// Runs the idempotent v1 schema bootstrap and reports which migration steps
-    /// actually advanced the ledger.
-    ///
-    /// Callers that hold a project audit key should pass the returned
-    /// [`SchemaMigrationOutcome`] to [`Self::record_schema_migrate_audit`] so a
-    /// `SCHEMA_MIGRATE` audit row is appended for any real version change. A
-    /// no-op re-initialization returns an outcome with no applied steps and
-    /// must not be audited.
+    /// Creates a fresh store at [`SCHEMA_VERSION`], opens one already at it, or
+    /// upgrades a version 6 store in place.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::UnsupportedSchema`] when the database has already been
-    /// migrated by a newer Locket binary. Returns [`StoreError::Sqlite`] for `SQLite`
+    /// Returns [`StoreError::UnsupportedSchema`] for a store from a newer Locket
+    /// binary and [`StoreError::OutdatedSchema`] for an older store, which
+    /// Locket does not migrate. Returns [`StoreError::Sqlite`] for `SQLite`
     /// failures while creating or recording the schema.
-    pub fn initialize_schema(&mut self) -> Result<SchemaMigrationOutcome, StoreError> {
+    pub fn initialize_schema(&mut self) -> Result<(), StoreError> {
         schema::initialize_schema(&mut self.connection)
     }
 

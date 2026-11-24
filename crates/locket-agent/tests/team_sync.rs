@@ -408,7 +408,6 @@ fn owner_poll_publishes_only_changes_and_offboarding_rotates_keys()
     let mut owner_store = receiver(&dir.path().join("owner.db"))?;
     let (statement, signer, _) = fixture()?;
     insert_local(&owner_store, &statement.publisher)?;
-    owner_store.mark_device_signing_v2(&statement.publisher.id)?;
     owner_store.insert_team(&locket_store::TeamRecord {
         id: "team".into(),
         project_id: "project".into(),

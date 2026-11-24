@@ -2,7 +2,7 @@ use std::error::Error;
 
 use tempfile::tempdir;
 
-use crate::{AUDIT_ACTION_SCHEMA_MIGRATE, SCHEMA_VERSION, Store, StoreError};
+use crate::{SCHEMA_VERSION, Store, StoreError};
 
 use super::{insert_project_profile, insert_project_profile_secret, open_initialized_store};
 
@@ -290,11 +290,8 @@ fn schema_initialization_is_idempotent() -> Result<(), Box<dyn Error>> {
     let mut test_store = open_initialized_store()?;
 
     assert_eq!(test_store.store.current_schema_version()?, Some(i64::from(SCHEMA_VERSION)));
-    let outcome = test_store.store.initialize_schema()?;
-    assert!(!outcome.advanced(), "no-op initialize must not advance the ledger");
-    assert_eq!(outcome.applied_steps.len(), 0);
-    assert_eq!(outcome.before, Some(SCHEMA_VERSION));
-    assert_eq!(outcome.after, SCHEMA_VERSION);
+    test_store.store.initialize_schema()?;
+    assert_eq!(test_store.store.current_schema_version()?, Some(i64::from(SCHEMA_VERSION)));
 
     let migration_rows = test_store.store.connection().query_row(
         "SELECT COUNT(*) FROM schema_migrations WHERE version = ?1",
@@ -307,181 +304,79 @@ fn schema_initialization_is_idempotent() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn fresh_initialize_reports_pending_schema_migration() -> Result<(), Box<dyn Error>> {
+fn fresh_initialize_records_only_the_current_schema_version() -> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;
-    let path = directory.path().join("store.db");
-    let mut store = Store::open(path)?;
+    let mut store = Store::open(directory.path().join("store.db"))?;
 
-    let outcome = store.initialize_schema()?;
-    assert!(outcome.advanced(), "fresh store must advance the ledger");
-    assert_eq!(outcome.before, None);
-    assert_eq!(outcome.after, SCHEMA_VERSION);
-    assert_eq!(outcome.applied_steps.as_slice(), &["schema.bootstrap_v7"]);
-
+    store.initialize_schema()?;
+    let versions: Vec<i64> = store
+        .connection()
+        .prepare("SELECT version FROM schema_migrations ORDER BY version")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    assert_eq!(versions, vec![i64::from(SCHEMA_VERSION)]);
     Ok(())
 }
 
 #[test]
-fn v1_store_migrates_recent_schema_alignment_columns_and_indexes() -> Result<(), Box<dyn Error>> {
+fn store_without_a_schema_ledger_is_rejected_unchanged() -> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;
-    let path = directory.path().join("store.db");
-    let mut store = Store::open(path)?;
-    create_legacy_v1_schema(store.connection())?;
+    let mut store = Store::open(directory.path().join("store.db"))?;
+    store.connection().execute("CREATE TABLE projects(id TEXT PRIMARY KEY)", [])?;
 
-    let outcome = store.initialize_schema()?;
+    match store.initialize_schema() {
+        Err(StoreError::OutdatedSchema { found: 0, supported }) => {
+            assert_eq!(supported, SCHEMA_VERSION);
+        }
+        other => return Err(format!("unexpected schema result: {other:?}").into()),
+    }
+    assert_eq!(store.current_schema_version()?, None);
+    Ok(())
+}
 
-    assert!(outcome.advanced(), "v1 store must advance to current schema");
-    assert_eq!(outcome.before, Some(1));
-    assert_eq!(outcome.after, SCHEMA_VERSION);
+#[test]
+fn older_schema_version_is_rejected_unchanged() -> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let mut store = Store::open(directory.path().join("store.db"))?;
+    store.initialize_schema()?;
+    store
+        .connection()
+        .execute("DELETE FROM schema_migrations WHERE version = ?1", [i64::from(SCHEMA_VERSION)])?;
+    store
+        .connection()
+        .execute("INSERT INTO schema_migrations(version, applied_at) VALUES (?1, 1)", [5_i64])?;
+
+    match store.initialize_schema() {
+        Err(StoreError::OutdatedSchema { found, supported }) => {
+            assert_eq!(found, 5);
+            assert_eq!(supported, SCHEMA_VERSION);
+        }
+        other => return Err(format!("unexpected schema result: {other:?}").into()),
+    }
+    assert_eq!(store.current_schema_version()?, Some(5));
+    Ok(())
+}
+
+#[test]
+fn schema_six_store_upgrades_to_current_with_existing_secrets() -> Result<(), Box<dyn Error>> {
+    let mut test_store = open_initialized_store()?;
+    insert_project_profile_secret(&test_store.store)?;
+    test_store.store.connection().execute_batch(
+        "DROP TABLE audit_witness_receipts;
+         ALTER TABLE secrets DROP COLUMN expires_at;
+         ALTER TABLE secrets DROP COLUMN rotate_after_days;
+         DELETE FROM schema_migrations;
+         INSERT INTO schema_migrations(version, applied_at) VALUES (6, 1);",
+    )?;
+
+    test_store.store.initialize_schema()?;
+    assert_eq!(test_store.store.current_schema_version()?, Some(i64::from(SCHEMA_VERSION)));
     assert_eq!(
-        outcome.applied_steps.as_slice(),
-        &[
-            "schema.migrate_v2_recent_schema_alignment",
-            "schema.migrate_v3_team_member_profiles",
-            "schema.migrate_v4_device_signing",
-            "schema.migrate_v5_authenticated_team_sync",
-            "schema.migrate_v6_pending_team_profiles",
-            "schema.migrate_v7_expiry_and_witnesses",
-        ]
+        test_store.store.get_secret_expiry_policy("lk_sec_test")?,
+        Some(crate::SecretExpiryPolicy::default())
     );
-    assert_eq!(store.current_schema_version()?, Some(i64::from(SCHEMA_VERSION)));
-
-    for (table, column) in [
-        ("directory_grants", "granted_by"),
-        ("directory_grants", "revoked_at"),
-        ("devices", "member_id"),
-        ("devices", "label"),
-        ("team_members", "profiles_json"),
-        ("passkey_credentials", "device_id"),
-        ("passkey_credentials", "member_id"),
-        ("passkey_credentials", "public_key"),
-        ("passkey_credentials", "user_handle"),
-    ] {
-        assert!(column_exists(store.connection(), table, column)?, "{table}.{column} missing");
-    }
-
-    for index in [
-        "secrets_bundle_conflict_idx",
-        "devices_member_idx",
-        "directory_grants_active_idx",
-        "passkey_credentials_device_idx",
-        "passkey_credentials_member_idx",
-    ] {
-        assert!(index_exists(store.connection(), index)?, "{index} missing");
-    }
-
-    let migrated_label: String = store.connection().query_row(
-        "SELECT label FROM devices WHERE id = 'lk_dev_legacy'",
-        [],
-        |row| row.get(0),
-    )?;
-    assert_eq!(migrated_label, "", "legacy devices must receive the label default");
-
-    Ok(())
-}
-
-#[test]
-fn record_schema_migrate_audit_skips_when_no_steps_applied() -> Result<(), Box<dyn Error>> {
-    let mut test_store = open_initialized_store()?;
-    insert_project_profile(&test_store.store)?;
-
-    let outcome = test_store.store.initialize_schema()?;
-    assert!(!outcome.advanced());
-
-    let wrote = test_store.store.record_schema_migrate_audit(
-        "lk_proj_test",
-        &[42; 32],
-        &outcome,
-        1_700_000_000_000_000_000,
-    )?;
-    assert!(!wrote, "no row must be written when no steps were applied");
-
-    let actions = test_store.store.list_recent_audit_actions("lk_proj_test", 8)?;
-    assert!(actions.is_empty(), "no audit rows must be written");
-
-    Ok(())
-}
-
-#[test]
-fn record_schema_migrate_audit_writes_row_for_advancement() -> Result<(), Box<dyn Error>> {
-    let mut test_store = open_initialized_store()?;
-    insert_project_profile(&test_store.store)?;
-
-    // Simulate the fresh-initialize outcome (`before = None`, `after = 3`)
-    // produced when the schema bootstrap actually advanced the ledger. The
-    // outcome is constructed directly because v1 is the only schema family
-    // and the ledger created during fresh initialization has no project
-    // context yet to consume the row.
-    let outcome = crate::SchemaMigrationOutcome {
-        before: None,
-        after: SCHEMA_VERSION,
-        applied_steps: vec!["schema.bootstrap_v6"],
-    };
-
-    let wrote = test_store.store.record_schema_migrate_audit(
-        "lk_proj_test",
-        &[42; 32],
-        &outcome,
-        1_700_000_000_000_000_000,
-    )?;
-    assert!(wrote, "advancement must produce one audit row");
-
-    let actions = test_store.store.list_recent_audit_actions("lk_proj_test", 8)?;
-    assert_eq!(actions.as_slice(), &[AUDIT_ACTION_SCHEMA_MIGRATE.to_owned()]);
-
-    let metadata_json: String = test_store.store.connection().query_row(
-        "SELECT metadata_json FROM audit_log
-         WHERE project_id = ?1 AND action = ?2
-         ORDER BY sequence DESC
-         LIMIT 1",
-        ["lk_proj_test", AUDIT_ACTION_SCHEMA_MIGRATE],
-        |row| row.get::<_, String>(0),
-    )?;
-    let metadata: serde_json::Value = serde_json::from_str(&metadata_json)?;
-    assert_eq!(metadata["schema_versions"]["before"], serde_json::Value::Null);
-    assert_eq!(metadata["schema_versions"]["after"], SCHEMA_VERSION);
-    assert_eq!(metadata["migration_count"], 1);
-    assert_eq!(metadata["check_names"][0], "schema.bootstrap_v6");
-    assert_eq!(metadata["status"], "SUCCESS");
-
-    Ok(())
-}
-
-#[test]
-fn record_schema_migrate_audit_writes_row_for_stale_schema() -> Result<(), Box<dyn Error>> {
-    let mut test_store = open_initialized_store()?;
-    insert_project_profile(&test_store.store)?;
-
-    let outcome = crate::SchemaMigrationOutcome {
-        before: Some(0),
-        after: SCHEMA_VERSION,
-        applied_steps: vec![
-            "schema.migrate_v2_recent_schema_alignment",
-            "schema.migrate_v3_team_member_profiles",
-        ],
-    };
-
-    let wrote = test_store.store.record_schema_migrate_audit(
-        "lk_proj_test",
-        &[42; 32],
-        &outcome,
-        1_700_000_000_000_000_001,
-    )?;
-    assert!(wrote);
-
-    let metadata_json: String = test_store.store.connection().query_row(
-        "SELECT metadata_json FROM audit_log
-         WHERE project_id = ?1 AND action = ?2
-         ORDER BY sequence DESC
-         LIMIT 1",
-        ["lk_proj_test", AUDIT_ACTION_SCHEMA_MIGRATE],
-        |row| row.get::<_, String>(0),
-    )?;
-    let metadata: serde_json::Value = serde_json::from_str(&metadata_json)?;
-    assert_eq!(metadata["schema_versions"]["before"], 0);
-    assert_eq!(metadata["schema_versions"]["after"], SCHEMA_VERSION);
-    assert_eq!(metadata["migration_count"], 2);
-
+    assert_eq!(test_store.store.list_audit_witness_receipts("lk_proj_test")?, []);
+    test_store.store.initialize_schema()?;
     Ok(())
 }
 
@@ -560,11 +455,6 @@ fn foreign_keys_are_enforced() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn schema_migrate_audit_action_constant_matches_spec() {
-    assert_eq!(AUDIT_ACTION_SCHEMA_MIGRATE, "SCHEMA_MIGRATE");
-}
-
-#[test]
 fn wal_journal_mode_is_enabled() -> Result<(), Box<dyn Error>> {
     let test_store = open_initialized_store()?;
 
@@ -596,37 +486,6 @@ fn schema_migrations_applied_at_is_positive_integer() -> Result<(), Box<dyn Erro
 #[test]
 fn schema_version_constant_is_current() {
     assert_eq!(SCHEMA_VERSION, 7);
-}
-
-#[test]
-fn schema_six_upgrades_with_existing_secrets_and_nullable_expiry() -> Result<(), Box<dyn Error>> {
-    let mut test_store = open_initialized_store()?;
-    insert_project_profile_secret(&test_store.store)?;
-    test_store.store.connection().execute_batch(
-        "DROP TABLE audit_witness_receipts;
-         ALTER TABLE secrets DROP COLUMN expires_at;
-         ALTER TABLE secrets DROP COLUMN rotate_after_days;
-         DELETE FROM schema_migrations WHERE version = 7;",
-    )?;
-
-    let migration = test_store.store.initialize_schema()?;
-    assert_eq!(migration.before, Some(6));
-    assert_eq!(migration.after, 7);
-    assert_eq!(migration.applied_steps, ["schema.migrate_v7_expiry_and_witnesses"]);
-    assert_eq!(
-        test_store.store.get_secret_expiry_policy("lk_sec_test")?,
-        Some(crate::SecretExpiryPolicy::default())
-    );
-    assert_eq!(test_store.store.list_audit_witness_receipts("lk_proj_test")?, []);
-    assert!(!test_store.store.initialize_schema()?.advanced());
-
-    // A repeated migration must tolerate columns and the witness table already existing.
-    let policy = crate::SecretExpiryPolicy { expires_at: Some(20), rotate_after_days: Some(2) };
-    assert!(test_store.store.set_secret_expiry_policy("lk_sec_test", policy, 10)?);
-    test_store.store.connection().execute("DELETE FROM schema_migrations WHERE version = 7", [])?;
-    assert!(test_store.store.initialize_schema()?.advanced());
-    assert_eq!(test_store.store.get_secret_expiry_policy("lk_sec_test")?, Some(policy));
-    Ok(())
 }
 
 #[test]
@@ -719,147 +578,6 @@ fn collect_query_plan(
     Ok(rows)
 }
 
-#[allow(clippy::too_many_lines)]
-fn create_legacy_v1_schema(connection: &rusqlite::Connection) -> Result<(), Box<dyn Error>> {
-    connection.execute_batch(
-        r"
-        CREATE TABLE schema_migrations (
-          version INTEGER PRIMARY KEY,
-          applied_at INTEGER NOT NULL
-        );
-        INSERT INTO schema_migrations(version, applied_at) VALUES (1, 1);
-
-        CREATE TABLE projects (
-          id TEXT PRIMARY KEY,
-          name TEXT NOT NULL,
-          user_verification_policy_json TEXT NOT NULL DEFAULT '{}',
-          created_at INTEGER NOT NULL
-        );
-        CREATE TABLE profiles (
-          id TEXT PRIMARY KEY,
-          project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-          name TEXT NOT NULL,
-          dangerous INTEGER NOT NULL CHECK (dangerous IN (0, 1)),
-          created_at INTEGER NOT NULL,
-          UNIQUE (project_id, name)
-        );
-        CREATE TABLE teams (
-          id TEXT PRIMARY KEY,
-          project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-          name TEXT NOT NULL,
-          created_at INTEGER NOT NULL,
-          updated_at INTEGER NOT NULL,
-          UNIQUE (project_id, name)
-        );
-        CREATE TABLE team_members (
-          id TEXT PRIMARY KEY,
-          team_id TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
-          device_id TEXT REFERENCES devices(id) ON DELETE SET NULL,
-          display_name TEXT NOT NULL,
-          role TEXT NOT NULL CHECK (role IN ('owner', 'maintainer', 'developer', 'read-only')),
-          joined_at INTEGER NOT NULL,
-          removed_at INTEGER,
-          UNIQUE (team_id, display_name)
-        );
-        CREATE TABLE directory_grants (
-          grant_id TEXT PRIMARY KEY,
-          project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-          profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
-          root_hash BLOB NOT NULL CHECK (length(root_hash) = 32),
-          directory_hash BLOB NOT NULL CHECK (length(directory_hash) = 32),
-          grant_scope TEXT NOT NULL CHECK (grant_scope IN ('project-root')),
-          display_path TEXT,
-          created_at INTEGER NOT NULL,
-          updated_at INTEGER NOT NULL,
-          UNIQUE (project_id, profile_id, root_hash, directory_hash, grant_scope)
-        );
-        CREATE TABLE secrets (
-          id TEXT PRIMARY KEY,
-          project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-          profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
-          name TEXT NOT NULL,
-          description TEXT,
-          owner TEXT,
-          source TEXT NOT NULL CHECK (source IN ('team-managed', 'user-local', 'machine-local')),
-          origin TEXT NOT NULL CHECK (origin IN ('manual', 'imported', 'team-accept', 'profile-copy')),
-          tags_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(tags_json)),
-          required INTEGER NOT NULL CHECK (required IN (0, 1)),
-          current_version INTEGER NOT NULL,
-          state TEXT NOT NULL CHECK (state IN ('active', 'deleted')),
-          created_at INTEGER NOT NULL,
-          updated_at INTEGER NOT NULL,
-          last_rotated_at INTEGER,
-          deleted_at INTEGER,
-          UNIQUE (project_id, profile_id, name, source)
-        );
-        CREATE TABLE devices (
-          id TEXT PRIMARY KEY,
-          project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-          name TEXT NOT NULL,
-          signing_public_key BLOB NOT NULL CHECK (length(signing_public_key) = 32),
-          sealing_public_key BLOB NOT NULL CHECK (length(sealing_public_key) = 32),
-          fingerprint TEXT NOT NULL,
-          safety_words_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(safety_words_json)),
-          local INTEGER NOT NULL CHECK (local IN (0, 1)),
-          created_at INTEGER NOT NULL,
-          last_seen_at INTEGER,
-          revoked_at INTEGER
-        );
-        CREATE TABLE passkey_credentials (
-          id TEXT PRIMARY KEY,
-          project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-          label TEXT NOT NULL,
-          credential_id BLOB NOT NULL CHECK (length(credential_id) > 0),
-          transports_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(transports_json)),
-          prf_capable INTEGER NOT NULL CHECK (prf_capable IN (0, 1)),
-          webauthn_relying_party_id TEXT NOT NULL DEFAULT 'locket.localhost',
-          backup_eligible INTEGER CHECK (backup_eligible IN (0, 1)),
-          backup_state INTEGER CHECK (backup_state IN (0, 1)),
-          created_at INTEGER NOT NULL,
-          last_used_at INTEGER,
-          revoked_at INTEGER,
-          UNIQUE (project_id, label),
-          UNIQUE (project_id, credential_id)
-        );
-        INSERT INTO projects(id, name, created_at) VALUES ('lk_proj_legacy', 'legacy', 1);
-        INSERT INTO devices(
-          id, project_id, name, signing_public_key, sealing_public_key, fingerprint,
-          safety_words_json, local, created_at
-        )
-        VALUES (
-          'lk_dev_legacy', 'lk_proj_legacy', 'legacy-device', zeroblob(32), zeroblob(32),
-          'legacy-fp', '[]', 1, 1
-        );
-        ",
-    )?;
-    Ok(())
-}
-
-fn column_exists(
-    connection: &rusqlite::Connection,
-    table: &str,
-    column: &str,
-) -> Result<bool, Box<dyn Error>> {
-    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
-    let mut rows = statement.query([])?;
-    while let Some(row) = rows.next()? {
-        let name: String = row.get(1)?;
-        if name == column {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn index_exists(connection: &rusqlite::Connection, index: &str) -> Result<bool, Box<dyn Error>> {
-    let exists = connection.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
-        [index],
-        |row| row.get::<_, i64>(0),
-    )?;
-    Ok(exists == 1)
-}
-
 #[test]
 fn directory_grants_table_persists_granted_by_and_revoked_at_columns() -> Result<(), Box<dyn Error>>
 {
@@ -926,44 +644,7 @@ fn newer_schema_version_blocks_initialization_before_any_tables_are_created()
 }
 
 #[test]
-fn schema_five_adds_pending_tables_with_an_explicit_six_migration() -> Result<(), Box<dyn Error>> {
-    let directory = tempdir()?;
-    let mut store = Store::open(directory.path().join("store.db"))?;
-    store.initialize_schema()?;
-    store.connection().execute("DELETE FROM schema_migrations WHERE version >= 6", [])?;
-    store.connection().execute_batch(
-        "DROP TABLE team_sync_pending_profiles; DROP TABLE team_sync_pending_packages;",
-    )?;
-    store.connection().execute_batch("ALTER TABLE team_sync_folders DROP COLUMN scan_after; ALTER TABLE team_sync_folders DROP COLUMN last_error;")?;
-    store.insert_project_if_absent("old-team-project", "fixture", 1)?;
-    store.connection().execute(
-        "INSERT INTO team_sync_heads VALUES ('old-team-project',5,'head-five','[]','verified',1)",
-        [],
-    )?;
-    store.connection().execute("INSERT INTO team_sync_seen VALUES ('old-team-project','first-three',3,'applied'),('old-team-project','head-five',5,'applied')",[])?;
-    let migration = store.initialize_schema()?;
-    assert_eq!(migration.before, Some(5));
-    assert_eq!(migration.after, 7);
-    assert_eq!(
-        migration.applied_steps,
-        ["schema.migrate_v6_pending_team_profiles", "schema.migrate_v7_expiry_and_witnesses"]
-    );
-    let tables:i64=store.connection().query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('team_sync_pending_profiles','team_sync_pending_packages')",[],|row|row.get(0))?;
-    assert_eq!(tables, 2);
-    let join: i64 = store.connection().query_row(
-        "SELECT epoch FROM team_sync_join_checkpoints WHERE project_id='old-team-project'",
-        [],
-        |row| row.get(0),
-    )?;
-    assert_eq!(join, 3, "upgrade preserves the earliest authenticated join boundary");
-    assert!(column_exists(store.connection(), "team_sync_folders", "scan_after")?);
-    assert!(column_exists(store.connection(), "team_sync_folders", "last_error")?);
-    assert!(!store.initialize_schema()?.advanced());
-    Ok(())
-}
-
-#[test]
-fn read_only_store_preserves_legacy_schema_and_journal_and_rejects_writes()
+fn read_only_store_preserves_older_schema_and_journal_and_rejects_writes()
 -> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;
     let path = directory.path().join("read-only.db");

@@ -26,7 +26,7 @@ Component responsibilities:
 | --- | --- |
 | CLI | Command-line surface and thin client for the agent when available |
 | Core | Project resolution, profile resolution, policy evaluation, typed errors, shared models |
-| Store | SQLite persistence, encrypted blobs, schema migrations, audit log |
+| Store | SQLite persistence, encrypted blobs, schema version check, audit log |
 | Crypto | Encryption, key derivation, key wrapping, keyed fingerprints, audit chain HMACs |
 | Platform | OS keychain integration, passphrase fallback, peer credential helpers |
 | Exec | Process spawning, environment isolation, reference resolution, shell/argv handling |
@@ -42,11 +42,11 @@ Per-component acceptance checks may live with crate implementation plans, but th
 This spec describes the intended v1 product surface for Locket. A conforming implementation must eventually include:
 
 - Workspace scaffolding for the Rust crates listed in Architecture.
-- Encrypted SQLite store with schema migrations.
+- Encrypted SQLite store at a single current schema version.
 - OS key integration, passphrase fallback, recovery code generation, and `locket recover`.
 - Project resolution, trusted roots, profiles, dangerous-profile policy, and `locket project trust-root`.
 - Project template initialization through `locket new --from-template` using bundled or local templates only.
-- Platform local user verification for unlock, dangerous actions, team/device trust, and recovery gates. Genuine passkey/PRF registration is unavailable in the default backend; legacy software keyring recovery remains explicitly labeled and requires fresh verification.
+- Platform local user verification for unlock, dangerous actions, team/device trust, and recovery gates. Passkey/PRF registration uses external FIDO2 keys from macOS and Linux terminals.
 - Team setup, device identity, sealed invites, member/device revocation, and `locket bootstrap`.
 - Core secret lifecycle: `init`, `set`, `get`, `rm`, `purge`, `list`, `rotate`, rotation grace/deprecated-version handling, `history`, and `diff`.
 - CLI reveal/copy gates with TTY and `--force` semantics.
@@ -73,7 +73,7 @@ This spec describes the intended v1 product surface for Locket. A conforming imp
 
 The v1 surface is organized by dependency boundary:
 
-1. Foundation: typed core models, validation, error taxonomy, project resolution, storage migrations, crypto envelopes, and audit chain.
+1. Foundation: typed core models, validation, error taxonomy, project resolution, storage schema, crypto envelopes, and audit chain.
 2. Local CLI MVP: `init`, `set`, metadata-only `get`, `list`, `rotate`, `rm`, `purge`, `.env` import, `.env.example`, and scan/redact basics.
 3. Agent and runtime: authenticated local agent, grants, `lk://` resolution, command policies, path-scoped env sets, `locket run`, and Docker/Compose helpers.
 4. Desktop and integrations: Tauri v2 app/tray, shell hook, VS Code extension, status streams, and local user-verification gates.

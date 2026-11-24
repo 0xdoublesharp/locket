@@ -584,8 +584,8 @@ fn deleted_vs_active_arm() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Legacy parity contract for an invite without a sealed payload:
-/// metadata-only `team accept` followed by `import-bundle` must converge
+/// Parity contract for an invite whose sealed payload imports nothing:
+/// `team accept` followed by `import-bundle` must converge
 /// with direct `import-bundle`.
 ///
 /// This test pins that contract by comparing two arms over the same
@@ -684,7 +684,9 @@ fn team_accept_then_import_bundle_matches_import_only_state()
             profiles: vec!["dev".to_owned()],
             expires_at: 4_102_444_800_i64,
             nonce: data_encoding::BASE64URL_NOPAD.encode(&[7_u8; 24]),
-            sealed_payload: None,
+            sealed_payload: crate::tests::empty_sealed_invite_payload(
+                &local_device.sealing_public_key,
+            )?,
         };
         let signed = SignedInvite::sign(&issuer_signing, payload)?;
         let invite_path = directory_root.join(format!("{invite_id}.locket-invite"));

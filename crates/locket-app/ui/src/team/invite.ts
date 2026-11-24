@@ -17,7 +17,7 @@ export type TeamInviteRole = 'owner' | 'maintainer' | 'developer' | 'read-only';
 export interface TeamInviteIssueFormState {
   /** Display label of the recipient member, used only as a metadata label. */
   recipientLabel: string;
-  /** Recipient device descriptor, `lkdev1_<base64url>`. */
+  /** Recipient device descriptor, `lkdev2_<base64url>`. */
   deviceDescriptor: string;
   /** Role granted by the invite. */
   role: TeamInviteRole;
@@ -84,7 +84,7 @@ export interface TeamInviteRevokePayload {
   invite_id: string;
 }
 
-const DEVICE_DESCRIPTOR_PREFIX = 'lkdev1_';
+const DEVICE_DESCRIPTOR_PREFIX = 'lkdev2_';
 const INVITE_ID_PREFIX = 'lk_invite_';
 const PROFILE_NAME_PATTERN = /^[A-Za-z0-9._-]+$/;
 const FINGERPRINT_HEX_PATTERN = /^[0-9a-f]{64}$/i;

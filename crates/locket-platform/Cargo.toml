@@ -42,7 +42,6 @@ linux-fido2 = []
 [dependencies]
 data-encoding = { workspace = true }
 directories = { workspace = true }
-hmac = { workspace = true }
 locket-core = { version = "0.1.1", path = "../locket-core" }
 tempfile = { workspace = true }
 keyring-core = { workspace = true }

@@ -814,28 +814,6 @@ mod tests {
     }
 
     #[test]
-    fn agent_sync_open_migrates_existing_v5_before_pending_queries()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
-        let path = directory.path().join("store.db");
-        {
-            let store = open_sync_store(&path)?;
-            store.connection().execute_batch("DROP TABLE team_sync_pending_profiles; DROP TABLE team_sync_pending_packages; DELETE FROM schema_migrations WHERE version >= 6;")?;
-        }
-        let store = open_sync_store(&path)?;
-        assert!(team_sync::status(&store, "project")?.pending_profiles.is_empty());
-        assert_eq!(
-            store.connection().query_row(
-                "SELECT MAX(version) FROM schema_migrations",
-                [],
-                |row| row.get::<_, i64>(0)
-            )?,
-            i64::from(locket_store::SCHEMA_VERSION)
-        );
-        Ok(())
-    }
-
-    #[test]
     fn reconciliation_commit_rechecks_revoked_or_expired_process_grant()
     -> Result<(), Box<dyn std::error::Error>> {
         let state = AgentSocketState::locked("test");
