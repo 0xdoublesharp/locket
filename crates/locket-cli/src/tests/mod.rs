@@ -325,6 +325,7 @@ pub(super) fn context_with_recovery_code(context: &RuntimeContext, code: &str) -
 
 pub(super) fn test_secret_write_args(key: &str) -> super::SecretWriteArgs {
     super::SecretWriteArgs {
+        target: crate::commands::secrets::set::WriteTargetArgs::default(),
         key: key.to_owned(),
         source: super::SourceArg { source: Some(super::SecretSourceArg::UserLocal) },
         metadata: super::SecretMetadataFlags {
@@ -466,6 +467,7 @@ mod ai_safe;
 mod cli_basics;
 mod cli_errors;
 mod config_passkey_lock;
+mod cross_project;
 mod dangerous_profile_gating;
 mod diff_copy;
 mod e2e_bundle_roundtrip;

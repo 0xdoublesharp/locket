@@ -3,6 +3,7 @@ pub mod backup;
 pub mod clients;
 pub mod config;
 pub mod device_members;
+pub mod discovery;
 pub mod policies;
 pub mod prepare_exec;
 pub mod profile;

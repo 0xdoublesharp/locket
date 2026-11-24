@@ -4,17 +4,21 @@
 //! live grant and unlock-cache entry first, then encrypts the value and
 //! stores only encrypted rows plus metadata-only audit rows.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::str::FromStr;
 
-use locket_core::{LocketError, SecretId, SecretName, SecretSource};
+use locket_core::{
+    LocketError, MetadataPrivacyFinding, SecretId, SecretName, SecretSource,
+    validate_metadata_field,
+};
 use locket_crypto::{
     EncryptedSecretValue, KeyPurpose, KeyWrapAad, KeyWrapPurpose, SecretBlobAad,
     encrypt_secret_value_v1, key_wrap_aad_v1, secret_blob_aad_v1, secret_fingerprint_v1,
 };
 use locket_store::{
-    AuditContext, AuditWrite, SecretBlobRecord, SecretFingerprintRecord, SecretRecord,
-    SecretVersionRecord, Store, VersionDeprecation,
+    AuditContext, AuditWrite, SecretBlobRecord, SecretFingerprintRecord, SecretInitialMetadata,
+    SecretRecord, SecretVersionRecord, Store, StoreError, VersionDeprecation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -73,6 +77,68 @@ pub struct SetSecretRequest {
     pub binding: Option<GrantBinding>,
 }
 
+/// Extended wire payload for `SetSecret`. Existing clients can continue to send
+/// a [`SetSecretRequest`]; absent extension fields use their defaults.
+#[derive(Deserialize, Serialize)]
+pub struct SetSecretWriteRequest {
+    /// Original request fields and grant binding.
+    #[serde(flatten)]
+    pub request: SetSecretRequest,
+    /// Create or rotate according to the current state of the target source.
+    #[serde(default)]
+    pub upsert: bool,
+    /// Description replacement.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Owner replacement.
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// Replacement tags. An empty list preserves tags during rotation.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Required flag replacement.
+    #[serde(default)]
+    pub required: Option<bool>,
+}
+
+#[derive(Default)]
+struct WriteOptions<'a> {
+    upsert: bool,
+    description: Option<&'a str>,
+    owner: Option<&'a str>,
+    tags: &'a [String],
+    required: Option<bool>,
+}
+
+impl WriteOptions<'_> {
+    fn current_metadata(
+        &self,
+        store: &Store,
+        id: &str,
+    ) -> Result<Option<locket_store::SecretMutableMetadata>, StoreError> {
+        if self.description.is_none()
+            && self.owner.is_none()
+            && self.tags.is_empty()
+            && self.required.is_none()
+        {
+            return Ok(None);
+        }
+        store.get_secret_mutable_metadata(id)
+    }
+
+    fn merge<'a>(
+        &'a self,
+        current: &'a locket_store::SecretMutableMetadata,
+    ) -> SecretInitialMetadata<'a> {
+        SecretInitialMetadata {
+            description: self.description.or(current.description.as_deref()),
+            owner: self.owner.or(current.owner.as_deref()),
+            tags: if self.tags.is_empty() { &current.tags } else { self.tags },
+            required: self.required.unwrap_or(current.required),
+        }
+    }
+}
+
 /// Response payload for `SetSecret`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SetSecretResponse {
@@ -92,10 +158,21 @@ pub async fn handle_set_secret(
     state: &crate::server::AgentSocketState,
     now_unix_nanos: i128,
 ) -> ResponseEnvelope {
-    let Ok(mut typed) = serde_json::from_value::<SetSecretRequest>(request.payload.clone()) else {
+    let Ok(mut payload) = SetSecretWriteRequest::deserialize(&request.payload) else {
         return protocol_error(request, "invalid SetSecret payload");
     };
+    let typed = &mut payload.request;
     let value = Zeroizing::new(std::mem::take(&mut typed.value));
+    let options = WriteOptions {
+        upsert: payload.upsert,
+        description: payload.description.as_deref(),
+        owner: payload.owner.as_deref(),
+        tags: &payload.tags,
+        required: payload.required,
+    };
+    if let Err(error) = validate_write_metadata(&options, &value) {
+        return typed_error(request, error.error, error.message, error.kind);
+    }
     let Ok(name) = SecretName::new(typed.secret_name.clone()) else {
         return typed_error(
             request,
@@ -151,20 +228,23 @@ pub async fn handle_set_secret(
         );
     };
 
-    match set_secret(SetSecretOperation {
-        store_path: Path::new(&typed.store_path),
-        project_id: &typed.project_id,
-        profile_id: &typed.profile_id,
-        name: name.as_str(),
-        source,
-        source_was_omitted,
-        value: &value,
-        rotate: typed.rotate,
-        grace_until: typed.grace_until,
-        master_key: &master_key,
-        timestamp: now_unix_nanos,
-        imported: false,
-    }) {
+    match set_secret(
+        SetSecretOperation {
+            store_path: Path::new(&typed.store_path),
+            project_id: &typed.project_id,
+            profile_id: &typed.profile_id,
+            name: name.as_str(),
+            source,
+            source_was_omitted,
+            value: &value,
+            rotate: typed.rotate,
+            grace_until: typed.grace_until,
+            master_key: &master_key,
+            timestamp: now_unix_nanos,
+            imported: false,
+        },
+        &options,
+    ) {
         Ok(response) => {
             let payload = serde_json::to_value(response).unwrap_or(Value::Null);
             ResponseEnvelope::Success(SuccessEnvelope::new(request.id.clone(), payload))
@@ -219,11 +299,16 @@ pub(super) struct SetSecretOperation<'a> {
     pub(crate) imported: bool,
 }
 
-fn set_secret(operation: SetSecretOperation<'_>) -> Result<SetSecretResponse, SetSecretFailure> {
+fn set_secret(
+    operation: SetSecretOperation<'_>,
+    options: &WriteOptions<'_>,
+) -> Result<SetSecretResponse, SetSecretFailure> {
     let timestamp = i64::try_from(operation.timestamp).map_err(|_| corrupt_db())?;
     let master_key = master_key_array(operation.master_key).map_err(|_| corrupt_db())?;
     let mut store = Store::open(operation.store_path).map_err(|_| corrupt_db())?;
-    set_secret_in_store(&mut store, &operation, &master_key, timestamp)
+    store.with_atomic_write(|store| {
+        apply_secret_write(store, &operation, &master_key, timestamp, options)
+    })
 }
 
 pub(super) fn set_secret_in_store(
@@ -232,11 +317,62 @@ pub(super) fn set_secret_in_store(
     master_key: &locket_crypto::KeyBytes,
     timestamp: i64,
 ) -> Result<SetSecretResponse, SetSecretFailure> {
+    apply_secret_write(store, operation, master_key, timestamp, &WriteOptions::default())
+}
+
+impl From<StoreError> for SetSecretFailure {
+    fn from(_: StoreError) -> Self {
+        corrupt_db()
+    }
+}
+
+fn apply_secret_write(
+    store: &mut Store,
+    operation: &SetSecretOperation<'_>,
+    master_key: &locket_crypto::KeyBytes,
+    timestamp: i64,
+    options: &WriteOptions<'_>,
+) -> Result<SetSecretResponse, SetSecretFailure> {
     ensure_profile_exists(store, operation.project_id, operation.profile_id)?;
-    if operation.rotate {
-        rotate_secret(store, operation, master_key, timestamp)
+    let fields = options
+        .description
+        .into_iter()
+        .chain(options.owner)
+        .chain(options.tags.iter().map(String::as_str));
+    if fields.clone().next().is_some() {
+        let key = unwrap_profile_key_with_master(
+            store,
+            operation.project_id,
+            operation.profile_id,
+            master_key,
+            KeyPurpose::ProfileFingerprint,
+        )
+        .map_err(|_| corrupt_db())?;
+        for text in fields {
+            let fingerprint = secret_fingerprint_v1(&key, text).map_err(|_| corrupt_db())?;
+            if has_secret_fingerprint(
+                store,
+                operation.project_id,
+                operation.profile_id,
+                &fingerprint,
+            )? {
+                return Err(secret_like_metadata());
+            }
+        }
+    }
+    let upsert_existing = options.upsert
+        && store
+            .get_secret_by_source(
+                operation.project_id,
+                operation.profile_id,
+                operation.name,
+                operation.source,
+            )?
+            .is_some();
+    if operation.rotate || upsert_existing {
+        rotate_secret(store, operation, master_key, timestamp, options)
     } else {
-        create_secret(store, operation, master_key, timestamp)
+        create_secret(store, operation, master_key, timestamp, options)
     }
 }
 
@@ -246,6 +382,7 @@ fn create_secret(
     operation: &SetSecretOperation<'_>,
     master_key: &locket_crypto::KeyBytes,
     timestamp: i64,
+    options: &WriteOptions<'_>,
 ) -> Result<SetSecretResponse, SetSecretFailure> {
     if let Some(existing) = store
         .get_secret_by_source(
@@ -315,7 +452,7 @@ fn create_secret(
         timestamp,
     };
     store
-        .create_active_secret_with_audit(
+        .create_active_secret_with_metadata_and_audit(
             &SecretRecord {
                 id: secret_id.clone(),
                 project_id: operation.project_id.to_owned(),
@@ -348,6 +485,12 @@ fn create_secret(
                 fingerprint,
                 created_at: timestamp,
             },
+            SecretInitialMetadata {
+                description: options.description,
+                owner: options.owner,
+                tags: options.tags,
+                required: options.required.unwrap_or(false),
+            },
             Some(AuditContext { key: audit_key.as_ref(), write: &audit }),
         )
         .map_err(|_| corrupt_db())?;
@@ -365,6 +508,7 @@ fn rotate_secret(
     operation: &SetSecretOperation<'_>,
     master_key: &locket_crypto::KeyBytes,
     timestamp: i64,
+    options: &WriteOptions<'_>,
 ) -> Result<SetSecretResponse, SetSecretFailure> {
     let secret = store
         .get_secret_by_source(
@@ -430,8 +574,10 @@ fn rotate_secret(
         metadata_json: &metadata,
         timestamp,
     };
+    let current = options.current_metadata(store, &secret.id)?;
+    let mutable_metadata = current.as_ref().map(|current| options.merge(current));
     store
-        .rotate_secret_with_audit(
+        .rotate_secret_with_metadata_and_audit(
             &secret,
             &SecretVersionRecord {
                 secret_id: secret.id.clone(),
@@ -452,6 +598,7 @@ fn rotate_secret(
                 created_at: timestamp,
             },
             VersionDeprecation { deprecated_at: timestamp, grace_until: operation.grace_until },
+            mutable_metadata,
             Some(AuditContext { key: audit_key.as_ref(), write: &audit }),
         )
         .map_err(|_| corrupt_db())?;
@@ -462,6 +609,96 @@ fn rotate_secret(
         version: new_version,
         source: operation.source.to_owned(),
     })
+}
+
+fn validate_write_metadata(
+    options: &WriteOptions<'_>,
+    value: &str,
+) -> Result<(), SetSecretFailure> {
+    let fields = options
+        .description
+        .map(|text| ("description", text))
+        .into_iter()
+        .chain(options.owner.map(|text| ("owner", text)))
+        .chain(options.tags.iter().map(|tag| ("tag", tag.as_str())));
+    for (field, text) in fields {
+        let findings = text
+            .split(|ch: char| ch.is_whitespace() || "=,;:()[]{}<>\"'`".contains(ch))
+            .filter_map(metadata_finding);
+        if let Err(error) = validate_metadata_field(field, text, [value], findings) {
+            return Err(if error.is_secret_like() {
+                secret_like_metadata()
+            } else {
+                SetSecretFailure::new(
+                    ERROR_METADATA_INVALID,
+                    "invalid secret metadata",
+                    LocketError::MetadataInvalid,
+                )
+            });
+        }
+    }
+    Ok(())
+}
+
+const fn secret_like_metadata() -> SetSecretFailure {
+    SetSecretFailure::new(
+        "MetadataLooksLikeSecret",
+        "metadata looks like a secret",
+        LocketError::MetadataLooksLikeSecret,
+    )
+}
+
+/// Checks for an exact metadata match using only stored keyed fingerprints.
+///
+/// # Errors
+///
+/// Returns a storage error if the fingerprint metadata cannot be queried.
+pub fn has_secret_fingerprint(
+    store: &Store,
+    project_id: &str,
+    profile_id: &str,
+    fingerprint: &[u8],
+) -> Result<bool, StoreError> {
+    Ok(store.connection().query_row(
+        "SELECT EXISTS (
+            SELECT 1 FROM fingerprints f JOIN secrets s ON s.id = f.secret_id
+            WHERE s.project_id = ?1 AND s.profile_id = ?2 AND f.fingerprint = ?3
+        )",
+        rusqlite::params![project_id, profile_id, fingerprint],
+        |row| row.get(0),
+    )?)
+}
+
+// The agent's dependency set does not include locket-scan. Apply the scanner's
+// provider prefixes and Shannon threshold at this wire boundary.
+fn metadata_finding(token: &str) -> Option<MetadataPrivacyFinding> {
+    if ["sk_live_", "sk_test_", "ghp_", "github_pat_", "xoxb-"]
+        .iter()
+        .any(|prefix| token.strip_prefix(prefix).is_some_and(|suffix| !suffix.is_empty()))
+    {
+        return Some(MetadataPrivacyFinding::ProviderToken);
+    }
+    if token.len() < 20
+        || ["lk_proj_", "lk_prof_", "lk_sec_", "lk_key_", "lkdev1_"]
+            .iter()
+            .any(|prefix| token.starts_with(prefix))
+    {
+        return None;
+    }
+    let mut counts = BTreeMap::<char, u32>::new();
+    for character in token.chars() {
+        let count = counts.entry(character).or_default();
+        *count = count.saturating_add(1);
+    }
+    let total = counts.values().map(|&count| f64::from(count)).sum::<f64>();
+    let entropy = counts
+        .values()
+        .map(|&count| {
+            let probability = f64::from(count) / total;
+            -probability * probability.log2()
+        })
+        .sum::<f64>();
+    (entropy >= 4.5).then_some(MetadataPrivacyFinding::HighEntropy)
 }
 
 fn validate_secret_value(value: &str) -> Result<(), SetSecretFailure> {
@@ -956,6 +1193,56 @@ mod tests {
         assert!(audits[0].get("value").is_none());
         assert!(!audits[0].to_string().contains(&fixture_value("one")));
         assert!(!serde_json::to_string(&payload)?.contains(&fixture_value("one")));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn set_secret_extensions_upsert_merge_metadata_and_refuse_secret_text()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = build_fixture()?;
+        let state = unlocked_state(&fixture).await;
+
+        let mut create = serde_json::to_value(request(&fixture))?;
+        create["upsert"] = json!(true);
+        create["description"] = json!("Initial description");
+        create["owner"] = json!("Platform");
+        create["tags"] = json!(["ops"]);
+        create["required"] = json!(true);
+        let envelope = RequestEnvelope::new("create", AgentMethod::SetSecret, create);
+        let created = success_payload(handle_set_secret(&envelope, &state, NOW).await)?;
+        assert_eq!(created.action, "SET");
+
+        let mut update = serde_json::to_value(request(&fixture))?;
+        update["value"] = json!(fixture_value("two"));
+        update["upsert"] = json!(true);
+        update["description"] = json!("Updated description");
+        let envelope = RequestEnvelope::new("rotate", AgentMethod::SetSecret, update);
+        let rotated = success_payload(handle_set_secret(&envelope, &state, NOW + 1).await)?;
+        assert_eq!(rotated.action, "ROTATE");
+        assert_eq!(rotated.version, 2);
+        assert_eq!(created.secret_id, rotated.secret_id);
+
+        let store = Store::open(&fixture.store_path)?;
+        let metadata =
+            store.get_secret_mutable_metadata(&created.secret_id)?.ok_or("missing metadata")?;
+        assert_eq!(metadata.description.as_deref(), Some("Updated description"));
+        assert_eq!(metadata.owner.as_deref(), Some("Platform"));
+        assert_eq!(metadata.tags, ["ops"]);
+        assert!(metadata.required);
+
+        for rejected in [json!("sk_live_ExampleToken123"), json!(fixture_value("two"))] {
+            let mut unsafe_update = serde_json::to_value(request(&fixture))?;
+            unsafe_update["upsert"] = json!(true);
+            unsafe_update["owner"] = rejected.clone();
+            let envelope = RequestEnvelope::new("unsafe", AgentMethod::SetSecret, unsafe_update);
+            let reply = handle_set_secret(&envelope, &state, NOW + 2).await;
+            assert!(
+                !serde_json::to_string(&reply)?
+                    .contains(rejected.as_str().ok_or("expected rejected text")?)
+            );
+            assert_eq!(error_code(reply)?, "MetadataLooksLikeSecret");
+        }
+        assert_eq!(audit_metadata(&fixture)?.len(), 2);
         Ok(())
     }
 

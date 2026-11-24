@@ -194,6 +194,19 @@ enum Command {
     Init(InitArgs),
     /// Store a new secret.
     Set(SecretWriteArgs),
+    /// Generate and store a secret without displaying its value.
+    Generate(commands::secrets::generate::GenerateArgs),
+    /// Discover metadata across the local vault.
+    Discover(commands::discovery::DiscoverArgs),
+    /// Manage the shared local vault.
+    Shared {
+        #[command(subcommand)]
+        command: commands::discovery::SharedCommand,
+    },
+    /// Check profile parity and workspace plaintext drift.
+    Parity(commands::parity::ParityArgs),
+    /// Serve tools over stdio using MCP.
+    Mcp,
     /// Import secrets from an env file.
     Import(ImportArgs),
     /// Get secret metadata, reveal, or copy.
@@ -434,6 +447,8 @@ struct CompletionArgs {
 
 #[derive(Debug, Args)]
 struct SecretWriteArgs {
+    #[command(flatten)]
+    target: commands::secrets::set::WriteTargetArgs,
     /// Secret key name.
     key: String,
     #[command(flatten)]
@@ -463,6 +478,12 @@ struct ImportArgs {
 #[derive(Debug, Args)]
 #[allow(clippy::struct_excessive_bools)]
 struct GetArgs {
+    /// Project id, name, or trusted root.
+    #[arg(long)]
+    project: Option<String>,
+    /// Profile name.
+    #[arg(long)]
+    profile: Option<String>,
     /// Secret key name.
     key: String,
     #[command(flatten)]
@@ -703,7 +724,10 @@ struct ShellenvArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(args_conflicts_with_subcommands = true)]
 struct HookArgs {
+    #[command(subcommand)]
+    command: Option<commands::hook::HookCommand>,
     /// Shell syntax to emit.
     #[arg(long, value_enum)]
     shell: Option<ShellArg>,
@@ -731,6 +755,13 @@ enum ShellArg {
 
 #[derive(Debug, Subcommand)]
 enum ProjectCommand {
+    /// List local vault projects.
+    List {
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        redact_names: bool,
+    },
     /// Trust the current project root.
     TrustRoot,
     /// List trusted roots.
@@ -743,6 +774,7 @@ enum ProjectCommand {
 }
 
 #[derive(Debug, Args)]
+#[allow(clippy::struct_excessive_bools)] // Independent CLI switches.
 struct ScanArgs {
     /// Scan staged Git content.
     #[arg(long)]
@@ -750,6 +782,8 @@ struct ScanArgs {
     /// Require known-value coverage.
     #[arg(long)]
     require_known: bool,
+    #[arg(long, hide = true)]
+    known_if_unlocked: bool,
     /// Ignore .gitignore rules.
     #[arg(long)]
     no_gitignore: bool,
@@ -1456,7 +1490,7 @@ pub(crate) enum SecretSourceArg {
     MachineLocal,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Default, Args)]
 struct SecretMetadataFlags {
     /// Metadata description.
     #[arg(long)]
@@ -1552,13 +1586,26 @@ fn run_with_context(
         }
         Command::Debug { command } => debug::debug_command(context, output, command)?,
         Command::Init(args) => project::init::init(context, output, args)?,
-        Command::Set(args) => secrets::set::set_command(context, output, &args)?,
+        Command::Set(args) => return secrets::set::set_command(context, output, &args),
+        Command::Generate(args) => {
+            return secrets::generate::generate_command(context, output, &args);
+        }
+        Command::Discover(args) => {
+            return commands::discovery::discover_command(context, output, args);
+        }
+        Command::Shared { command } => {
+            return commands::discovery::shared_command(context, output, command);
+        }
+        Command::Parity(args) => return commands::parity::parity_command(context, output, &args),
+        Command::Mcp => commands::mcp::serve(&mut io::stdin().lock(), output, context)?,
         Command::Import(args) => secrets::import::import_command(context, output, &args)?,
         Command::Get(args) => secrets::get::get_command(context, output, &args)?,
         Command::Reveal(args) => secrets::get::get_command(
             context,
             output,
             &GetArgs {
+                project: None,
+                profile: None,
                 key: args.key,
                 source: args.source,
                 reveal: true,
@@ -1572,6 +1619,8 @@ fn run_with_context(
             context,
             output,
             &GetArgs {
+                project: None,
+                profile: None,
                 key: args.key,
                 source: args.source,
                 reveal: false,
@@ -1602,7 +1651,13 @@ fn run_with_context(
         Command::Policy { command } => policy::command(context, output, command)?,
         Command::Project { command } => trust::project::project_command(context, output, command)?,
         Command::Shellenv(args) => shell::shellenv_command(output, &args)?,
-        Command::Hook(args) => shell::hook_command(context, output, &args)?,
+        Command::Hook(args) => {
+            if let Some(command) = args.command {
+                commands::hook::hook_command(context, output, command)?;
+            } else {
+                shell::hook_command(context, output, &args)?;
+            }
+        }
         Command::Allow => shell::allow_command(context, output)?,
         Command::Deny(args) => shell::deny_command(context, output, &args)?,
         Command::Agent { command } => agent::agent_command(context, output, command)?,
@@ -1937,7 +1992,7 @@ fn preflight_rotate_secret_value(
     let name = SecretName::new(args.key.clone())
         .map_err(|err| invalid_secret_name_error(err.to_string()))?;
     resolve_active_secret_for_source(context, name.as_str(), args.source.source)?;
-    Ok(())
+    commands::secrets::set::validate_write_metadata(&args.metadata, None)
 }
 
 fn rotate_secret_value(
@@ -1952,85 +2007,28 @@ fn rotate_secret_value(
     validate_secret_value_str(value)?;
     let resolved_secret =
         resolve_active_secret_for_source(context, name.as_str(), args.source.source)?;
-    let new_version = next_secret_version(resolved_secret.secret.current_version)?;
     let mut store = open_store(context)?;
-    let audit_key = load_project_key(
+    commands::secrets::set::validate_write_metadata(&args.metadata, Some(value))?;
+    let keys = commands::secrets::set::SecretWriteKeys::load(
         context,
         &store,
-        resolved_secret.project.config.project_id.as_str(),
-        KeyPurpose::Audit,
+        &resolved_secret.secret.project_id,
+        &resolved_secret.profile.id,
     )?;
-    let (encrypted, fingerprint) = encrypt_secret_version(
-        context,
-        &store,
-        SecretEncryptRequest {
-            project_id: resolved_secret.project.config.project_id.as_str(),
-            profile_id: &resolved_secret.profile.id,
-            secret_id: &resolved_secret.secret.id,
-            secret_name: &resolved_secret.secret.name,
-            version: new_version,
-            value,
-        },
-    )?;
-    let source = resolved_secret.secret.source.clone();
-    let origin = resolved_secret.secret.origin.clone();
-    let metadata = json!({
-        "schema_version": 1,
-        "action": "ROTATE",
-        "status": "SUCCESS",
-        "secret_name": &resolved_secret.secret.name,
-        "profile_id": &resolved_secret.profile.id,
-        "source": &source,
-        "prior_version": resolved_secret.secret.current_version,
-        "deprecated_version": resolved_secret.secret.current_version,
-        "target_version": new_version,
-        "deprecated_at": timestamp,
-        "grace_until": grace_until,
-    });
-    let audit = AuditWrite {
-        project_id: resolved_secret.project.config.project_id.as_str(),
-        profile_id: Some(&resolved_secret.profile.id),
-        action: "ROTATE",
-        status: "SUCCESS",
-        secret_name: Some(&resolved_secret.secret.name),
-        command: None,
-        metadata_json: &metadata,
-        timestamp,
-    };
-
-    store.rotate_secret_with_audit(
+    let version = commands::secrets::set::rotate_value(
+        &mut store,
+        &keys,
         &resolved_secret.secret,
-        &SecretVersionRecord {
-            secret_id: resolved_secret.secret.id.clone(),
-            version: new_version,
-            source: source.clone(),
-            origin,
-            state: "current".to_owned(),
-            created_at: timestamp,
-            deprecated_at: None,
-            grace_until: None,
-            purged_at: None,
+        &commands::secrets::set::Rotation {
+            value,
+            origin: &resolved_secret.secret.origin,
+            timestamp,
+            grace_until,
+            metadata: &args.metadata,
+            action: "ROTATE",
         },
-        &SecretBlobRecord {
-            secret_id: resolved_secret.secret.id.clone(),
-            version: new_version,
-            encrypted_dek: encrypted.encrypted_dek,
-            ciphertext: encrypted.ciphertext,
-            value_nonce: encrypted.value_nonce,
-            aad_schema_version: encrypted.aad_schema_version,
-            created_at: timestamp,
-        },
-        &SecretFingerprintRecord {
-            secret_id: resolved_secret.secret.id.clone(),
-            version: new_version,
-            fingerprint,
-            created_at: timestamp,
-        },
-        VersionDeprecation { deprecated_at: timestamp, grace_until },
-        Some(AuditContext { key: audit_key.as_ref(), write: &audit }),
     )?;
-
-    Ok((source, new_version))
+    Ok((resolved_secret.secret.source, version))
 }
 
 struct CopySecretResult {

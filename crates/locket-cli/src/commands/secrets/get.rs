@@ -1,11 +1,12 @@
 //! Implementation of the `locket get` command and clipboard helpers.
 
+use locket_core::SecretName;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::Path;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::thread;
 use std::time::Duration;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::runtime::RuntimeContext;
 use crate::runtime::dangerous_profile::{
@@ -14,10 +15,14 @@ use crate::runtime::dangerous_profile::{
 use crate::runtime::error::{CliError, external_source_unavailable_error};
 use crate::runtime::user_verification::{UserVerificationAudit, require_user_verification};
 use crate::support::secret_helpers::{
-    ResolvedSecret, ValueAccessAudit, decrypt_current_secret, resolve_active_secret,
-    resolve_active_secret_for_source, reveal_ttl_seconds, write_value_access_audit_if_available,
+    ValueAccessAudit, ValueAccessTarget, decrypt_secret_version, resolve_active_secret,
+    resolve_active_secret_for_source, reveal_ttl_seconds, select_highest_precedence_secret,
+    write_value_access_audit_if_available,
 };
-use crate::{GetArgs, access_denied_error};
+use crate::{
+    GetArgs, access_denied_error, invalid_secret_name_error, secret_deleted_error,
+    secret_not_found_error, source_arg_to_str,
+};
 
 pub fn get_command(
     context: &RuntimeContext,
@@ -120,10 +125,7 @@ pub fn get_command_with_clipboard_status_and_limit(
     ) -> Result<ClipboardCopyStatus, String>,
     limit: ClipboardClearLimit,
 ) -> Result<(), CliError> {
-    let resolved_secret = match args.source.source {
-        Some(source) => resolve_active_secret_for_source(context, &args.key, Some(source))?,
-        None => resolve_active_secret(context, &args.key)?,
-    };
+    let resolved_secret = resolve_value_access(context, args)?;
     let (action, access_mode) = get_audit_action_and_access_mode(args);
     enforce_dangerous_profile_consent_or_audit(
         context,
@@ -158,6 +160,61 @@ pub fn get_command_with_clipboard_status_and_limit(
     Ok(())
 }
 
+fn resolve_value_access(
+    context: &RuntimeContext,
+    args: &GetArgs,
+) -> Result<ValueAccessTarget, CliError> {
+    if args.project.is_none() && args.profile.is_none() {
+        let resolved = match args.source.source {
+            Some(source) => resolve_active_secret_for_source(context, &args.key, Some(source))?,
+            None => resolve_active_secret(context, &args.key)?,
+        };
+        return Ok(resolved.into());
+    }
+    let name = SecretName::new(args.key.clone())
+        .map_err(|_| invalid_secret_name_error("invalid secret name"))?;
+    let store = crate::commands::discovery::require_metadata_store(context)?;
+    let target = super::set::select_target(
+        context,
+        &store,
+        args.project.as_deref(),
+        args.profile.as_deref(),
+    )?;
+    let (project_id, profile_id) = (&target.project.id, &target.profile.id);
+    let secret = if let Some(source) = args.source.source {
+        store.get_secret_by_source(
+            project_id,
+            profile_id,
+            name.as_str(),
+            source_arg_to_str(source),
+        )?
+    } else {
+        let rows = store.list_secrets_by_name(project_id, profile_id, name.as_str())?;
+        select_highest_precedence_secret(rows.into_iter().filter(|row| row.state == "active"))
+    }
+    .ok_or_else(|| secret_not_found_error("secret not found"))?;
+    if secret.state != "active" {
+        return Err(secret_deleted_error("secret source is deleted"));
+    }
+    Ok(ValueAccessTarget { profile: target.profile, secret })
+}
+
+fn decrypt_access_secret(
+    context: &RuntimeContext,
+    target: &ValueAccessTarget,
+) -> Result<Zeroizing<String>, CliError> {
+    let store = crate::open_store(context)?;
+    let secret = &target.secret;
+    decrypt_secret_version(
+        context,
+        &store,
+        &secret.project_id,
+        &secret.profile_id,
+        secret,
+        secret.current_version,
+    )
+}
+
 /// Returns the audit-row `action` and `access_mode` strings that match the
 /// requested `get` mode. `--copy` wins over `--reveal` because clap rejects
 /// the conflicting combination.
@@ -178,7 +235,7 @@ const fn get_audit_action_and_access_mode(args: &GetArgs) -> (&'static str, &'st
 /// work happens.
 fn enforce_dangerous_profile_consent_or_audit(
     context: &RuntimeContext,
-    resolved_secret: &ResolvedSecret,
+    resolved_secret: &ValueAccessTarget,
     action: &'static str,
     access_mode: &'static str,
     use_dangerous: bool,
@@ -209,7 +266,7 @@ fn get_copy_command(
     context: &RuntimeContext,
     output: &mut impl Write,
     error_output: &mut impl Write,
-    resolved_secret: &ResolvedSecret,
+    resolved_secret: &ValueAccessTarget,
     verify_user: bool,
     copy_to_clipboard: impl FnOnce(
         &str,
@@ -231,7 +288,7 @@ fn get_copy_command(
         false,
         "clipboard",
     )?;
-    let value = decrypt_current_secret(context, resolved_secret).inspect_err(|error| {
+    let value = decrypt_access_secret(context, resolved_secret).inspect_err(|error| {
         record_locked_vault_refusal_if_applicable(
             context,
             error,
@@ -280,7 +337,7 @@ fn get_copy_command(
 fn get_reveal_command(
     context: &RuntimeContext,
     output: &mut impl Write,
-    resolved_secret: &ResolvedSecret,
+    resolved_secret: &ValueAccessTarget,
     force: bool,
     verify_user: bool,
 ) -> Result<(), CliError> {
@@ -313,7 +370,7 @@ fn get_reveal_command(
         force,
         "stdout",
     )?;
-    let value = decrypt_current_secret(context, resolved_secret).inspect_err(|error| {
+    let value = decrypt_access_secret(context, resolved_secret).inspect_err(|error| {
         record_locked_vault_refusal_if_applicable(
             context,
             error,
@@ -348,7 +405,7 @@ fn get_reveal_command(
 fn record_locked_vault_refusal_if_applicable(
     context: &RuntimeContext,
     error: &CliError,
-    resolved_secret: &ResolvedSecret,
+    resolved_secret: &ValueAccessTarget,
     action: &'static str,
     command: &'static str,
 ) {
@@ -356,7 +413,7 @@ fn record_locked_vault_refusal_if_applicable(
         crate::runtime::degraded_audit::record_locked_refusal(
             context,
             action,
-            Some(resolved_secret.project.config.project_id.as_str()),
+            Some(&resolved_secret.secret.project_id),
             command,
         );
     }
@@ -364,7 +421,7 @@ fn record_locked_vault_refusal_if_applicable(
 
 fn value_access_user_verification_or_audit_denial(
     context: &RuntimeContext,
-    resolved_secret: &ResolvedSecret,
+    resolved_secret: &ValueAccessTarget,
     audit_action: &'static str,
     verify_user: bool,
     ttl_seconds: Option<u64>,
@@ -406,10 +463,16 @@ fn value_access_user_verification(
     action: &'static str,
     secret_name: &str,
 ) -> Result<UserVerificationAudit, CliError> {
-    if !required {
-        return Ok(UserVerificationAudit::not_required());
+    let reason = format!("{action} secret {secret_name}");
+    if required {
+        return require_user_verification(context, action, reason);
     }
-    require_user_verification(context, action, format!("{action} secret {secret_name}"))
+    let key = if action == "copy" {
+        "user_verification_required_for.copy"
+    } else {
+        "user_verification_required_for.reveal"
+    };
+    crate::runtime::user_verification::configured_user_verification(context, key, action, reason)
 }
 
 #[derive(Debug, Eq, PartialEq)]

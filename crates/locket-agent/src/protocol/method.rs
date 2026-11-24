@@ -65,6 +65,10 @@ pub enum AgentMethod {
     ClientHello,
     /// Return metadata-only active-profile secret rows.
     ListSecrets,
+    /// Return metadata-only local project summaries.
+    ListProjects,
+    /// Discover secret metadata across local projects.
+    DiscoverSecrets,
     /// Return metadata-only secret version rows.
     ListVersions,
     /// Create or rotate one secret value through a gated path.
@@ -127,6 +131,8 @@ impl AgentMethod {
             Self::CancelSubscription => "CancelSubscription",
             Self::ClientHello => "ClientHello",
             Self::ListSecrets => "ListSecrets",
+            Self::ListProjects => "ListProjects",
+            Self::DiscoverSecrets => "DiscoverSecrets",
             Self::ListVersions => "ListVersions",
             Self::SetSecret => "SetSecret",
             Self::ImportDotenv => "ImportDotenv",
@@ -178,6 +184,8 @@ impl FromStr for AgentMethod {
             "CancelSubscription" => Ok(Self::CancelSubscription),
             "ClientHello" => Ok(Self::ClientHello),
             "ListSecrets" => Ok(Self::ListSecrets),
+            "ListProjects" => Ok(Self::ListProjects),
+            "DiscoverSecrets" => Ok(Self::DiscoverSecrets),
             "ListVersions" => Ok(Self::ListVersions),
             "SetSecret" => Ok(Self::SetSecret),
             "ImportDotenv" => Ok(Self::ImportDotenv),

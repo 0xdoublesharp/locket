@@ -138,6 +138,8 @@ fn get_copy_with_explicit_source_uses_selected_source_and_audit_shape()
     setup_two_source_secret(&context, "SECRET", "user-secret", "machine-secret", 1_000)?;
 
     let copy_args = crate::GetArgs {
+        project: None,
+        profile: None,
         key: "SECRET".to_owned(),
         source: crate::SourceArg { source: Some(crate::SecretSourceArg::UserLocal) },
         reveal: false,

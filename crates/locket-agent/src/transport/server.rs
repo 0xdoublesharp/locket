@@ -1136,6 +1136,8 @@ pub async fn dispatch(envelope: &RequestEnvelope, state: &AgentSocketState) -> R
         }
         Ok(AgentMethod::PrepareExec) => prepare_exec_dispatch(envelope, state).await,
         Ok(AgentMethod::ListSecrets) => handle_list_secrets(envelope),
+        Ok(AgentMethod::ListProjects) => crate::discovery::handle_list_projects(envelope),
+        Ok(AgentMethod::DiscoverSecrets) => crate::discovery::handle_discover_secrets(envelope),
         Ok(AgentMethod::ListVersions) => handle_list_versions(envelope),
         Ok(AgentMethod::ImportDotenv) => {
             crate::mutations::handle_import_dotenv(envelope, state, current_unix_nanos()).await

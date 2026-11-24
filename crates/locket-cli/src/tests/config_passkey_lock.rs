@@ -1094,17 +1094,29 @@ fn unlock_with_verify_user_denial_returns_typed_error_and_writes_no_unlock_audit
 
     let denying_context =
         context_with_user_verifier(&context, Arc::new(MemoryLocalUserVerifier::denying()));
-    let mut unlock_output = Vec::new();
-    let result = run_with_context(
-        Cli::try_parse_from(["locket", "unlock", "--verify-user"])?,
-        &denying_context,
-        &mut unlock_output,
-    );
-    let Err(error) = result else {
-        return Err("denied user verification must fail unlock".into());
-    };
-    assert_eq!(error.exit_code(), locket_core::LocketError::UserVerificationFailed.exit_code());
-    assert_eq!(unlock_output.len(), 0);
+    for args in [vec!["locket", "unlock", "--verify-user"], vec!["locket", "unlock"]] {
+        if args.len() == 2 {
+            run_with_context(
+                Cli::try_parse_from([
+                    "locket",
+                    "config",
+                    "set",
+                    "user_verification_required_for.unlock",
+                    "true",
+                ])?,
+                &context,
+                &mut Vec::new(),
+            )?;
+        }
+        let mut unlock_output = Vec::new();
+        let result =
+            run_with_context(Cli::try_parse_from(args)?, &denying_context, &mut unlock_output);
+        let Err(error) = result else {
+            return Err("denied user verification must fail unlock".into());
+        };
+        assert_eq!(error.exit_code(), locket_core::LocketError::UserVerificationFailed.exit_code());
+        assert_eq!(unlock_output, [] as [u8; 0]);
+    }
 
     let store = locket_store::Store::open(directory.path().join("store.db"))?;
     let unlock_count: i64 = store.connection().query_row(
