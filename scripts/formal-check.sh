@@ -54,12 +54,13 @@ esac
 check_model() {
     local model=$1
     local log="$work/$model.log"
+    local workers=${COMPUTE_JOBS:-2}
     printf 'Checking %s with TLC\n' "$model"
     cp -- "$root/formal/tla/$model.tla" "$root/formal/tla/$model.cfg" "$work/"
     if ! (
         cd -- "$work"
         "$java_bin" -Xmx512m -XX:+UseParallelGC -Djava.io.tmpdir="$work" \
-            -cp "$jar" tlc2.TLC -deadlock -workers 2 -metadir "$work/$model-states" \
+            -cp "$jar" tlc2.TLC -deadlock -workers "$workers" -metadir "$work/$model-states" \
             -config "$model.cfg" "$model.tla"
     ) >"$log" 2>&1; then
         cat -- "$log" >&2
@@ -78,6 +79,8 @@ check_model() {
 
 check_model AgentUnlockGrantLifecycle
 check_model SecretLifecycleAuditChain
+check_model EgressProxyAndRedaction
+check_model TeamSyncAndAuditWitness
 
 # Build the exact sources in a Scratch copy so Lake's artifacts stay off Data.
 lean_project="$work/formal/lean"
@@ -88,4 +91,4 @@ printf 'Building Lean proofs\n'
     cd -- "$lean_project"
     lake --no-cache --wfail build
 )
-printf 'Formal checks passed for both TLC models and all Lean modules.\n'
+printf 'Formal checks passed for all four TLC models and all Lean modules.\n'
