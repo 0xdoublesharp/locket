@@ -5,12 +5,14 @@
 //! and peer-credential checks in this module; Windows named-pipe
 //! construction lives in `windows_pipe`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use locket_crypto::KeyBytes;
 #[cfg(not(test))]
@@ -30,8 +32,11 @@ use crate::error::ProtocolError;
 use crate::framing::decode_request_frame;
 #[cfg(unix)]
 use crate::framing::encode_frame;
-use crate::keys::{KeyError, cached_master_key, master_key_array, unwrap_audit_key_with_master};
+use crate::keys::{
+    KeyError, StoreFileIdentity, cached_master_key, master_key_array, unwrap_audit_key_with_master,
+};
 use crate::method::AgentMethod;
+use crate::peer_cred::PeerIdentity;
 use crate::session_lock::{
     SessionLockAudit, SessionLockOutcome, SessionLockSource, append_lock_audit,
 };
@@ -40,7 +45,7 @@ use crate::status_stream::StatusHub;
 
 #[cfg(all(test, unix))]
 type PeerCredentialValidator =
-    dyn Fn(&UnixStream, u32) -> Result<(), SocketServerError> + Send + Sync;
+    dyn Fn(&UnixStream, u32, u64) -> Result<PeerIdentity, SocketServerError> + Send + Sync;
 
 /// Resolves the default on-disk directory the passphrase-fallback
 /// envelope store should use when callers don't supply one explicitly.
@@ -268,6 +273,10 @@ pub struct AgentSocketState {
     /// UID of the running daemon process, used to validate peer
     /// credentials on every accept.
     pub daemon_uid: u32,
+    #[cfg(unix)]
+    connections: Arc<AtomicU64>,
+    canonical_store_path: Option<PathBuf>,
+    canonical_store_identity: Arc<OnceLock<StoreFileIdentity>>,
     /// Per-project unlock-key cache populated by `Unlock` and cleared
     /// by `Lock`. Status responses derive `lock_state` and
     /// `unlock_ttl_seconds` from the live entries here.
@@ -305,7 +314,7 @@ pub struct AgentSocketState {
     pub shutdown: Arc<Notify>,
     /// Serializes native session transitions with key/grant creation. Each
     /// block reason remains active until its matching OS resume notification.
-    session_gate: Arc<Mutex<std::collections::BTreeSet<&'static str>>>,
+    session_gate: Arc<Mutex<BTreeSet<&'static str>>>,
     /// Counts expiry work for deterministic idle-work regression checks.
     #[cfg(test)]
     pub(crate) expiry_checks: Arc<std::sync::atomic::AtomicUsize>,
@@ -361,6 +370,10 @@ impl AgentSocketState {
         Self {
             agent_version,
             daemon_uid,
+            #[cfg(unix)]
+            connections: Arc::new(AtomicU64::new(1)),
+            canonical_store_path: None,
+            canonical_store_identity: Arc::new(OnceLock::new()),
             unlock_cache: Arc::new(Mutex::new(crate::unlock_cache::UnlockCache::default())),
             grants: Arc::new(Mutex::new(crate::grant::GrantTable::default())),
             runtime_sessions: Arc::new(Mutex::new(Vec::new())),
@@ -373,7 +386,7 @@ impl AgentSocketState {
             passphrase_store,
             status_hub,
             shutdown: Arc::new(Notify::new()),
-            session_gate: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+            session_gate: Arc::new(Mutex::new(BTreeSet::new())),
             #[cfg(test)]
             expiry_checks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
@@ -399,6 +412,10 @@ impl AgentSocketState {
         Self {
             agent_version,
             daemon_uid,
+            #[cfg(unix)]
+            connections: Arc::new(AtomicU64::new(1)),
+            canonical_store_path: None,
+            canonical_store_identity: Arc::new(OnceLock::new()),
             unlock_cache: cache,
             grants: Arc::new(Mutex::new(crate::grant::GrantTable::default())),
             runtime_sessions: Arc::new(Mutex::new(Vec::new())),
@@ -413,7 +430,7 @@ impl AgentSocketState {
             )),
             status_hub,
             shutdown: Arc::new(Notify::new()),
-            session_gate: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+            session_gate: Arc::new(Mutex::new(BTreeSet::new())),
             expiry_checks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             test_expiry_clock_offset: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             #[cfg(unix)]
@@ -421,6 +438,35 @@ impl AgentSocketState {
             #[cfg(unix)]
             peer_credential_validator: Arc::new(crate::peer_cred::validate_peer_stream),
         }
+    }
+
+    /// Restricts requests to the configured store. If it does not exist yet, pin
+    /// its identity on first use after the CLI initializes it.
+    #[must_use]
+    pub fn with_canonical_store_path(mut self, path: PathBuf) -> Self {
+        let identity = OnceLock::new();
+        if let Ok((_, captured)) = StoreFileIdentity::capture(&path) {
+            let _ = identity.set(captured);
+        }
+        self.canonical_store_path = Some(path);
+        self.canonical_store_identity = Arc::new(identity);
+        self
+    }
+
+    fn validate_store_path(&self, path: &Path) -> io::Result<(PathBuf, StoreFileIdentity)> {
+        let captured = StoreFileIdentity::capture(path)?;
+        if let Some(configured) = &self.canonical_store_path {
+            let (trusted_path, current) = StoreFileIdentity::capture(configured)?;
+            let pinned = self.canonical_store_identity.get_or_init(|| current.clone());
+            if *pinned != current || *pinned != captured.1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "store identity mismatch",
+                ));
+            }
+            return Ok((trusted_path, current));
+        }
+        Ok(captured)
     }
 
     /// Test-only helper that writes `master_key` into the agent's
@@ -446,8 +492,9 @@ impl AgentSocketState {
     #[cfg(all(test, unix))]
     #[must_use]
     pub fn with_test_peer_uid(mut self, peer_uid: u32) -> Self {
-        self.peer_credential_validator = Arc::new(move |_stream, daemon_uid| {
-            crate::peer_cred::validate_peer_uid(peer_uid, daemon_uid)
+        self.peer_credential_validator = Arc::new(move |_stream, daemon_uid, connection_id| {
+            crate::peer_cred::validate_peer_uid(peer_uid, daemon_uid)?;
+            Ok(PeerIdentity { uid: peer_uid, pid: None, connection_id })
         });
         self
     }
@@ -745,6 +792,7 @@ struct LockAuditMaterial {
     project_id: String,
     profile_id: Option<String>,
     store_path: PathBuf,
+    store_identity: Option<StoreFileIdentity>,
     master_key: zeroize::Zeroizing<Vec<u8>>,
 }
 
@@ -759,6 +807,7 @@ fn lock_audit_material(
                 project_id: project_id.clone(),
                 profile_id: context.profile_id.clone(),
                 store_path: context.store_path.clone(),
+                store_identity: entry.store_identity.clone(),
                 master_key: zeroize::Zeroizing::new(entry.key_bytes().to_vec()),
             })
         })
@@ -773,6 +822,12 @@ fn append_lock_audits(
 ) -> Result<(), StoreError> {
     let timestamp = i64::try_from(now_unix_nanos).unwrap_or(i64::MAX);
     for material in audit_material {
+        if material.store_identity.as_ref().is_some_and(|pin| !pin.matches(&material.store_path)) {
+            return Err(StoreError::AuditIntegrity {
+                sequence: 0,
+                reason: "store identity changed before lock audit".into(),
+            });
+        }
         let mut store = Store::open(&material.store_path)?;
         let key_error = || StoreError::AuditIntegrity {
             sequence: 0,
@@ -846,9 +901,15 @@ pub async fn handle_connection(
     mut stream: UnixStream,
     state: AgentSocketState,
 ) -> ConnectionOutcome {
-    if let Err(error) = validate_connection_peer(&stream, &state) {
-        return ConnectionOutcome::Rejected { reason: error };
-    }
+    let Ok(connection_id) =
+        state.connections.try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+    else {
+        return ConnectionOutcome::Errored;
+    };
+    let peer = match validate_connection_peer(&stream, &state, connection_id) {
+        Ok(peer) => peer,
+        Err(reason) => return ConnectionOutcome::Rejected { reason },
+    };
     let mut buffer = Zeroizing::new(Vec::with_capacity(FRAME_READ_CHUNK_SIZE));
     loop {
         match read_one_frame(&mut stream, &mut buffer).await {
@@ -857,7 +918,7 @@ pub async fn handle_connection(
                 if matches!(envelope.method(), Ok(AgentMethod::SubscribeStatus)) {
                     return stream_status(stream, state, envelope.id.clone(), buffer).await;
                 }
-                let response = dispatch(&envelope, &state).await;
+                let response = dispatch_with_peer(&envelope, &state, Some(peer)).await;
                 if !write_response(&mut stream, &response).await {
                     return ConnectionOutcome::Errored;
                 }
@@ -871,14 +932,15 @@ pub async fn handle_connection(
 fn validate_connection_peer(
     stream: &UnixStream,
     state: &AgentSocketState,
-) -> Result<(), SocketServerError> {
+    connection_id: u64,
+) -> Result<PeerIdentity, SocketServerError> {
     #[cfg(test)]
     {
-        (state.peer_credential_validator)(stream, state.daemon_uid)
+        (state.peer_credential_validator)(stream, state.daemon_uid, connection_id)
     }
     #[cfg(not(test))]
     {
-        crate::peer_cred::validate_peer_stream(stream, state.daemon_uid)
+        crate::peer_cred::validate_peer_stream(stream, state.daemon_uid, connection_id)
     }
 }
 
@@ -1065,16 +1127,67 @@ fn error_response(envelope: &RequestEnvelope, error: &str, message: &str) -> Res
     ResponseEnvelope::Error(ErrorEnvelope::new(envelope.id.clone(), error, message, false))
 }
 
-#[allow(clippy::too_many_lines)]
 /// Dispatches one validated agent request envelope against shared
 /// daemon state and returns a framed-response payload.
 pub async fn dispatch(envelope: &RequestEnvelope, state: &AgentSocketState) -> ResponseEnvelope {
-    if let Some(response) =
-        crate::auth::authenticate_request_if_present(envelope, state, current_unix_nanos()).await
+    dispatch_with_peer(envelope, state, None).await
+}
+
+/// Dispatches a request with the local transport's kernel-observed identity.
+#[allow(clippy::too_many_lines)]
+pub async fn dispatch_with_peer(
+    envelope: &RequestEnvelope,
+    state: &AgentSocketState,
+    peer: Option<PeerIdentity>,
+) -> ResponseEnvelope {
+    let method = envelope.method();
+    // Keep store validation and key insertion ordered with session locks.
+    let unlock_session = if matches!(method, Ok(AgentMethod::Unlock)) {
+        Some(state.session_gate.lock().await)
+    } else {
+        None
+    };
+    let observed_pid = peer.and_then(|peer| peer.pid);
+    let Ok(store_path) = request_store_path(envelope, state).await else {
+        return error_response(
+            envelope,
+            "AccessDenied",
+            "request store does not match the pinned vault",
+        );
+    };
+    let grant_id = envelope.payload.get("grant_id").and_then(serde_json::Value::as_str);
+    if let (Some(pid), Some(grant_id)) = (observed_pid, grant_id) {
+        let revoking = matches!(method, Ok(AgentMethod::RevokeGrant | AgentMethod::ExpireGrant));
+        let grants = state.grants.lock().await;
+        if grants.get(grant_id).is_some_and(|grant| !grant.permits_peer(pid, revoking)) {
+            return error_response(
+                envelope,
+                "GrantRequired",
+                "grant belongs to a different process",
+            );
+        }
+    }
+    if let Some(response) = crate::auth::authenticate_request_if_present(
+        envelope,
+        state,
+        current_unix_nanos(),
+        store_path.as_deref(),
+    )
+    .await
     {
         return response;
     }
-    match envelope.method() {
+    let normalized = store_path.map(|path| {
+        let mut copy = envelope.clone();
+        copy.payload["store_path"] = serde_json::Value::String(path);
+        copy
+    });
+    let envelope = normalized.as_ref().unwrap_or(envelope);
+    if let Some(session) = unlock_session {
+        return handle_unlock(envelope, state, session).await;
+    }
+    drop(unlock_session);
+    match method {
         Ok(AgentMethod::TeamSyncStatus) => {
             crate::handlers::team_sync::handle_team_sync_status(envelope, state).await
         }
@@ -1099,7 +1212,6 @@ pub async fn dispatch(envelope: &RequestEnvelope, state: &AgentSocketState) -> R
             let payload = serde_json::to_value(snapshot).unwrap_or(serde_json::Value::Null);
             ResponseEnvelope::Success(SuccessEnvelope::new(envelope.id.clone(), payload))
         }
-        Ok(AgentMethod::Unlock) => handle_unlock(envelope, state).await,
         Ok(AgentMethod::Lock) => {
             let payload = match serde::Deserialize::deserialize(&envelope.payload) {
                 Ok(Some(payload)) => payload,
@@ -1140,7 +1252,7 @@ pub async fn dispatch(envelope: &RequestEnvelope, state: &AgentSocketState) -> R
             ))
         }
         Ok(AgentMethod::ClientHello) => crate::auth::handle_client_hello(envelope, state).await,
-        Ok(AgentMethod::RequestGrant) => handle_request_grant(envelope, state).await,
+        Ok(AgentMethod::RequestGrant) => handle_request_grant(envelope, state, observed_pid).await,
         Ok(AgentMethod::RevokeGrant) => handle_revoke_grant(envelope, state).await,
         Ok(AgentMethod::ExpireGrant) => handle_expire_grant(envelope, state).await,
         Ok(AgentMethod::Reveal) => {
@@ -1170,7 +1282,7 @@ pub async fn dispatch(envelope: &RequestEnvelope, state: &AgentSocketState) -> R
         Ok(AgentMethod::ResolveReference) => {
             crate::resolve::handle_resolve(envelope, state, current_unix_nanos()).await
         }
-        Ok(AgentMethod::PrepareExec) => prepare_exec_dispatch(envelope, state).await,
+        Ok(AgentMethod::PrepareExec) => prepare_exec_dispatch(envelope, state, observed_pid).await,
         Ok(AgentMethod::ListSecrets) => handle_list_secrets(envelope),
         Ok(AgentMethod::ListProjects) => crate::discovery::handle_list_projects(envelope),
         Ok(AgentMethod::DiscoverSecrets) => crate::discovery::handle_discover_secrets(envelope),
@@ -1215,16 +1327,76 @@ pub async fn dispatch(envelope: &RequestEnvelope, state: &AgentSocketState) -> R
     }
 }
 
+async fn request_store_path(
+    envelope: &RequestEnvelope,
+    state: &AgentSocketState,
+) -> Result<Option<String>, ()> {
+    let payload = &envelope.payload;
+    let supplied =
+        [payload.get("store_path"), payload.get("audit").and_then(|audit| audit.get("store_path"))];
+    let uses_cached_store = matches!(
+        envelope.method(),
+        Ok(AgentMethod::TeamSyncStatus
+            | AgentMethod::TeamSyncConfigure
+            | AgentMethod::TeamSyncNow
+            | AgentMethod::TeamSyncReconcile)
+    );
+    if !uses_cached_store && supplied.iter().flatten().all(|value| value.is_null()) {
+        return Ok(None);
+    }
+    let cache = state.unlock_cache.lock().await;
+    let entry = payload
+        .get("project_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|project| cache.lookup(project, current_unix_nanos()));
+    let pin = entry.and_then(|entry| entry.store_identity.as_ref());
+    if state.canonical_store_path.is_none() && pin.is_none() {
+        return Ok(None);
+    }
+    let check = |path: &Path| {
+        let (path, identity) = state.validate_store_path(path).map_err(|_| ())?;
+        if pin.is_some_and(|pin| identity != *pin) {
+            return Err(());
+        }
+        Ok(path)
+    };
+    let mut path = None;
+    for (index, value) in supplied.into_iter().enumerate() {
+        if let Some(value) = value.filter(|value| !value.is_null()) {
+            let requested = value.as_str().ok_or(())?;
+            let trusted = check(Path::new(requested))?;
+            if index == 0 {
+                let trusted = trusted.into_os_string().into_string().map_err(|_| ())?;
+                if trusted != requested {
+                    path = Some(trusted);
+                }
+            }
+        }
+    }
+    if uses_cached_store
+        && let Some(context) = entry.and_then(crate::unlock_cache::UnlockEntry::audit_context)
+    {
+        check(&context.store_path)?;
+    }
+    Ok(path)
+}
+
 async fn prepare_exec_dispatch(
     envelope: &RequestEnvelope,
     state: &AgentSocketState,
+    observed_pid: Option<u32>,
 ) -> ResponseEnvelope {
     let session = state.session_gate.lock().await;
     if !session.is_empty() {
         return error_response(envelope, "UnlockRequired", "OS session is locked or suspended");
     }
-    let response =
-        crate::prepare_exec::handle_prepare_exec(envelope, state, current_unix_nanos()).await;
+    let response = crate::prepare_exec::handle_prepare_exec(
+        envelope,
+        state,
+        current_unix_nanos(),
+        observed_pid,
+    )
+    .await;
     drop(session);
     response
 }
@@ -1262,18 +1434,16 @@ const MAX_UNLOCK_TTL_SECONDS: u64 = 86_400;
 /// the passphrase-fallback envelope itself, then derives the per-project
 /// audit key, writes the `UNLOCK` audit row, and finally caches the
 /// unwrapped master key so subsequent RPCs can reuse it.
-async fn handle_unlock(envelope: &RequestEnvelope, state: &AgentSocketState) -> ResponseEnvelope {
-    // Hold through insertion so native locking either runs after this unlock
-    // and erases it, or rejects it for the entire locked/suspended session.
-    let session = state.session_gate.lock().await;
+async fn handle_unlock(
+    envelope: &RequestEnvelope,
+    state: &AgentSocketState,
+    session: tokio::sync::MutexGuard<'_, BTreeSet<&'static str>>,
+) -> ResponseEnvelope {
     if !session.is_empty() {
         return error_response(envelope, "UnlockRequired", "OS session is locked or suspended");
     }
     let now = current_unix_nanos();
-    if state.expire_unlocks(now).await.is_err() {
-        return error_response(envelope, "CorruptDb", "failed to audit expired unlock");
-    }
-    let payload: UnlockPayload = match serde::Deserialize::deserialize(&envelope.payload) {
+    let mut payload: UnlockPayload = match serde::Deserialize::deserialize(&envelope.payload) {
         Ok(payload) => payload,
         Err(_) => return error_response(envelope, "ProtocolError", "invalid Unlock payload"),
     };
@@ -1284,6 +1454,16 @@ async fn handle_unlock(envelope: &RequestEnvelope, state: &AgentSocketState) -> 
             "MetadataInvalid",
             "unlock TTL must be between 1 and 86400 seconds",
         );
+    }
+
+    let (store_identity, previous_context) =
+        match pin_unlock_store(envelope, state, &mut payload, now).await {
+            Ok(pinned) => pinned,
+            Err(message) => return error_response(envelope, "AccessDenied", message),
+        };
+
+    if state.expire_unlocks(now).await.is_err() {
+        return error_response(envelope, "CorruptDb", "failed to audit expired unlock");
     }
 
     // Execution reuses an existing authorization without re-prompting or extending
@@ -1329,16 +1509,62 @@ async fn handle_unlock(envelope: &RequestEnvelope, state: &AgentSocketState) -> 
         std::time::Duration::from_secs(payload.ttl_seconds),
         resolved_method,
     );
-    if let Some(audit) = payload.audit {
-        entry = entry.with_audit_context(crate::unlock_cache::UnlockAuditContext {
+    entry.store_identity = store_identity;
+    let audit_context = payload
+        .audit
+        .map(|audit| crate::unlock_cache::UnlockAuditContext {
             store_path: audit.store_path,
             profile_id: audit.profile_id,
-        });
+        })
+        .or(previous_context);
+    if let Some(context) = audit_context {
+        entry = entry.with_audit_context(context);
     }
     state.unlock_cache.lock().await.insert(payload.project_id, entry);
     drop(session);
     state.publish_status_snapshot(now).await;
     ResponseEnvelope::Success(SuccessEnvelope::new(envelope.id.clone(), serde_json::Value::Null))
+}
+
+async fn pin_unlock_store(
+    envelope: &RequestEnvelope,
+    state: &AgentSocketState,
+    payload: &mut UnlockPayload,
+    now: i128,
+) -> Result<
+    (Option<StoreFileIdentity>, Option<crate::unlock_cache::UnlockAuditContext>),
+    &'static str,
+> {
+    let (previous_pin, previous_context) = {
+        let cache = state.unlock_cache.lock().await;
+        cache.lookup(&payload.project_id, now).map_or((None, None), |entry| {
+            (entry.store_identity.clone(), entry.audit_context().cloned())
+        })
+    };
+    let store_path = payload
+        .audit
+        .as_ref()
+        .map(|audit| audit.store_path.as_path())
+        .or_else(|| {
+            envelope.payload.get("store_path").and_then(serde_json::Value::as_str).map(Path::new)
+        })
+        .or(state.canonical_store_path.as_deref())
+        .or_else(|| previous_context.as_ref().map(|context| context.store_path.as_path()));
+    let store_identity = if let Some(path) = store_path {
+        let Ok((path, identity)) = state.validate_store_path(path) else {
+            return Err("could not verify unlock store identity");
+        };
+        if previous_pin.is_some_and(|pin| pin != identity) {
+            return Err("unlock store identity changed");
+        }
+        if let Some(audit) = payload.audit.as_mut() {
+            audit.store_path = path;
+        }
+        Some(identity)
+    } else {
+        previous_pin
+    };
+    Ok((store_identity, previous_context))
 }
 
 /// Loads the master key for `project_id` from the OS keychain, falling
@@ -1668,6 +1894,7 @@ async fn list_audit(
 async fn handle_request_grant(
     envelope: &RequestEnvelope,
     state: &AgentSocketState,
+    observed_pid: Option<u32>,
 ) -> ResponseEnvelope {
     let session = state.session_gate.lock().await;
     if !session.is_empty() {
@@ -1709,11 +1936,18 @@ async fn handle_request_grant(
         }
         payload.ttl_seconds = policy_ttl_seconds;
     }
+    if !crate::grant::constrain_peer_grant(&mut payload, observed_pid) {
+        return error_response(
+            envelope,
+            "AccessDenied",
+            "grant binding does not match the connecting process",
+        );
+    }
     let now = current_unix_nanos();
     let ttl_nanos = i128::from(payload.ttl_seconds).saturating_mul(1_000_000_000);
     let record = {
         let mut grants = state.grants.lock().await;
-        match grants.issue(payload, now, now.saturating_add(ttl_nanos)) {
+        match grants.issue_with_peer(payload, now, now.saturating_add(ttl_nanos), observed_pid) {
             Ok(record) => record,
             Err(_) => {
                 return error_response(envelope, "ProtocolError", "failed to allocate grant id");

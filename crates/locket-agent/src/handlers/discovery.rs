@@ -134,16 +134,36 @@ pub fn discover_secrets(store: &Store, filters: DiscoveryFilters) -> Result<Valu
         include_deleted: filters.include_deleted,
         limit: filters.limit,
     })?;
+    let notices = if store.current_schema_version()?.is_some_and(|version| version >= 7) {
+        store.list_expiring_or_stale_secrets(
+            project.as_deref(),
+            i64::try_from(crate::server::current_unix_nanos()).unwrap_or(i64::MAX),
+            7 * 86_400_000_000_000,
+        )?
+    } else {
+        Vec::new()
+    };
+    let notices = notices
+        .iter()
+        .map(|notice| (notice.secret_id.as_str(), notice))
+        .collect::<std::collections::BTreeMap<_, _>>();
     Ok(json!(
         records
             .into_iter()
             .filter(|record| project.as_ref().is_none_or(|id| &record.project_id == id))
-            .map(|record| secret_row(record, filters.redact_names))
+            .map(|record| {
+                let notice = notices.get(record.secret_id.as_str()).copied();
+                secret_row(record, filters.redact_names, notice)
+            })
             .collect::<Vec<_>>()
     ))
 }
 
-fn secret_row(record: DiscoveredSecretRecord, redact: bool) -> Value {
+fn secret_row(
+    record: DiscoveredSecretRecord,
+    redact: bool,
+    notice: Option<&locket_store::SecretExpirationNotice>,
+) -> Value {
     let name = label("secret", &record.name, &record.name, redact);
     let profile = label("profile", &record.profile_id, &record.profile_name, redact);
     let roots = record
@@ -151,7 +171,7 @@ fn secret_row(record: DiscoveredSecretRecord, redact: bool) -> Value {
         .iter()
         .map(|path| label("root", path, path, redact))
         .collect::<Vec<_>>();
-    json!({
+    let mut row = json!({
         "project_id": record.project_id,
         "project_name": label("project", &record.project_id, &record.project_name, redact),
         "trusted_roots": roots,
@@ -173,7 +193,18 @@ fn secret_row(record: DiscoveredSecretRecord, redact: bool) -> Value {
         "updated_at": record.updated_at,
         "last_rotated_at": record.last_rotated_at,
         "reference": format!("lk://{profile}/{name}"),
-    })
+    });
+    if let Some(notice) = notice {
+        let status = notice.expiry_status.map(|status| match status {
+            locket_store::SecretExpiryStatus::Expired => "expired",
+            locket_store::SecretExpiryStatus::ExpiringSoon => "expiring_soon",
+        });
+        row["expiry_status"] = json!(status);
+        row["expires_at"] = json!(notice.policy.expires_at);
+        row["rotate_after_days"] = json!(notice.policy.rotate_after_days);
+        row["stale"] = json!(notice.stale);
+    }
+    row
 }
 
 fn label(kind: &str, id: &str, name: &str, redact: bool) -> String {

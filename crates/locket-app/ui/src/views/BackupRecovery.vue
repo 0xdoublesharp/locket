@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, ref, watch } from 'vue';
 
 import { exportSelectionKey } from '../backup/actions';
 import type {
@@ -27,6 +27,7 @@ const exportDraft = ref<ExportDraft>({
   includeAudit: false,
   includePersonal: false,
   includeHistory: false,
+  confirmDangerous: false,
   previewOnly: false,
   outputPath: '',
 });
@@ -35,6 +36,7 @@ const importDraft = ref<ImportDraft>({
   bundlePath: '',
   includeAudit: false,
   conflictMode: 'review',
+  confirmDangerous: false,
 });
 
 const verifyDraft = ref<VerifyDraft>({
@@ -57,6 +59,21 @@ const previewMatches = computed(
   () => props.previewKey === exportSelectionKey(exportDraft.value) && !!props.previewMessage,
 );
 
+watch(
+  () => [exportSelectionKey(exportDraft.value), props.previewKey],
+  () => {
+    exportDraft.value.confirmDangerous = false;
+  },
+  { flush: 'sync' },
+);
+watch(
+  () => [importDraft.value.bundlePath, importDraft.value.conflictMode],
+  () => {
+    importDraft.value.confirmDangerous = false;
+  },
+  { flush: 'sync' },
+);
+
 function exportAction(previewOnly = false): void {
   if (props.busy || (!previewOnly && !previewMatches.value)) return;
   emit('action', {
@@ -64,6 +81,7 @@ function exportAction(previewOnly = false): void {
     label: 'export sealed bundle',
     request: { ...exportDraft.value, previewOnly },
   });
+  if (!previewOnly) exportDraft.value.confirmDangerous = false;
 }
 
 function importAction(): void {
@@ -72,6 +90,7 @@ function importAction(): void {
     label: 'import bundle',
     request: { ...importDraft.value },
   });
+  importDraft.value.confirmDangerous = false;
 }
 
 function verifyAction(): void {
@@ -160,6 +179,10 @@ function rotateAction(): void {
           Preview scope
         </button>
         <p v-if="previewMatches" role="status" class="view__preview">{{ props.previewMessage }}</p>
+        <label v-if="previewMatches" class="view__field view__field--inline">
+          <input v-model="exportDraft.confirmDangerous" type="checkbox" />
+          <span>Confirm export from dangerous environments in this scope</span>
+        </label>
         <button
           type="button"
           class="view__action"
@@ -205,6 +228,11 @@ function rotateAction(): void {
             <span>Import new values and keep local conflicts</span>
           </label>
         </fieldset>
+
+        <label v-if="importDraft.conflictMode !== 'review'" class="view__field view__field--inline">
+          <input v-model="importDraft.confirmDangerous" type="checkbox" />
+          <span>Confirm changes to dangerous environments in this bundle</span>
+        </label>
 
         <button
           type="button"

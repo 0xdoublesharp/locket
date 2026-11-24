@@ -291,8 +291,18 @@ env_mode = "strict"
         <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
     )?;
     let agent = TestAgent::start(&context)?;
-    let result = run_with_context(
+    let blocked = run_with_context(
         Cli::try_parse_from(["locket", "run", "deploy"])?,
+        &context,
+        &mut Vec::new(),
+    );
+    let Err(error) = blocked else {
+        return Err("argv references require explicit opt-in".into());
+    };
+    assert_eq!(error.exit_code(), locket_core::LocketError::InvalidPolicy.exit_code());
+    assert!(error.to_string().contains("--allow-insecure-argv"));
+    let result = run_with_context(
+        Cli::try_parse_from(["locket", "run", "--allow-insecure-argv", "deploy"])?,
         &context,
         &mut Vec::new(),
     );
@@ -320,6 +330,77 @@ env_mode = "strict"
     assert_eq!(metadata_json["status"], "DENIED");
     assert_eq!(metadata_json["failure_reason"], "invalid_lk_reference");
     assert_eq!(metadata_json["policy_id"], "deploy");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn run_argv_break_glass_warns_and_records_metadata_only() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--no-device", "--no-passkey"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    let value = "canary-argv-value";
+    crate::set_secret_value(&context, &test_secret_write_args("API_KEY"), value, "manual", 1000)?;
+    run_with_context(
+        Cli::try_parse_from([
+            "locket",
+            "policy",
+            "add",
+            "deploy",
+            "--",
+            test_shell(),
+            "-c",
+            "case \"$1\" in *://*|'') exit 1;; esac; /usr/bin/touch ran-with-argv",
+            "shell",
+            "lk://dev/API_KEY",
+        ])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    run_with_context(
+        Cli::try_parse_from(["locket", "policy", "allow", "deploy", "API_KEY"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    std::fs::set_permissions(
+        directory.path(),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+    )?;
+    let agent = TestAgent::start(&context)?;
+    let Some(crate::Command::Run(args)) =
+        Cli::try_parse_from(["locket", "run", "--allow-insecure-argv", "deploy"])?.command
+    else {
+        return Err("run arguments did not parse".into());
+    };
+    let mut diagnostics = Vec::new();
+    let result = crate::commands::exec::run::run_command_with_diagnostics(
+        &context,
+        &mut Vec::new(),
+        &mut diagnostics,
+        &args,
+    );
+    agent.stop()?;
+    result?;
+    assert!(directory.path().join("ran-with-argv").exists());
+    let diagnostics = String::from_utf8(diagnostics)?;
+    assert!(
+        diagnostics.contains("warning: secret values in process argv are visible via ps or /proc")
+    );
+    assert!(!diagnostics.contains(value));
+    let store = locket_store::Store::open(&context.store_path)?;
+    let audit: String = store.connection().query_row(
+        "SELECT metadata_json FROM audit_log WHERE action = 'RUN_POLICY' AND status = 'SUCCESS'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert!(!audit.contains(value));
+    let audit: serde_json::Value = serde_json::from_str(&audit)?;
+    assert_eq!(audit["delivery_mode"], "insecure_argv");
     Ok(())
 }
 

@@ -6,12 +6,18 @@ const draft: ExportDraft = {
   includeAudit: false,
   includePersonal: false,
   includeHistory: false,
+  confirmDangerous: false,
   outputPath: '',
   previewOnly: true,
 };
 describe('backup scope preview', () => {
   it('allows the same selection to export after preview', () => {
     expect(exportSelectionKey(draft)).toBe(exportSelectionKey({ ...draft, previewOnly: false }));
+  });
+  it('lets the user confirm the previewed selection without changing its scope', () => {
+    expect(exportSelectionKey(draft)).toBe(
+      exportSelectionKey({ ...draft, confirmDangerous: true }),
+    );
   });
   it.each([
     'recipientDescriptor',

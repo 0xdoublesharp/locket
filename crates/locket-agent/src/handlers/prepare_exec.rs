@@ -101,6 +101,7 @@ pub async fn handle_prepare_exec(
     request: &RequestEnvelope,
     state: &crate::server::AgentSocketState,
     now_unix_nanos: i128,
+    observed_pid: Option<u32>,
 ) -> ResponseEnvelope {
     let Ok(typed) = serde_json::from_value::<PrepareExecRequest>(request.payload.clone()) else {
         return protocol_error(request, "invalid PrepareExec payload");
@@ -150,12 +151,15 @@ pub async fn handle_prepare_exec(
     let command_kind = command_kind(&policy);
     let allowed_env_names = policy.allowed_secrets.clone();
 
-    // Issue a live PrepareExec grant and surface its id on the
-    // response so the trusted CLI execution path (and policy doctor)
-    // can reuse it for the subsequent `ResolveReference` call without
-    // a second `RequestGrant` round-trip.
-    let binding = typed.binding.clone().unwrap_or_else(|| GrantBinding::new(process::id(), "0"));
-    let grant_payload = RequestGrantPayload {
+    let Some(binding) = typed.binding.or_else(|| prepare_binding(observed_pid)) else {
+        return typed_error(
+            request,
+            "AccessDenied",
+            "connecting process identity is unavailable",
+            LocketError::AccessDenied,
+        );
+    };
+    let mut grant_payload = RequestGrantPayload {
         project_id: project_id.to_owned(),
         profile_id: typed.profile_id.clone(),
         policy_name: Some(policy.name.clone()),
@@ -163,10 +167,24 @@ pub async fn handle_prepare_exec(
         ttl_seconds,
         binding,
     };
+    if !crate::grant::constrain_peer_grant(&mut grant_payload, observed_pid) {
+        return typed_error(
+            request,
+            "AccessDenied",
+            "grant binding does not match the connecting process",
+            LocketError::AccessDenied,
+        );
+    }
+    let ttl_seconds = grant_payload.ttl_seconds;
     let ttl_nanos = i128::from(ttl_seconds).saturating_mul(1_000_000_000);
     let issued = {
         let mut grants = state.grants.lock().await;
-        grants.issue(grant_payload, now_unix_nanos, now_unix_nanos.saturating_add(ttl_nanos))
+        grants.issue_with_peer(
+            grant_payload,
+            now_unix_nanos,
+            now_unix_nanos.saturating_add(ttl_nanos),
+            observed_pid,
+        )
     };
     let grant_id = match issued {
         Ok(record) => record.grant_id,
@@ -190,6 +208,14 @@ pub async fn handle_prepare_exec(
         |_| protocol_error(request, "failed to serialize PrepareExec response"),
         |payload| ResponseEnvelope::Success(SuccessEnvelope::new(request.id.clone(), payload)),
     )
+}
+
+fn prepare_binding(observed_pid: Option<u32>) -> Option<GrantBinding> {
+    let Some(pid) = observed_pid else {
+        return Some(GrantBinding::new(process::id(), "0"));
+    };
+    let live = locket_platform::process_binding_for_pid(pid).ok()?;
+    Some(GrantBinding::new(pid, live.process_start_time))
 }
 
 fn find_policy<'a>(
@@ -334,7 +360,7 @@ mod tests {
             request_payload(Some(PROJECT_ID)),
         );
 
-        let response = handle_prepare_exec(&envelope, &state, 1).await;
+        let response = handle_prepare_exec(&envelope, &state, 1, None).await;
         let ResponseEnvelope::Success(success) = response else {
             return Err("expected success envelope".into());
         };
@@ -379,7 +405,7 @@ mod tests {
             request_payload(Some(PROJECT_ID)),
         );
 
-        let response = handle_prepare_exec(&envelope, &state, 1).await;
+        let response = handle_prepare_exec(&envelope, &state, 1, None).await;
         let ResponseEnvelope::Success(success) = response else {
             return Err("expected success envelope".into());
         };
@@ -400,7 +426,7 @@ mod tests {
             request_payload(Some(PROJECT_ID)),
         );
 
-        let response = handle_prepare_exec(&envelope, &state, 1).await;
+        let response = handle_prepare_exec(&envelope, &state, 1, None).await;
         let ResponseEnvelope::Success(success) = response else {
             return Err("expected success envelope".into());
         };
@@ -426,7 +452,7 @@ mod tests {
         // tests. The wiring is exercised by
         // `degraded_audit::tests::record_locked_refusal_writes_to_store_path_parent`
         // and the per-handler reveal/scan/resolve tests.
-        let response = handle_prepare_exec(&envelope, &state, 1).await;
+        let response = handle_prepare_exec(&envelope, &state, 1, None).await;
         let ResponseEnvelope::Error(error) = response else {
             panic!("expected error envelope");
         };
@@ -443,7 +469,7 @@ mod tests {
             request_payload(Some(PROJECT_ID)),
         );
 
-        let response = handle_prepare_exec(&envelope, &state, 1).await;
+        let response = handle_prepare_exec(&envelope, &state, 1, None).await;
         let ResponseEnvelope::Error(error) = response else {
             panic!("expected error envelope");
         };
@@ -459,7 +485,7 @@ mod tests {
             json!({"policy_name": 1, "profile_id": null}),
         );
 
-        let response = handle_prepare_exec(&envelope, &state, 1).await;
+        let response = handle_prepare_exec(&envelope, &state, 1, None).await;
         let ResponseEnvelope::Error(error) = response else {
             panic!("expected error envelope");
         };
@@ -472,7 +498,7 @@ mod tests {
         let envelope =
             RequestEnvelope::new("req-no-project", AgentMethod::PrepareExec, request_payload(None));
 
-        let response = handle_prepare_exec(&envelope, &state, 1).await;
+        let response = handle_prepare_exec(&envelope, &state, 1, None).await;
         let ResponseEnvelope::Error(error) = response else {
             panic!("expected error envelope");
         };

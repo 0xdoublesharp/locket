@@ -137,7 +137,7 @@ mod unix {
     #[tokio::test]
     async fn stream_status_events_decodes_subscribe_status_frames() {
         let dir = tempdir_user_only();
-        let socket_path = dir.path().join("status-stream.sock");
+        let socket_path = dir.path().join("agent.sock");
         let listener = UnixListener::bind(&socket_path).expect("bind stream listener");
 
         let server = tokio::spawn(async move {

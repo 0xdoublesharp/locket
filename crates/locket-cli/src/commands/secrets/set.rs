@@ -458,20 +458,22 @@ pub fn create_value(
     );
     record_generation(&mut audit_metadata, request.origin);
     let audit = write_audit(&secret, request.action, request.timestamp, &audit_metadata);
-    store.create_active_secret_with_metadata_and_audit(
-        &secret,
-        &version_record(&secret, 1, request.origin, request.timestamp),
-        &blob,
-        &fingerprint,
-        SecretInitialMetadata {
-            description: request.metadata.description.as_deref(),
-            owner: request.metadata.owner.as_deref(),
-            tags: &request.metadata.tags,
-            required: metadata_required_update(request.metadata).unwrap_or(false),
-        },
-        Some(AuditContext { key: keys.audit.as_ref(), write: &audit }),
-    )?;
-    Ok(())
+    store.with_atomic_write(|store| -> Result<(), CliError> {
+        store.create_active_secret_with_metadata_and_audit(
+            &secret,
+            &version_record(&secret, 1, request.origin, request.timestamp),
+            &blob,
+            &fingerprint,
+            SecretInitialMetadata {
+                description: request.metadata.description.as_deref(),
+                owner: request.metadata.owner.as_deref(),
+                tags: &request.metadata.tags,
+                required: metadata_required_update(request.metadata).unwrap_or(false),
+            },
+            Some(AuditContext { key: keys.audit.as_ref(), write: &audit }),
+        )?;
+        super::expiry::update_expiry_policy(store, &secret.id, request.metadata, request.timestamp)
+    })
 }
 
 pub struct Rotation<'a> {
@@ -536,7 +538,7 @@ pub fn rotate_value(
             metadata,
             Some(AuditContext { key: keys.audit.as_ref(), write: &audit }),
         )?;
-        Ok(())
+        super::expiry::update_expiry_policy(store, &secret.id, update, rotation.timestamp)
     })?;
     Ok(version)
 }

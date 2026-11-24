@@ -40,6 +40,7 @@ pub struct UnlockEntry {
     /// Optional metadata needed to append `LOCK` rows when project
     /// context is available.
     audit_context: Option<UnlockAuditContext>,
+    pub(crate) store_identity: Option<crate::keys::StoreFileIdentity>,
 }
 
 impl std::fmt::Debug for UnlockEntry {
@@ -50,7 +51,7 @@ impl std::fmt::Debug for UnlockEntry {
             .field("ttl", &self.ttl)
             .field("method", &self.method)
             .field("has_audit_context", &self.audit_context.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -81,7 +82,7 @@ impl UnlockEntry {
         ttl: Duration,
         method: UnlockMethod,
     ) -> Self {
-        Self { key, inserted_at_unix_nanos, ttl, method, audit_context: None }
+        Self { key, inserted_at_unix_nanos, ttl, method, audit_context: None, store_identity: None }
     }
 
     /// Adds metadata-only audit context to an unlock entry.

@@ -1,5 +1,9 @@
 //! Shared unwrapping for keys protected by a project's master key.
 
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+
 use locket_crypto::{
     CryptoError, HkdfWrapInfo, KeyBytes, KeyPurpose, KeyWrapAad, KeyWrapPurpose,
     WrappedKeyMaterial, derive_wrapping_key_v1, key_wrap_aad_v1, unwrap_key_material_v1,
@@ -8,6 +12,42 @@ use locket_store::{Store, StoreError};
 use zeroize::Zeroizing;
 
 use crate::server::AgentSocketState;
+
+/// File identity captured independently of the path used to reach it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoreFileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(not(unix))]
+    path: PathBuf,
+}
+
+impl StoreFileIdentity {
+    pub(crate) fn capture(path: &Path) -> io::Result<(PathBuf, Self)> {
+        let path = fs::canonicalize(path)?;
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "store must be a regular file",
+            ));
+        }
+        #[cfg(unix)]
+        let identity = {
+            use std::os::unix::fs::MetadataExt;
+            Self { device: metadata.dev(), inode: metadata.ino() }
+        };
+        #[cfg(not(unix))]
+        let identity = Self { path: path.clone() };
+        Ok((path, identity))
+    }
+
+    pub(crate) fn matches(&self, path: &Path) -> bool {
+        Self::capture(path).is_ok_and(|(_, identity)| *self == identity)
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum KeyError {

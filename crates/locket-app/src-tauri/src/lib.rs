@@ -597,8 +597,7 @@ async fn agent_policy_doctor(
 async fn agent_export_bundle(
     request: locket_agent::ExportBundleRequest,
 ) -> Result<locket_agent::BackupActionResponse, AgentClientError> {
-    let path = agent_client::resolve_socket_path();
-    agent_client::invoke_method(&path, locket_agent::AgentMethod::ExportBundle, &request).await
+    desktop_actions::export_bundle(&default_store_path()?, request).await
 }
 
 /// Tauri command exposing the agent's typed sealed-bundle import path.
@@ -606,8 +605,7 @@ async fn agent_export_bundle(
 async fn agent_import_bundle(
     request: locket_agent::ImportBundleRequest,
 ) -> Result<locket_agent::BackupActionResponse, AgentClientError> {
-    let path = agent_client::resolve_socket_path();
-    agent_client::invoke_method(&path, locket_agent::AgentMethod::ImportBundle, &request).await
+    desktop_actions::import_bundle(&default_store_path()?, request).await
 }
 
 /// Tauri command exposing non-destructive sealed-bundle verification.

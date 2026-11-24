@@ -684,6 +684,100 @@ fn denied_policy_readiness_does_not_hide_an_available_policy() -> Result<(), Box
     Ok(())
 }
 
+#[tokio::test]
+#[cfg(unix)]
+async fn desktop_backup_mints_required_grants_and_forwards_dangerous_confirmation()
+-> Result<(), Box<dyn Error>> {
+    use locket_agent::{AgentMethod, ResponseEnvelope};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let fixture = Fixture::new()?;
+    let context = open_project_at(&fixture.store, &fixture.root)?;
+    let export: locket_agent::ExportBundleRequest = serde_json::from_value(serde_json::json!({
+        "project_id": fixture.id, "profile_id": context.profile_id,
+        "recipient_descriptor": "test", "scope": "all-profiles",
+        "include_audit": false, "confirm_dangerous": true,
+    }))?;
+    let import: locket_agent::ImportBundleRequest = serde_json::from_value(serde_json::json!({
+        "project_id": fixture.id, "bundle_path": "fixture.locket", "include_audit": false,
+        "conflict_mode": "accept-incoming", "confirm_dangerous": true,
+    }))?;
+    let state = locket_agent::AgentSocketState::locked("desktop-test");
+    for (method, payload) in [
+        (AgentMethod::ExportBundle, serde_json::to_value(&export)?),
+        (AgentMethod::ImportBundle, serde_json::to_value(&import)?),
+    ] {
+        let request = locket_agent::RequestEnvelope::new("without-grant", method, payload);
+        assert!(matches!(locket_agent::dispatch(&request, &state).await,
+            ResponseEnvelope::Error(error) if error.error == "GrantRequired"));
+    }
+
+    let socket = fixture.directory.path().join("backup.sock");
+    let listener = tokio::net::UnixListener::bind(&socket)?;
+    let binding = serde_json::to_value(native_binding()?)?;
+    let server = tokio::spawn(async move {
+        for (kind, action) in [("ExportBundle", "Export"), ("ImportBundle", "ImportDotenv")] {
+            for expected in ["RequestGrant", kind, "RevokeGrant"] {
+                let (mut stream, _) = listener.accept().await?;
+                let length = stream.read_u32_le().await?;
+                let mut bytes = vec![0; length as usize];
+                stream.read_exact(&mut bytes).await?;
+                let request: locket_agent::RequestEnvelope = serde_json::from_slice(&bytes)?;
+                assert_eq!(request.kind, expected);
+                let payload = if expected == "RequestGrant" {
+                    assert_eq!(request.payload["action"], action);
+                    assert_eq!(
+                        request.payload["profile_id"],
+                        locket_agent::BUNDLE_PROJECT_GRANT_SCOPE
+                    );
+                    assert_eq!(request.payload["ttl_seconds"], 30);
+                    assert_eq!(request.payload["binding"], binding);
+                    serde_json::json!({"grant_id": "native-backup-grant"})
+                } else {
+                    assert_eq!(request.payload["grant_id"], "native-backup-grant");
+                    if expected == kind {
+                        assert_eq!(request.payload["binding"], binding);
+                        assert_eq!(request.payload["confirm_dangerous"], true);
+                    }
+                    serde_json::json!({"status": "completed"})
+                };
+                let response = ResponseEnvelope::Success(locket_agent::SuccessEnvelope::new(
+                    request.id, payload,
+                ));
+                stream
+                    .write_all(&locket_agent::encode_frame(
+                        &response,
+                        locket_agent::DEFAULT_MAX_MESSAGE_SIZE,
+                    )?)
+                    .await?;
+            }
+        }
+        Ok::<(), Box<dyn Error + Send + Sync>>(())
+    });
+    let exported: serde_json::Value = invoke_granted_at(
+        &socket,
+        AgentMethod::ExportBundle,
+        locket_agent::GrantAction::Export,
+        export,
+        &fixture.store,
+        &context,
+    )
+    .await?;
+    let imported: serde_json::Value = invoke_granted_at(
+        &socket,
+        AgentMethod::ImportBundle,
+        locket_agent::GrantAction::ImportDotenv,
+        import,
+        &fixture.store,
+        &context,
+    )
+    .await?;
+    assert_eq!(exported["status"], "completed");
+    assert_eq!(imported["status"], "completed");
+    server.await?.map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 #[test]
 fn readiness_scope_and_acl_use_verified_command_directory() -> Result<(), Box<dyn Error>> {
     let fixture = Fixture::new()?;
@@ -763,7 +857,7 @@ async fn pending_profile_actions_use_team_sync_grants_and_return_status_metadata
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let fixture = Fixture::new()?;
     let context = open_project_at(&fixture.store, &fixture.root)?;
-    let socket = fixture.directory.path().join("pending-grant.sock");
+    let socket = fixture.directory.path().join("agent.sock");
     let listener = tokio::net::UnixListener::bind(&socket)?;
     let expected = native_binding()?;
     let id = fixture.id.clone();

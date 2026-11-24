@@ -101,6 +101,7 @@ pub fn status_with_scan(
     writeln!(output, "agent: {agent_state}")?;
     writeln!(output, "agent_state: {agent_state}")?;
     writeln!(output, "running_sessions: {running_sessions}")?;
+    write_secret_expiry_summary(&store, resolved.config.project_id.as_str(), output)?;
     match scan_warning_count {
         Some(count) => writeln!(output, "scan_warnings: {count}")?,
         None => writeln!(output, "scan_warnings: unknown")?,
@@ -110,6 +111,34 @@ pub fn status_with_scan(
     writeln!(output, "profile: {}", if profile.is_some() { "ready" } else { "missing" })?;
     writeln!(output, "metadata_only: yes")?;
     writeln!(output, "next_action: {next_action}")?;
+    Ok(())
+}
+
+fn write_secret_expiry_summary(
+    store: &locket_store::Store,
+    project_id: &str,
+    output: &mut impl Write,
+) -> Result<(), CliError> {
+    let notices = crate::commands::secrets::expiry::expiry_notices(
+        store,
+        project_id,
+        crate::now_unix_nanos()?,
+    )?;
+    let expired = notices
+        .iter()
+        .filter(|notice| notice.expiry_status == Some(locket_store::SecretExpiryStatus::Expired))
+        .count();
+    let expiring_soon = notices
+        .iter()
+        .filter(|notice| {
+            notice.expiry_status == Some(locket_store::SecretExpiryStatus::ExpiringSoon)
+        })
+        .count();
+    let stale = notices.iter().filter(|notice| notice.stale).count();
+    writeln!(
+        output,
+        "secret_expiry: expired={expired} expiring_soon={expiring_soon} stale={stale}"
+    )?;
     Ok(())
 }
 

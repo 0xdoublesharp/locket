@@ -195,6 +195,7 @@ impl MetadataArgs {
             tags: self.tags.unwrap_or_default(),
             required: self.required == Some(true),
             optional: self.required == Some(false),
+            ..SecretMetadataFlags::default()
         }
     }
 }

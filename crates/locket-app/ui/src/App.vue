@@ -1364,6 +1364,7 @@ async function triggerBackupAction(action: BundleAction): Promise<void> {
         include_personal: action.request.includePersonal,
         include_history: action.request.includeHistory,
         preview_only: action.request.previewOnly,
+        confirm_dangerous: action.request.confirmDangerous,
       });
       if (result.ok) {
         if (action.request.previewOnly && result.value.status === 'preview') {
@@ -1383,6 +1384,7 @@ async function triggerBackupAction(action: BundleAction): Promise<void> {
         bundle_path: action.request.bundlePath,
         include_audit: action.request.includeAudit,
         conflict_mode: action.request.conflictMode,
+        confirm_dangerous: action.request.confirmDangerous,
       });
       if (result.ok) {
         backupNotice.value = `${result.value.status}: ${result.value.message}`;

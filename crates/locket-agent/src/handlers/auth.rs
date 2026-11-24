@@ -114,12 +114,16 @@ pub async fn authenticate_request_if_present(
     request: &RequestEnvelope,
     state: &crate::server::AgentSocketState,
     now_unix_nanos: i128,
+    trusted_store_path: Option<&str>,
 ) -> Option<ResponseEnvelope> {
-    let context = match auth_context(request) {
+    let mut context = match auth_context(request) {
         Ok(Some(context)) => context,
         Ok(None) => return None,
         Err(message) => return Some(error_response(request, "ProtocolError", message)),
     };
+    if let Some(path) = trusted_store_path {
+        context.store_path = PathBuf::from(path);
+    }
     match authenticate_request(request, state, now_unix_nanos, context).await {
         Ok(()) => None,
         Err(error) => Some(error_response(request, error.error_name(), error.to_string())),

@@ -8,6 +8,7 @@ export interface ExportDraft {
   includeAudit: boolean;
   includePersonal: boolean;
   includeHistory: boolean;
+  confirmDangerous: boolean;
   previewOnly: boolean;
   outputPath: string;
 }
@@ -16,6 +17,7 @@ export interface ImportDraft {
   bundlePath: string;
   includeAudit: boolean;
   conflictMode: ConflictMode;
+  confirmDangerous: boolean;
 }
 
 export interface VerifyDraft {

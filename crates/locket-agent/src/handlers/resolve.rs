@@ -333,6 +333,15 @@ fn resolve_reference_inner(
         ));
     }
     let secret = select_secret(store, project_id, &profile.id, parsed)?;
+    if super::secrets::secret_has_expired(store, &secret.id, now_unix_nanos)
+        .map_err(|_| corrupt_db())?
+    {
+        return Err(ResolveFailure::new(
+            "MetadataInvalid",
+            super::secrets::SECRET_EXPIRED_MESSAGE,
+            LocketError::MetadataInvalid,
+        ));
+    }
     let version_number = parsed.version().map_or(secret.current_version, SecretVersion::get);
     let version = store
         .get_secret_version(&secret.id, version_number)
@@ -1443,6 +1452,168 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn pinned_store_rejects_clones_without_decryption_or_audit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = build_fixture()?;
+        let copied = fixture.directory.path().join("copied.db");
+        std::fs::copy(&fixture.store_path, &copied)?;
+        for use_canonical_store in [false, true] {
+            let mut state = AgentSocketState::locked("test");
+            if use_canonical_store {
+                state = state.with_canonical_store_path(fixture.store_path.clone());
+            }
+            state.seed_master_key(PROJECT_ID, &fixture.master_key)?;
+            let unlock = RequestEnvelope::new(
+                "unlock",
+                AgentMethod::Unlock,
+                json!({
+                    "project_id": PROJECT_ID,
+                    "ttl_seconds": 60,
+                    "audit": {"store_path": fixture.store_path, "profile_id": PROFILE_ID},
+                }),
+            );
+            assert!(matches!(crate::dispatch(&unlock, &state).await, ResponseEnvelope::Success(_)));
+            let pathless_unlock = RequestEnvelope::new(
+                "unlock-again",
+                AgentMethod::Unlock,
+                json!({"project_id": PROJECT_ID, "ttl_seconds": 60}),
+            );
+            assert!(matches!(
+                crate::dispatch(&pathless_unlock, &state).await,
+                ResponseEnvelope::Success(_)
+            ));
+            {
+                let mut grants = state.grants.lock().await;
+                for (id, action) in [
+                    (GRANT_ID, GrantAction::ResolveReference),
+                    ("reveal", GrantAction::Reveal),
+                    ("export", GrantAction::Export),
+                ] {
+                    let mut grant = test_grant_record(i128::MAX);
+                    grant.grant_id = id.to_owned();
+                    grant.action = action;
+                    grants.insert(grant);
+                }
+            }
+            let mut reference = resolve_request(&fixture);
+            let original = RequestEnvelope::new(
+                "resolve",
+                AgentMethod::ResolveReference,
+                serde_json::to_value(&reference)?,
+            );
+            assert_eq!(
+                resolve_payload(crate::dispatch(&original, &state).await)?.value,
+                fixture.expected_value
+            );
+            reference.store_path = Some(copied.display().to_string());
+            let resolve_clone = RequestEnvelope::new(
+                "cloned-resolve",
+                AgentMethod::ResolveReference,
+                serde_json::to_value(&reference)?,
+            );
+            let reveal_clone = RequestEnvelope::new(
+                "cloned-reveal",
+                AgentMethod::Reveal,
+                json!({
+                    "project_id": PROJECT_ID, "profile_id": PROFILE_ID, "secret_name": SECRET_NAME,
+                    "store_path": copied, "grant_id": "reveal", "binding": reference.binding,
+                }),
+            );
+            let export_clone = RequestEnvelope::new(
+                "cloned-export",
+                AgentMethod::ExportBundle,
+                json!({
+                    "project_id": PROJECT_ID, "profile_id": PROFILE_ID, "store_path": copied,
+                    "scope": "active-profile", "recipient_descriptor": "unused", "include_audit": false,
+                    "grant_id": "export", "binding": reference.binding,
+                }),
+            );
+            for request in [resolve_clone, reveal_clone, export_clone] {
+                assert_eq!(error_code(crate::dispatch(&request, &state).await)?, "AccessDenied");
+            }
+        }
+        let rows = Store::open(&copied)?.list_exportable_audit_rows(PROJECT_ID)?;
+        assert_eq!(rows, []);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn grant_mint_and_use_require_the_kernel_observed_pid()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = build_fixture()?;
+        let state = AgentSocketState::locked("test");
+        state.seed_master_key(PROJECT_ID, &fixture.master_key)?;
+        let unlock = RequestEnvelope::new(
+            "unlock",
+            AgentMethod::Unlock,
+            json!({"project_id": PROJECT_ID, "ttl_seconds": 60}),
+        );
+        assert!(matches!(crate::dispatch(&unlock, &state).await, ResponseEnvelope::Success(_)));
+        let pid = std::process::id();
+        let peer = crate::PeerIdentity { uid: state.daemon_uid, pid: Some(pid), connection_id: 1 };
+        let other = crate::PeerIdentity { pid: Some(pid ^ 1), connection_id: 2, ..peer };
+        let mint = RequestEnvelope::new(
+            "mint",
+            AgentMethod::RequestGrant,
+            json!({
+                "project_id": PROJECT_ID, "profile_id": PROFILE_ID, "action": "ResolveReference",
+                "ttl_seconds": 30, "binding": {"pid": pid, "process_start_time": "0"},
+            }),
+        );
+        assert_eq!(
+            error_code(crate::dispatch_with_peer(&mint, &state, Some(other)).await)?,
+            "AccessDenied"
+        );
+        let ResponseEnvelope::Success(grant) =
+            crate::dispatch_with_peer(&mint, &state, Some(peer)).await
+        else {
+            return Err("valid peer could not mint a grant".into());
+        };
+        let mut request = resolve_request(&fixture);
+        request.grant_id = grant.payload["grant_id"].as_str().map(str::to_owned);
+        let resolve = RequestEnvelope::new(
+            "resolve",
+            AgentMethod::ResolveReference,
+            serde_json::to_value(&request)?,
+        );
+        assert_eq!(
+            error_code(crate::dispatch_with_peer(&resolve, &state, Some(other)).await)?,
+            "GrantRequired"
+        );
+        let new_connection = crate::PeerIdentity { connection_id: 3, ..peer };
+        assert_eq!(
+            resolve_payload(
+                crate::dispatch_with_peer(&resolve, &state, Some(new_connection)).await
+            )?
+            .value,
+            fixture.expected_value
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_refuses_expired_secret_before_decryption()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = build_fixture()?;
+        let store = Store::open(&fixture.store_path)?;
+        store.set_secret_expiry_policy(
+            SECRET_ID,
+            locket_store::SecretExpiryPolicy { expires_at: Some(5), rotate_after_days: None },
+            2,
+        )?;
+        let state = unlocked_state(&fixture).await;
+        let request = RequestEnvelope::new(
+            "expired",
+            AgentMethod::ResolveReference,
+            serde_json::to_value(resolve_request(&fixture))?,
+        );
+        let response = handle_resolve(&request, &state, 5).await;
+        assert!(matches!(response, ResponseEnvelope::Error(error)
+            if error.error == "MetadataInvalid" && error.message.contains("secret has expired")));
+        Ok(())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn handle_resolve_requires_caller_policy_name() -> Result<(), Box<dyn std::error::Error>>
     {
@@ -1604,7 +1775,7 @@ mod tests {
             AgentMethod::PrepareExec,
             serde_json::to_value(&prepare_request)?,
         );
-        let prepare_response = handle_prepare_exec(&prepare_envelope, &state, 1).await;
+        let prepare_response = handle_prepare_exec(&prepare_envelope, &state, 1, None).await;
         let ResponseEnvelope::Success(prepare_success) = prepare_response else {
             return Err("PrepareExec must succeed for the test fixture".into());
         };

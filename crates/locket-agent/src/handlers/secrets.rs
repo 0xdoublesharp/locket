@@ -6,6 +6,20 @@ use locket_core::privacy_alias;
 use locket_store::{Store, StoreError};
 use serde::{Deserialize, Serialize};
 
+pub(super) const SECRET_EXPIRED_MESSAGE: &str =
+    "secret has expired; rotate or update expiry before use";
+
+pub(super) fn secret_has_expired(
+    store: &Store,
+    secret_id: &str,
+    now: i128,
+) -> Result<bool, StoreError> {
+    Ok(store
+        .get_secret_expiry_policy(secret_id)?
+        .and_then(|policy| policy.expires_at)
+        .is_some_and(|expires_at| i128::from(expires_at) <= now))
+}
+
 /// Wire payload for the `ListSecrets` RPC.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ListSecretsRequest {

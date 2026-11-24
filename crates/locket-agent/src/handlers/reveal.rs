@@ -392,7 +392,14 @@ fn read_secret_value(
 ) -> Result<ResolvedValue, ValueAccessFailure> {
     let master_key = master_key_array(master_key).map_err(|_| corrupt_db())?;
     let mut store = Store::open(store_path).map_err(|_| corrupt_db())?;
-    match read_secret_value_inner(&store, project_id, profile_id, secret_name, &master_key) {
+    match read_secret_value_inner(
+        &store,
+        project_id,
+        profile_id,
+        secret_name,
+        &master_key,
+        timestamp,
+    ) {
         Ok(details) => {
             append_value_access_audit(
                 &mut store,
@@ -430,8 +437,16 @@ fn read_secret_value_inner(
     profile_id: &str,
     secret_name: &str,
     master_key: &locket_crypto::KeyBytes,
+    now: i128,
 ) -> Result<ResolvedValueDetails, ValueAccessFailure> {
     let secret = select_secret(store, project_id, profile_id, secret_name)?;
+    if super::secrets::secret_has_expired(store, &secret.id, now).map_err(|_| corrupt_db())? {
+        return Err(ValueAccessFailure::new(
+            "MetadataInvalid",
+            super::secrets::SECRET_EXPIRED_MESSAGE,
+            LocketError::MetadataInvalid,
+        ));
+    }
     let version = store
         .get_secret_version(&secret.id, secret.current_version)
         .map_err(|_| corrupt_db())?
@@ -1185,6 +1200,37 @@ mod tests {
         assert_eq!(row["command"], "agent.Reveal");
         assert_eq!(row["project_id"], PROJECT_ID);
         assert!(row.get("secret_name").is_none(), "must never include secret_name");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reveal_and_copy_refuse_expired_secrets() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = build_fixture()?;
+        let store = Store::open(&fixture.store_path)?;
+        store.set_secret_expiry_policy(
+            SECRET_ID,
+            locket_store::SecretExpiryPolicy { expires_at: Some(5), rotate_after_days: None },
+            2,
+        )?;
+        let reveal_state = state_with_grant(&fixture, GrantAction::Reveal).await;
+        let reveal = RequestEnvelope::new(
+            "expired-reveal",
+            AgentMethod::Reveal,
+            serde_json::to_value(reveal_request(&fixture, GrantAction::Reveal))?,
+        );
+        let copy_state = state_with_grant(&fixture, GrantAction::Copy).await;
+        let copy = RequestEnvelope::new(
+            "expired-copy",
+            AgentMethod::Copy,
+            serde_json::to_value(copy_request(&fixture))?,
+        );
+        for response in [
+            super::handle_reveal(&reveal, &reveal_state, 5).await,
+            super::handle_copy(&copy, &copy_state, 5).await,
+        ] {
+            assert!(matches!(response, ResponseEnvelope::Error(error)
+                if error.error == "MetadataInvalid" && error.message.contains("secret has expired")));
+        }
         Ok(())
     }
 

@@ -2,6 +2,105 @@
 use super::*;
 
 #[test]
+fn audit_witness_detects_tampering_and_rollback_to_an_older_receipt()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let retained = tempdir()?;
+    let context = test_context(&directory);
+    let cli = |arguments: &[&str], output: &mut Vec<u8>| {
+        run_with_context(Cli::try_parse_from(arguments)?, &context, output)
+            .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })
+    };
+    cli(&["locket", "init", "--no-device", "--no-passkey"], &mut Vec::new())?;
+    let key_file = retained.path().join("witness.ed25519");
+    let key_path = key_file.to_str().ok_or("witness key path is not UTF-8")?;
+    let mut key_result = Vec::new();
+    cli(&["locket", "audit", "witness", "--generate-key", key_path, "--json"], &mut key_result)?;
+    let key_result: serde_json::Value = serde_json::from_slice(&key_result)?;
+    let trusted_key = key_result["witness_public_key_b64"].as_str().ok_or("missing public key")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&key_file)?.permissions().mode() & 0o777, 0o600);
+    }
+    let public_file = retained.path().join("witness.pub");
+    std::fs::write(&public_file, trusted_key)?;
+    let public_path = public_file.to_str().ok_or("witness public key path is not UTF-8")?;
+    let receipt_path = retained.path().join("latest.json");
+    let receipt_path = receipt_path.to_str().ok_or("receipt path is not UTF-8")?;
+    let mut first = Vec::new();
+    cli(
+        &[
+            "locket",
+            "audit",
+            "witness",
+            "--key-file",
+            key_path,
+            "--witness-id",
+            "external",
+            "--json",
+        ],
+        &mut first,
+    )?;
+    let first: locket_core::AuditWitnessReceipt = serde_json::from_slice(&first)?;
+    assert_eq!(first.statement.witness_id, "external");
+    assert_eq!(first.statement.prev_receipt_sha256_hex, None);
+    cli(&["locket", "audit", "verify"], &mut Vec::new())?;
+    cli(
+        &["locket", "audit", "witness", "--key-file", key_path, "--output", receipt_path],
+        &mut Vec::new(),
+    )?;
+    let second: locket_core::AuditWitnessReceipt =
+        serde_json::from_slice(&std::fs::read(receipt_path)?)?;
+    assert!(second.statement.seq_no > first.statement.seq_no);
+    let store = locket_store::Store::open(&context.store_path)?;
+    let project = &first.statement.project_id;
+    let receipts = store.list_audit_witness_receipts(project)?;
+    assert_eq!(receipts.len(), 2);
+    assert_eq!(
+        second.statement.prev_receipt_sha256_hex.as_deref(),
+        receipts.first().map(|row| row.receipt_sha256_hex.as_str())
+    );
+    cli(&["locket", "audit", "verify"], &mut Vec::new())?;
+    let mut verification = Vec::new();
+    cli(
+        &["locket", "audit", "verify", "--witness-key", public_path, "--receipt", receipt_path],
+        &mut verification,
+    )?;
+    assert!(String::from_utf8(verification)?.contains("witness: verified 2 receipt(s)"));
+
+    let command = ["locket", "audit", "verify", "--witness-key", trusted_key];
+    let original_status: String = store.connection().query_row(
+        "SELECT status FROM audit_log WHERE project_id = ?1 AND sequence = 1",
+        [project],
+        |row| row.get(0),
+    )?;
+    store.connection().execute(
+        "UPDATE audit_log SET status = 'FAILED' WHERE project_id = ?1 AND sequence = 1",
+        [project],
+    )?;
+    assert!(cli(&command, &mut Vec::new()).is_err());
+    store.connection().execute(
+        "UPDATE audit_log SET status = ?2 WHERE project_id = ?1 AND sequence = 1",
+        rusqlite::params![project, original_status],
+    )?;
+    let sequence = i64::try_from(second.statement.seq_no)?;
+    store.connection().execute(
+        "DELETE FROM audit_log WHERE project_id = ?1 AND sequence >= ?2",
+        rusqlite::params![project, sequence],
+    )?;
+    assert!(cli(&command, &mut Vec::new()).is_err());
+    store.connection().execute(
+        "DELETE FROM audit_witness_receipts WHERE project_id = ?1 AND seq_no = ?2",
+        rusqlite::params![project, sequence],
+    )?;
+    let anchored =
+        ["locket", "audit", "verify", "--witness-key", trusted_key, "--receipt", receipt_path];
+    assert!(cli(&anchored, &mut Vec::new()).is_err());
+    Ok(())
+}
+
+#[test]
 fn audit_checkpoint_detects_rollback_without_overwriting_the_external_anchor()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempdir()?;

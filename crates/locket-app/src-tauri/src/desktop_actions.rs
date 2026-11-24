@@ -867,6 +867,15 @@ pub(crate) async fn invoke_granted<R: serde::de::DeserializeOwned>(
     project_id: &str,
     profile_id: &str,
 ) -> Result<R, super::AgentClientError> {
+    let context = granted_project_context(store, project_id, Some(profile_id))?;
+    invoke_granted_at(&super::resolve_socket_path(), method, action, payload, store, &context).await
+}
+
+fn granted_project_context(
+    store: &Path,
+    project_id: &str,
+    profile_id: Option<&str>,
+) -> Result<DesktopProjectContext, super::AgentClientError> {
     let selected =
         SELECTED_PROJECT.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
     if selected.as_ref().is_some_and(|selected| selected.project_id != project_id) {
@@ -876,20 +885,93 @@ pub(crate) async fn invoke_granted<R: serde::de::DeserializeOwned>(
     }
     let context = project_context_with_selection(store, project_id, selected.as_ref())
         .map_err(|reason| super::AgentClientError::Protocol { reason })?;
-    if context.profile_id != profile_id {
+    if profile_id.is_some_and(|profile_id| context.profile_id != profile_id) {
         return Err(super::AgentClientError::Protocol {
             reason: "The active profile changed. Refresh before retrying.".into(),
         });
     }
-    invoke_granted_at(&super::resolve_socket_path(), method, action, payload, store, &context).await
+    Ok(context)
+}
+
+pub(crate) async fn export_bundle(
+    store: &Path,
+    mut request: locket_agent::ExportBundleRequest,
+) -> Result<locket_agent::BackupActionResponse, super::AgentClientError> {
+    let context =
+        granted_project_context(store, &request.project_id, request.profile_id.as_deref())?;
+    request.profile_id = Some(context.profile_id.clone());
+    invoke_granted_at(
+        &super::resolve_socket_path(),
+        locket_agent::AgentMethod::ExportBundle,
+        locket_agent::GrantAction::Export,
+        request,
+        store,
+        &context,
+    )
+    .await
+}
+
+pub(crate) async fn import_bundle(
+    store: &Path,
+    request: locket_agent::ImportBundleRequest,
+) -> Result<locket_agent::BackupActionResponse, super::AgentClientError> {
+    let context = granted_project_context(store, &request.project_id, None)?;
+    invoke_granted_at(
+        &super::resolve_socket_path(),
+        locket_agent::AgentMethod::ImportBundle,
+        locket_agent::GrantAction::ImportDotenv,
+        request,
+        store,
+        &context,
+    )
+    .await
 }
 
 pub(crate) trait GrantPayload: serde::Serialize {
+    fn grant_profile_id<'a>(&self, active_profile: &'a str) -> &'a str {
+        active_profile
+    }
+
     fn authorize(
         &mut self,
         grant: &locket_agent::GrantIdPayload,
         binding: locket_agent::GrantBinding,
     );
+}
+
+impl GrantPayload for locket_agent::ExportBundleRequest {
+    fn grant_profile_id<'a>(&self, active_profile: &'a str) -> &'a str {
+        match self.scope {
+            locket_agent::BundleExportScope::ActiveProfile => active_profile,
+            locket_agent::BundleExportScope::AllProfiles => {
+                locket_agent::BUNDLE_PROJECT_GRANT_SCOPE
+            }
+        }
+    }
+
+    fn authorize(
+        &mut self,
+        grant: &locket_agent::GrantIdPayload,
+        binding: locket_agent::GrantBinding,
+    ) {
+        self.grant_id = Some(grant.grant_id.clone());
+        self.binding = Some(binding);
+    }
+}
+
+impl GrantPayload for locket_agent::ImportBundleRequest {
+    fn grant_profile_id<'a>(&self, _active_profile: &'a str) -> &'a str {
+        locket_agent::BUNDLE_PROJECT_GRANT_SCOPE
+    }
+
+    fn authorize(
+        &mut self,
+        grant: &locket_agent::GrantIdPayload,
+        binding: locket_agent::GrantBinding,
+    ) {
+        self.grant_id = Some(grant.grant_id.clone());
+        self.binding = Some(binding);
+    }
 }
 
 impl GrantPayload for serde_json::Value {
@@ -912,7 +994,7 @@ async fn invoke_granted_at<R: serde::de::DeserializeOwned>(
     context: &DesktopProjectContext,
 ) -> Result<R, super::AgentClientError> {
     let project_id = context.project_id.as_str();
-    let profile_id = context.profile_id.as_str();
+    let profile_id = payload.grant_profile_id(&context.profile_id);
     let binding = native_binding()?;
     let grant: locket_agent::GrantIdPayload = super::invoke_method(
         socket,
@@ -927,13 +1009,14 @@ async fn invoke_granted_at<R: serde::de::DeserializeOwned>(
         },
     )
     .await?;
-    let fresh = open_project_at(store, Path::new(&context.root))
-        .map_err(|reason| super::AgentClientError::Protocol { reason })?;
-    if &fresh != context {
+    let fresh = open_project_at(store, Path::new(&context.root));
+    if fresh.as_ref() != Ok(context) {
         let _: Result<serde_json::Value, _> =
             super::invoke_method(socket, locket_agent::AgentMethod::RevokeGrant, &grant).await;
         return Err(super::AgentClientError::Protocol {
-            reason: "Project metadata changed before authorization. Refresh and retry.".into(),
+            reason: fresh.err().unwrap_or_else(|| {
+                "Project metadata changed before authorization. Refresh and retry.".into()
+            }),
         });
     }
     payload.authorize(&grant, binding);

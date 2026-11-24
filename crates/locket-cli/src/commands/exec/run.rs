@@ -279,46 +279,45 @@ pub fn run_command(
     output: &mut impl Write,
     run_args: &RunArgs,
 ) -> Result<(), CliError> {
+    run_command_with_diagnostics(context, output, &mut io::stderr(), run_args)
+}
+
+pub fn run_command_with_diagnostics(
+    context: &RuntimeContext,
+    output: &mut impl Write,
+    diagnostics: &mut impl Write,
+    run_args: &RunArgs,
+) -> Result<(), CliError> {
     let resolved = require_project(context)?;
     let effective = resolve_run_policy(context, output, &resolved, run_args)?;
     let policy = &effective.policy;
     let mut store = open_store(context)?;
     ensure_trusted_project_root(&store, &resolved)?;
     let profile = effective_policy_profile(&store, &resolved, &effective)?;
+    let insecure_argv = match argv_reference_access(&policy.command, run_args.allow_insecure_argv) {
+        Ok(allowed) => allowed,
+        Err(error) => {
+            let _ignored = write_runtime_policy_denial_audit_if_available(
+                context,
+                &mut store,
+                &resolved,
+                Some(&profile),
+                Some(policy),
+                &policy.name,
+                "insecure_argv_denied",
+            );
+            return Err(error);
+        }
+    };
 
-    let confirmation_source = if policy.confirm || profile.dangerous {
-        if profile.dangerous {
-            writeln!(output, "dangerous_environment: {}", profile.name)?;
-        }
-        let expected = format!("run {}", policy.name);
-        writeln!(output, "type '{expected}' to confirm run")?;
-        let confirmation = context.confirmation_reader.read_confirmation("run")?;
-        if confirmation.trim_end_matches(['\r', '\n']) != expected {
-            return Err(confirmation_failed_error("confirmation did not match run scope"));
-        }
-        Some("interactive")
-    } else {
-        None
-    };
-    let user_verification = if policy.require_user_verification {
-        let request =
-            LocalUserVerificationRequest::new("run", format!("authorize policy {}", policy.name));
-        match context.user_verifier.verify_user(&request) {
-            Ok(verified) => Some(verified),
-            Err(
-                PlatformError::LocalUserVerificationFailed
-                | PlatformError::LocalUserVerificationUnavailable,
-            ) => {
-                return Err(user_verification_failed_error(
-                    "policy requires local user verification",
-                ));
-            }
-            Err(error) => return Err(error.into()),
-        }
-    } else {
-        None
-    };
-    ensure_agent_running_for_execution(context)?;
+    let (confirmation_source, user_verification) =
+        authorize_run_invocation(context, output, policy, &profile)?;
+    if insecure_argv {
+        writeln!(
+            diagnostics,
+            "warning: secret values in process argv are visible via ps or /proc"
+        )?;
+    }
     let mut prepared_policy = match prepare_policy_execution(
         context,
         output,
@@ -373,6 +372,7 @@ pub fn run_command(
         confirmation_source,
         user_verification.as_ref(),
         outcome.run_policy_grant.as_ref(),
+        insecure_argv,
     )?;
     if status.success() {
         return Ok(());
@@ -380,6 +380,47 @@ pub fn run_command(
 
     writeln!(output, "child exited with status {status}")?;
     Err(child_exit_error(status))
+}
+
+fn authorize_run_invocation(
+    context: &RuntimeContext,
+    output: &mut impl Write,
+    policy: &CommandPolicy,
+    profile: &ProfileRecord,
+) -> Result<(Option<&'static str>, Option<locket_platform::LocalUserVerification>), CliError> {
+    let confirmation_source = if policy.confirm || profile.dangerous {
+        if profile.dangerous {
+            writeln!(output, "dangerous_environment: {}", profile.name)?;
+        }
+        let expected = format!("run {}", policy.name);
+        writeln!(output, "type '{expected}' to confirm run")?;
+        let confirmation = context.confirmation_reader.read_confirmation("run")?;
+        if confirmation.trim_end_matches(['\r', '\n']) != expected {
+            return Err(confirmation_failed_error("confirmation did not match run scope"));
+        }
+        Some("interactive")
+    } else {
+        None
+    };
+    let user_verification = if policy.require_user_verification {
+        let request =
+            LocalUserVerificationRequest::new("run", format!("authorize policy {}", policy.name));
+        match context.user_verifier.verify_user(&request) {
+            Ok(verified) => Some(verified),
+            Err(
+                PlatformError::LocalUserVerificationFailed
+                | PlatformError::LocalUserVerificationUnavailable,
+            ) => {
+                return Err(user_verification_failed_error(
+                    "policy requires local user verification",
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        None
+    };
+    Ok((confirmation_source, user_verification))
 }
 
 /// Reviews and saves a detected project command without running it.
@@ -404,6 +445,7 @@ fn resolve_run_policy(
         return load_command_policy_or_audit_denial(context, resolved, &run_args.policy);
     }
     let argv = requested_run_argv(run_args, &resolved.root)?;
+    argv_reference_access(&CommandSpec::Argv(argv.clone()), run_args.allow_insecure_argv)?;
     let document = crate::read_policy_document(&resolved.root.join(crate::LOCKET_TOML))?;
     let matched = document
         .commands
@@ -722,6 +764,10 @@ fn prepare_policy_execution(
     protect_output: bool,
 ) -> Result<PreparedPolicyExecution, CliError> {
     let selections = policy_secret_selections(store, resolved, profile, policy)?;
+    for secret in selections.iter().filter_map(|selection| selection.selected.as_ref()) {
+        crate::commands::secrets::expiry::check_secret_expiry(store, &secret.id)?;
+    }
+    ensure_agent_running_for_execution(context)?;
     let parent_env = std::env::vars()
         .map(|(name, value)| (name, locket_exec::env_value(value)))
         .collect::<locket_exec::EnvMap>();
@@ -1224,6 +1270,7 @@ fn policy_locket_env(
     let mut locket_env = locket_exec::EnvMap::new();
     for selection in selections {
         if let Some(secret) = &selection.selected {
+            crate::commands::secrets::expiry::check_secret_expiry(store, &secret.id)?;
             let value = decrypt_secret_version(
                 context,
                 store,
@@ -1431,6 +1478,30 @@ fn policy_command_has_lk_references(policy: &CommandPolicy) -> bool {
         CommandSpec::Argv(arguments) => arguments.iter().any(|argument| argument.contains("lk://")),
         CommandSpec::Shell(script) => script.contains("lk://"),
     }
+}
+
+fn argv_reference_access(
+    command: &CommandSpec,
+    allow_insecure_argv: bool,
+) -> Result<bool, CliError> {
+    let contains_reference = match command {
+        CommandSpec::Argv(arguments) => arguments.iter().any(|arg| arg.contains("lk://")),
+        CommandSpec::Shell(script) => script.contains("lk://"),
+    };
+    if !contains_reference {
+        return Ok(false);
+    }
+    if !allow_insecure_argv {
+        return Err(invalid_policy_error(
+            "secret values in process argv are visible via ps or /proc. Use environment injection or stdin, or pass --allow-insecure-argv to permit substitution",
+        ));
+    }
+    if matches!(command, CommandSpec::Shell(_)) {
+        return Err(invalid_policy_error(
+            "embedded lk:// references in shell policies are unsupported",
+        ));
+    }
+    Ok(true)
 }
 
 fn agent_grant_binding() -> Result<locket_agent::GrantBinding, CliError> {
@@ -1796,7 +1867,7 @@ fn request_run_policy_grant_with_binding(
         policy_name: policy_name.map(ToOwned::to_owned),
         action: locket_agent::GrantAction::RunPolicy,
         ttl_seconds,
-        binding: locket_agent::GrantBinding::new(binding.pid, binding.process_start_time.clone()),
+        binding: agent_grant_binding()?,
     };
     let response = request_agent_once(
         context,
@@ -1942,6 +2013,11 @@ fn denial_failure_reason(error: &CliError) -> &'static str {
                 }
             }
             LocketError::ExternalSourceUnavailable => "external_source_unavailable",
+            LocketError::MetadataInvalid
+                if message == crate::commands::secrets::expiry::SECRET_EXPIRED_MESSAGE =>
+            {
+                "secret_expired"
+            }
             LocketError::MetadataInvalid => "external_source_metadata_invalid",
             LocketError::InvalidReference => "invalid_lk_reference",
             LocketError::AgentUnavailable => "agent_unavailable",

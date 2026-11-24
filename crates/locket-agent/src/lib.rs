@@ -30,9 +30,9 @@ pub use audit::{AuditChainStatus, ListAuditRequest, ListAuditResponse, ListAudit
 pub use audit_verify::{VerifyAuditRequest, VerifyAuditResponse};
 pub use auth::{ClientHelloRequest, ClientHelloResponse};
 pub use backup::{
-    BackupActionResponse, BundleConflictMode, BundleExportScope, ExportBundleRequest,
-    ImportBundleRequest, RecoveryRotateRequest, RecoveryVerification, VerifyBundleRequest,
-    VerifyBundleResponse,
+    BUNDLE_PROJECT_GRANT_SCOPE, BackupActionResponse, BundleConflictMode, BundleExportScope,
+    ExportBundleRequest, ImportBundleRequest, RecoveryRotateRequest, RecoveryVerification,
+    VerifyBundleRequest, VerifyBundleResponse,
 };
 pub use clients::{
     RegisterClientRequest, RegisterClientResponse, RevokeClientRequest, RevokeClientResponse,
@@ -62,7 +62,7 @@ pub use ide_env_session::{
     MAX_IDE_ENV_SESSION_TTL_SECONDS, RegisterIdeEnvSessionRequest, RegisterIdeEnvSessionResponse,
 };
 pub use method::{AgentMethod, UnknownMethod};
-pub use peer_cred::current_process_uid;
+pub use peer_cred::{PeerIdentity, current_process_uid};
 #[cfg(unix)]
 pub use peer_cred::{validate_peer_stream, validate_peer_uid};
 pub use policies::{
@@ -84,7 +84,7 @@ pub use server::{
     AgentSocketConfig, ConnectionOutcome, SocketServerError, bind_socket_listener,
     handle_connection, socket_permission_mode,
 };
-pub use server::{AgentSocketState, dispatch};
+pub use server::{AgentSocketState, dispatch, dispatch_with_peer};
 pub use session_lock::{
     SessionLockAudit, SessionLockOutcome, SessionLockSource, append_lock_audit, lock_audit_metadata,
 };

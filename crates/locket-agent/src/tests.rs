@@ -985,16 +985,18 @@ async fn lock_with_audit_context_appends_metadata_only_lock_row()
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn lock_audit_failure_returns_corrupt_db_after_clearing_state() {
+async fn lock_audit_failure_returns_corrupt_db_after_clearing_state()
+-> Result<(), Box<dyn std::error::Error>> {
     use crate::envelope::{RequestEnvelope, ResponseEnvelope};
     use crate::method::AgentMethod;
     use crate::server::{AgentSocketState, dispatch};
     use serde_json::json;
 
-    let tempdir = tempfile::tempdir().expect("tempdir");
-    let missing_store = tempdir.path().join("missing").join("locket.sqlite3");
+    let tempdir = tempfile::tempdir()?;
+    let store_path = tempdir.path().join("locket.sqlite3");
+    std::fs::File::create(&store_path)?;
     let state = AgentSocketState::locked("test-version");
-    state.seed_master_key("lk_proj_test", &[7; 32]).expect("seed master key");
+    state.seed_master_key("lk_proj_test", &[7; 32])?;
     let unlock = RequestEnvelope::new(
         "req-1",
         AgentMethod::Unlock,
@@ -1003,21 +1005,23 @@ async fn lock_audit_failure_returns_corrupt_db_after_clearing_state() {
             "ttl_seconds": 30,
             "method": "OsKeychain",
             "audit": {
-                "store_path": missing_store,
+                "store_path": store_path,
                 "profile_id": "lk_prof_test"
             }
         }),
     );
     assert!(matches!(dispatch(&unlock, &state).await, ResponseEnvelope::Success(_)));
     state.grants.lock().await.insert(test_grant_record("g-live", i128::MAX));
+    std::fs::remove_file(store_path)?;
 
     let lock = RequestEnvelope::new("req-2", AgentMethod::Lock, json!({}));
     let ResponseEnvelope::Error(error) = dispatch(&lock, &state).await else {
-        unreachable!("missing audit store should fail lock response");
+        return Err("missing audit store should fail lock response".into());
     };
     assert_eq!(error.error, "CorruptDb");
     assert!(state.unlock_cache.lock().await.is_empty());
     assert!(state.grants.lock().await.is_empty());
+    Ok(())
 }
 
 #[tokio::test(flavor = "current_thread")]

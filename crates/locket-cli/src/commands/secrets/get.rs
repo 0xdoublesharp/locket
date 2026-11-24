@@ -126,6 +126,10 @@ pub fn get_command_with_clipboard_status_and_limit(
     limit: ClipboardClearLimit,
 ) -> Result<(), CliError> {
     let resolved_secret = resolve_value_access(context, args)?;
+    super::expiry::check_secret_expiry(
+        &crate::commands::discovery::require_metadata_store(context)?,
+        &resolved_secret.secret.id,
+    )?;
     let (action, access_mode) = get_audit_action_and_access_mode(args);
     enforce_dangerous_profile_consent_or_audit(
         context,
@@ -205,6 +209,7 @@ fn decrypt_access_secret(
 ) -> Result<Zeroizing<String>, CliError> {
     let store = crate::open_store(context)?;
     let secret = &target.secret;
+    super::expiry::check_secret_expiry(&store, &secret.id)?;
     decrypt_secret_version(
         context,
         &store,

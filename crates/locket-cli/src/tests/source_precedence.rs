@@ -235,13 +235,7 @@ fn rotate_without_source_when_multiple_sources_exist_requires_explicit_source()
     let rotate_args = crate::RotateArgs {
         key: "TOKEN".to_owned(),
         source: crate::SourceArg { source: None },
-        metadata: crate::SecretMetadataFlags {
-            description: None,
-            owner: None,
-            tags: Vec::new(),
-            required: false,
-            optional: false,
-        },
+        metadata: crate::SecretMetadataFlags::default(),
         grace_ttl: None,
     };
     let result = crate::rotate_secret_value(&context, &rotate_args, "new-value", 2_000, None);
@@ -265,13 +259,7 @@ fn rotate_with_explicit_source_rotates_only_that_source() -> Result<(), Box<dyn 
     let rotate_args = crate::RotateArgs {
         key: "TOKEN".to_owned(),
         source: crate::SourceArg { source: Some(crate::SecretSourceArg::MachineLocal) },
-        metadata: crate::SecretMetadataFlags {
-            description: None,
-            owner: None,
-            tags: Vec::new(),
-            required: false,
-            optional: false,
-        },
+        metadata: crate::SecretMetadataFlags::default(),
         grace_ttl: None,
     };
     let (source, version) =
@@ -526,13 +514,7 @@ fn purge_resolves_explicit_source_for_version_purge() -> Result<(), Box<dyn std:
     let rotate_args = crate::RotateArgs {
         key: "DB_PASS".to_owned(),
         source: crate::SourceArg { source: Some(crate::SecretSourceArg::UserLocal) },
-        metadata: crate::SecretMetadataFlags {
-            description: None,
-            owner: None,
-            tags: Vec::new(),
-            required: false,
-            optional: false,
-        },
+        metadata: crate::SecretMetadataFlags::default(),
         grace_ttl: None,
     };
     crate::rotate_secret_value(&context, &rotate_args, "user-rotated", 2_000, None)?;

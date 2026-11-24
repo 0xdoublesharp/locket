@@ -195,6 +195,11 @@ enum Command {
     Generate(commands::secrets::generate::GenerateArgs),
     /// Discover metadata across the local vault.
     Discover(commands::discovery::DiscoverArgs),
+    /// Manage secret metadata.
+    Secret {
+        #[command(subcommand)]
+        command: SecretCommand,
+    },
     /// Manage the shared local vault.
     Shared {
         #[command(subcommand)]
@@ -596,6 +601,9 @@ pub struct ExecArgs {
                         Secret ACLs in [secrets.<NAME>] can further limit delivery by command identity,\n\
                         structured argv pattern, and project-relative path.")]
 pub struct RunArgs {
+    /// Permit lk:// substitution into process arguments visible to ps and /proc.
+    #[arg(long)]
+    pub allow_insecure_argv: bool,
     /// Redact resolved secrets and recognized provider tokens from child output.
     #[arg(long, env = "LOCKET_REDACT_OUTPUT", value_parser = clap::builder::BoolishValueParser::new())]
     pub redact_output: bool,
@@ -1039,6 +1047,12 @@ struct DebugBundleArgs {
     output: Option<String>,
 }
 
+#[derive(Debug, Subcommand)]
+enum SecretCommand {
+    /// Update the current secret's metadata and expiry policy.
+    Meta(SecretMetaArgs),
+}
+
 #[derive(Clone, Debug, Subcommand)]
 enum AuditCommand {
     /// Verify the local audit HMAC chain.
@@ -1046,12 +1060,36 @@ enum AuditCommand {
         /// Require the chain to extend an independently retained checkpoint.
         #[arg(long, value_name = "FILE")]
         checkpoint: Option<PathBuf>,
+        /// Verify Ed25519 receipts with a trusted public key or public-key file.
+        #[arg(long, value_name = "PUBLIC_KEY_OR_FILE", conflicts_with = "checkpoint")]
+        witness_key: Option<String>,
+        /// Also require an independently retained witness receipt.
+        #[arg(long, value_name = "FILE", requires = "witness_key")]
+        receipt: Option<PathBuf>,
     },
     /// Save an authenticated audit checkpoint for independent retention.
     Checkpoint {
         /// Create a new checkpoint file; existing files are never overwritten.
         #[arg(long, value_name = "FILE")]
         output: PathBuf,
+    },
+    /// Sign the verified audit head with an independent Ed25519 key.
+    Witness {
+        /// Ed25519 seed or keypair file, raw, hex, or base64.
+        #[arg(long, value_name = "FILE", required_unless_present = "generate_key")]
+        key_file: Option<PathBuf>,
+        /// Generate a private Ed25519 keypair file and show its public key.
+        #[arg(long, value_name = "FILE", conflicts_with = "key_file")]
+        generate_key: Option<PathBuf>,
+        /// Identifier for the witness, defaulting to the public key.
+        #[arg(long, requires = "key_file")]
+        witness_id: Option<String>,
+        /// Save the signed receipt in a new file for independent retention.
+        #[arg(long, value_name = "FILE", requires = "key_file")]
+        output: Option<PathBuf>,
+        /// Print the signed receipt or generated public key in JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1496,6 +1534,12 @@ pub(crate) enum SecretSourceArg {
 
 #[derive(Debug, Default, Args)]
 struct SecretMetadataFlags {
+    /// Expire this secret after a duration such as 24h, 30d, or 90d.
+    #[arg(long, value_name = "DURATION")]
+    expires_in: Option<LocketDuration>,
+    /// Advise rotating this secret after this many days.
+    #[arg(long, value_name = "DAYS", value_parser = clap::value_parser!(u32).range(1..))]
+    rotate_after_days: Option<u32>,
     /// Metadata description.
     #[arg(long)]
     description: Option<String>,
@@ -1642,7 +1686,9 @@ fn run_with_context(
         Command::Env { command } => exec::env::env_command(context, output, command)?,
         Command::Compose { command } => exec::compose::compose_command(context, output, command)?,
         Command::Rotate(args) => secrets::lifecycle::rotate_command(context, output, &args)?,
-        Command::Meta(args) => secrets::meta::meta_command(context, output, &args)?,
+        Command::Meta(args) | Command::Secret { command: SecretCommand::Meta(args) } => {
+            secrets::meta::meta_command(context, output, &args)?;
+        }
         Command::History(args) => secrets::lifecycle::history_command(context, output, &args)?,
         Command::Diff(args) => scan::diff::diff_command(context, output, &args)?,
         Command::Copy(args) => secrets::lifecycle::copy_command(context, output, &args)?,
@@ -1688,7 +1734,9 @@ fn run_with_context(
         Command::Recovery { command } => {
             vault::recovery::recovery_command(context, output, command)?;
         }
-        Command::InternalAgentServe(args) => agent::run_internal_agent_serve(&args)?,
+        Command::InternalAgentServe(args) => {
+            agent::run_internal_agent_serve(&args, &context.store_path)?;
+        }
         Command::InternalClipboardClear(args) => {
             secrets::get::run_internal_clipboard_clear(args.ttl_seconds)?;
         }
@@ -2852,6 +2900,7 @@ pub(crate) fn write_runtime_policy_audit_if_available(
     confirmation_source: Option<&str>,
     user_verification: Option<&locket_platform::LocalUserVerification>,
     run_policy_grant: Option<&commands::exec::run::RunPolicyGrantMetadata>,
+    insecure_argv: bool,
 ) -> Result<(), CliError> {
     if store.get_project(resolved.config.project_id.as_str())?.is_none() {
         return Ok(());
@@ -2900,6 +2949,9 @@ pub(crate) fn write_runtime_policy_audit_if_available(
         "user_verification": user_verification_metadata,
         "child_exit": child_exit,
     });
+    if insecure_argv {
+        metadata["delivery_mode"] = json!("insecure_argv");
+    }
     if let Some(grant) = run_policy_grant
         && let Some(metadata) = metadata.as_object_mut()
     {
@@ -3048,6 +3100,8 @@ const fn metadata_flags_have_updates(metadata: &SecretMetadataFlags) -> bool {
         || !metadata.tags.is_empty()
         || metadata.required
         || metadata.optional
+        || metadata.expires_in.is_some()
+        || metadata.rotate_after_days.is_some()
 }
 
 const fn metadata_required_update(metadata: &SecretMetadataFlags) -> Option<bool> {
@@ -3074,6 +3128,12 @@ fn metadata_update_field_names(metadata: &SecretMetadataFlags) -> Vec<&'static s
     if metadata.required || metadata.optional {
         fields.push("required");
     }
+    if metadata.expires_in.is_some() {
+        fields.push("expires_at");
+    }
+    if metadata.rotate_after_days.is_some() {
+        fields.push("rotate_after_days");
+    }
     fields
 }
 
@@ -3084,6 +3144,9 @@ fn validate_secret_metadata_update(
     timestamp: i64,
 ) -> Result<(), CliError> {
     let fields = secret_metadata_text_fields(metadata);
+    if fields.is_empty() {
+        return Ok(());
+    }
     let known_values = collect_known_secret_values(context, &resolved_secret.project, timestamp)
         .unwrap_or_default();
     let known_values =

@@ -17,6 +17,17 @@ use tokio::net::UnixStream;
 #[cfg(unix)]
 use crate::server::SocketServerError;
 
+/// Connection identity reported by the local operating system.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PeerIdentity {
+    /// Effective UID of the connecting process.
+    pub uid: u32,
+    /// Connecting process ID, when the platform reports one.
+    pub pid: Option<u32>,
+    /// Monotonic ID assigned by the daemon to this connection.
+    pub connection_id: u64,
+}
+
 /// Returns the effective UID of the running process.
 ///
 /// Used as the canonical "daemon UID" against which connecting peers
@@ -26,7 +37,7 @@ use crate::server::SocketServerError;
 #[cfg(unix)]
 #[must_use]
 pub fn current_process_uid() -> u32 {
-    rustix::process::getuid().as_raw()
+    rustix::process::geteuid().as_raw()
 }
 
 /// Returns a sentinel UID on platforms without Unix peer credentials.
@@ -47,9 +58,18 @@ pub const fn current_process_uid() -> u32 {
 /// for this connection (typically only on platforms where peer-cred
 /// retrieval is unsupported, in which case the agent must fail closed).
 #[cfg(unix)]
-pub fn validate_peer_stream(stream: &UnixStream, daemon_uid: u32) -> Result<(), SocketServerError> {
+pub fn validate_peer_stream(
+    stream: &UnixStream,
+    daemon_uid: u32,
+    connection_id: u64,
+) -> Result<PeerIdentity, SocketServerError> {
     let cred = stream.peer_cred()?;
-    validate_peer_uid(cred.uid(), daemon_uid)
+    validate_peer_uid(cred.uid(), daemon_uid)?;
+    Ok(PeerIdentity {
+        uid: cred.uid(),
+        pid: cred.pid().and_then(|pid| u32::try_from(pid).ok()),
+        connection_id,
+    })
 }
 
 /// Pure validator: returns `Ok(())` when `peer_uid == daemon_uid` and a
@@ -74,6 +94,20 @@ pub const fn validate_peer_uid(peer_uid: u32, daemon_uid: u32) -> Result<(), Soc
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn accepted_stream_reports_kernel_pid_and_connection_id()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (server, _client) = UnixStream::pair()?;
+        let uid = current_process_uid();
+        let identity = validate_peer_stream(&server, uid, 42)?;
+        assert_eq!(
+            identity,
+            PeerIdentity { uid, pid: Some(std::process::id()), connection_id: 42 }
+        );
+        Ok(())
+    }
 
     #[test]
     fn validate_peer_uid_accepts_matching_uids() {

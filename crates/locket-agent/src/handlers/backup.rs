@@ -40,6 +40,9 @@ use crate::keys::{
 };
 use crate::server::{AgentSocketState, current_unix_nanos};
 
+/// Grant scope for backup operations that can access multiple profiles.
+pub const BUNDLE_PROJECT_GRANT_SCOPE: &str = "*";
+
 /// Bundle export profile scope.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -72,7 +75,7 @@ pub struct ExportBundleRequest {
     /// Return selection metadata without writing a bundle.
     #[serde(default)]
     pub preview_only: bool,
-    /// Live Export grant, when this client uses grant-based authorization.
+    /// Live Export grant required for this operation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grant_id: Option<String>,
     /// Process binding of the supplied grant.
@@ -111,6 +114,12 @@ pub struct ImportBundleRequest {
     /// Explicit confirmation to apply changes involving dangerous profiles.
     #[serde(default)]
     pub confirm_dangerous: bool,
+    /// Live project-wide `ImportDotenv` grant required for this operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_id: Option<String>,
+    /// Process binding of the supplied grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<GrantBinding>,
 }
 
 /// Desktop request for non-destructive bundle verification.
@@ -397,6 +406,9 @@ pub async fn handle_export_bundle(
         Ok(request) => request,
         Err(_) => return error_response(envelope, "ProtocolError", "invalid ExportBundle payload"),
     };
+    if request.grant_id.is_none() || request.binding.is_none() {
+        return error_response(envelope, "GrantRequired", "live Export grant required");
+    }
     let unlocked = match unlocked_project(envelope, state, &request.project_id).await {
         Ok(unlocked) => unlocked,
         Err(response) => return response,
@@ -411,8 +423,8 @@ pub async fn handle_export_bundle(
     if request.recipient_descriptor.trim().is_empty() {
         return error_response(envelope, "InvalidReference", "bundle export requires a recipient");
     }
-    let grants = if request.grant_id.is_some() { Some(state.grants.lock().await) } else { None };
-    match export_bundle(&request, &unlocked, grants.as_deref()) {
+    let grants = state.grants.lock().await;
+    match export_bundle(&request, &unlocked, &grants) {
         Ok(response) => success_response(envelope, response),
         Err((code, message)) => error_response(envelope, code, &message),
     }
@@ -427,13 +439,36 @@ pub async fn handle_import_bundle(
         Ok(request) => request,
         Err(_) => return error_response(envelope, "ProtocolError", "invalid ImportBundle payload"),
     };
-    if !request.bundle_path.exists() {
-        return error_response(envelope, "BundleVerificationFailed", "bundle file was not found");
-    }
+    let Some(grant_id) = request.grant_id.as_deref() else {
+        return error_response(
+            envelope,
+            "GrantRequired",
+            "live project-wide import grant required",
+        );
+    };
     let unlocked = match unlocked_project(envelope, state, &request.project_id).await {
         Ok(unlocked) => unlocked,
         Err(response) => return response,
     };
+    let grants = state.grants.lock().await;
+    if grants.validate(
+        grant_id,
+        &request.project_id,
+        BUNDLE_PROJECT_GRANT_SCOPE,
+        GrantAction::ImportDotenv,
+        current_unix_nanos(),
+        request.binding.as_ref(),
+    ) != GrantValidation::Valid
+    {
+        return error_response(
+            envelope,
+            "GrantRequired",
+            "live project-wide import grant required",
+        );
+    }
+    if !request.bundle_path.exists() {
+        return error_response(envelope, "BundleVerificationFailed", "bundle file was not found");
+    }
     match import_bundle(&request, &unlocked, state) {
         Ok(response) => success_response(envelope, response),
         Err((code, message)) => error_response(envelope, code, &message),
@@ -517,9 +552,12 @@ type BackupResult<T> = Result<T, (&'static str, String)>;
 fn export_bundle(
     request: &ExportBundleRequest,
     unlocked: &UnlockedProject,
-    grants: Option<&GrantTable>,
+    grants: &GrantTable,
 ) -> BackupResult<BackupActionResponse> {
-    let recipient = bundle_recipient(&request.recipient_descriptor)?;
+    let grant_required = || {
+        ("GrantRequired", "live Export grant covering the selected scope is required".to_owned())
+    };
+    let grant_id = request.grant_id.as_deref().ok_or_else(grant_required)?;
     let mut store = Store::open(&unlocked.store_path)
         .map_err(|error| ("CorruptDb", format!("could not open store: {error}")))?;
     if store
@@ -529,6 +567,28 @@ fn export_bundle(
     {
         return Err(("ProjectNotFound", "project not found".to_owned()));
     }
+    let profiles = selected_profiles(&store, request, unlocked)?;
+    let grant_scope = match request.scope {
+        BundleExportScope::AllProfiles => BUNDLE_PROJECT_GRANT_SCOPE,
+        BundleExportScope::ActiveProfile => {
+            let [profile] = profiles.as_slice() else {
+                return Err(grant_required());
+            };
+            profile.id.as_str()
+        }
+    };
+    if grants.validate(
+        grant_id,
+        &request.project_id,
+        grant_scope,
+        GrantAction::Export,
+        current_unix_nanos(),
+        request.binding.as_ref(),
+    ) != GrantValidation::Valid
+    {
+        return Err(grant_required());
+    }
+    let recipient = bundle_recipient(&request.recipient_descriptor)?;
     if store
         .bundle_recipient_is_denied(&request.project_id, &recipient.sealing_public_key)
         .map_err(|error| ("CorruptDb", error.to_string()))?
@@ -537,27 +597,6 @@ fn export_bundle(
             "AccessDenied",
             "recipient device is revoked or its member was removed".to_owned(),
         ));
-    }
-    let profiles = selected_profiles(&store, &request.project_id, unlocked, &request.scope)?;
-    if let Some(grant_id) = request.grant_id.as_deref() {
-        let [profile] = profiles.as_slice() else {
-            return Err((
-                "GrantRequired",
-                "export grant must cover the selected profile".to_owned(),
-            ));
-        };
-        if !grants.is_some_and(|grants| {
-            grants.validate(
-                grant_id,
-                &request.project_id,
-                &profile.id,
-                GrantAction::Export,
-                current_unix_nanos(),
-                request.binding.as_ref(),
-            ) == GrantValidation::Valid
-        }) {
-            return Err(("GrantRequired", "live profile-scoped Export grant required".to_owned()));
-        }
     }
     if !request.preview_only
         && !request.confirm_dangerous
@@ -818,17 +857,17 @@ fn decrypt_local_bundle(
 
 fn selected_profiles(
     store: &Store,
-    project_id: &str,
+    request: &ExportBundleRequest,
     unlocked: &UnlockedProject,
-    scope: &BundleExportScope,
 ) -> BackupResult<Vec<ProfileRecord>> {
     let profiles = store
-        .list_profiles(project_id)
+        .list_profiles(&request.project_id)
         .map_err(|error| ("CorruptDb", format!("could not list profiles: {error}")))?;
-    match scope {
+    match request.scope {
         BundleExportScope::AllProfiles => Ok(profiles),
         BundleExportScope::ActiveProfile => {
-            let Some(profile_id) = unlocked.profile_id.as_deref() else {
+            let Some(profile_id) = request.profile_id.as_deref().or(unlocked.profile_id.as_deref())
+            else {
                 return Err((
                     "MetadataInvalid",
                     "active-profile export requires unlock audit profile context".to_owned(),
@@ -2255,6 +2294,13 @@ async fn unlocked_project(
             "bundle operation requires unlock audit context with store_path",
         ));
     };
+    if entry.store_identity.as_ref().is_some_and(|pin| !pin.matches(&context.store_path)) {
+        return Err(error_response(
+            envelope,
+            "AccessDenied",
+            "bundle store no longer matches the pinned vault",
+        ));
+    }
     let master_key = master_key_array(entry.key_bytes()).map_err(|_| {
         error_response(envelope, "MetadataInvalid", "cached master key has invalid length")
     })?;
@@ -2414,6 +2460,32 @@ mod tests {
                 if result.payload["decryptable_by_this_device"] == true),
             "{response:?}"
         );
+
+        let mut import = RequestEnvelope::new(
+            "import",
+            crate::AgentMethod::ImportBundle,
+            json!({"project_id": PROJECT_ID, "bundle_path": path, "include_audit": false, "conflict_mode": "review"}),
+        );
+        assert!(matches!(crate::dispatch(&import, &state).await,
+            ResponseEnvelope::Error(error) if error.error == "GrantRequired"));
+        let now = current_unix_nanos();
+        let binding = GrantBinding::new(std::process::id(), "fixture");
+        let grant = state.grants.lock().await.issue(
+            crate::RequestGrantPayload {
+                project_id: PROJECT_ID.to_owned(),
+                profile_id: BUNDLE_PROJECT_GRANT_SCOPE.to_owned(),
+                policy_name: None,
+                action: GrantAction::ImportDotenv,
+                ttl_seconds: 30,
+                binding: binding.clone(),
+            },
+            now,
+            now + 30_000_000_000,
+        )?;
+        import.payload["grant_id"] = json!(grant.grant_id);
+        import.payload["binding"] = json!(binding);
+        assert!(matches!(crate::dispatch(&import, &state).await,
+            ResponseEnvelope::Success(result) if result.payload["status"] == "review"));
         Ok(())
     }
 
@@ -2915,22 +2987,8 @@ mod tests {
             master_key: zeroize::Zeroizing::new(master_key),
         };
 
-        let mut preview_request = request.clone();
-        preview_request.preview_only = true;
-        let preview =
-            export_bundle(&preview_request, &unlocked, None).map_err(|(_, message)| message)?;
-        assert_eq!(preview.status, "preview");
-        assert!(preview.message.contains("No team-managed values"));
-        assert!(!output_path.exists());
-        let store = Store::open(&store_path)?;
-        store
-            .connection()
-            .execute("UPDATE profiles SET dangerous = 1 WHERE id = ?1", [PROFILE_ID])?;
-        drop(store);
-        assert!(matches!(export_bundle(&request, &unlocked, None), Err(("ConfirmationFailed", _))));
-
-        request.confirm_dangerous = true;
         let mut grants = GrantTable::default();
+        assert!(matches!(export_bundle(&request, &unlocked, &grants), Err(("GrantRequired", _))));
         let binding = GrantBinding::new(42, "fixture");
         let mut grant_request = crate::RequestGrantPayload {
             project_id: PROJECT_ID.to_owned(),
@@ -2944,15 +3002,40 @@ mod tests {
         let now = current_unix_nanos();
         let expiry = now + 60_000_000_000;
         request.grant_id = Some(grants.issue(grant_request.clone(), now, expiry)?.grant_id);
-        assert!(matches!(
-            export_bundle(&request, &unlocked, Some(&grants)),
-            Err(("GrantRequired", _))
-        ));
+        assert!(matches!(export_bundle(&request, &unlocked, &grants), Err(("GrantRequired", _))));
         assert!(!output_path.exists());
         grant_request.action = GrantAction::Export;
-        request.grant_id = Some(grants.issue(grant_request, now, expiry)?.grant_id);
+        request.grant_id = Some(grants.issue(grant_request.clone(), now, expiry)?.grant_id);
+        let mut preview_request = request.clone();
+        preview_request.preview_only = true;
+        let preview =
+            export_bundle(&preview_request, &unlocked, &grants).map_err(|(_, message)| message)?;
+        assert_eq!(preview.status, "preview");
+        assert!(preview.message.contains("No team-managed values"));
+        assert!(!output_path.exists());
+        preview_request.scope = BundleExportScope::AllProfiles;
+        assert!(matches!(
+            export_bundle(&preview_request, &unlocked, &grants),
+            Err(("GrantRequired", _))
+        ));
+        grant_request.profile_id = BUNDLE_PROJECT_GRANT_SCOPE.to_owned();
+        preview_request.grant_id = Some(grants.issue(grant_request, now, expiry)?.grant_id);
+        assert!(
+            matches!(export_bundle(&preview_request, &unlocked, &grants), Ok(result) if result.status == "preview")
+        );
+
+        let store = Store::open(&store_path)?;
+        store
+            .connection()
+            .execute("UPDATE profiles SET dangerous = 1 WHERE id = ?1", [PROFILE_ID])?;
+        drop(store);
+        assert!(matches!(
+            export_bundle(&request, &unlocked, &grants),
+            Err(("ConfirmationFailed", _))
+        ));
+        request.confirm_dangerous = true;
         let response =
-            export_bundle(&request, &unlocked, Some(&grants)).map_err(|(_, message)| message)?;
+            export_bundle(&request, &unlocked, &grants).map_err(|(_, message)| message)?;
         assert_eq!(response.status, "exported");
         let bytes = fs::read(&output_path)?;
         let bundle = BundleContainer::deserialize(&bytes)?;

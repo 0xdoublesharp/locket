@@ -97,6 +97,9 @@ pub struct GrantRecord {
     pub action: GrantAction,
     /// Process identity required to use the grant.
     pub binding: GrantBinding,
+    /// Kernel-observed PID of the process that requested this grant, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_peer_pid: Option<u32>,
     /// Issue timestamp in Unix nanoseconds.
     pub issued_at_unix_nanos: i128,
     /// TTL in seconds.
@@ -136,11 +139,76 @@ impl GrantRecord {
             profile_id: fields.profile_id,
             action: fields.action,
             binding: fields.binding,
+            observed_peer_pid: None,
             issued_at_unix_nanos: fields.issued_at_unix_nanos,
             ttl_seconds: fields.ttl_seconds,
             expires_at_unix_nanos: fields.expires_at_unix_nanos,
         }
     }
+
+    pub(crate) fn permits_peer(&self, pid: u32, revoking: bool) -> bool {
+        let Some(issuer) = self.observed_peer_pid else {
+            return true;
+        };
+        if revoking && pid == issuer {
+            return true;
+        }
+        if self.action == GrantAction::PrepareExec && self.binding.pid != issuer {
+            return pid == self.binding.pid && self.binding.matches_live_process();
+        }
+        pid == issuer
+    }
+}
+
+impl GrantBinding {
+    fn matches_live_process(&self) -> bool {
+        locket_platform::process_binding_for_pid(self.pid)
+            .is_ok_and(|live| live.process_start_time == self.process_start_time)
+    }
+}
+
+/// Checks the sole exception to issuing a grant for the connecting process.
+pub fn constrain_peer_grant(payload: &mut RequestGrantPayload, observed_pid: Option<u32>) -> bool {
+    if observed_pid.is_none_or(|pid| pid == payload.binding.pid) {
+        return true;
+    }
+    let Some(scope) = &payload.binding.execution else {
+        return false;
+    };
+    if payload.action != GrantAction::PrepareExec
+        || payload.policy_name.as_deref() != Some(scope.policy_name.as_str())
+        || !scope.cwd.is_absolute()
+        || child_parent_pid(payload.binding.pid) != observed_pid
+        || !payload.binding.matches_live_process()
+    {
+        return false;
+    }
+    // A child handoff is for startup, even when the saved policy runs longer.
+    payload.ttl_seconds = payload.ttl_seconds.min(60);
+    true
+}
+
+#[cfg(target_os = "linux")]
+fn child_parent_pid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(") ")?.1.split_whitespace().nth(1)?.parse().ok()
+}
+
+#[cfg(target_os = "macos")]
+fn child_parent_pid(pid: u32) -> Option<u32> {
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-o", "ppid=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    std::str::from_utf8(&output.stdout).ok()?.trim().parse().ok()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const fn child_parent_pid(_pid: u32) -> Option<u32> {
+    None
 }
 
 /// Result of validating a process-bound live grant.
@@ -283,8 +351,18 @@ impl GrantTable {
         issued_at_unix_nanos: i128,
         expires_at_unix_nanos: i128,
     ) -> Result<GrantRecord, locket_core::id::IdGenerationError> {
+        self.issue_with_peer(payload, issued_at_unix_nanos, expires_at_unix_nanos, None)
+    }
+
+    pub(crate) fn issue_with_peer(
+        &mut self,
+        payload: RequestGrantPayload,
+        issued_at_unix_nanos: i128,
+        expires_at_unix_nanos: i128,
+        observed_peer_pid: Option<u32>,
+    ) -> Result<GrantRecord, locket_core::id::IdGenerationError> {
         let grant_id = locket_core::id::GrantId::generate()?;
-        let record = GrantRecord::new(GrantRecordFields {
+        let mut record = GrantRecord::new(GrantRecordFields {
             grant_id: grant_id.into_string(),
             project_id: payload.project_id,
             profile_id: payload.profile_id,
@@ -294,6 +372,7 @@ impl GrantTable {
             ttl_seconds: payload.ttl_seconds,
             expires_at_unix_nanos,
         });
+        record.observed_peer_pid = observed_peer_pid;
         self.insert(record.clone());
         Ok(record)
     }

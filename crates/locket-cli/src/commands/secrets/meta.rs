@@ -58,17 +58,49 @@ pub fn meta_command(
         metadata_json: &metadata,
         timestamp,
     };
-    let changed = store.update_secret_metadata_with_options(
-        &resolved_secret.secret.id,
-        SecretMetadataUpdate {
-            description: args.metadata.description.as_deref(),
-            owner: args.metadata.owner.as_deref(),
-            tags,
-            required,
-            updated_at: None,
-            audit: Some(AuditContext { key: audit_key.as_ref(), write: &audit }),
-        },
-    )?;
+    let id = &resolved_secret.secret.id;
+    let changed = if args.metadata.expires_in.is_some() || args.metadata.rotate_after_days.is_some()
+    {
+        // The legacy metadata update starts its own transaction. Compose the
+        // metadata edit, expiry policy, and audit using the same savepoint here.
+        let tags_json = tags.map(serde_json::to_string).transpose()?;
+        store.with_atomic_write(|store| -> Result<bool, CliError> {
+            let changed = store
+                .connection()
+                .execute(
+                    "UPDATE secrets
+                 SET description = COALESCE(?2, description), owner = COALESCE(?3, owner),
+                     tags_json = COALESCE(?4, tags_json), required = COALESCE(?5, required)
+                 WHERE id = ?1 AND state = 'active'",
+                    rusqlite::params![
+                        id,
+                        args.metadata.description,
+                        args.metadata.owner,
+                        tags_json,
+                        required
+                    ],
+                )
+                .map_err(locket_store::StoreError::from)?;
+            if changed == 0 {
+                return Ok(false);
+            }
+            super::expiry::update_expiry_policy(store, id, &args.metadata, timestamp)?;
+            store.append_audit(audit_key.as_ref(), &audit)?;
+            Ok(true)
+        })?
+    } else {
+        store.update_secret_metadata_with_options(
+            id,
+            SecretMetadataUpdate {
+                description: args.metadata.description.as_deref(),
+                owner: args.metadata.owner.as_deref(),
+                tags,
+                required,
+                updated_at: None,
+                audit: Some(AuditContext { key: audit_key.as_ref(), write: &audit }),
+            },
+        )?
+    };
     if !changed {
         return Err(secret_not_found_error("secret not found"));
     }

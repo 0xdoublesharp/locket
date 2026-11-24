@@ -148,7 +148,10 @@ fn run_internal_agent_serve_listens_and_cleans_up_on_sigterm()
             pid_file: serve_pid,
             require_session_monitoring: false,
         };
-        crate::commands::agent::run_internal_agent_serve(&args)
+        crate::commands::agent::run_internal_agent_serve(
+            &args,
+            &args.pid_file.with_file_name("store.db"),
+        )
     });
 
     // Wait for the daemon to bind its socket (up to ~3s).

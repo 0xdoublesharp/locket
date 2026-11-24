@@ -328,13 +328,7 @@ pub(super) fn test_secret_write_args(key: &str) -> super::SecretWriteArgs {
         target: crate::commands::secrets::set::WriteTargetArgs::default(),
         key: key.to_owned(),
         source: super::SourceArg { source: Some(super::SecretSourceArg::UserLocal) },
-        metadata: super::SecretMetadataFlags {
-            description: None,
-            owner: None,
-            tags: Vec::new(),
-            required: false,
-            optional: false,
-        },
+        metadata: super::SecretMetadataFlags::default(),
     }
 }
 
@@ -351,13 +345,7 @@ pub(super) fn test_rotate_args(key: &str, grace_ttl: Option<&str>) -> super::Rot
     super::RotateArgs {
         key: key.to_owned(),
         source: super::SourceArg { source: Some(super::SecretSourceArg::UserLocal) },
-        metadata: super::SecretMetadataFlags {
-            description: None,
-            owner: None,
-            tags: Vec::new(),
-            required: false,
-            optional: false,
-        },
+        metadata: super::SecretMetadataFlags::default(),
         grace_ttl: grace_ttl.map(ToOwned::to_owned),
     }
 }

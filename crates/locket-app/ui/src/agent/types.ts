@@ -269,6 +269,7 @@ export interface ExportBundleRequest {
   include_personal?: boolean;
   include_history?: boolean;
   preview_only?: boolean;
+  confirm_dangerous?: boolean;
 }
 
 export interface ImportBundleRequest {
@@ -276,6 +277,7 @@ export interface ImportBundleRequest {
   bundle_path: string;
   include_audit: boolean;
   conflict_mode: BundleConflictMode;
+  confirm_dangerous?: boolean;
 }
 
 export interface VerifyBundleRequest {

@@ -519,13 +519,7 @@ fn copy_picks_highest_precedence_source_when_unambiguous() -> Result<(), Box<dyn
         target: crate::commands::secrets::set::WriteTargetArgs::default(),
         key: "API_KEY".to_owned(),
         source: crate::SourceArg { source: Some(crate::SecretSourceArg::MachineLocal) },
-        metadata: crate::SecretMetadataFlags {
-            description: None,
-            owner: None,
-            tags: Vec::new(),
-            required: false,
-            optional: false,
-        },
+        metadata: crate::SecretMetadataFlags::default(),
     };
     crate::set_secret_value(&context, &machine_local_args, "machine-value", "manual", 1_500)?;
     run_with_context(
@@ -568,13 +562,7 @@ fn copy_resolves_explicit_from_source_over_default_precedence()
         target: crate::commands::secrets::set::WriteTargetArgs::default(),
         key: "API_KEY".to_owned(),
         source: crate::SourceArg { source: Some(crate::SecretSourceArg::MachineLocal) },
-        metadata: crate::SecretMetadataFlags {
-            description: None,
-            owner: None,
-            tags: Vec::new(),
-            required: false,
-            optional: false,
-        },
+        metadata: crate::SecretMetadataFlags::default(),
     };
     crate::set_secret_value(&context, &machine_local_args, "machine-value", "manual", 1_500)?;
     run_with_context(
@@ -611,13 +599,7 @@ fn copy_to_source_falls_back_to_user_local_when_target_missing()
         target: crate::commands::secrets::set::WriteTargetArgs::default(),
         key: "API_KEY".to_owned(),
         source: crate::SourceArg { source: Some(crate::SecretSourceArg::MachineLocal) },
-        metadata: crate::SecretMetadataFlags {
-            description: None,
-            owner: None,
-            tags: Vec::new(),
-            required: false,
-            optional: false,
-        },
+        metadata: crate::SecretMetadataFlags::default(),
     };
     crate::set_secret_value(&context, &machine_local_args, "machine-value", "manual", 1_000)?;
     run_with_context(

@@ -1,5 +1,6 @@
 //! Secret CRUD commands.
 
+pub mod expiry;
 pub mod generate;
 pub mod get;
 pub mod import;

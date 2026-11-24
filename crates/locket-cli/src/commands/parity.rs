@@ -46,7 +46,11 @@ pub fn parity_command(
     let report = result?;
     for profile in report["profiles"].as_array().into_iter().flatten() {
         let name = profile["profile"].as_str().unwrap_or_default();
-        writeln!(output, "{name}: missing {} | stale {}", profile["missing"], profile["stale"])?;
+        writeln!(
+            output,
+            "{name}: missing {} | stale {} | expired {} | expiring soon {}",
+            profile["missing"], profile["stale"], profile["expired"], profile["expiring_soon"]
+        )?;
     }
     for file in report["plaintext_drift"].as_array().into_iter().flatten() {
         let name = file["file"].as_str().unwrap_or_default();
@@ -81,13 +85,11 @@ fn parity_report(context: &RuntimeContext, args: &ParityArgs) -> Result<Value, C
             return Err(profile_not_found_error("requested parity profile not found"));
         }
     }
+    let now = now_unix_nanos()?;
+    let notices = crate::commands::secrets::expiry::expiry_notices(&store, &project_id, now)?;
     let stale_before = args
         .max_age_days
-        .map(|days| {
-            let age = i64::from(days).saturating_mul(86_400_000_000_000);
-            now_unix_nanos().map(|now| now.saturating_sub(age))
-        })
-        .transpose()?;
+        .map(|days| now.saturating_sub(i64::from(days).saturating_mul(86_400_000_000_000)));
     let mut names = BTreeSet::new();
     let mut selected = Vec::new();
     for profile in profiles {
@@ -95,7 +97,7 @@ fn parity_report(context: &RuntimeContext, args: &ParityArgs) -> Result<Value, C
             continue;
         }
         let records = store.list_active_secrets_by_profile(&project_id, &profile.id)?;
-        let stale = records
+        let mut stale = records
             .iter()
             .filter(|secret| {
                 stale_before.is_some_and(|cutoff| {
@@ -104,17 +106,35 @@ fn parity_report(context: &RuntimeContext, args: &ParityArgs) -> Result<Value, C
             })
             .map(|secret| secret.name.clone())
             .collect::<BTreeSet<_>>();
+        let mut expired = BTreeSet::new();
+        let mut expiring_soon = BTreeSet::new();
+        for notice in notices.iter().filter(|notice| notice.profile_id == profile.id) {
+            match notice.expiry_status {
+                Some(locket_store::SecretExpiryStatus::Expired) => {
+                    expired.insert(&notice.name);
+                }
+                Some(locket_store::SecretExpiryStatus::ExpiringSoon) => {
+                    expiring_soon.insert(&notice.name);
+                }
+                None => {}
+            }
+            if notice.stale {
+                stale.insert(notice.name.clone());
+            }
+        }
         let present = records.into_iter().map(|secret| secret.name).collect::<BTreeSet<_>>();
         names.extend(present.iter().cloned());
-        selected.push((profile, present, stale));
+        selected.push((profile, present, stale, expired, expiring_soon));
     }
     let profiles = selected
         .iter()
-        .map(|(profile, present, stale)| {
+        .map(|(profile, present, stale, expired, expiring_soon)| {
             json!({
                 "profile": profile.name, "dangerous": profile.dangerous,
                 "missing": names.difference(present).collect::<Vec<_>>(),
                 "stale": stale,
+                "expired": expired,
+                "expiring_soon": expiring_soon,
             })
         })
         .collect::<Vec<_>>();

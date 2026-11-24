@@ -284,6 +284,11 @@ async fn cached_sync_context(
         let context = entry.audit_context().cloned().ok_or_else(|| {
             team_sync::SyncError::Rejected("unlock context lacks store path".into())
         })?;
+        if entry.store_identity.as_ref().is_some_and(|pin| !pin.matches(&context.store_path)) {
+            return Err(team_sync::SyncError::Rejected(
+                "sync store no longer matches the pinned vault".into(),
+            ));
+        }
         let key = crate::keys::master_key_array(entry.key_bytes())
             .map_err(|_| team_sync::SyncError::Rejected("invalid cached key".into()))?;
         let result = (key, context, entry.expires_at_unix_nanos());
@@ -484,6 +489,7 @@ fn commit_authorization(
                 entry.expires_at_unix_nanos() == expiry
                     && entry.key_bytes() == key.as_slice()
                     && entry.audit_context().is_some_and(|context| context.store_path == store_path)
+                    && entry.store_identity.as_ref().is_none_or(|pin| pin.matches(&store_path))
             });
         if !allowed {
             drop(guard);

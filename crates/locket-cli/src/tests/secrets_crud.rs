@@ -2,6 +2,112 @@
 use super::*;
 
 #[test]
+fn expiry_metadata_round_trips_and_get_and_run_refuse_expired_values()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context_with_secret_value(&directory, "canary-expired-value");
+    let cli = |args: &[&str], output: &mut Vec<u8>| {
+        run_with_context(Cli::try_parse_from(args)?, &context, output)
+            .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })
+    };
+    cli(&["locket", "init", "--no-device", "--no-passkey"], &mut Vec::new())?;
+    cli(
+        &["locket", "set", "TOKEN", "--expires-in", "24h", "--rotate-after-days", "3"],
+        &mut Vec::new(),
+    )?;
+    let store = locket_store::Store::open(&context.store_path)?;
+    let resolved = crate::require_project(&context)?;
+    let project = resolved.config.project_id.as_str();
+    let profile = crate::default_profile(&store, &resolved.config)?;
+    let token = store
+        .list_secrets_by_name(project, &profile.id, "TOKEN")?
+        .into_iter()
+        .next()
+        .ok_or("missing token metadata")?;
+    let initial = store.get_secret_expiry_policy(&token.id)?.ok_or("missing expiry policy")?;
+    assert!(initial.expires_at.is_some());
+    assert_eq!(initial.rotate_after_days, Some(3));
+    cli(&["locket", "rotate", "TOKEN", "--expires-in", "30d"], &mut Vec::new())?;
+    let rotated =
+        store.get_secret_expiry_policy(&token.id)?.ok_or("missing rotate expiry policy")?;
+    assert!(rotated.expires_at > initial.expires_at);
+    assert_eq!(rotated.rotate_after_days, Some(3));
+    cli(
+        &[
+            "locket",
+            "secret",
+            "meta",
+            "TOKEN",
+            "--rotate-after-days",
+            "2",
+            "--description",
+            "API credential",
+        ],
+        &mut Vec::new(),
+    )?;
+    let edited =
+        store.get_secret_expiry_policy(&token.id)?.ok_or("missing edited expiry policy")?;
+    assert_eq!(edited.expires_at, rotated.expires_at);
+    assert_eq!(edited.rotate_after_days, Some(2));
+    cli(&["locket", "generate", "GENERATED", "--expires-in", "90d"], &mut Vec::new())?;
+    let generated = store
+        .list_secrets_by_name(project, &profile.id, "GENERATED")?
+        .into_iter()
+        .next()
+        .ok_or("missing generated secret metadata")?;
+    let generated_expiry =
+        store.get_secret_expiry_policy(&generated.id)?.ok_or("missing generated expiry policy")?;
+    assert!(generated_expiry.expires_at > edited.expires_at);
+    cli(&["locket", "secret", "meta", "GENERATED", "--expires-in", "24h"], &mut Vec::new())?;
+
+    let now = crate::now_unix_nanos()?;
+    store.set_secret_expiry_policy(
+        &token.id,
+        locket_store::SecretExpiryPolicy { expires_at: Some(now), ..edited },
+        now,
+    )?;
+    store
+        .connection()
+        .execute("UPDATE secrets SET last_rotated_at = 0 WHERE id = ?1", [&token.id])?;
+    let mut output = Vec::new();
+    let err = cli(&["locket", "get", "TOKEN", "--reveal", "--force"], &mut output)
+        .err()
+        .ok_or("expired value was revealed")?;
+    assert!(err.to_string().contains("secret has expired"));
+    assert_eq!(output, [] as [u8; 0]);
+    cli(&["locket", "policy", "add", "deploy", "--", test_true()], &mut Vec::new())?;
+    cli(&["locket", "policy", "require", "deploy", "TOKEN"], &mut Vec::new())?;
+    let err =
+        cli(&["locket", "run", "deploy"], &mut output).err().ok_or("expired value was injected")?;
+    assert!(err.to_string().contains("secret has expired"));
+    let sessions: u32 =
+        store
+            .connection()
+            .query_row("SELECT count(*) FROM runtime_sessions", [], |row| row.get(0))?;
+    assert_eq!(sessions, 0);
+
+    let mut output = Vec::new();
+    cli(&["locket", "parity", "--json"], &mut output)?;
+    let parity: serde_json::Value = serde_json::from_slice(&output)?;
+    let profile = &parity["profiles"][0];
+    assert_eq!(profile["expired"], serde_json::json!(["TOKEN"]));
+    assert_eq!(profile["stale"], serde_json::json!(["TOKEN"]));
+    assert_eq!(profile["expiring_soon"], serde_json::json!(["GENERATED"]));
+    output.clear();
+    cli(&["locket", "discover", "--json"], &mut output)?;
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(&output)?;
+    assert!(rows.iter().any(|row| row["name"] == "TOKEN"
+        && row["expiry_status"] == "expired"
+        && row["stale"] == true));
+    assert!(
+        rows.iter()
+            .any(|row| row["name"] == "GENERATED" && row["expiry_status"] == "expiring_soon")
+    );
+    assert!(!String::from_utf8(output)?.contains("canary-expired-value"));
+    Ok(())
+}
+
+#[test]
 fn reveal_rejects_unsupported_stored_blob_schema() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempdir()?;
     let context = test_context(&directory);
@@ -255,13 +361,7 @@ fn set_list_get_and_rm_secret_value() -> Result<(), Box<dyn std::error::Error>> 
         target: crate::commands::secrets::set::WriteTargetArgs::default(),
         key: "DATABASE_URL".to_owned(),
         source: crate::SourceArg { source: Some(crate::SecretSourceArg::UserLocal) },
-        metadata: crate::SecretMetadataFlags {
-            description: None,
-            owner: None,
-            tags: Vec::new(),
-            required: false,
-            optional: false,
-        },
+        metadata: crate::SecretMetadataFlags::default(),
     };
     crate::set_secret_value(&context, &args, "postgres://localhost/app", "manual", 1_000)?;
 
@@ -959,13 +1059,7 @@ fn meta_requires_source_for_multiple_active_sources_and_updates_explicit_source(
         target: crate::commands::secrets::set::WriteTargetArgs::default(),
         key: "DATABASE_URL".to_owned(),
         source: crate::SourceArg { source: Some(crate::SecretSourceArg::MachineLocal) },
-        metadata: crate::SecretMetadataFlags {
-            description: None,
-            owner: None,
-            tags: Vec::new(),
-            required: false,
-            optional: false,
-        },
+        metadata: crate::SecretMetadataFlags::default(),
     };
     crate::set_secret_value(
         &context,

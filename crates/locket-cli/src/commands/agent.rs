@@ -865,17 +865,26 @@ pub fn request_status_snapshot(_socket_path: &Path) -> Result<Value, io::Error> 
 /// shuts down on `SIGTERM`/`SIGINT`. On exit it removes both the pid
 /// file and the socket so the next `agent start` is unblocked.
 #[cfg(unix)]
-pub fn run_internal_agent_serve(args: &InternalAgentServeArgs) -> Result<(), CliError> {
+pub fn run_internal_agent_serve(
+    args: &InternalAgentServeArgs,
+    store_path: &Path,
+) -> Result<(), CliError> {
     let args = InternalAgentServeArgs {
         socket: args.socket.clone(),
         pid_file: args.pid_file.clone(),
         require_session_monitoring: args.require_session_monitoring,
     };
-    locket_platform::run_with_native_session_loop(move || run_internal_agent_worker(&args))?
+    let store_path = store_path.to_path_buf();
+    locket_platform::run_with_native_session_loop(move || {
+        run_internal_agent_worker(&args, &store_path)
+    })?
 }
 
 #[cfg(unix)]
-fn run_internal_agent_worker(args: &InternalAgentServeArgs) -> Result<(), CliError> {
+fn run_internal_agent_worker(
+    args: &InternalAgentServeArgs,
+    store_path: &Path,
+) -> Result<(), CliError> {
     // Daemon-startup ordering invariant:
     //
     // `agent_lifecycle::run_internal_agent_serve_listens_and_cleans_up_on_sigterm`
@@ -889,7 +898,7 @@ fn run_internal_agent_worker(args: &InternalAgentServeArgs) -> Result<(), CliErr
     // exit instead of the daemon.
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let result = runtime.block_on(async {
-        let (listener, state) = bind_and_record(args)?;
+        let (listener, state) = bind_and_record(args, store_path)?;
         let sync_task = locket_agent::team_sync::spawn_team_sync_poll(state.clone());
         let expiry_task = state.spawn_unlock_expiry();
         let result =
@@ -909,6 +918,7 @@ fn run_internal_agent_worker(args: &InternalAgentServeArgs) -> Result<(), CliErr
 #[cfg(unix)]
 fn bind_and_record(
     args: &InternalAgentServeArgs,
+    store_path: &Path,
 ) -> Result<(tokio::net::UnixListener, locket_agent::AgentSocketState), CliError> {
     use locket_agent::{AgentSocketConfig, AgentSocketState, bind_socket_listener};
 
@@ -920,7 +930,8 @@ fn bind_and_record(
         env!("CARGO_PKG_VERSION"),
     ))
     .map_err(socket_error_to_cli)?;
-    let state = AgentSocketState::locked(env!("CARGO_PKG_VERSION"));
+    let state = AgentSocketState::locked(env!("CARGO_PKG_VERSION"))
+        .with_canonical_store_path(store_path.to_path_buf());
     Ok((listener, state))
 }
 
@@ -1075,13 +1086,17 @@ async fn next_native_session_event(
 }
 
 #[cfg(target_os = "windows")]
-pub fn run_internal_agent_serve(args: &InternalAgentServeArgs) -> Result<(), CliError> {
+pub fn run_internal_agent_serve(
+    args: &InternalAgentServeArgs,
+    store_path: &Path,
+) -> Result<(), CliError> {
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let result = runtime.block_on(async {
         let config = locket_agent::AgentPipeConfig::current_user(args.socket.clone())
             .map_err(|error| io::Error::other(error.to_string()))?;
         let mut listener = locket_agent::bind_named_pipe_listener(&config)?;
-        let state = locket_agent::AgentSocketState::locked(env!("CARGO_PKG_VERSION"));
+        let state = locket_agent::AgentSocketState::locked(env!("CARGO_PKG_VERSION"))
+            .with_canonical_store_path(store_path.to_path_buf());
         let mut observer = start_session_observer(&state, args.require_session_monitoring).await?;
         write_pid_file(&args.pid_file).map_err(|error| io::Error::other(error.to_string()))?;
         let sync_task = locket_agent::team_sync::spawn_team_sync_poll(state.clone());
@@ -1122,7 +1137,10 @@ pub fn run_internal_agent_serve(args: &InternalAgentServeArgs) -> Result<(), Cli
 }
 
 #[cfg(not(any(unix, target_os = "windows")))]
-pub fn run_internal_agent_serve(_args: &InternalAgentServeArgs) -> Result<(), CliError> {
+pub fn run_internal_agent_serve(
+    _args: &InternalAgentServeArgs,
+    _store_path: &Path,
+) -> Result<(), CliError> {
     Err(typed_cli_error(
         locket_core::LocketError::AgentUnavailable,
         "agent daemon is only supported on Unix targets",
@@ -1344,6 +1362,7 @@ mod tests {
                 profile_id: "profile".to_owned(),
                 action: GrantAction::RunPolicy,
                 binding: GrantBinding::new(std::process::id(), "test"),
+                observed_peer_pid: None,
                 issued_at_unix_nanos: 0,
                 ttl_seconds: 30,
                 expires_at_unix_nanos: i128::MAX,
