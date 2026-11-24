@@ -74,10 +74,16 @@ check_model() {
         cat -- "$log" >&2
         die "$model did not report an exhaustive pass"
     fi
-    printf '  %s states, 0 errors\n' "$counts"
+    if grep -Eiq '(^|[[:space:]])warning:' "$log"; then
+        cat -- "$log" >&2
+        die "$model emitted a TLC warning"
+    fi
+    printf '  %s states, 0 errors, 0 warnings\n' "$counts"
 }
 
 check_model AgentUnlockGrantLifecycle
+check_model AgentAuthzProtocol
+check_model AutomationClientAuth
 check_model SecretLifecycleAuditChain
 check_model EgressProxyAndRedaction
 check_model TeamSyncAndAuditWitness
@@ -91,4 +97,4 @@ printf 'Building Lean proofs\n'
     cd -- "$lean_project"
     lake --no-cache --wfail build
 )
-printf 'Formal checks passed for all four TLC models and all Lean modules.\n'
+printf 'Formal checks passed for all six TLC models and all Lean modules.\n'

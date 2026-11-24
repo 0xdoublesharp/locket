@@ -219,4 +219,242 @@ theorem redacted_output_free_of_pattern (nonempty : pattern ≠ []) (disjoint : 
   rw [(streaming_eq_batch pattern [marker] chunks).2]
   exact scan_free_of_pattern nonempty disjoint
 
+/-- The marker tests used by the known-pattern selector. Either containment
+would make the marker unsafe, as would a proper suffix/prefix overlap in
+either direction. -/
+def MarkerSafe (patterns : List Bytes) (marker : Bytes) : Prop :=
+  marker ≠ [] ∧ ∀ pattern ∈ patterns,
+    ¬pattern <:+: marker ∧ ¬marker <:+: pattern ∧
+    (∀ overlap : Bytes, overlap ≠ [] → overlap ≠ marker → overlap ≠ pattern →
+      ¬(overlap <:+ pattern ∧ overlap <+: marker) ∧
+      ¬(overlap <:+ marker ∧ overlap <+: pattern))
+
+open Classical in
+noncomputable def chooseReplacement (patterns : List Bytes) : List Bytes → Option Bytes
+  | [] => none
+  | candidate :: rest =>
+    if MarkerSafe patterns candidate then some candidate else chooseReplacement patterns rest
+
+theorem chooseReplacement_safe (selected : chooseReplacement patterns candidates = some marker) :
+    MarkerSafe patterns marker := by
+  induction candidates with
+  | nil => simp [chooseReplacement] at selected
+  | cons candidate rest ih =>
+    by_cases safe : MarkerSafe patterns candidate
+    · simp [chooseReplacement, safe] at selected
+      exact selected ▸ safe
+    · exact ih (by simpa [chooseReplacement, safe] using selected)
+
+private theorem prefix_at_marker (safe : MarkerSafe patterns marker) (registered : test ∈ patterns)
+    (hit : test <+: left ++ (marker ++ right)) : test <+: left := by
+  rcases List.prefix_or_prefix_of_prefix hit (List.prefix_append left (marker ++ right)) with
+    within | across
+  · exact within
+  · obtain ⟨tail, tailEq⟩ := across
+    by_cases emptyTail : tail = []
+    · simp [emptyTail] at tailEq
+      exact tailEq ▸ List.prefix_refl left
+    have tailAtStart : tail <+: marker ++ right := by
+      rw [← tailEq] at hit
+      exact (List.prefix_append_right_inj left).mp hit
+    obtain ⟨noInner, noWhole, noOverlap⟩ := safe.2 test registered
+    rcases List.prefix_or_prefix_of_prefix tailAtStart (List.prefix_append marker right) with
+      short | long
+    · have suffix : tail <:+ test := tailEq ▸ List.suffix_append left tail
+      by_cases whole : tail = marker
+      · exact False.elim (noWhole (whole ▸ suffix.isInfix))
+      by_cases starts : tail = test
+      · exact False.elim (noInner (starts ▸ short.isInfix))
+      exact False.elim ((noOverlap tail emptyTail whole starts).1 ⟨suffix, short⟩)
+    · have suffix : tail <:+ test := tailEq ▸ List.suffix_append left tail
+      exact False.elim (noWhole (long.isInfix.trans suffix.isInfix))
+
+/-- An occurrence in a splice lies entirely in one of the two retained spans. -/
+theorem marker_splice (safe : MarkerSafe patterns marker) (registered : test ∈ patterns) :
+    test <:+: left ++ (marker ++ right) ↔ test <:+: left ∨ test <:+: right := by
+  refine ⟨?_, ?_⟩
+  · induction left with
+    | nil =>
+      simp only [List.nil_append]
+      intro hit
+      rcases List.infix_append_iff_ne_nil.mp hit with inside | inside | crossing
+      · exact False.elim ((safe.2 test registered).1 inside)
+      · exact Or.inr inside
+      · obtain ⟨stem, tail, stemNe, tailNe, rfl, stemSuffix, _⟩ := crossing
+        obtain ⟨_, noWhole, noOverlap⟩ := safe.2 (stem ++ tail) registered
+        by_cases whole : stem = marker
+        · exact False.elim (noWhole (whole ▸ (List.prefix_append stem tail).isInfix))
+        have proper : stem ≠ stem ++ tail := by
+          intro eq
+          have := congrArg List.length eq
+          simp at this
+          exact tailNe this
+        exact False.elim ((noOverlap stem stemNe whole proper).2
+          ⟨stemSuffix, List.prefix_append stem tail⟩)
+    | cons byte left ih =>
+      intro hit
+      rcases infix_cons_iff.mp hit with atStart | later
+      · exact Or.inl (prefix_at_marker safe registered atStart).isInfix
+      · exact (ih later).imp (fun h => infix_cons_iff.mpr (Or.inr h)) id
+  · rintro (inLeft | inRight)
+    · exact List.infix_append_of_infix_left inLeft
+    · exact List.infix_append_of_infix_right (List.infix_append_of_infix_right inRight)
+
+private def matchWidth (patterns : List Bytes) (input : Bytes) : Nat :=
+  patterns.foldr (fun pattern width => if startsWith pattern input then max pattern.length width
+      else width) 0
+
+private def maxPatternLength (patterns : List Bytes) : Nat :=
+  patterns.foldr (fun pattern width => max pattern.length width) 0
+
+private theorem matchWidth_lower_bound (registered : pattern ∈ patterns)
+    (hit : pattern <+: input) : pattern.length ≤ matchWidth patterns input := by
+  induction patterns with
+  | nil => simp at registered
+  | cons first rest ih =>
+    simp only [List.mem_cons] at registered
+    rcases registered with rfl | later
+    · simp only [matchWidth, List.foldr_cons, startsWith_iff.mpr hit, ite_true]
+      exact Nat.le_max_left ..
+    · have bounded := ih later
+      change _ ≤ (if startsWith first input then max first.length (matchWidth rest input)
+                  else matchWidth rest input)
+      split
+      · exact Nat.le_trans bounded (Nat.le_max_right ..)
+      · exact bounded
+
+private theorem matchWidth_append (enough : maxPatternLength patterns ≤ input.length) :
+    matchWidth patterns (input ++ rest) = matchWidth patterns input := by
+  induction patterns with
+  | nil => rfl
+  | cons pattern patterns ih =>
+    have bounds : pattern.length ≤ input.length ∧ maxPatternLength patterns ≤ input.length := by
+      exact Nat.max_le.mp (show max pattern.length (maxPatternLength patterns) ≤ input.length from enough)
+    change (if startsWith pattern (input ++ rest) then
+      max pattern.length (matchWidth patterns (input ++ rest)) else matchWidth patterns (input ++ rest)) = _
+    rw [startsWith_append bounds.1, ih bounds.2]
+    rfl
+
+private def multiStep (patterns : List Bytes) (marker : Bytes) (covered : Nat)
+    (byte : UInt8) (tail : Bytes) : Nat × Bytes :=
+  let width := matchWidth patterns (byte :: tail)
+  (max covered width - 1, if covered = 0 then (if width = 0 then [byte] else marker) else [])
+
+def multiScan (patterns : List Bytes) (marker : Bytes) (covered : Nat) : Bytes → Bytes
+  | [] => []
+  | byte :: tail =>
+    let (remaining, emitted) := multiStep patterns marker covered byte tail
+    emitted ++ multiScan patterns marker remaining tail
+
+private theorem multi_prefix_preserved (safe : MarkerSafe patterns marker) (registered : test ∈ patterns)
+    (hit : test <+: kept ++ multiScan patterns marker 0 input) : test <+: kept ++ input := by
+  induction input generalizing kept with
+  | nil => exact hit
+  | cons byte tail ih =>
+    by_cases matched : matchWidth patterns (byte :: tail) = 0
+    · have nextHit : test <+: (kept ++ [byte]) ++ multiScan patterns marker 0 tail := by
+        simpa [multiScan, multiStep, matched, List.append_assoc] using hit
+      simpa [List.append_assoc] using ih nextHit
+    · have nextHit : test <+: kept ++ (marker ++ multiScan patterns marker
+          (matchWidth patterns (byte :: tail) - 1) tail) := by
+        simpa [multiScan, multiStep, matched] using hit
+      exact (prefix_at_marker safe registered nextHit).trans (List.prefix_append kept (byte :: tail))
+
+private theorem multiScan_free (safe : MarkerSafe patterns marker) (registered : test ∈ patterns)
+    (nonempty : test ≠ []) : ¬test <:+: multiScan patterns marker covered input := by
+  induction input generalizing covered with
+  | nil => intro hit; exact nonempty (List.infix_nil.mp hit)
+  | cons byte tail ih =>
+    by_cases openSpan : covered = 0
+    · subst covered
+      by_cases matched : matchWidth patterns (byte :: tail) = 0
+      · have outputEq : multiScan patterns marker 0 (byte :: tail) =
+            byte :: multiScan patterns marker 0 tail := by simp [multiScan, multiStep, matched]
+        rw [outputEq, infix_cons_iff]
+        rintro (atStart | later)
+        · have hit : test <+: [] ++ multiScan patterns marker 0 (byte :: tail) := by
+            simpa [outputEq] using atStart
+          have original : test <+: byte :: tail := by
+            simpa using multi_prefix_preserved safe registered hit
+          have positive := List.length_pos_iff.mpr nonempty
+          have bounded := matchWidth_lower_bound registered original
+          omega
+        · exact ih later
+      · have outputEq : multiScan patterns marker 0 (byte :: tail) = marker ++
+            multiScan patterns marker (matchWidth patterns (byte :: tail) - 1) tail := by
+          simp [multiScan, multiStep, matched]
+        rw [outputEq, ← List.nil_append (marker ++ _), marker_splice safe registered]
+        exact fun h => h.elim (fun hit => nonempty (List.infix_nil.mp hit)) ih
+    · simpa [multiScan, multiStep, openSpan] using
+        ih (covered := max covered (matchWidth patterns (byte :: tail)) - 1)
+
+private def multiFeedByte (patterns : List Bytes) (marker : Bytes) (state : Stream)
+    (byte : UInt8) : Stream :=
+  let window := state.pending ++ [byte]
+  if maxPatternLength patterns ≤ window.length then
+    match window with
+    | [] => state
+    | first :: tail =>
+      let (covered, emitted) := multiStep patterns marker state.covered first tail
+      ⟨tail, covered, state.output ++ emitted⟩
+  else {state with pending := window}
+
+private def multiFinishWith (patterns : List Bytes) (marker : Bytes) (state : Stream)
+    (future : Bytes) : Bytes :=
+  state.output ++ multiScan patterns marker state.covered (state.pending ++ future)
+
+private theorem multiFeedByte_correct (patterns : List Bytes) (marker : Bytes) (state : Stream)
+    (byte : UInt8) (future : Bytes) :
+    multiFinishWith patterns marker (multiFeedByte patterns marker state byte) future =
+      multiFinishWith patterns marker state (byte :: future) := by
+  unfold multiFeedByte multiFinishWith
+  rw [show state.pending ++ byte :: future = (state.pending ++ [byte]) ++ future by simp]
+  generalize windowEq : state.pending ++ [byte] = window
+  by_cases enough : maxPatternLength patterns ≤ window.length
+  · simp only [ite_eq_left enough]
+    cases window with
+    | nil => simp at windowEq
+    | cons first tail =>
+      have same : matchWidth patterns (first :: (tail ++ future)) = matchWidth patterns (first :: tail) :=
+        matchWidth_append enough
+      simp [multiScan, multiStep, same, List.append_assoc]
+  · simp [enough]
+
+def multiStreaming (patterns : List Bytes) (marker : Bytes) (chunks : List Bytes) : Bytes :=
+  let final := chunks.foldl (fun state chunk => chunk.foldl (multiFeedByte patterns marker) state) initial
+  multiFinishWith patterns marker final []
+
+private theorem multiFeed_correct (patterns : List Bytes) (marker : Bytes) (input future : Bytes)
+    (state : Stream) :
+    multiFinishWith patterns marker (input.foldl (multiFeedByte patterns marker) state) future =
+      multiFinishWith patterns marker state (input ++ future) := by
+  induction input generalizing state with
+  | nil => rfl
+  | cons byte tail ih =>
+    rw [List.foldl_cons, ih, multiFeedByte_correct]
+    rfl
+
+theorem multiStreaming_eq_batch (patterns : List Bytes) (marker : Bytes) (chunks : List Bytes) :
+    multiStreaming patterns marker chunks = multiScan patterns marker 0 chunks.flatten := by
+  have flattenFeed (state : Stream) :
+      chunks.foldl (fun s chunk => chunk.foldl (multiFeedByte patterns marker) s) state =
+        chunks.flatten.foldl (multiFeedByte patterns marker) state := by
+    induction chunks generalizing state with
+    | nil => rfl
+    | cons chunk chunks ih => simp [List.foldl_append, ih]
+  unfold multiStreaming
+  rw [flattenFeed, multiFeed_correct]
+  simp [multiFinishWith, initial]
+
+theorem multiStreaming_free_of_patterns (safe : MarkerSafe patterns marker)
+    (nonempty : ∀ pattern ∈ patterns, pattern ≠ []) (registered : test ∈ patterns) :
+    ¬test <:+: multiStreaming patterns marker chunks := by
+  rw [multiStreaming_eq_batch]
+  exact multiScan_free safe registered (nonempty test registered)
+
+theorem selected_marker_redacts_all (selected : chooseReplacement patterns candidates = some marker)
+    (nonempty : ∀ pattern ∈ patterns, pattern ≠ []) (registered : test ∈ patterns) :
+    ¬test <:+: multiStreaming patterns marker chunks :=
+  multiStreaming_free_of_patterns (chooseReplacement_safe selected) nonempty registered
+
 end LocketProofs.StreamingRedaction
