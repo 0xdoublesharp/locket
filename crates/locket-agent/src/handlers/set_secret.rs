@@ -679,7 +679,7 @@ fn metadata_finding(token: &str) -> Option<MetadataPrivacyFinding> {
         return Some(MetadataPrivacyFinding::ProviderToken);
     }
     if token.len() < 20
-        || ["lk_proj_", "lk_prof_", "lk_sec_", "lk_key_", "lkdev1_"]
+        || ["lk_proj_", "lk_prof_", "lk_sec_", "lk_key_", "lkdev2_"]
             .iter()
             .any(|prefix| token.starts_with(prefix))
     {

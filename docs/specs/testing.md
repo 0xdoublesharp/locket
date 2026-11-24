@@ -21,7 +21,7 @@ For new behavior:
 3. Add edge-case and error-path tests before widening the API.
 4. Add a fuzz target when the behavior accepts structured external input.
 
-Implementation should use TDD for parser, policy, crypto envelope, store migration, scanner, and agent protocol behavior where the expected behavior is known from this spec.
+Implementation should use TDD for parser, policy, crypto envelope, store schema checks, scanner, and agent protocol behavior where the expected behavior is known from this spec.
 
 ## Coverage Commands
 
