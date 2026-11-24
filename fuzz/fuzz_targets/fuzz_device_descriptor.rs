@@ -12,7 +12,7 @@ fuzz_target!(|data: &[u8]| {
     let Ok(input) = std::str::from_utf8(data) else {
         return;
     };
-    let descriptor = if let Some(encoded) = input.strip_prefix("lkdev1_") {
+    let descriptor = if let Some(encoded) = input.strip_prefix("lkdev2_") {
         let Ok(bytes) = BASE64URL_NOPAD.decode(encoded.as_bytes()) else {
             return;
         };
@@ -23,7 +23,7 @@ fuzz_target!(|data: &[u8]| {
     let Ok(descriptor) = descriptor else {
         return;
     };
-    if descriptor.v == 1 {
+    if descriptor.v == 2 {
         if DeviceId::new(descriptor.device_id).is_err()
             || decode_key_len(&descriptor.signing_public_key_ed25519) != Some(32)
             || decode_key_len(&descriptor.sealing_public_key_x25519) != Some(32)
