@@ -92,21 +92,17 @@ jobs:
             ${{ runner.temp }}/locket/cargo
             ${{ runner.temp }}/locket/build/tools
           key: unsigned-${{ matrix.os }}-tauri-2.10.1-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-      - name: Install Cargo Steward v0.2.0
+      - name: Configure Cargo Steward wrapper
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          installer="$RUNNER_TEMP/install-cargo-steward.sh"
-          curl --fail --silent --show-error --location --retry 3 https://raw.githubusercontent.com/0xdoublesharp/cargo-steward/v0.2.0/scripts/install.sh -o "$installer"
-          sh "$installer" --release 0.2.0 --repo 0xdoublesharp/cargo-steward --no-setup
-          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
           if [[ -n "${RUSTC_WRAPPER:-}" && "$RUSTC_WRAPPER" != cargo-steward ]]; then
             printf 'CARGO_STEWARD_INNER=%s\n' "$RUSTC_WRAPPER" >> "$GITHUB_ENV"
           fi
           echo "RUSTC_WRAPPER=cargo-steward" >> "$GITHUB_ENV"
       - name: Track Cargo build cache
         if: runner.os != 'Windows'
-        uses: 0xdoublesharp/cargo-steward@v0.2.0
+        uses: 0xdoublesharp/cargo-steward@v0.2.2
         with:
           mode: start
           target-dir: ${{ runner.temp }}/locket/cargo
@@ -141,7 +137,7 @@ jobs:
           cargo test -p locket-desktop --release --all-targets --locked
       - name: Trim Cargo build cache
         if: runner.os != 'Windows'
-        uses: 0xdoublesharp/cargo-steward@v0.2.0
+        uses: 0xdoublesharp/cargo-steward@v0.2.2
         with:
           mode: trim
           target-dir: ${{ runner.temp }}/locket/cargo
