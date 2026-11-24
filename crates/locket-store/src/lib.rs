@@ -93,8 +93,7 @@ impl Store {
         Ok(Self { connection })
     }
 
-    /// Creates a fresh store at [`SCHEMA_VERSION`], opens one already at it, or
-    /// upgrades a version 6 store in place.
+    /// Creates a fresh store at [`SCHEMA_VERSION`] or opens one already at it.
     ///
     /// # Errors
     ///

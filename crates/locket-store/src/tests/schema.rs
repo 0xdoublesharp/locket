@@ -338,38 +338,32 @@ fn store_without_a_schema_ledger_is_rejected_unchanged() -> Result<(), Box<dyn E
 fn older_schema_version_is_rejected_unchanged() -> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;
     let mut store = Store::open(directory.path().join("store.db"))?;
-    store.initialize_schema()?;
+    store.connection().execute(
+        "CREATE TABLE schema_migrations (
+           version INTEGER PRIMARY KEY,
+           applied_at INTEGER NOT NULL
+         )",
+        [],
+    )?;
     store
         .connection()
-        .execute("DELETE FROM schema_migrations WHERE version = ?1", [i64::from(SCHEMA_VERSION)])?;
-    store
-        .connection()
-        .execute("INSERT INTO schema_migrations(version, applied_at) VALUES (?1, 1)", [5_i64])?;
+        .execute("INSERT INTO schema_migrations(version, applied_at) VALUES (0, 1)", [])?;
 
     match store.initialize_schema() {
         Err(StoreError::OutdatedSchema { found, supported }) => {
-            assert_eq!(found, 5);
+            assert_eq!(found, 0);
             assert_eq!(supported, SCHEMA_VERSION);
         }
         other => return Err(format!("unexpected schema result: {other:?}").into()),
     }
-    assert_eq!(store.current_schema_version()?, Some(5));
+    assert_eq!(store.current_schema_version()?, Some(0));
     Ok(())
 }
 
 #[test]
-fn schema_six_store_upgrades_to_current_with_existing_secrets() -> Result<(), Box<dyn Error>> {
+fn fresh_v1_schema_includes_expiry_and_audit_witness_tables() -> Result<(), Box<dyn Error>> {
     let mut test_store = open_initialized_store()?;
     insert_project_profile_secret(&test_store.store)?;
-    test_store.store.connection().execute_batch(
-        "DROP TABLE audit_witness_receipts;
-         ALTER TABLE secrets DROP COLUMN expires_at;
-         ALTER TABLE secrets DROP COLUMN rotate_after_days;
-         DELETE FROM schema_migrations;
-         INSERT INTO schema_migrations(version, applied_at) VALUES (6, 1);",
-    )?;
-
-    test_store.store.initialize_schema()?;
     assert_eq!(test_store.store.current_schema_version()?, Some(i64::from(SCHEMA_VERSION)));
     assert_eq!(
         test_store.store.get_secret_expiry_policy("lk_sec_test")?,
@@ -485,7 +479,7 @@ fn schema_migrations_applied_at_is_positive_integer() -> Result<(), Box<dyn Erro
 
 #[test]
 fn schema_version_constant_is_current() {
-    assert_eq!(SCHEMA_VERSION, 7);
+    assert_eq!(SCHEMA_VERSION, 1);
 }
 
 #[test]
