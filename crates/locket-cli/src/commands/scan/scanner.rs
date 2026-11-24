@@ -1,5 +1,6 @@
 //! Scan command implementation.
 
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
@@ -53,6 +54,8 @@ pub fn scan_command(
     let known_values = if args.require_known {
         let project = project.as_ref().ok_or_else(project_not_found_error)?;
         collect_known_secret_values(context, project, now_unix_nanos()?)?
+    } else if args.known_if_unlocked {
+        known_if_unlocked(context, project.as_ref())?
     } else {
         Vec::new()
     };
@@ -105,17 +108,26 @@ pub fn scan_command(
         writeln!(output, "scan: known-value coverage checked {} value(s)", known_values.len())?;
     }
 
-    if !suppressed.is_empty()
-        && let Some(project) = project.as_ref()
-    {
-        write_scan_suppression_audit(
-            context,
-            project,
-            &suppressed,
-            &findings,
-            args.staged,
-            scan_policy,
-        )?;
+    if let Some(project) = project.as_ref() {
+        if args.known_if_unlocked && !known_values.is_empty() {
+            write_known_hook_scan_audit(
+                context,
+                project,
+                if args.staged { "staged" } else { "tree" },
+                blocking_count,
+                warning_count,
+                suppressed.len(),
+            )?;
+        } else if !suppressed.is_empty() {
+            write_scan_suppression_audit(
+                context,
+                project,
+                &suppressed,
+                &findings,
+                args.staged,
+                scan_policy,
+            )?;
+        }
     }
 
     if blocking_count > 0 {
@@ -178,6 +190,39 @@ fn format_suppressed_finding(finding: &SuppressedFinding) -> String {
             finding.path_label, finding.line, finding.column, finding.rule_id, finding.reason,
         )
     }
+}
+
+fn write_known_hook_scan_audit(
+    context: &RuntimeContext,
+    project: &ResolvedProject,
+    scope: &str,
+    blocking: usize,
+    warning: usize,
+    suppressed: usize,
+) -> Result<(), CliError> {
+    let mut store = open_store(context)?;
+    let project_id = project.config.project_id.as_str();
+    let key = load_project_key(context, &store, project_id, KeyPurpose::Audit)?;
+    let status = if blocking == 0 { "SUCCESS" } else { "FAILED" };
+    let metadata = json!({
+        "schema_version": 1, "action": "SCAN", "status": status, "command": "scan",
+        "scope": scope, "known_value_coverage": "unlocked", "pattern_only": false,
+        "finding_counts": { "blocking": blocking, "warning": warning, "suppressed": suppressed },
+    });
+    store.append_audit(
+        key.as_ref(),
+        &AuditWrite {
+            project_id,
+            profile_id: None,
+            action: "SCAN",
+            status,
+            secret_name: None,
+            command: Some("scan"),
+            metadata_json: &metadata,
+            timestamp: now_unix_nanos()?,
+        },
+    )?;
+    Ok(())
 }
 
 fn write_scan_suppression_audit(
@@ -324,30 +369,159 @@ fn scan_staged_path(
             continue;
         }
 
-        let spec = format!(":{path}");
-        let object_type =
-            String::from_utf8_lossy(&git_output(git_root, ["cat-file", "-t", &spec])?)
-                .trim()
-                .to_owned();
-        if object_type != "blob" {
-            continue;
-        }
+        scan_git_blob(
+            git_root,
+            &format!(":{path}"),
+            &path,
+            known_values,
+            entropy_rule,
+            findings,
+            suppressed,
+        )?;
+    }
+    Ok(())
+}
 
-        let contents = git_output(git_root, ["cat-file", "-p", &spec])?;
-        match String::from_utf8(contents) {
-            Ok(text) => {
-                let mut file_findings = scan_text_with_entropy_rule(&path, &text, entropy_rule);
-                file_findings.extend(scan_known_values(&path, &text, known_values));
-                let result = partition_inline_suppressions_strict(&text, file_findings)
-                    .map_err(|error| metadata_invalid_error(error.to_string()))?;
-                findings.extend(result.kept);
-                suppressed.extend(result.suppressed);
-            }
-            Err(_) => findings.extend(scan_text_with_entropy_rule(&path, "", entropy_rule)),
-        }
+fn scan_git_blob(
+    git_root: &Path,
+    spec: &str,
+    path: &str,
+    known_values: &[zeroize::Zeroizing<String>],
+    entropy_rule: EntropyRule,
+    findings: &mut Vec<ScanFinding>,
+    suppressed: &mut Vec<SuppressedFinding>,
+) -> Result<(), CliError> {
+    let object_type =
+        String::from_utf8_lossy(&git_output(git_root, ["cat-file", "-t", spec])?).trim().to_owned();
+    if object_type != "blob" {
+        return Ok(());
     }
 
+    let contents = zeroize::Zeroizing::new(git_output(git_root, ["cat-file", "-p", spec])?);
+    match std::str::from_utf8(&contents) {
+        Ok(text) => {
+            let mut file_findings = scan_text_with_entropy_rule(path, text, entropy_rule);
+            file_findings.extend(scan_known_values(path, text, known_values));
+            let result = partition_inline_suppressions_strict(text, file_findings)
+                .map_err(|error| metadata_invalid_error(error.to_string()))?;
+            findings.extend(result.kept);
+            suppressed.extend(result.suppressed);
+        }
+        Err(_) => findings.extend(scan_text_with_entropy_rule(path, "", entropy_rule)),
+    }
     Ok(())
+}
+
+fn known_if_unlocked(
+    context: &RuntimeContext,
+    project: Option<&ResolvedProject>,
+) -> Result<Vec<zeroize::Zeroizing<String>>, CliError> {
+    let Some(project) = project else { return Ok(Vec::new()) };
+    let id = project.config.project_id.as_str();
+    if context.master_key_cache.get(id).is_none() {
+        let Ok(key) = context.key_store.load_master_key(id) else { return Ok(Vec::new()) };
+        context.master_key_cache.insert(id, key, crate::MasterKeySource::OsKeyStore);
+    }
+    Ok(collect_known_secret_values(context, project, now_unix_nanos()?).unwrap_or_default())
+}
+
+pub fn scan_push(
+    context: &RuntimeContext,
+    output: &mut impl io::Write,
+    root: &Path,
+    input: &mut impl io::BufRead,
+) -> Result<(), CliError> {
+    let project = resolve_project(root)?;
+    let policy = project
+        .as_ref()
+        .map(|project| read_scan_policy(&project.root.join(crate::LOCKET_TOML)))
+        .transpose()?
+        .unwrap_or_default();
+    let known_values = known_if_unlocked(context, project.as_ref())?;
+    let ignore = locket_ignore(root)?;
+    let mut findings = Vec::new();
+    let mut suppressed = Vec::new();
+    let mut commits = BTreeSet::new();
+    for line in io::BufRead::lines(input) {
+        let line = line?;
+        let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
+        let [_, local, _, remote] = fields.as_slice() else {
+            return Err(metadata_invalid_error("invalid Git pre-push input"));
+        };
+        if !valid_oid(local) || !valid_oid(remote) {
+            return Err(metadata_invalid_error("invalid Git pre-push object id"));
+        }
+        if zero_oid(local) {
+            continue;
+        }
+        let mut revisions = vec!["rev-list", *local];
+        if !zero_oid(remote) && git_output(root, ["cat-file", "-e", remote]).is_ok() {
+            revisions.extend(["--not", remote]);
+        }
+        for commit in String::from_utf8_lossy(&git_output(root, revisions)?).lines() {
+            commits.insert(commit.to_owned());
+        }
+    }
+    for commit in commits {
+        let paths = git_output(
+            root,
+            [
+                "diff-tree",
+                "--root",
+                "-m",
+                "-r",
+                "--no-commit-id",
+                "--name-only",
+                "-z",
+                "--diff-filter=ACMRT",
+                &commit,
+            ],
+        )?;
+        for path in paths.split(|byte| *byte == 0).filter(|path| !path.is_empty()) {
+            let path = String::from_utf8_lossy(path);
+            if ignore.matched_path_or_any_parents(path.as_ref(), false).is_ignore()
+                || should_skip_scan_path(Path::new(path.as_ref()))
+            {
+                continue;
+            }
+            scan_git_blob(
+                root,
+                &format!("{commit}:{path}"),
+                &path,
+                &known_values,
+                policy.entropy_rule,
+                &mut findings,
+                &mut suppressed,
+            )?;
+        }
+    }
+    for finding in &findings {
+        writeln!(output, "{}", format_finding_with_policy(finding, policy))?;
+    }
+    let blocking = severity_count(&findings, policy, Severity::Blocking);
+    if let Some(project) = project.as_ref().filter(|_| !known_values.is_empty()) {
+        write_known_hook_scan_audit(
+            context,
+            project,
+            "pre-push",
+            blocking,
+            severity_count(&findings, policy, Severity::Warning),
+            suppressed.len(),
+        )?;
+    }
+    if blocking > 0 {
+        return Err(scan_finding_blocked_error(format!("push blocked by {blocking} finding(s)")));
+    }
+    writeln!(output, "push scan: {} finding(s)", findings.len())?;
+    Ok(())
+}
+
+fn valid_oid(oid: &str) -> bool {
+    matches!(oid.len(), 40 | 64) && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn zero_oid(oid: &str) -> bool {
+    oid.bytes().all(|byte| byte == b'0')
 }
 
 pub fn read_scan_entropy_rule(path: &Path) -> Result<EntropyRule, CliError> {

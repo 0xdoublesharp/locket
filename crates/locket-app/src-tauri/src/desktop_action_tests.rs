@@ -259,6 +259,35 @@ fn terminal_script_quotes_adversarial_paths_and_policy() {
 }
 
 #[test]
+fn terminal_commands_pin_only_the_dev_instance() {
+    let (cli, root) = (Path::new("/bin/locket"), Path::new("/project"));
+    for args in [&["run", "dev"][..], &["scan", "--require-known"][..]] {
+        let dev = terminal_command_script_for(LocketInstance::Dev, cli, root, args);
+        assert!(dev.starts_with("export LOCKET_INSTANCE='dev'\n"));
+        let installed = terminal_command_script_for(LocketInstance::Installed, cli, root, args);
+        assert!(!installed.contains("LOCKET_INSTANCE"));
+    }
+    let dev = posix_terminal_command_for(LocketInstance::Dev, cli, root, &["run", "dev"]);
+    assert_eq!(dev[..2], ["/usr/bin/env".into(), std::ffi::OsString::from("LOCKET_INSTANCE=dev")]);
+    let installed =
+        posix_terminal_command_for(LocketInstance::Installed, cli, root, &["run", "dev"]);
+    assert_eq!(installed, ["/bin/locket", "run", "dev"].map(std::ffi::OsString::from));
+}
+
+#[test]
+#[cfg(unix)]
+fn dev_terminal_launcher_reaches_cli_with_dev_instance_without_inherited_env()
+-> Result<(), Box<dyn Error>> {
+    let f = Fixture::new()?;
+    let cli = executable(&f.root, "printf '%s' \"$LOCKET_INSTANCE\" > terminal-instance")?;
+    let launcher = write_terminal_launcher(&cli, &f.root, &["run", "dev"])?;
+    let result = Command::new("/bin/sh").arg(launcher.path()).env_clear().status()?;
+    assert!(result.success());
+    assert_eq!(fs::read_to_string(f.root.join("terminal-instance"))?, "dev");
+    Ok(())
+}
+
+#[test]
 fn scoped_status_preserves_agent_lock_state_and_only_enriches_verified_context()
 -> Result<(), Box<dyn Error>> {
     let f = Fixture::new()?;
@@ -295,6 +324,7 @@ fn windows_terminal_receives_only_encoded_untrusted_content() -> Result<(), Box<
     let command = String::from_utf16(&units)?;
     assert!(command.contains("Set-Location -LiteralPath 'C:\\root; '' $(oops)'"));
     assert!(command.contains("'task''; write-host nope'"));
+    assert!(command.starts_with("$env:LOCKET_INSTANCE = 'dev'; Set-Location"));
     Ok(())
 }
 
@@ -323,7 +353,7 @@ fn scan_terminal_script_quotes_hostile_paths_and_keeps_fixed_arguments() {
         &["scan", "--require-known"],
     );
     assert!(script.starts_with(
-        "#!/bin/sh\n/bin/rm -- \"$0\"\ncd -- '/project/a'\\''b\n$(oops); `oops`' && '/bin/locket '\\''$(touch nope)'\\''' 'scan' '--require-known'\n"
+        "#!/bin/sh\n/bin/rm -- \"$0\"\nexport LOCKET_INSTANCE='dev'\ncd -- '/project/a'\\''b\n$(oops); `oops`' && '/bin/locket '\\''$(touch nope)'\\''' 'scan' '--require-known'\n"
     ));
 }
 
@@ -409,7 +439,7 @@ fn scan_windows_terminal_encodes_paths_and_fixed_argv() -> Result<(), Box<dyn Er
         bytes.as_chunks::<2>().0.iter().map(|pair| u16::from_le_bytes(*pair)).collect();
     assert_eq!(
         String::from_utf16(&units)?,
-        "Set-Location -LiteralPath 'C:\\root; '' $(oops)\n`oops`' -ErrorAction Stop; & 'C:\\cli''; write-host nope\\locket.exe' 'scan' '--require-known'; $scanExit = $LASTEXITCODE; Read-Host \"Scan finished (exit $scanExit). Press Enter to close\" | Out-Null; exit $scanExit"
+        "$env:LOCKET_INSTANCE = 'dev'; Set-Location -LiteralPath 'C:\\root; '' $(oops)\n`oops`' -ErrorAction Stop; & 'C:\\cli''; write-host nope\\locket.exe' 'scan' '--require-known'; $scanExit = $LASTEXITCODE; Read-Host \"Scan finished (exit $scanExit). Press Enter to close\" | Out-Null; exit $scanExit"
     );
     Ok(())
 }

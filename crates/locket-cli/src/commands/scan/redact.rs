@@ -218,7 +218,6 @@ pub struct RedactedBytes {
     pub invalid_utf8_passthrough: bool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn redact_stdin_bytes(
     input: &[u8],
     known_redactions: &[KnownSecretRedaction],

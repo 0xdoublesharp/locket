@@ -6,6 +6,7 @@
 
 mod error;
 mod hardening;
+mod instance;
 mod ipc;
 mod session;
 mod storage;
@@ -25,7 +26,10 @@ pub(crate) use verification::{passkey, user_verification};
 #[cfg(target_os = "windows")]
 pub(crate) use verification::{windows_local_authentication, windows_user_verifier};
 
-pub use agent_pipe::{AGENT_PIPE_PREFIX, agent_pipe_dacl_sddl_for_sid, agent_pipe_name_for_sid};
+pub use agent_pipe::{
+    AGENT_PIPE_PREFIX, agent_pipe_dacl_sddl_for_sid, agent_pipe_name_for_instance,
+    agent_pipe_name_for_sid,
+};
 pub use automation_client_key::{
     AutomationClientKeyStore, AutomationClientKeychainRef, KeyringAutomationClientKeyStore,
     MemoryAutomationClientKeyStore,
@@ -37,6 +41,7 @@ pub use device_private_key::{
 };
 pub use error::PlatformError;
 pub use fs_helpers::{secure_directory, write_user_only_file};
+pub use instance::{INSTANCE_ENV, LocketInstance};
 pub use locked_vault_audit::{
     DEGRADED_AUDIT_LOG_FILENAME, DEGRADED_AUDIT_LOG_MAX_ROTATIONS, DEGRADED_AUDIT_LOG_ROTATE_BYTES,
     DEGRADED_AUDIT_LOG_SCHEMA_VERSION, LockedVaultAuditLogger, LockedVaultDenialRow,
@@ -48,10 +53,9 @@ pub use master_key::{
 };
 pub use memory_lock::{MemoryLockHardening, lock_process_memory, memory_lock_hardening_state};
 pub use passkey::{
-    DefaultPlatformPasskeyRegistrar, KeyringPlatformPasskeyRegistrar, MemoryPlatformPasskeyOutcome,
-    MemoryPlatformPasskeyRegistrar, PasskeyAssertionContext, PasskeyRegistration,
-    PlatformPasskeyRegistrar, UnavailablePlatformPasskeyRegistrar,
-    default_platform_passkey_registrar,
+    DefaultPlatformPasskeyRegistrar, MemoryPlatformPasskeyOutcome, MemoryPlatformPasskeyRegistrar,
+    PasskeyAssertionContext, PasskeyRegistration, PlatformPasskeyRegistrar,
+    UnavailablePlatformPasskeyRegistrar, default_platform_passkey_registrar,
 };
 pub use passphrase::PassphraseFallbackMasterKeyStore;
 pub use process::{
@@ -62,8 +66,8 @@ pub use process::{
 pub use process::{terminate_windows_process, windows_process_is_live};
 pub use recovery::{
     RECOVERY_KDF_TOML_VERSION, RecoveryEnvelope, RecoveryEnvelopeEntry, RecoveryKdfToml,
-    decode_recovery_state, load_recovery_envelope, load_recovery_kdf_toml, save_recovery_envelope,
-    save_recovery_kdf_toml, save_recovery_state,
+    decode_recovery_state, load_recovery_envelope, load_recovery_kdf_toml, load_recovery_state,
+    save_recovery_envelope, save_recovery_state,
 };
 pub use session::{
     NativeSessionEvent, NativeSessionNotification, SessionObserver, run_with_native_session_loop,

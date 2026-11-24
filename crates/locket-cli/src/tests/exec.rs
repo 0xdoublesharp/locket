@@ -350,6 +350,114 @@ inherit_env = ["PATH"]
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn run_redacts_child_stdout_and_stderr() -> Result<(), Box<dyn std::error::Error>> {
+    const SECRET: &str = "fixture/token+with:symbols";
+    const URL_ENCODED: &str = "fixture%2Ftoken%2Bwith%3Asymbols";
+    const CHILD_MODE: &str = "LOCKET_TEST_CHILD_REDACTION";
+    if let Ok(mode) = std::env::var(CHILD_MODE) {
+        let directory = tempdir()?;
+        let context = protected_run_fixture(
+            &directory,
+            &format!(
+                "printf 'raw=%s' \"${{API_KEY%/*}}\"; printf '/%s\\n' \"${{API_KEY#*/}}\"; printf 'encoded=%s\\n' '{}'; printf 'url=%s\\n' '{}' >&2; exit 23",
+                data_encoding::BASE64.encode(SECRET.as_bytes()),
+                URL_ENCODED,
+            ),
+            SECRET,
+        )?;
+        let cli = if mode == "flag" {
+            Cli::try_parse_from(["locket", "run", "--redact-output", "protected_run"])?
+        } else {
+            Cli::try_parse_from(["locket", "run", "protected_run"])?
+        };
+        let result = run_with_context(cli, &context, &mut Vec::new());
+        assert!(matches!(result, Err(error) if error.exit_code() == 23));
+        return Ok(());
+    }
+
+    for (mode, env_value) in [("flag", "0"), ("env", "1")] {
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", "tests::exec::run_redacts_child_stdout_and_stderr", "--nocapture"])
+            .env(CHILD_MODE, mode)
+            .env("LOCKET_REDACT_OUTPUT", env_value)
+            .output()?;
+        assert!(output.status.success(), "child fixture failed");
+        let stdout = String::from_utf8(output.stdout)?;
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(stdout.contains("raw=[REDACTED:locket]"));
+        assert!(stdout.contains("encoded=[REDACTED:locket]"));
+        assert!(stderr.contains("url=[REDACTED:locket]"));
+        for value in [SECRET, URL_ENCODED, &data_encoding::BASE64.encode(SECRET.as_bytes())] {
+            assert!(!stdout.contains(value));
+            assert!(!stderr.contains(value));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn run_egress_validates_bindings_and_injects_placeholder() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempdir()?;
+    let context = protected_run_fixture(
+        &directory,
+        r#"case "$API_KEY" in lk_egress_*) ;; *) exit 1 ;; esac; case "$HTTP_PROXY" in http://*@127.0.0.1:*) ;; *) exit 2 ;; esac; test "$HTTPS_PROXY" = "$http_proxy" && test "$https_proxy" = "$HTTP_PROXY" && test -z "$NO_PROXY$no_proxy" && : > child-ran"#,
+        "fixture-egress-credential",
+    )?;
+
+    for bad in [
+        "API_KEY",
+        "=example.com",
+        "API_KEY=",
+        "API_KEY=https://example.com/path",
+        "MISSING=example.com",
+    ] {
+        let cli = Cli::try_parse_from(["locket", "run", "--egress-host", bad, "protected_run"])?;
+        let result = run_with_context(cli, &context, &mut Vec::new());
+        assert!(matches!(
+            result,
+            Err(crate::CliError::Typed { kind: locket_core::LocketError::MetadataInvalid, .. })
+        ));
+        assert!(!directory.path().join("child-ran").exists());
+    }
+    let cli = Cli::try_parse_from([
+        "locket",
+        "run",
+        "--egress-host",
+        "API_KEY=example.com",
+        "--egress-host",
+        "API_KEY=*.example.net",
+        "protected_run",
+    ])?;
+    run_with_context(cli, &context, &mut Vec::new())?;
+    assert!(directory.path().join("child-ran").is_file());
+    Ok(())
+}
+
+#[cfg(unix)]
+fn protected_run_fixture(
+    directory: &tempfile::TempDir,
+    script: &str,
+    secret: &str,
+) -> Result<crate::runtime::RuntimeContext, Box<dyn std::error::Error>> {
+    let context = test_context(directory);
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--name", "app", "--profile", "dev"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    crate::set_secret_value(&context, &test_secret_write_args("API_KEY"), secret, "manual", 1_000)?;
+    let argv = serde_json::to_string(&[test_shell(), "-c", script])?;
+    writeln!(
+        std::fs::OpenOptions::new().append(true).open(directory.path().join("locket.toml"))?,
+        "\n[commands.protected_run]\nargv = {argv}\nrequired_secrets = ['API_KEY']\nenv_mode = 'strict'",
+    )?;
+    Ok(context)
+}
+
 #[test]
 fn run_policy_audit_records_selected_source_by_precedence_without_values()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -1078,6 +1186,7 @@ required_secrets = ["DATABASE_URL"]
 optional_secrets = ["API_KEY", "LOG_LEVEL", "PORT"]
 external_env_sources = ["compose"]
 env_mode = "strict"
+inherit_env = ["INHERITED"]
 "#
         .replace("/bin/sh", test_shell())
         .replace("/usr/bin/true", test_true())),
@@ -1086,13 +1195,17 @@ env_mode = "strict"
     let project_root = tempdir()?;
     let args = [
         "-c",
-        r#"printf '%s' '{"environment":{"LOG_LEVEL":"debug","PORT":5432,"NOT_ALLOWED":"denied"},"services":{"web":{"environment":{"DATABASE_URL":"from-compose"}},"worker":{"environment":["API_KEY=from-compose-array","IGNORED=denied"]}}}'"#,
+        r#"test -z "${AWS_SECRET_ACCESS_KEY+x}" && test "$DOCKER_CONTEXT" = fixture && test "$INHERITED" = fixture && test "$API_KEY" = fixture && printf '%s' '{"environment":{"LOG_LEVEL":"debug","PORT":5432,"NOT_ALLOWED":"denied"},"services":{"web":{"environment":{"DATABASE_URL":"from-compose"}},"worker":{"environment":["API_KEY=from-compose-array","IGNORED=denied"]}}}'"#,
     ];
     let command = crate::ComposeConfigCommand::new(Path::new(test_shell()), &args);
 
+    let parent_env = ["AWS_SECRET_ACCESS_KEY", "DOCKER_CONTEXT", "INHERITED", "API_KEY"]
+        .into_iter()
+        .map(|name| (name.to_owned(), zeroize::Zeroizing::new("fixture".to_owned())))
+        .collect();
     let external_env = crate::resolve_policy_external_env_with_compose_config_command(
         policy,
-        &locket_exec::EnvMap::new(),
+        &parent_env,
         project_root.path(),
         &command,
         None,

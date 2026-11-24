@@ -19,7 +19,6 @@ locket-core = { version = "0.1.1", path = "../locket-core" }
 locket-platform = { version = "0.1.1", path = "../locket-platform" }
 locket-store = { version = "0.1.1", path = "../locket-store" }
 data-encoding = { workspace = true }
-directories = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
 rusqlite = { workspace = true }

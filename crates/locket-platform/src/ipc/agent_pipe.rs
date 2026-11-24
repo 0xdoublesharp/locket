@@ -7,20 +7,33 @@
 
 use std::borrow::Cow;
 
-use crate::PlatformError;
+use crate::{LocketInstance, PlatformError};
 
-/// Windows named-pipe prefix for the local agent endpoint.
+/// Windows named-pipe prefix for the installed agent endpoint.
 pub const AGENT_PIPE_PREFIX: &str = r"\\.\pipe\locket-agent-";
 
-/// Returns the spec-mandated Windows named-pipe path for a user SID.
+/// Returns the spec-mandated installed Windows named-pipe path for a user SID.
 ///
 /// # Errors
 ///
 /// Returns [`PlatformError::InvalidWindowsSid`] when `sid` is empty,
 /// malformed, or would produce an overlong pipe path.
 pub fn agent_pipe_name_for_sid(sid: &str) -> Result<String, PlatformError> {
+    agent_pipe_name_for_instance(LocketInstance::Installed, sid)
+}
+
+/// Returns the Windows named-pipe path for a user SID in `instance`.
+///
+/// # Errors
+///
+/// Returns [`PlatformError::InvalidWindowsSid`] when `sid` is empty,
+/// malformed, or would produce an overlong pipe path.
+pub fn agent_pipe_name_for_instance(
+    instance: LocketInstance,
+    sid: &str,
+) -> Result<String, PlatformError> {
     let sid = validate_sid_fragment(sid)?;
-    let pipe_name = format!("{AGENT_PIPE_PREFIX}{sid}");
+    let pipe_name = format!("{}{sid}", instance.agent_pipe_prefix());
     if pipe_name.len() > 256 {
         return Err(PlatformError::InvalidWindowsSid);
     }
@@ -71,7 +84,7 @@ pub fn current_user_sid_string() -> Result<String, PlatformError> {
 /// user's SID cannot be read.
 #[cfg(target_os = "windows")]
 pub fn default_agent_pipe_name() -> Result<String, PlatformError> {
-    agent_pipe_name_for_sid(&current_user_sid_string()?)
+    agent_pipe_name_for_instance(LocketInstance::current(), &current_user_sid_string()?)
 }
 
 /// Creates a Windows named-pipe server with a protected DACL SDDL.
@@ -452,13 +465,25 @@ mod windows_impl {
 
 #[cfg(test)]
 mod tests {
-    use super::{agent_pipe_dacl_sddl_for_sid, agent_pipe_name_for_sid};
+    use super::{
+        agent_pipe_dacl_sddl_for_sid, agent_pipe_name_for_instance, agent_pipe_name_for_sid,
+    };
+    use crate::LocketInstance;
 
     #[test]
     fn agent_pipe_name_uses_sid_suffix() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(
             agent_pipe_name_for_sid("S-1-5-21-1000")?,
             r"\\.\pipe\locket-agent-S-1-5-21-1000"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dev_agent_pipe_name_is_separate() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            agent_pipe_name_for_instance(LocketInstance::Dev, "S-1-5-21-1000")?,
+            r"\\.\pipe\locket-dev-agent-S-1-5-21-1000"
         );
         Ok(())
     }

@@ -12,6 +12,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::envelope::{ErrorEnvelope, RequestEnvelope, ResponseEnvelope, SuccessEnvelope};
+use crate::keys::{KeyError, cached_master_key, unwrap_audit_key_with_master};
 
 const PRIVACY_REDACT_NAMES: &str = "privacy.redact_names";
 const AGENT_UNLOCK_TTL: &str = "agent.unlock_ttl";
@@ -166,6 +167,8 @@ enum ConfigRpcError {
     #[error("profile not found")]
     ProfileNotFound,
     #[error(transparent)]
+    Key(#[from] KeyError),
+    #[error(transparent)]
     Store(#[from] locket_store::StoreError),
     #[error(transparent)]
     Io(#[from] io::Error),
@@ -185,6 +188,7 @@ impl ConfigRpcError {
             | Self::TomlSerialize(_) => "MetadataInvalid",
             Self::UnlockRequired => "UnlockRequired",
             Self::ProfileNotFound => "ProfileNotFound",
+            Self::Key(_) => "AuditIntegrityFailed",
             Self::Store(error) => match error.locket_error() {
                 locket_core::LocketError::StorageBusy => "StorageBusy",
                 locket_core::LocketError::SchemaNewerThanBinary => "SchemaNewerThanBinary",
@@ -257,7 +261,9 @@ async fn write_settings(
     now_unix_nanos: i128,
 ) -> Result<WriteConfigResponse, ConfigRpcError> {
     let timestamp = i64::try_from(now_unix_nanos).unwrap_or(i64::MAX);
-    let audit_key = audit_key_for_project(state, &request.project_id, now_unix_nanos).await?;
+    let master_key = cached_master_key(state, &request.project_id, now_unix_nanos)
+        .await?
+        .ok_or(ConfigRpcError::UnlockRequired)?;
     let mut config = read_config_table(&request.config_path)?;
     let mut changed_keys = Vec::new();
 
@@ -301,6 +307,7 @@ async fn write_settings(
     }
 
     let mut store = Store::open(&request.store_path)?;
+    let audit_key = unwrap_audit_key_with_master(&store, &request.project_id, &master_key)?;
     if !changed_keys.is_empty() {
         write_config_table(&request.config_path, &config)?;
         for key in &changed_keys {
@@ -309,7 +316,7 @@ async fn write_settings(
                 &request.project_id,
                 &request.config_path,
                 key,
-                &audit_key,
+                audit_key.as_ref(),
                 timestamp,
             )?;
         }
@@ -320,7 +327,7 @@ async fn write_settings(
             ConfigRpcError::Protocol("profile_name is required for dangerous_profile".to_owned())
         })?;
         let audit = locket_store::ProfileDangerousAudit {
-            audit_key: &audit_key,
+            audit_key: audit_key.as_ref(),
             timestamp,
             command: "agent config",
         };
@@ -343,20 +350,6 @@ async fn write_settings(
         request.profile_name.as_deref(),
     )?;
     Ok(WriteConfigResponse { settings, changed_keys })
-}
-
-async fn audit_key_for_project(
-    state: &crate::server::AgentSocketState,
-    project_id: &str,
-    now_unix_nanos: i128,
-) -> Result<Vec<u8>, ConfigRpcError> {
-    let cache = state.unlock_cache.lock().await;
-    let Some(entry) = cache.lookup(project_id, now_unix_nanos) else {
-        return Err(ConfigRpcError::UnlockRequired);
-    };
-    let key_bytes = entry.key_bytes().to_vec();
-    drop(cache);
-    Ok(key_bytes)
 }
 
 fn push_bool_patch(
@@ -589,6 +582,8 @@ mod tests {
         store
             .insert_profile_if_absent("lk_prof_default", "lk_proj_test", "default", false, 200)
             .expect("insert profile");
+        crate::tests::insert_wrapped_audit_key(&store, "lk_proj_test", &[42; 32], &[11; 32])
+            .expect("wrap audit key");
         store
     }
 

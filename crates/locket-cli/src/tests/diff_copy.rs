@@ -200,6 +200,8 @@ fn diff_since_ignores_access_audit_rows() -> Result<(), Box<dyn std::error::Erro
     crate::set_secret_value(&context, &db_args, "postgres://localhost/dev", "manual", 1_000)?;
 
     let copy_args = crate::GetArgs {
+        project: None,
+        profile: None,
         key: "DATABASE_URL".to_owned(),
         source: crate::SourceArg { source: None },
         reveal: false,
@@ -514,6 +516,7 @@ fn copy_picks_highest_precedence_source_when_unambiguous() -> Result<(), Box<dyn
     let user_local_args = test_secret_write_args("API_KEY");
     crate::set_secret_value(&context, &user_local_args, "user-value", "manual", 1_000)?;
     let machine_local_args = crate::SecretWriteArgs {
+        target: crate::commands::secrets::set::WriteTargetArgs::default(),
         key: "API_KEY".to_owned(),
         source: crate::SourceArg { source: Some(crate::SecretSourceArg::MachineLocal) },
         metadata: crate::SecretMetadataFlags {
@@ -562,6 +565,7 @@ fn copy_resolves_explicit_from_source_over_default_precedence()
     let user_local_args = test_secret_write_args("API_KEY");
     crate::set_secret_value(&context, &user_local_args, "user-value", "manual", 1_000)?;
     let machine_local_args = crate::SecretWriteArgs {
+        target: crate::commands::secrets::set::WriteTargetArgs::default(),
         key: "API_KEY".to_owned(),
         source: crate::SourceArg { source: Some(crate::SecretSourceArg::MachineLocal) },
         metadata: crate::SecretMetadataFlags {
@@ -604,6 +608,7 @@ fn copy_to_source_falls_back_to_user_local_when_target_missing()
         &mut Vec::new(),
     )?;
     let machine_local_args = crate::SecretWriteArgs {
+        target: crate::commands::secrets::set::WriteTargetArgs::default(),
         key: "API_KEY".to_owned(),
         source: crate::SourceArg { source: Some(crate::SecretSourceArg::MachineLocal) },
         metadata: crate::SecretMetadataFlags {

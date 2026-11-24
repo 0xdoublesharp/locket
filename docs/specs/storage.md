@@ -18,7 +18,7 @@ Use SQLite through `rusqlite`. Encrypted secret blobs live in the SQLite `blobs`
 
 Each project stores recovery material under `<project>/.locket/recovery/`, outside the shared user store. Its `envelope.bin` contains the KDF metadata plus the encrypted master, device and managed automation-client keys. Keep an independent backup of this encrypted file and its recovery code. The directory must never contain plaintext keys, plaintext secrets, or the recovery code itself.
 
-New recovery state embeds KDF TOML and the inner encrypted envelope in one `envelope.bin`, using the container specified in [crypto.md](crypto.md). Rotation syncs a new file, then atomically replaces the prior file. A crash cannot commit only one half of a pair. Legacy backups with separate `kdf.toml` and raw `envelope.bin` remain readable; for those backups both files are required. Any legacy `kdf.toml` beside a modern container is non-authoritative. KDF and inner envelope profile IDs must match or recovery fails closed. SQLite stores no recovery-code salt, recovery-code verifier, or recovery unwrap key.
+Recovery state embeds KDF TOML and the inner encrypted envelope in one `envelope.bin`, using the container specified in [crypto.md](crypto.md). Rotation syncs a new file, then atomically replaces the prior file. A crash cannot commit only one half of a pair. An `envelope.bin` without the container header, or a separate `kdf.toml`, is not read. KDF and inner envelope profile IDs must match or recovery fails closed. SQLite stores no recovery-code salt, recovery-code verifier, or recovery unwrap key.
 
 Required tables:
 
@@ -121,12 +121,12 @@ CREATE TABLE automation_client_nonces (
 );
 ```
 
-`Vec<u8>` fields use SQLite `BLOB`; opaque ids and enum values use `TEXT`; `Timestamp` uses `INTEGER` UTC Unix nanoseconds; version numbers use `INTEGER` with the u32 range check above. Full migrations may add indexes, triggers, and additional tables, but they must preserve these column meanings and constraints.
+`Vec<u8>` fields use SQLite `BLOB`; opaque ids and enum values use `TEXT`; `Timestamp` uses `INTEGER` UTC Unix nanoseconds; version numbers use `INTEGER` with the u32 range check above. The bootstrap may add indexes, triggers, and additional tables, but it must preserve these column meanings and constraints.
 
 Rules:
 
 - Use explicit transactions for operations that update metadata, encrypted blobs, fingerprints, and audit rows together.
-- Version schema migrations from the first implementation.
+- Record the store schema version in `schema_migrations`.
 - Secret version numbers are 1-indexed. The initial version is `1`; every rotation increments by exactly one. Version `0` is invalid in CLI flags, `lk://...@vN` references, storage APIs, and import/export manifests.
 - Secret updates create a new version. The current version pointer advances atomically with the encrypted blob write.
 - Prior versions may remain for rotation/history, but their values are never displayed by `history`.
@@ -145,14 +145,12 @@ Rules:
 - SQLite must enable foreign keys, use WAL mode where available, configure a 5000 ms busy timeout by default, and run integrity checks through `locket doctor`.
 - Required indexes include project/profile/name lookups for secrets, secret/version lookups for blobs and fingerprints, audit sequence ordering, trusted root hash lookup, and bundle/import conflict lookup by profile/name/version.
 
-Schema migrations:
+Schema versions:
 
-- Each migration writes a `SCHEMA_MIGRATE` audit row when project context is available.
-- Before any migration that mutates schema or persistent data, Locket creates a local pre-migration backup of `store.db` and recovery metadata with user-only permissions, or requires explicit user confirmation if a safe backup cannot be created.
-- Failed migrations must roll back completely or leave the store read-only with a clear failure mode.
-- Migrations must be idempotent, transactional where SQLite permits it, and declare the minimum and maximum schema versions they can read.
-- `locket doctor` reports pending, failed, or backup-skipped migrations and the path of the latest pre-migration backup when one exists.
-- Downgrades are not supported against a mutable store; older binaries must fail closed when the schema is newer.
+- A new store is created at the current schema version. A store at the current version opens, and a version 6 store is upgraded in place by adding the version 7 `secrets.expires_at` and `secrets.rotate_after_days` columns and the `audit_witness_receipts` table. Locket keeps no other migrations.
+- A store without a schema ledger, or older than version 6, fails with `OutdatedSchema` and is left unchanged. Move it aside and run `locket init`.
+- A store with a newer version fails closed with `UnsupportedSchema`.
+- Opening an existing store at the current version may create missing tables and indexes with `CREATE ... IF NOT EXISTS`; it never alters existing columns.
 
 Component checks:
 

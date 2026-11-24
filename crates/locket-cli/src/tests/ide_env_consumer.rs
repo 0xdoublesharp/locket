@@ -19,7 +19,7 @@ use super::*;
 struct IdeTestAgent {
     shutdown: Arc<tokio::sync::Notify>,
     handle: std::thread::JoinHandle<Result<(), String>>,
-    ide_registry: locket_agent::IdeEnvSessionRegistry,
+    ide_registry: Arc<tokio::sync::Mutex<locket_agent::IdeEnvSessionRegistry>>,
 }
 
 impl IdeTestAgent {

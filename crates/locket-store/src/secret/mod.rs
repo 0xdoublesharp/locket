@@ -2,8 +2,13 @@
 
 use crate::audit::AuditContext;
 
+mod discovery;
+mod expiry;
 mod lifecycle;
 mod queries;
+
+pub use discovery::{DiscoveredSecretRecord, SecretDiscoveryFilter};
+pub use expiry::{SecretExpirationNotice, SecretExpiryPolicy, SecretExpiryStatus};
 
 /// Secret metadata row.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -178,6 +183,45 @@ pub enum SecretCopyTarget<'a> {
         /// Metadata to apply to the superseded target version.
         deprecation: VersionDeprecation,
     },
+}
+
+/// Complete mutable metadata written when creating or rotating a secret.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SecretInitialMetadata<'a> {
+    /// Optional description.
+    pub description: Option<&'a str>,
+    /// Optional owner.
+    pub owner: Option<&'a str>,
+    /// Full tag list.
+    pub tags: &'a [String],
+    /// Whether command policies should treat the secret as required.
+    pub required: bool,
+}
+
+/// Stored mutable metadata for a secret.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecretMutableMetadata {
+    /// Optional description.
+    pub description: Option<String>,
+    /// Optional owner.
+    pub owner: Option<String>,
+    /// Full tag list.
+    pub tags: Vec<String>,
+    /// Whether command policies should treat the secret as required.
+    pub required: bool,
+}
+
+fn mutable_metadata_from_row(
+    row: &rusqlite::Row<'_>,
+    start: usize,
+) -> Result<SecretMutableMetadata, crate::StoreError> {
+    let tags_json: String = row.get(start + 2)?;
+    Ok(SecretMutableMetadata {
+        description: row.get(start)?,
+        owner: row.get(start + 1)?,
+        tags: serde_json::from_str(&tags_json)?,
+        required: row.get(start + 3)?,
+    })
 }
 
 /// Mutable secret metadata update plus optional timestamp/audit context.

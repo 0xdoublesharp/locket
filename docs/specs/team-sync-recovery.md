@@ -62,7 +62,7 @@ Team invite trust ceremony:
 
 - Every device has a public-key fingerprint and a short safety-words representation.
 - `locket device pubkey` prints a device descriptor containing both the Ed25519 signing public key and X25519 sealing public key, plus the combined fingerprint and safety words.
-- Device descriptors are encoded as `lkdev1_` followed by unpadded base64url JSON. The decoded JSON must contain `v`, `device_id`, `label`, `signing_public_key_ed25519`, `sealing_public_key_x25519`, `fingerprint_sha256`, and `safety_words`. Public keys are unpadded base64url byte strings.
+- Device descriptors are encoded as `lkdev2_` followed by unpadded base64url JSON with `v` set to 2. The decoded JSON must contain `v`, `device_id`, `label`, `signing_public_key_ed25519`, `sealing_public_key_x25519`, `fingerprint_sha256`, and `safety_words`. Public keys are unpadded base64url byte strings.
 - Device identity fingerprint v1 is lowercase hex `SHA-256("locket-device-v1" || u16_le(signing_key_len) || signing_public_key_ed25519 || u16_le(sealing_key_len) || sealing_public_key_x25519)`. `device_id` and `label` are descriptor metadata and must not affect the fingerprint, so relabeling a device does not create a new identity.
 - Safety words are 4 words derived from the fingerprint by splitting the first 8 bytes of the SHA-256 fingerprint into four 2-byte windows and indexing the PGP word list (alternating even/odd columns per byte position), producing a fixed-length human-pronounceable phrase suitable for out-of-band verification.
 - `locket device add`, `locket team invite`, and `locket export --sealed --recipient` all accept the same `<device-descriptor>` format. The CLI flag name for accepting a descriptor is `--device` except export, where `--recipient` names the recipient role.
@@ -164,7 +164,7 @@ Recovery error mapping:
 | --- | --- |
 | Recovery code checksum or format is invalid | `BackupRecoveryFailed` |
 | Recovery code is well-formed but cannot decrypt the envelope | `BackupRecoveryFailed` |
-| embedded KDF metadata (or legacy `recovery/kdf.toml`) is missing, unparsable, unsupported, or mismatches the inner envelope | `BackupRecoveryFailed` |
+| embedded KDF metadata is missing, unparsable, unsupported, or mismatches the inner envelope | `BackupRecoveryFailed` |
 | `recovery/envelope.bin` has a schema version newer than this binary understands | `ConfigError` with upgrade-required guidance |
 | `recovery/envelope.bin` is missing, corrupt, truncated, or fails AAD/authentication checks | `BackupRecoveryFailed` |
 | Required `master_key`, `device_signing_private_key`, or `device_sealing_private_key` entry is missing after successful envelope parse | `LocalVaultUnrecoverable` |
@@ -181,7 +181,7 @@ Behavior:
 
 - Requires an unlocked vault plus fresh local user verification through the configured platform prompt, hardware-key presence, or passphrase fallback.
 - Generates a fresh recovery code with the same entropy and encoding rules as `locket init`.
-- Re-wraps the recovery envelope under a new Argon2id-derived key from the new code. Displays the code and requires typed acknowledgment before replacing recovery state. Then writes KDF metadata and the encrypted envelope as one atomic container; the old envelope is not retained as a fallback. A legacy loose KDF file may remain, but cannot recover keys without its old envelope.
+- Re-wraps the recovery envelope under a new Argon2id-derived key from the new code. Displays the code and requires typed acknowledgment before replacing recovery state. Then writes KDF metadata and the encrypted envelope as one atomic container; the old envelope is not retained as a fallback.
 - The one-time display uses typed acknowledgment and a scrollback warning, and clears the terminal only after acknowledgment. Rejected acknowledgment or audit-write failure leaves the previous backup intact. If an error occurs after the atomic replacement, the user already has the acknowledged new code; retain both codes until verifying the committed backup.
 - Writes a `RECOVERY_ROTATE` audit row. The prior code is invalidated immediately on commit; an in-progress recovery using the prior code will fail with `BackupRecoveryFailed`.
 - Refuses to run from a merely unlocked agent session without fresh user verification. If the current recovery code is available, the user may provide it as the verification factor; otherwise fresh platform/hardware-key/passphrase verification is required so a briefly unattended unlocked session cannot silently rotate the user out of recovery.

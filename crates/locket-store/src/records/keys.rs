@@ -69,13 +69,12 @@ impl Store {
     /// Returns [`StoreError::Sqlite`] when `SQLite` cannot query the key row.
     pub fn get_key(&self, id: &str) -> Result<Option<KeyRecord>, StoreError> {
         self.connection
-            .query_row(
+            .prepare_cached(
                 "SELECT id, project_id, profile_id, purpose, wrapped_material, nonce, created_at
                  FROM keys
                  WHERE id = ?1",
-                [id],
-                key_record_from_row,
-            )
+            )?
+            .query_row([id], key_record_from_row)
             .optional()
             .map_err(StoreError::from)
     }
@@ -92,13 +91,12 @@ impl Store {
         purpose: &str,
     ) -> Result<Option<KeyRecord>, StoreError> {
         self.connection
-            .query_row(
+            .prepare_cached(
                 "SELECT id, project_id, profile_id, purpose, wrapped_material, nonce, created_at
                  FROM keys
                  WHERE project_id = ?1 AND profile_id IS ?2 AND purpose = ?3",
-                params![project_id, profile_id, purpose],
-                key_record_from_row,
-            )
+            )?
+            .query_row(params![project_id, profile_id, purpose], key_record_from_row)
             .optional()
             .map_err(StoreError::from)
     }

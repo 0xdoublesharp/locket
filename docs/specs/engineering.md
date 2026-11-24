@@ -54,7 +54,7 @@ A change is not ready if it:
 - Weakens deny-by-default behavior.
 - Adds a new secret delivery path without policy and audit coverage.
 - Adds a parser or binary decoder without malformed-input tests and a fuzz target.
-- Adds a new storage migration without rollback/fail-closed behavior.
+- Changes the store schema without bumping `SCHEMA_VERSION`; Locket does not migrate older stores.
 - Adds a CLI command without failure-mode documentation.
 - Adds a network call, remote resource load, telemetry-like event, or support artifact path without an explicit privacy review and data-minimization note.
 - Adds a new metadata field or display surface without deciding whether `privacy.redact_names` applies.

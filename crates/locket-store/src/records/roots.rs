@@ -86,7 +86,7 @@ impl Store {
         &self,
         project_id: &str,
     ) -> Result<Vec<ProjectRootRecord>, StoreError> {
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare_cached(
             "SELECT project_id, root_hash, display_path, created_at, last_seen_at
              FROM project_roots
              WHERE project_id = ?1

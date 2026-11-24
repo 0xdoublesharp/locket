@@ -28,7 +28,9 @@ pub fn random_bytes<const N: usize>() -> CryptoResult<[u8; N]> {
 /// Returns [`CryptoError::RandomFailed`] when operating-system randomness is
 /// unavailable.
 pub fn generate_key() -> CryptoResult<Zeroizing<KeyBytes>> {
-    Ok(Zeroizing::new(random_bytes::<KEY_LEN>()?))
+    let mut key = Zeroizing::new([0_u8; KEY_LEN]);
+    SysRng.try_fill_bytes(&mut *key).map_err(|_| CryptoError::RandomFailed)?;
+    Ok(key)
 }
 
 /// Generates a random salt for passphrase fallback KDF profiles.
@@ -47,9 +49,9 @@ pub fn generate_passphrase_salt() -> CryptoResult<[u8; PASSPHRASE_FALLBACK_SALT_
 ///
 /// Returns `CryptoError::RandomFailed` if the OS RNG fails.
 pub fn generate_recovery_code_bytes() -> CryptoResult<[u8; RECOVERY_CODE_BYTES]> {
-    let mut bytes = [0u8; RECOVERY_CODE_BYTES];
-    SysRng.try_fill_bytes(&mut bytes).map_err(|_| CryptoError::RandomFailed)?;
-    Ok(bytes)
+    let mut bytes = Zeroizing::new([0u8; RECOVERY_CODE_BYTES]);
+    SysRng.try_fill_bytes(&mut *bytes).map_err(|_| CryptoError::RandomFailed)?;
+    Ok(*bytes)
 }
 
 /// Generates a fresh random recovery salt.
@@ -58,7 +60,5 @@ pub fn generate_recovery_code_bytes() -> CryptoResult<[u8; RECOVERY_CODE_BYTES]>
 ///
 /// Returns `CryptoError::RandomFailed` if the OS RNG fails.
 pub fn generate_recovery_salt() -> CryptoResult<[u8; RECOVERY_SALT_LEN]> {
-    let mut salt = [0u8; RECOVERY_SALT_LEN];
-    SysRng.try_fill_bytes(&mut salt).map_err(|_| CryptoError::RandomFailed)?;
-    Ok(salt)
+    random_bytes::<RECOVERY_SALT_LEN>()
 }

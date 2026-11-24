@@ -17,7 +17,7 @@ use locket_crypto::{
     wrap_key_material_v1,
 };
 use serde::{Deserialize, Serialize};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::error::PlatformError;
 use crate::fs_helpers::{
@@ -149,18 +149,15 @@ impl WrappedLocalFileDevicePrivateKeyStorage {
         })
     }
 
-    fn temp_envelope_path(&self, device_id: &str) -> Result<PathBuf, PlatformError> {
-        validate_path_component(device_id)?;
-        Ok(self.devices_directory().join(format!("{device_id}.tmp")))
-    }
-
     fn wrap_aad(&self, device_id: &str) -> Vec<u8> {
-        let mut aad = Vec::new();
-        aad.extend_from_slice(if self.signing {
+        let prefix: &[u8] = if self.signing {
             b"locket-device-signing-private-key-v2"
         } else {
             b"locket-device-private-key-v1"
-        });
+        };
+        let mut aad =
+            Vec::with_capacity(prefix.len() + self.project_id.len() + 1 + device_id.len());
+        aad.extend_from_slice(prefix);
         aad.extend_from_slice(self.project_id.as_bytes());
         aad.push(0);
         aad.extend_from_slice(device_id.as_bytes());
@@ -175,7 +172,6 @@ impl WrappedLocalFileDevicePrivateKeyStorage {
 impl LocalDevicePrivateKeyStorage for WrappedLocalFileDevicePrivateKeyStorage {
     fn store(&self, device_id: &str, private_key: &PrivateKeyBytes) -> Result<(), PlatformError> {
         let path = self.envelope_path(device_id)?;
-        let temp_path = self.temp_envelope_path(device_id)?;
         let wrapping_key = self.master_key()?;
         let aad = self.wrap_aad(device_id);
         let wrapped = wrap_key_material_v1(&wrapping_key, private_key, &aad)?;
@@ -189,9 +185,7 @@ impl LocalDevicePrivateKeyStorage for WrappedLocalFileDevicePrivateKeyStorage {
         };
         secure_directory(&self.devices_directory())?;
         let rendered = toml::to_string_pretty(&envelope)?;
-        write_user_only_file(&temp_path, rendered.as_bytes())?;
-        fs::rename(&temp_path, &path)?;
-        Ok(())
+        write_user_only_file(&path, rendered.as_bytes())
     }
 
     fn load(&self, device_id: &str) -> Result<Zeroizing<PrivateKeyBytes>, PlatformError> {
@@ -282,36 +276,35 @@ impl LocalDevicePrivateKeyStorage for WrappedLocalFileDevicePrivateKeyStorage {
 }
 
 /// Deterministic in-memory device private-key storage for tests.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MemoryDevicePrivateKeyStorage {
-    keys: Mutex<BTreeMap<String, PrivateKeyBytes>>,
+    keys: Mutex<BTreeMap<String, Zeroizing<PrivateKeyBytes>>>,
+}
+
+impl std::fmt::Debug for MemoryDevicePrivateKeyStorage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("MemoryDevicePrivateKeyStorage").finish_non_exhaustive()
+    }
 }
 
 impl LocalDevicePrivateKeyStorage for MemoryDevicePrivateKeyStorage {
     fn store(&self, device_id: &str, private_key: &PrivateKeyBytes) -> Result<(), PlatformError> {
         let mut keys = self.keys.lock().map_err(|_| PlatformError::MemoryPoisoned)?;
-        if let Some(old_key) = keys.get_mut(device_id) {
-            old_key.zeroize();
-        }
-        keys.insert(device_id.to_owned(), *private_key);
+        keys.insert(device_id.to_owned(), Zeroizing::new(*private_key));
         drop(keys);
         Ok(())
     }
 
     fn load(&self, device_id: &str) -> Result<Zeroizing<PrivateKeyBytes>, PlatformError> {
         let keys = self.keys.lock().map_err(|_| PlatformError::MemoryPoisoned)?;
-        let Some(key) = keys.get(device_id).copied() else {
-            return Err(PlatformError::DevicePrivateKeyNotFound);
-        };
+        let key = keys.get(device_id).cloned();
         drop(keys);
-        Ok(Zeroizing::new(key))
+        key.ok_or(PlatformError::DevicePrivateKeyNotFound)
     }
 
     fn delete(&self, device_id: &str) -> Result<(), PlatformError> {
         let mut keys = self.keys.lock().map_err(|_| PlatformError::MemoryPoisoned)?;
-        if let Some(mut key) = keys.remove(device_id) {
-            key.zeroize();
-        }
+        keys.remove(device_id);
         drop(keys);
         Ok(())
     }

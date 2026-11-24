@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+
+# Release binaries here must use the development instance; the OS keychain
+# ignores the temporary HOME these scripts set.
+export LOCKET_INSTANCE=dev
 umask 0077
 
 cargo_bin="${CARGO:-cargo}"

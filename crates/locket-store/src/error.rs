@@ -1,6 +1,6 @@
 //! Storage-layer error types.
 
-use locket_core::{AuditCanonicalizationError, LocketError};
+use locket_core::{AuditCanonicalizationError, AuditWitnessError, LocketError};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -36,6 +36,15 @@ pub enum StoreError {
         expected_version: u32,
     },
 
+    /// The selected versions include the current version of an active secret.
+    #[error("cannot purge current version {version} of active secret {secret_id}")]
+    ActiveSecretVersionPurge {
+        /// Identifier of the active secret.
+        secret_id: String,
+        /// Current version that cannot be purged.
+        version: u32,
+    },
+
     /// JSON metadata encoding failed.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
@@ -43,6 +52,10 @@ pub enum StoreError {
     /// Audit HMAC canonicalization failed.
     #[error(transparent)]
     AuditCanonicalization(#[from] AuditCanonicalizationError),
+
+    /// External witness signature or chain verification failed.
+    #[error(transparent)]
+    AuditWitness(#[from] AuditWitnessError),
 
     /// Audit HMAC key length was invalid.
     #[error("audit HMAC key must be non-empty, got {actual}")]
@@ -100,6 +113,18 @@ pub enum StoreError {
         supported: u32,
     },
 
+    /// The database predates this binary's schema. Locket does not migrate
+    /// older stores. `found` is 0 for a store without a schema ledger.
+    #[error(
+        "database schema version {found} is older than supported schema version {supported}; Locket does not migrate older stores"
+    )]
+    OutdatedSchema {
+        /// Older schema version found in the database, or 0 without a ledger.
+        found: i64,
+        /// Schema version this binary supports.
+        supported: u32,
+    },
+
     /// A team-invite acceptance was attempted for an invite that has
     /// already been accepted or revoked. Maps to
     /// [`LocketError::ReplayDetected`] (exit 113) at the CLI boundary.
@@ -129,11 +154,13 @@ impl StoreError {
             Self::AuditIntegrity { .. }
             | Self::InvalidAuditHmacLength { .. }
             | Self::InvalidAuditKeyLength { .. }
-            | Self::AuditCanonicalization(_) => LocketError::AuditIntegrityFailed,
+            | Self::AuditCanonicalization(_)
+            | Self::AuditWitness(_) => LocketError::AuditIntegrityFailed,
             Self::AuditMetadataTooLarge { .. }
             | Self::AuditMetadataInvalid { .. }
+            | Self::ActiveSecretVersionPurge { .. }
             | Self::InviteNotFound { .. } => LocketError::MetadataInvalid,
-            Self::Json(_) => LocketError::CorruptDb,
+            Self::Json(_) | Self::OutdatedSchema { .. } => LocketError::CorruptDb,
             Self::InviteReplayDetected { .. } => LocketError::ReplayDetected,
         }
     }

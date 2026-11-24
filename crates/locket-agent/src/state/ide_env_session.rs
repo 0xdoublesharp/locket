@@ -35,6 +35,7 @@ use serde_json::json;
 use tokio::sync::Mutex;
 
 use crate::envelope::{ErrorEnvelope, RequestEnvelope, ResponseEnvelope, SuccessEnvelope};
+use crate::keys::{cached_master_key, unwrap_audit_key_with_master};
 
 /// Maximum TTL accepted for an IDE env-session registration.
 ///
@@ -86,13 +87,43 @@ impl IdeEnvSessionEntry {
     }
 }
 
-/// Type alias for the shared registry held on `AgentSocketState`.
-pub type IdeEnvSessionRegistry = Arc<Mutex<HashMap<String, IdeEnvSessionEntry>>>;
+/// In-memory IDE environment sessions indexed by session id.
+#[derive(Default)]
+pub struct IdeEnvSessionRegistry {
+    entries: HashMap<String, IdeEnvSessionEntry>,
+}
 
-/// Constructs an empty registry suitable for `AgentSocketState`.
+impl IdeEnvSessionRegistry {
+    /// Registers a session under its IDE-provided id.
+    pub fn insert(&mut self, id: String, entry: IdeEnvSessionEntry) -> Option<IdeEnvSessionEntry> {
+        self.entries.insert(id, entry)
+    }
+
+    /// Returns whether the registry has no entries.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Revokes every session for a project and returns the number removed.
+    pub fn revoke_project(&mut self, project_id: &str) -> usize {
+        let count = self.entries.len();
+        self.entries.retain(|_, entry| entry.project_id != project_id);
+        count - self.entries.len()
+    }
+
+    /// Revokes all sessions and returns the number removed.
+    pub fn clear(&mut self) -> usize {
+        let count = self.entries.len();
+        self.entries.clear();
+        count
+    }
+}
+
+/// Constructs an empty shared registry suitable for `AgentSocketState`.
 #[must_use]
-pub fn new_registry() -> IdeEnvSessionRegistry {
-    Arc::new(Mutex::new(HashMap::new()))
+pub fn new_registry() -> Arc<Mutex<IdeEnvSessionRegistry>> {
+    Arc::new(Mutex::new(IdeEnvSessionRegistry::default()))
 }
 
 /// Request payload for `RegisterIdeEnvSession`.
@@ -186,20 +217,28 @@ pub async fn handle_register_ide_env_session(
     // The audit row is HMAC-chained with the project audit key, so we
     // require an unlocked vault — `RegisterIdeEnvSession` is a write of
     // metadata-grade authorization state.
-    let audit_key = {
-        let cache = state.unlock_cache.lock().await;
-        cache.lookup(&payload.project_id, now_unix_nanos).map(|entry| entry.key_bytes().to_vec())
+    let master_key = match cached_master_key(state, &payload.project_id, now_unix_nanos).await {
+        Ok(Some(key)) => key,
+        Ok(None) => {
+            return error_response(
+                request,
+                "UnlockRequired",
+                "unlock required to register an IDE env session",
+            );
+        }
+        Err(error) => return error_response(request, "CorruptDb", error.to_string()),
     };
-    let Some(audit_key) = audit_key else {
-        return error_response(
-            request,
-            "UnlockRequired",
-            "unlock required to register an IDE env session",
-        );
+    let Ok(mut store) = Store::open(&payload.store_path) else {
+        return error_response(request, "CorruptDb", "failed to open store");
     };
-
-    if let Err(message) = append_register_audit(&payload, &audit_key, ttl_seconds, now_unix_nanos) {
-        return error_response(request, "CorruptDb", message);
+    let audit_key = match unwrap_audit_key_with_master(&store, &payload.project_id, &master_key) {
+        Ok(key) => key,
+        Err(error) => return error_response(request, "AuditIntegrityFailed", error.to_string()),
+    };
+    if append_register_audit(&mut store, &payload, audit_key.as_ref(), ttl_seconds, now_unix_nanos)
+        .is_err()
+    {
+        return error_response(request, "CorruptDb", "failed to append AGENT_GRANT audit row");
     }
 
     let ttl_nanos = i128::from(ttl_seconds).saturating_mul(1_000_000_000);
@@ -212,7 +251,7 @@ pub async fn handle_register_ide_env_session(
         let mut registry = state.ide_env_sessions.lock().await;
         // Drop expired siblings opportunistically so the registry does
         // not grow unbounded across IDE reloads.
-        registry.retain(|_, existing| !existing.is_expired(now_unix_nanos));
+        registry.entries.retain(|_, existing| !existing.is_expired(now_unix_nanos));
         registry.insert(payload.session_id.clone(), entry);
     }
 
@@ -243,10 +282,10 @@ pub async fn handle_ide_env_session(
 
     let lookup = {
         let mut registry = state.ide_env_sessions.lock().await;
-        match registry.get(&payload.session_id) {
+        match registry.entries.get(&payload.session_id) {
             None => SessionLookup::NotRegistered,
             Some(entry) if entry.is_expired(now_unix_nanos) => {
-                registry.remove(&payload.session_id);
+                registry.entries.remove(&payload.session_id);
                 SessionLookup::Expired
             }
             Some(entry) if entry.project_id != payload.project_id => SessionLookup::ProjectMismatch,
@@ -291,12 +330,12 @@ enum SessionLookup {
 }
 
 fn append_register_audit(
+    store: &mut Store,
     payload: &RegisterIdeEnvSessionRequest,
     audit_key: &[u8],
     ttl_seconds: u64,
     now_unix_nanos: i128,
-) -> Result<(), &'static str> {
-    let mut store = Store::open(&payload.store_path).map_err(|_| "failed to open store")?;
+) -> Result<(), locket_store::StoreError> {
     // Audit metadata is restricted to the known-field set in
     // `locket-store::audit`. We intentionally omit a numeric env-name
     // count here because the field is not on the allow-list; the
@@ -321,7 +360,7 @@ fn append_register_audit(
         metadata_json: &metadata,
         timestamp,
     };
-    store.append_audit(audit_key, &write).map_err(|_| "failed to append AGENT_GRANT audit row")
+    store.append_audit(audit_key, &write)
 }
 
 fn success_response<T: Serialize>(request: &RequestEnvelope, payload: T) -> ResponseEnvelope {
@@ -373,6 +412,7 @@ mod tests {
                 [],
             )
             .unwrap();
+        crate::tests::insert_wrapped_audit_key(&store, "proj-1", &[7; 32], &[11; 32]).unwrap();
     }
 
     fn unlocked_state(project_id: &str, now: i128) -> AgentSocketState {

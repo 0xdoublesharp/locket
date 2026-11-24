@@ -14,16 +14,17 @@ use std::path::Path;
 
 use locket_core::{LkReferenceUri, LocketError, SecretVersion};
 use locket_crypto::{
-    EncryptedSecretValue, HkdfWrapInfo, KeyPurpose, KeyWrapAad, KeyWrapPurpose, WrappedKeyMaterial,
-    decrypt_secret_value_v1, derive_wrapping_key_v1, key_wrap_aad_v1, secret_blob_aad_v1,
-    unwrap_key_material_v1,
+    EncryptedSecretValue, KeyPurpose, KeyWrapAad, KeyWrapPurpose, decrypt_secret_value_v1,
+    key_wrap_aad_v1, secret_blob_aad_v1,
 };
 use locket_store::{AuditWrite, SecretRecord, SecretVersionRecord, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use zeroize::Zeroizing;
 
 use crate::envelope::{ErrorEnvelope, RequestEnvelope, ResponseEnvelope};
 use crate::grant::{GrantAction, GrantBinding, GrantValidation};
+use crate::keys::{master_key_array, unwrap_audit_key_with_master, unwrap_profile_key_with_master};
 
 /// Wire `error` value used when the caller lacks a grant.
 const ERROR_GRANT_REQUIRED: &str = "GrantRequired";
@@ -115,7 +116,9 @@ pub async fn handle_resolve(
 
     let cached_master_key_for_denial = || async {
         let cache = state.unlock_cache.lock().await;
-        cache.lookup(project_id, now_unix_nanos).map(|entry| entry.key_bytes().to_vec())
+        cache
+            .lookup(project_id, now_unix_nanos)
+            .map(|entry| Zeroizing::new(entry.key_bytes().to_vec()))
     };
     let grant_validation = {
         let Some(grant_id) = typed.grant_id.as_deref() else {
@@ -124,7 +127,7 @@ pub async fn handle_resolve(
                 project_id,
                 profile_id,
                 Some(Path::new(store_path)),
-                key.as_deref(),
+                key.as_ref().map(|key| key.as_slice()),
                 GrantAction::ResolveReference,
                 0,
                 now_unix_nanos,
@@ -152,7 +155,7 @@ pub async fn handle_resolve(
             project_id,
             profile_id,
             Some(Path::new(store_path)),
-            key.as_deref(),
+            key.as_ref().map(|key| key.as_slice()),
             GrantAction::ResolveReference,
             0,
             now_unix_nanos,
@@ -163,7 +166,9 @@ pub async fn handle_resolve(
 
     let master_key = {
         let cache = state.unlock_cache.lock().await;
-        cache.lookup(project_id, now_unix_nanos).map(|entry| entry.key_bytes().to_vec())
+        cache
+            .lookup(project_id, now_unix_nanos)
+            .map(|entry| Zeroizing::new(entry.key_bytes().to_vec()))
     };
     let Some(master_key) = master_key else {
         crate::degraded_audit::record_locked_refusal(
@@ -250,7 +255,7 @@ fn resolve_reference(
             LocketError::InvalidReference,
         )
     })?;
-    let master_key = key_array(master_key).ok_or_else(corrupt_db)?;
+    let master_key = master_key_array(master_key).map_err(|_| corrupt_db())?;
     let mut store = Store::open(store_path).map_err(|_| corrupt_db())?;
     match resolve_reference_inner(
         &store,
@@ -388,8 +393,8 @@ fn append_resolve_reference_audit(
     timestamp: i128,
     outcome: ResolveAuditOutcome<'_>,
 ) -> Result<(), ResolveFailure> {
-    let audit_key = load_project_key_with_master(store, project_id, KeyPurpose::Audit, master_key)
-        .map_err(|_| corrupt_db())?;
+    let audit_key =
+        unwrap_audit_key_with_master(store, project_id, master_key).map_err(|_| corrupt_db())?;
     let timestamp = i64::try_from(timestamp).map_err(|_| corrupt_db())?;
     // Pre-seed `profile_id` and `source` so the audit-store
     // `RESOLVE_REFERENCE` required-fields validator (audit.rs) accepts
@@ -579,29 +584,32 @@ fn select_secret(
         return Ok(secret);
     }
 
-    let active = store
+    let secrets = store
         .list_secrets_by_name(project_id, profile_id, parsed.key().as_str())
-        .map_err(|_| corrupt_db())?
+        .map_err(|_| corrupt_db())?;
+    preferred_active_secret(secrets).ok_or_else(|| {
+        ResolveFailure::new(ERROR_SECRET_NOT_FOUND, "secret not found", LocketError::SecretNotFound)
+    })
+}
+
+pub(super) fn preferred_active_secret(secrets: Vec<SecretRecord>) -> Option<SecretRecord> {
+    // Reverse the order so ties keep the first row, as in reference resolution.
+    secrets
         .into_iter()
+        .rev()
         .filter(|secret| secret.state == "active")
-        .collect::<Vec<_>>();
-    let highest =
-        active.iter().map(|secret| source_precedence(&secret.source)).max().ok_or_else(|| {
-            ResolveFailure::new(
-                ERROR_SECRET_NOT_FOUND,
-                "secret not found",
-                LocketError::SecretNotFound,
-            )
-        })?;
-    active.into_iter().find(|secret| source_precedence(&secret.source) == highest).ok_or_else(
-        || {
-            ResolveFailure::new(
-                ERROR_SECRET_NOT_FOUND,
-                "secret not found",
-                LocketError::SecretNotFound,
-            )
-        },
-    )
+        .max_by_key(|secret| source_precedence(&secret.source))
+}
+
+pub(super) fn version_is_resolvable(
+    version: &SecretVersionRecord,
+    pinned: bool,
+    now_unix_nanos: i128,
+) -> bool {
+    version.state == "current"
+        || (pinned
+            && version.state == "deprecated"
+            && version.grace_until.is_some_and(|until| i128::from(until) > now_unix_nanos))
 }
 
 fn validate_version(
@@ -617,16 +625,7 @@ fn validate_version(
             LocketError::SecretDeleted,
         ));
     }
-    if !pinned && version.state == "current" {
-        return Ok(());
-    }
-    if pinned && version.state == "current" {
-        return Ok(());
-    }
-    if pinned
-        && version.state == "deprecated"
-        && version.grace_until.is_some_and(|grace_until| i128::from(grace_until) > now_unix_nanos)
-    {
+    if version_is_resolvable(version, pinned, now_unix_nanos) {
         return Ok(());
     }
     Err(ResolveFailure::new(
@@ -644,13 +643,14 @@ fn decrypt_secret(
     version: u32,
     master_key: &locket_crypto::KeyBytes,
 ) -> Result<zeroize::Zeroizing<String>, locket_crypto::CryptoError> {
-    let profile_secret_key = load_profile_key_with_master(
+    let profile_secret_key = unwrap_profile_key_with_master(
         store,
         project_id,
         profile_id,
-        KeyPurpose::ProfileSecret,
         master_key,
-    )?;
+        KeyPurpose::ProfileSecret,
+    )
+    .map_err(|_| locket_crypto::CryptoError::DecryptionFailed)?;
     let blob = store
         .get_blob(&secret.id, version)
         .map_err(|_| locket_crypto::CryptoError::DecryptionFailed)?
@@ -678,66 +678,8 @@ fn decrypt_secret(
     decrypt_secret_value_v1(&profile_secret_key, &encrypted, &value_aad, &wrap_aad)
 }
 
-fn load_profile_key_with_master(
-    store: &Store,
-    project_id: &str,
-    profile_id: &str,
-    purpose: KeyPurpose,
-    master_key: &locket_crypto::KeyBytes,
-) -> Result<zeroize::Zeroizing<locket_crypto::KeyBytes>, locket_crypto::CryptoError> {
-    let record = store
-        .get_key_by_scope(project_id, Some(profile_id), purpose.as_str())
-        .map_err(|_| locket_crypto::CryptoError::DecryptionFailed)?
-        .ok_or(locket_crypto::CryptoError::DecryptionFailed)?;
-    let wrapping_key = derive_wrapping_key_v1(
-        master_key,
-        &HkdfWrapInfo::new(project_id, Some(profile_id), purpose),
-    )?;
-    let aad = key_wrap_aad_v1(&KeyWrapAad::new(
-        project_id,
-        &record.id,
-        Some(profile_id),
-        0,
-        KeyWrapPurpose::from(purpose),
-    ))?;
-    let wrapped = WrappedKeyMaterial { ciphertext: record.wrapped_material, nonce: record.nonce };
-    unwrap_key_material_v1(&wrapping_key, &wrapped, &aad)
-}
-
-fn load_project_key_with_master(
-    store: &Store,
-    project_id: &str,
-    purpose: KeyPurpose,
-    master_key: &locket_crypto::KeyBytes,
-) -> Result<zeroize::Zeroizing<locket_crypto::KeyBytes>, locket_crypto::CryptoError> {
-    let record = store
-        .get_key_by_scope(project_id, None, purpose.as_str())
-        .map_err(|_| locket_crypto::CryptoError::DecryptionFailed)?
-        .ok_or(locket_crypto::CryptoError::DecryptionFailed)?;
-    let wrapping_key =
-        derive_wrapping_key_v1(master_key, &HkdfWrapInfo::new(project_id, None, purpose))?;
-    let aad = key_wrap_aad_v1(&KeyWrapAad::new(
-        project_id,
-        &record.id,
-        None,
-        0,
-        KeyWrapPurpose::from(purpose),
-    ))?;
-    let wrapped = WrappedKeyMaterial { ciphertext: record.wrapped_material, nonce: record.nonce };
-    unwrap_key_material_v1(&wrapping_key, &wrapped, &aad)
-}
-
-fn key_array(bytes: &[u8]) -> Option<locket_crypto::KeyBytes> {
-    bytes.try_into().ok()
-}
-
 const fn source_precedence(source: &str) -> u8 {
-    match source.as_bytes() {
-        b"team-managed" => 1,
-        b"user-local" => 2,
-        b"machine-local" => 3,
-        _ => 0,
-    }
+    locket_core::source_precedence(source)
 }
 
 const fn corrupt_db() -> ResolveFailure {
@@ -1654,7 +1596,7 @@ mod tests {
         let prepare_request = PrepareExecRequest {
             policy_name: POLICY_NAME.to_owned(),
             profile_id: PROFILE_ID.to_owned(),
-            project_id: Some(PROJECT_ID.to_owned()),
+            project_id: PROJECT_ID.to_owned(),
             binding: Some(GrantBinding::new(std::process::id(), "0")),
         };
         let prepare_envelope = RequestEnvelope::new(

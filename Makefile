@@ -35,7 +35,7 @@ else
 CARGO_OFFLINE_FLAG :=
 endif
 
-.PHONY: ci ci-local ci-strict fmt fmt-check clippy test nextest coverage coverage-html coverage-branch mutation supply-chain supply-chain-local audit deny vet unsafe-inventory sbom third-party-notices supply-chain-exceptions dependency-hygiene machete udeps bench-fixtures bench bench-ci bench-report bench-regression perf-agent-idle-memory perf-passphrase-unlock perf-recovery-envelope-unlock perf-cli-cold-start slsa-provenance fuzz-list fuzz-smoke fuzz fuzz-nightly fuzz-minimize leak-canary docs-check distribution-check app-ui-install app-ui-check app-ui-build vscode-vsix-package release-auditable release-auditable-print-deps clean
+.PHONY: ci ci-local ci-strict fmt fmt-check clippy test nextest coverage coverage-html coverage-branch mutation supply-chain supply-chain-local audit deny vet unsafe-inventory sbom third-party-notices supply-chain-exceptions dependency-hygiene machete udeps bench-fixtures bench bench-ci bench-report bench-regression perf-agent-idle-memory perf-passphrase-unlock perf-recovery-envelope-unlock perf-cli-cold-start slsa-provenance fuzz-list fuzz-smoke fuzz fuzz-nightly fuzz-minimize leak-canary formal-check docs-check distribution-check app-ui-install app-ui-check app-ui-build vscode-vsix-package release-auditable release-auditable-print-deps clean
 
 # Local default gate. It avoids network by default and skips missing optional tools
 # with explicit warnings. Use `make ci-strict OFFLINE=0 STRICT=1` for release-style
@@ -183,6 +183,9 @@ fuzz-minimize:
 
 leak-canary:
 	scripts/leak-canary.sh
+
+formal-check:
+	scripts/formal-check.sh
 
 docs-check:
 	scripts/docs-check.mjs

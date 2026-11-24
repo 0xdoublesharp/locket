@@ -11,14 +11,11 @@
 
 use std::path::Path;
 
-use locket_crypto::{
-    HkdfWrapInfo, KeyPurpose, KeyWrapAad, KeyWrapPurpose, WrappedKeyMaterial,
-    derive_wrapping_key_v1, key_wrap_aad_v1, unwrap_key_material_v1,
-};
 use locket_store::{AuditWrite, Store};
 use serde_json::json;
 
 use crate::grant::GrantAction;
+use crate::keys::{master_key_array, unwrap_audit_key_with_master};
 
 /// Append a metadata-only `AGENT_REVOKE DENIED` audit row best-effort.
 ///
@@ -38,10 +35,10 @@ pub fn try_append_grant_denial(
 ) -> bool {
     let Some(store_path) = store_path else { return false };
     let Some(master_key) = master_key else { return false };
-    let Ok(master_key_array) = key_array(master_key) else { return false };
+    let Ok(master_key) = master_key_array(master_key) else { return false };
     let Ok(timestamp) = i64::try_from(timestamp_unix_nanos) else { return false };
     let Ok(mut store) = Store::open(store_path) else { return false };
-    let Ok(audit_key) = unwrap_audit_key(&store, project_id, &master_key_array) else {
+    let Ok(audit_key) = unwrap_audit_key_with_master(&store, project_id, &master_key) else {
         return false;
     };
     let action = "AGENT_REVOKE";
@@ -70,10 +67,6 @@ pub fn try_append_grant_denial(
     store.append_audit(audit_key.as_ref(), &audit).is_ok()
 }
 
-fn key_array(bytes: &[u8]) -> Result<locket_crypto::KeyBytes, ()> {
-    bytes.try_into().map_err(|_| ())
-}
-
 const fn grant_action_label(action: GrantAction) -> &'static str {
     match action {
         GrantAction::RunPolicy => "RunPolicy",
@@ -89,30 +82,6 @@ const fn grant_action_label(action: GrantAction) -> &'static str {
         GrantAction::ApplyPolicy => "ApplyPolicy",
         GrantAction::TeamSync => "TeamSync",
     }
-}
-
-fn unwrap_audit_key(
-    store: &Store,
-    project_id: &str,
-    master_key: &locket_crypto::KeyBytes,
-) -> Result<zeroize::Zeroizing<locket_crypto::KeyBytes>, locket_crypto::CryptoError> {
-    let record = store
-        .get_key_by_scope(project_id, None, KeyPurpose::Audit.as_str())
-        .map_err(|_| locket_crypto::CryptoError::DecryptionFailed)?
-        .ok_or(locket_crypto::CryptoError::DecryptionFailed)?;
-    let wrapping_key = derive_wrapping_key_v1(
-        master_key,
-        &HkdfWrapInfo::new(project_id, None, KeyPurpose::Audit),
-    )?;
-    let aad = key_wrap_aad_v1(&KeyWrapAad::new(
-        project_id,
-        &record.id,
-        None,
-        0,
-        KeyWrapPurpose::from(KeyPurpose::Audit),
-    ))?;
-    let wrapped = WrappedKeyMaterial { ciphertext: record.wrapped_material, nonce: record.nonce };
-    unwrap_key_material_v1(&wrapping_key, &wrapped, &aad)
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use locket_core::{CommandSpec, PolicyDocument, ProjectConfig, SecretName};
-use locket_crypto::{KeyBytes, KeyPurpose};
+use locket_crypto::KeyBytes;
 use locket_platform::PolicyFileDocument;
 use locket_store::{AuditContext, AuditWrite, Store};
 use serde::{Deserialize, Serialize};
@@ -15,8 +15,9 @@ use zeroize::Zeroizing;
 
 use crate::envelope::{ErrorEnvelope, RequestEnvelope, ResponseEnvelope, SuccessEnvelope};
 use crate::grant::{GrantAction, GrantBinding, GrantValidation};
+use crate::keys::{master_key_array, unwrap_audit_key_with_master};
 use crate::policies::CommandPolicySnapshot;
-use crate::set_secret::{SetSecretOperation, load_project_key_with_master, set_secret_in_store};
+use crate::set_secret::{SetSecretOperation, set_secret_in_store};
 
 const MAX_ENV_BYTES: u64 = 1024 * 1024;
 const MAX_POLICY_BYTES: usize = 65_536;
@@ -191,7 +192,7 @@ async fn authorize(
     let entry = cache
         .lookup(&scope.project_id, now)
         .ok_or_else(|| failure("UnlockRequired", "unlock the selected project before retrying"))?;
-    let master = Zeroizing::new(entry.key_bytes().try_into().map_err(|_| storage())?);
+    let master = master_key_array(entry.key_bytes()).map_err(|_| storage())?;
     Ok((cache, master))
 }
 
@@ -525,9 +526,8 @@ pub fn apply_policy_with_master(
             "type the dangerous profile name to confirm policy changes",
         ));
     }
-    let audit_key =
-        load_project_key_with_master(&store, &request.scope.project_id, KeyPurpose::Audit, master)
-            .map_err(|_| storage())?;
+    let audit_key = unwrap_audit_key_with_master(&store, &request.scope.project_id, master)
+        .map_err(|_| storage())?;
     let path = verified.root.join("locket.toml");
     let mut document = PolicyFileDocument::read(&path).map_err(|_| metadata())?;
     edit_document(&mut document, request)?;

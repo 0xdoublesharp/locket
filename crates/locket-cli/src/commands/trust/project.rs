@@ -18,6 +18,9 @@ pub fn project_command(
     command: ProjectCommand,
 ) -> Result<(), CliError> {
     match command {
+        ProjectCommand::List { json, redact_names } => {
+            crate::commands::discovery::project_list_command(context, output, json, redact_names)
+        }
         ProjectCommand::TrustRoot => trust_root_command(context, output),
         ProjectCommand::ListRoots => list_roots_command(context, output),
         ProjectCommand::UntrustRoot { root_hash } => {

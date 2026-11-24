@@ -1,6 +1,7 @@
 //! Length-prefix framing for the v1 agent wire protocol.
 
 use serde::Serialize;
+use zeroize::Zeroizing;
 
 use crate::PROTOCOL_VERSION;
 use crate::envelope::{RequestEnvelope, ResponseEnvelope};
@@ -20,7 +21,8 @@ pub fn encode_frame<T: Serialize>(
     envelope: &T,
     maximum_size: usize,
 ) -> Result<Vec<u8>, ProtocolError> {
-    let payload = serde_json::to_vec(envelope)?;
+    let mut payload = Zeroizing::new(Vec::with_capacity(128));
+    serde_json::to_writer(&mut *payload, envelope)?;
     if payload.len() > maximum_size {
         return Err(ProtocolError::MessageTooLarge {
             length: payload.len(),

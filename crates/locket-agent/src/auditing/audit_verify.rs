@@ -48,12 +48,12 @@ impl VerifyAuditResponse {
 ///
 /// # Errors
 ///
-/// Returns [`StoreError`] when the store cannot be opened, queried, or verified.
+/// Returns [`StoreError`] when the chain cannot be queried or verified.
 pub fn verify_audit(
+    store: &Store,
     request: &VerifyAuditRequest,
     audit_key: &[u8],
 ) -> Result<VerifyAuditResponse, StoreError> {
-    let store = Store::open(&request.store_path)?;
     let verification = store.verify_audit_chain_read_only(&request.project_id, audit_key)?;
     Ok(VerifyAuditResponse {
         hmac_ok: Some(verification.hmac_ok),

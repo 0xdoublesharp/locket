@@ -10,12 +10,14 @@ use std::time::Duration;
 
 use super::{AgentClientError, CancelToken, endpoint_from_inputs, poll_status_events_with};
 use locket_agent::{LockState, StatusEvent, StatusPayload};
+use locket_platform::LocketInstance::{Dev, Installed};
 use tokio::sync::{Notify, mpsc};
 
 #[test]
 fn macos_default_endpoint_matches_cli_application_support_directory() {
     assert_eq!(
         endpoint_from_inputs(
+            Installed,
             "macos",
             None,
             Path::new("/Users/fixture"),
@@ -30,12 +32,19 @@ fn macos_default_endpoint_matches_cli_application_support_directory() {
 fn linux_endpoint_uses_xdg_runtime_then_home_fallback() {
     let home = Path::new("/home/fixture");
     assert_eq!(
-        endpoint_from_inputs("linux", None, home, Some(OsStr::new("/run/user/1000")), None),
+        endpoint_from_inputs(
+            Installed,
+            "linux",
+            None,
+            home,
+            Some(OsStr::new("/run/user/1000")),
+            None
+        ),
         PathBuf::from("/run/user/1000/locket/agent.sock")
     );
     for runtime in [None, Some(OsStr::new(""))] {
         assert_eq!(
-            endpoint_from_inputs("linux", None, home, runtime, None),
+            endpoint_from_inputs(Installed, "linux", None, home, runtime, None),
             home.join(".locket/agent.sock")
         );
     }
@@ -46,6 +55,7 @@ fn explicit_endpoint_override_wins_on_every_platform_and_empty_override_is_ignor
     for platform in ["macos", "linux", "windows"] {
         assert_eq!(
             endpoint_from_inputs(
+                Installed,
                 platform,
                 Some(OsStr::new("explicit-agent-endpoint")),
                 Path::new("home"),
@@ -56,17 +66,46 @@ fn explicit_endpoint_override_wins_on_every_platform_and_empty_override_is_ignor
         );
     }
     assert_eq!(
-        endpoint_from_inputs("macos", Some(OsStr::new("")), Path::new("home"), None, None),
+        endpoint_from_inputs(
+            Installed,
+            "macos",
+            Some(OsStr::new("")),
+            Path::new("home"),
+            None,
+            None
+        ),
         PathBuf::from("home/Library/Application Support/locket/agent.sock")
+    );
+}
+
+#[test]
+fn dev_endpoint_never_matches_the_installed_endpoint() {
+    let home = Path::new("/Users/fixture");
+    assert_eq!(
+        endpoint_from_inputs(Dev, "macos", None, home, None, None),
+        PathBuf::from("/Users/fixture/Library/Application Support/locket-dev/agent.sock")
+    );
+    assert_eq!(
+        endpoint_from_inputs(Dev, "linux", None, home, Some(OsStr::new("/run/user/1000")), None),
+        PathBuf::from("/run/user/1000/locket-dev/agent.sock")
+    );
+    assert_eq!(
+        endpoint_from_inputs(Dev, "linux", None, home, None, None),
+        home.join(".locket-dev/agent.sock")
     );
 }
 
 #[test]
 fn windows_endpoint_uses_resolved_user_pipe_and_fails_closed_without_sid() {
     let pipe = Path::new(r"\\.\pipe\locket-agent-S-1-5-21-1000");
-    assert_eq!(endpoint_from_inputs("windows", None, Path::new("home"), None, Some(pipe)), pipe);
+    assert_eq!(
+        endpoint_from_inputs(Installed, "windows", None, Path::new("home"), None, Some(pipe)),
+        pipe
+    );
     assert!(
-        endpoint_from_inputs("windows", None, Path::new("home"), None, None).as_os_str().is_empty()
+        endpoint_from_inputs(Installed, "windows", None, Path::new("home"), None, None)
+            .as_os_str()
+            .is_empty()
     );
 }
 

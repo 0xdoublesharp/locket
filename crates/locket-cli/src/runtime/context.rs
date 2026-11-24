@@ -10,11 +10,11 @@ use zeroize::Zeroizing;
 
 use crate::runtime::key_access::MasterKeySource;
 
-use directories::{BaseDirs, ProjectDirs};
+use directories::BaseDirs;
 use locket_platform::{
     AutomationClientKeyStore, KeyringAutomationClientKeyStore, KeyringMasterKeyStore,
-    LocalUserVerifier, MasterKeyStore, PassphraseFallbackMasterKeyStore, PlatformPasskeyRegistrar,
-    default_local_user_verifier, default_platform_passkey_registrar,
+    LocalUserVerifier, LocketInstance, MasterKeyStore, PassphraseFallbackMasterKeyStore,
+    PlatformPasskeyRegistrar, default_local_user_verifier, default_platform_passkey_registrar,
 };
 
 use crate::CONFIG_TOML;
@@ -98,7 +98,7 @@ impl MasterKeyCache {
 impl RuntimeContext {
     pub fn default() -> Result<Self, CliError> {
         let cwd = std::env::current_dir()?;
-        let Some(project_dirs) = ProjectDirs::from("dev", "0xdoublesharp", "Locket") else {
+        let Some(project_dirs) = LocketInstance::current().project_dirs() else {
             return Err(corrupt_db_error("could not resolve a local data directory"));
         };
         let Some(base_dirs) = BaseDirs::new() else {
@@ -113,7 +113,7 @@ impl RuntimeContext {
             store_path: data_dir.join("store.db"),
             config_path: config_dir.join(CONFIG_TOML),
             template_dir: base_dirs.home_dir().join(".locket").join("templates"),
-            agent_data_dir: resolve_default_agent_data_dir(base_dirs.home_dir()),
+            agent_data_dir: Some(resolve_default_agent_data_dir(base_dirs.home_dir())),
             key_store: Arc::new(KeyringMasterKeyStore),
             automation_client_key_store: Arc::new(KeyringAutomationClientKeyStore),
             passphrase_store: PassphraseFallbackMasterKeyStore::new(
@@ -131,7 +131,7 @@ impl RuntimeContext {
 }
 
 /// Resolves the spec-mandated default agent data directory for the
-/// current platform. Honors `docs/specs/agent.md:18-21`:
+/// current platform and Locket instance. Honors `docs/specs/agent.md:18-21`:
 ///
 /// - Linux: `$XDG_RUNTIME_DIR/locket` when set, falling back to
 ///   `<HOME>/.locket`. The runtime-dir path is the agent's preferred
@@ -140,46 +140,23 @@ impl RuntimeContext {
 /// - macOS: `<HOME>/Library/Application Support/locket`.
 /// - Windows: `<HOME>/.locket` for pid/log data. The agent endpoint is
 ///   the SID-scoped named pipe path resolved by `agent_socket_path`.
+///
+/// The development instance uses `locket-dev` and `.locket-dev` instead.
 #[must_use]
-pub fn resolve_default_agent_data_dir(home: &std::path::Path) -> Option<PathBuf> {
-    resolve_agent_data_dir_for_platform(home, std::env::var_os("XDG_RUNTIME_DIR").as_deref())
-}
-
-#[allow(clippy::unnecessary_wraps)]
-fn resolve_agent_data_dir_for_platform(
-    home: &std::path::Path,
-    xdg_runtime_dir: Option<&std::ffi::OsStr>,
-) -> Option<PathBuf> {
-    #[cfg(not(target_os = "linux"))]
-    let _ = xdg_runtime_dir;
-    #[cfg(target_os = "linux")]
-    {
-        if let Some(value) = xdg_runtime_dir {
-            let path = std::path::Path::new(value);
-            if !path.as_os_str().is_empty() {
-                return Some(path.join("locket"));
-            }
-        }
-        Some(home.join(".locket"))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Some(home.join("Library").join("Application Support").join("locket"))
-    }
-    #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
-    {
-        Some(home.join(".locket"))
-    }
+pub fn resolve_default_agent_data_dir(home: &std::path::Path) -> PathBuf {
+    LocketInstance::current().agent_data_dir(
+        std::env::consts::OS,
+        home,
+        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+    )
 }
 
 #[cfg(test)]
 #[allow(clippy::panic)]
 mod tests {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    use super::resolve_agent_data_dir_for_platform;
-    use super::{MasterKeyCache, MasterKeySource};
+    use super::{MasterKeyCache, MasterKeySource, resolve_default_agent_data_dir};
     use locket_crypto::KEY_LEN;
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use locket_platform::LocketInstance;
     use std::path::Path;
     use zeroize::Zeroizing;
 
@@ -224,36 +201,19 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
-    fn agent_data_dir_prefers_xdg_runtime_dir_on_linux() {
+    fn test_builds_resolve_the_dev_agent_data_dir() {
+        let home = Path::new("/Users/alice");
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR");
         assert_eq!(
-            resolve_agent_data_dir_for_platform(
-                Path::new("/home/alice"),
-                Some(std::ffi::OsStr::new("/run/user/1000"))
-            ),
-            Some(Path::new("/run/user/1000").join("locket"))
+            resolve_default_agent_data_dir(home),
+            LocketInstance::Dev.agent_data_dir(std::env::consts::OS, home, runtime.as_deref())
         );
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn agent_data_dir_falls_back_to_home_on_linux_without_xdg_runtime_dir() {
-        assert_eq!(
-            resolve_agent_data_dir_for_platform(Path::new("/home/alice"), None),
-            Some(Path::new("/home/alice").join(".locket"))
-        );
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn agent_data_dir_uses_application_support_on_macos() {
-        assert_eq!(
-            resolve_agent_data_dir_for_platform(Path::new("/Users/alice"), None),
-            Some(
-                Path::new("/Users/alice")
-                    .join("Library")
-                    .join("Application Support")
-                    .join("locket")
+        assert_ne!(
+            resolve_default_agent_data_dir(home),
+            LocketInstance::Installed.agent_data_dir(
+                std::env::consts::OS,
+                home,
+                runtime.as_deref()
             )
         );
     }

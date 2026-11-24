@@ -25,6 +25,7 @@ use bech32::{Bech32, Hrp};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 /// Magic header that prefixes every Locket sealed bundle.
 pub const BUNDLE_MAGIC: &[u8; 8] = b"LKBNDL\0\0";
@@ -215,6 +216,8 @@ pub fn verify_age_payload_structure(encrypted_payload: &[u8]) -> BundleEncryptio
 
 /// Decrypts an age-encrypted bundle payload with a local X25519 identity.
 ///
+/// Use [`decrypt_bundle_payload_zeroizing`] to clear the returned buffer on drop.
+///
 /// # Errors
 ///
 /// Returns [`BundleEncryptionError::Decrypt`] if the payload is
@@ -223,12 +226,28 @@ pub fn decrypt_bundle_payload_with_age_identity(
     encrypted_payload: &[u8],
     identity: &age::x25519::Identity,
 ) -> BundleEncryptionResult<Vec<u8>> {
+    decrypt_bundle_payload_zeroizing(encrypted_payload, identity)
+        .map(|mut plaintext| std::mem::take(&mut *plaintext))
+}
+
+/// Decrypts an age-encrypted bundle payload into a buffer that is cleared on drop.
+///
+/// # Errors
+///
+/// Returns [`BundleEncryptionError::Decrypt`] for a malformed payload, an
+/// incorrect recipient identity, or failed authentication.
+pub fn decrypt_bundle_payload_zeroizing(
+    encrypted_payload: &[u8],
+    identity: &age::x25519::Identity,
+) -> BundleEncryptionResult<Zeroizing<Vec<u8>>> {
     let decryptor = age::Decryptor::new(encrypted_payload)
         .map_err(|error| BundleEncryptionError::Decrypt(error.to_string()))?;
     let mut reader = decryptor
         .decrypt(std::iter::once(identity as &dyn age::Identity))
         .map_err(|error| BundleEncryptionError::Decrypt(error.to_string()))?;
-    let mut plaintext = Vec::new();
+    // The ciphertext is larger than the plaintext. Reserve once so that
+    // growing the buffer cannot leave copies of decrypted bytes in freed memory.
+    let mut plaintext = Zeroizing::new(Vec::with_capacity(encrypted_payload.len()));
     reader
         .read_to_end(&mut plaintext)
         .map_err(|error| BundleEncryptionError::Decrypt(error.to_string()))?;
@@ -241,6 +260,9 @@ pub fn decrypt_bundle_payload_with_age_identity(
 /// callers (such as `locket-cli`) that receive raw key bytes from the device
 /// private-key storage and don't depend on the `age` crate directly.
 ///
+/// Use [`decrypt_bundle_payload_with_x25519_secret_zeroizing`] to clear the
+/// returned buffer on drop.
+///
 /// # Errors
 ///
 /// Returns [`BundleEncryptionError::Decrypt`] if the secret cannot be encoded
@@ -250,17 +272,32 @@ pub fn decrypt_bundle_payload_with_x25519_secret(
     encrypted_payload: &[u8],
     secret_key: &[u8; 32],
 ) -> BundleEncryptionResult<Vec<u8>> {
+    decrypt_bundle_payload_with_x25519_secret_zeroizing(encrypted_payload, secret_key)
+        .map(|mut plaintext| std::mem::take(&mut *plaintext))
+}
+
+/// Decrypts with a raw X25519 secret into a buffer that is cleared on drop.
+///
+/// # Errors
+///
+/// Returns [`BundleEncryptionError::Decrypt`] for an invalid age identity,
+/// a malformed payload, an incorrect recipient, or failed authentication.
+pub fn decrypt_bundle_payload_with_x25519_secret_zeroizing(
+    encrypted_payload: &[u8],
+    secret_key: &[u8; 32],
+) -> BundleEncryptionResult<Zeroizing<Vec<u8>>> {
     let hrp = Hrp::parse("AGE-SECRET-KEY-").map_err(|error| {
         BundleEncryptionError::Decrypt(format!("invalid x25519 secret hrp: {error}"))
     })?;
-    let encoded = bech32::encode::<Bech32>(hrp, secret_key).map_err(|error| {
-        BundleEncryptionError::Decrypt(format!("invalid x25519 secret: {error}"))
-    })?;
-    let encoded = encoded.to_uppercase();
+    let mut encoded =
+        Zeroizing::new(bech32::encode::<Bech32>(hrp, secret_key).map_err(|error| {
+            BundleEncryptionError::Decrypt(format!("invalid x25519 secret: {error}"))
+        })?);
+    encoded.make_ascii_uppercase();
     let identity: age::x25519::Identity = encoded
         .parse()
         .map_err(|message: &'static str| BundleEncryptionError::Decrypt(message.to_owned()))?;
-    decrypt_bundle_payload_with_age_identity(encrypted_payload, &identity)
+    decrypt_bundle_payload_zeroizing(encrypted_payload, &identity)
 }
 
 impl BundleContainer {
@@ -1023,6 +1060,9 @@ mod tests {
             decrypt_bundle_payload_with_x25519_secret(&payload, &[42; 32]).unwrap(),
             br#"{"schema_version":1,"profile_count":1}"#
         );
+        let decrypted =
+            decrypt_bundle_payload_with_x25519_secret_zeroizing(&payload, &[42; 32]).unwrap();
+        assert_eq!(&decrypted[..], br#"{"schema_version":1,"profile_count":1}"#);
         assert!(decrypt_bundle_payload_with_x25519_secret(&payload, &[43; 32]).is_err());
     }
 }

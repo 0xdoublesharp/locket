@@ -13,6 +13,7 @@ mod audit;
 mod automation;
 mod command_policies;
 mod devices;
+mod discovery;
 mod grants;
 mod keys;
 mod passkeys;
@@ -25,7 +26,7 @@ mod secrets;
 mod team;
 
 pub(super) struct TestStore {
-    pub(super) _directory: TempDir,
+    pub(super) directory: TempDir,
     pub(super) store: Store,
 }
 
@@ -36,7 +37,7 @@ pub(super) fn open_initialized_store() -> Result<TestStore, Box<dyn Error>> {
     let mut store = Store::open(path)?;
     store.initialize_schema()?;
 
-    Ok(TestStore { _directory: directory, store })
+    Ok(TestStore { directory, store })
 }
 
 pub(super) fn insert_project_profile(store: &Store) -> Result<(), Box<dyn Error>> {

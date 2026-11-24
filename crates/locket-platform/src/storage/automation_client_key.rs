@@ -3,14 +3,13 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use data_encoding::BASE64URL_NOPAD;
 use keyring_core::Entry;
-use locket_crypto::{KEY_LEN, KeyBytes};
-use zeroize::{Zeroize, Zeroizing};
+use locket_crypto::KeyBytes;
+use zeroize::Zeroizing;
 
+use crate::LocketInstance;
 use crate::error::PlatformError;
 
-pub const AUTOMATION_CLIENT_KEYRING_SERVICE: &str = "dev.0xdoublesharp.locket";
 const AUTOMATION_CLIENT_ACCOUNT_PREFIX: &str = "automation-client:";
 
 /// OS-keychain reference for a stored automation-client private key.
@@ -71,9 +70,15 @@ impl AutomationClientKeyStore for KeyringAutomationClientKeyStore {
 }
 
 /// In-memory automation-client private-key store for tests.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MemoryAutomationClientKeyStore {
-    keys: Mutex<BTreeMap<String, KeyBytes>>,
+    keys: Mutex<BTreeMap<String, Zeroizing<KeyBytes>>>,
+}
+
+impl std::fmt::Debug for MemoryAutomationClientKeyStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("MemoryAutomationClientKeyStore").finish_non_exhaustive()
+    }
 }
 
 impl MemoryAutomationClientKeyStore {
@@ -87,7 +92,9 @@ impl MemoryAutomationClientKeyStore {
         client_id: &str,
     ) -> Result<Option<Zeroizing<KeyBytes>>, PlatformError> {
         let keys = self.keys.lock().map_err(|_| PlatformError::MemoryPoisoned)?;
-        Ok(keys.get(client_id).copied().map(Zeroizing::new))
+        let key = keys.get(client_id).cloned();
+        drop(keys);
+        Ok(key)
     }
 }
 
@@ -98,19 +105,14 @@ impl AutomationClientKeyStore for MemoryAutomationClientKeyStore {
         private_key: &KeyBytes,
     ) -> Result<AutomationClientKeychainRef, PlatformError> {
         let mut keys = self.keys.lock().map_err(|_| PlatformError::MemoryPoisoned)?;
-        if let Some(old_key) = keys.get_mut(client_id) {
-            old_key.zeroize();
-        }
-        keys.insert(client_id.to_owned(), *private_key);
+        keys.insert(client_id.to_owned(), Zeroizing::new(*private_key));
         drop(keys);
         Ok(automation_client_keychain_ref(client_id))
     }
 
     fn delete_client_key(&self, client_id: &str) -> Result<(), PlatformError> {
         let mut keys = self.keys.lock().map_err(|_| PlatformError::MemoryPoisoned)?;
-        if let Some(mut key) = keys.remove(client_id) {
-            key.zeroize();
-        }
+        keys.remove(client_id);
         drop(keys);
         Ok(())
     }
@@ -119,7 +121,7 @@ impl AutomationClientKeyStore for MemoryAutomationClientKeyStore {
 #[must_use]
 pub fn automation_client_keychain_ref(client_id: &str) -> AutomationClientKeychainRef {
     AutomationClientKeychainRef {
-        service: AUTOMATION_CLIENT_KEYRING_SERVICE.to_owned(),
+        service: LocketInstance::current().keyring_service().to_owned(),
         account: automation_client_key_account(client_id),
     }
 }
@@ -133,26 +135,15 @@ fn automation_client_key_account(client_id: &str) -> String {
     format!("{AUTOMATION_CLIENT_ACCOUNT_PREFIX}{client_id}")
 }
 
-fn encode_client_key(private_key: &KeyBytes) -> String {
-    BASE64URL_NOPAD.encode(private_key)
-}
-
-#[allow(dead_code)]
-fn decode_client_key(encoded: &str) -> Result<Zeroizing<KeyBytes>, PlatformError> {
-    let decoded = Zeroizing::new(
-        BASE64URL_NOPAD.decode(encoded.as_bytes()).map_err(|_| PlatformError::InvalidMasterKey)?,
-    );
-    if decoded.len() != KEY_LEN {
-        return Err(PlatformError::InvalidMasterKey);
-    }
-    let mut key = Zeroizing::new([0_u8; KEY_LEN]);
-    key.copy_from_slice(&decoded);
-    Ok(key)
+fn encode_client_key(private_key: &KeyBytes) -> Zeroizing<String> {
+    crate::master_key::encode_key(private_key)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::master_key::decode_key;
+    use locket_crypto::KEY_LEN;
 
     const CLIENT_ID: &str = "lk_client_test";
     const KEY: KeyBytes = [0x42; KEY_LEN];
@@ -161,7 +152,7 @@ mod tests {
     fn keychain_reference_uses_metadata_only_account() {
         let reference = automation_client_keychain_ref(CLIENT_ID);
 
-        assert_eq!(reference.service, AUTOMATION_CLIENT_KEYRING_SERVICE);
+        assert_eq!(reference.service, crate::LocketInstance::current().keyring_service());
         assert_eq!(reference.account, "automation-client:lk_client_test");
     }
 
@@ -170,9 +161,7 @@ mod tests {
         let encoded = encode_client_key(&KEY);
 
         assert!(!encoded.contains('='));
-        assert_eq!(&*decode_client_key(&encoded)?, &KEY);
-        assert!(matches!(decode_client_key("not base64"), Err(PlatformError::InvalidMasterKey)));
-        assert!(matches!(decode_client_key("AA"), Err(PlatformError::InvalidMasterKey)));
+        assert_eq!(&*decode_key(encoded.as_bytes())?, &KEY);
         Ok(())
     }
 

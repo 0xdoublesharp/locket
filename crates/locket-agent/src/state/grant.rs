@@ -4,6 +4,13 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+const MAX_GRANT_TTL_SECONDS: u32 = 3_600;
+
+/// Returns whether the requested live-grant lifetime is permitted.
+pub fn valid_grant_ttl(ttl_seconds: u64) -> bool {
+    (1..=u64::from(MAX_GRANT_TTL_SECONDS)).contains(&ttl_seconds)
+}
+
 /// Process identity attached to a live grant.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GrantBinding {

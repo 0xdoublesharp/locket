@@ -1862,7 +1862,7 @@ fn init_writes_recovery_envelope_and_metadata_only_audit() -> Result<(), Box<dyn
     assert!(output.contains("recovery_code_init: success"));
     assert!(output.contains("terminal scrollback may retain this code"));
     assert!(output.contains("metadata_only: yes"));
-    assert!(directory.path().join(".locket/recovery/kdf.toml").exists());
+    assert!(!directory.path().join(".locket/recovery/kdf.toml").exists());
     assert!(directory.path().join(".locket/recovery/envelope.bin").exists());
 
     let store = crate::open_store(&context)?;
@@ -2624,7 +2624,7 @@ fn team_invite_creates_signed_file_pending_row_and_audit() -> Result<(), Box<dyn
     assert_eq!(invite.payload.role, locket_core::TeamRole::Developer);
     assert_eq!(invite.payload.profiles, vec!["dev".to_owned()]);
     assert_ne!(invite.signature, "");
-    let sealed_payload = invite.payload.sealed_payload.as_ref().ok_or("sealed payload")?;
+    let sealed_payload = &invite.payload.sealed_payload;
     assert_eq!(sealed_payload.v, 1);
     assert_eq!(sealed_payload.plaintext_counts.profile_key_count, 2);
     assert_eq!(
@@ -2891,7 +2891,7 @@ fn team_invite_rejects_bad_descriptor_without_file_or_audit()
             "invite",
             "Teammate",
             "--device",
-            "lkdev1_not-base64",
+            "lkdev2_not-base64",
             "--profile",
             "dev",
             "--role",
@@ -3054,7 +3054,7 @@ fn team_accept_verifies_invite_displays_trust_summary_and_records_audit()
         profiles: vec!["dev".to_owned()],
         expires_at,
         nonce: data_encoding::BASE64URL_NOPAD.encode(&[7; 24]),
-        sealed_payload: Some({
+        sealed_payload: {
             let recipient_key: [u8; 32] = local_device
                 .sealing_public_key
                 .as_slice()
@@ -3116,7 +3116,7 @@ fn team_accept_verifies_invite_displays_trust_summary_and_records_audit()
                     secret_metadata_count: 0,
                 },
             }
-        }),
+        },
     };
     let signed = locket_core::SignedInvite::sign(&issuer_signing, payload)?;
     let invite_path = directory.path().join("accept.locket-invite");
@@ -3592,7 +3592,7 @@ fn team_accept_invite_fixture(
         profiles: vec!["dev".to_owned()],
         expires_at,
         nonce: data_encoding::BASE64URL_NOPAD.encode(&[7; 24]),
-        sealed_payload: None,
+        sealed_payload: super::empty_sealed_invite_payload(&local_device.sealing_public_key)?,
     };
     let mut signed = locket_core::SignedInvite::sign(&issuer_signing, payload)?;
     if let Some(signature) = signature_override {
@@ -4822,7 +4822,7 @@ fn device_init_bootstraps_when_master_key_and_envelope_are_absent()
         directory.path().join(".locket/recovery/envelope.bin").exists(),
         "recovery envelope must exist after bootstrap"
     );
-    assert!(directory.path().join(".locket/recovery/kdf.toml").exists());
+    assert!(!directory.path().join(".locket/recovery/kdf.toml").exists());
     let envelope = crate::load_recovery_envelope(&directory.path().join(".locket/recovery"))?;
     assert!(envelope.entries.iter().any(|entry| entry.entry_kind == "master_key"));
     assert!(envelope.entries.iter().any(|entry| entry.entry_kind == "device_signing_private_key"));
@@ -4909,7 +4909,6 @@ fn device_init_returns_ambiguous_state_when_recovery_envelope_exists_without_mas
     let recovery_dir = directory.path().join(".locket").join("recovery");
     std::fs::create_dir_all(&recovery_dir)?;
     std::fs::write(recovery_dir.join("envelope.bin"), b"placeholder")?;
-    std::fs::write(recovery_dir.join("kdf.toml"), b"placeholder")?;
 
     let result = run_with_context(
         Cli::try_parse_from(["locket", "device", "init"])?,
@@ -5310,8 +5309,7 @@ fn team_join_request_supports_passphrase_only_private_key_envelopes()
     let store = locket_store::Store::open(receiver.path().join("store.db"))?;
     let device =
         store.get_active_local_device(config.project_id.as_str())?.ok_or("device missing")?;
-    let signing =
-        crate::commands::team::device::load_device_signing_key(&context, &store, &device)?;
+    let signing = crate::commands::team::device::load_device_signing_key(&context, &device)?;
     assert_eq!(signing.verifying_key().as_bytes().as_slice(), device.signing_public_key);
     Ok(())
 }

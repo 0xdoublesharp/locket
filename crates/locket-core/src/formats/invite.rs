@@ -64,29 +64,15 @@ pub struct InvitePayload {
     /// 24-byte random nonce (base64url) to ensure uniqueness even across
     /// identical metadata.
     pub nonce: String,
-    /// Optional age-encrypted inner payload that, when present, lets
-    /// `team accept` import profile keys and command policies into the
-    /// recipient's store as part of the trust ceremony.
-    ///
-    /// Spec: `docs/specs/team-sync-recovery.md:7,28,67` calls for an
-    /// age-encrypted inner section that imports profile keys and
-    /// command policies into the recipient's store. Current issuers
-    /// populate this field and current recipients decrypt/apply it
-    /// during `team accept`. `None` is retained for legacy invite
-    /// compatibility.
-    ///
-    /// `Option<_>` with `#[serde(default, skip_serializing_if =
-    /// "Option::is_none")]` keeps existing legacy invites byte-stable:
-    /// when a legacy or test issuer omits the field, the encoded
-    /// invite is indistinguishable on the wire from a v1 invite that
-    /// pre-dated sealed payloads.
+    /// Age-encrypted inner payload that lets `team accept` import profile
+    /// keys and command policies into the recipient's store as part of
+    /// the trust ceremony.
     ///
     /// The whole field is signature-covered (Ed25519 over canonical
     /// JSON of `InvitePayload`), so a man-in-the-middle cannot strip
     /// or substitute the sealed section without invalidating
     /// [`SignedInvite::verify`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sealed_payload: Option<SealedInvitePayloadV1>,
+    pub sealed_payload: SealedInvitePayloadV1,
 }
 
 /// Age-encrypted inner section of an [`InvitePayload`].
@@ -383,7 +369,13 @@ mod tests {
             profiles: vec!["dev".to_owned()],
             expires_at: 9_999_999_999,
             nonce: BASE64URL_NOPAD.encode(&[0_u8; 24]),
-            sealed_payload: None,
+            sealed_payload: SealedInvitePayloadV1 {
+                v: 1,
+                ciphertext_b64: BASE64URL_NOPAD.encode(b"ciphertext"),
+                recipient_sealing_public_key_b64: BASE64URL_NOPAD.encode(sealing_pub),
+                aad_schema_version: 1,
+                plaintext_counts: SealedInvitePlaintextCounts::default(),
+            },
         }
     }
 
@@ -578,28 +570,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_invite_without_sealed_payload_field_round_trips_byte_stable() {
-        // A v1 invite whose JSON omits `sealed_payload` must continue
-        // to deserialize and the encode round-trip must omit the field
-        // (skip_serializing_if = "Option::is_none"). This pins the
-        // legacy on-the-wire layout.
+    fn invite_without_sealed_payload_is_rejected() {
         let sk = make_signing_key();
-        let sealing = [0x77_u8; 32];
-        let payload = make_payload(&sk, &sealing);
-        assert!(payload.sealed_payload.is_none());
-
-        let encoded = serde_json::to_value(&payload).unwrap();
-        assert!(
-            encoded.get("sealed_payload").is_none(),
-            "sealed_payload must be skipped when None: {encoded}"
-        );
-
-        // Forward-compat: a JSON document without the field still
-        // deserializes via #[serde(default)].
-        let mut bare = encoded;
-        bare.as_object_mut().unwrap().remove("sealed_payload");
-        let recovered: InvitePayload = serde_json::from_value(bare).unwrap();
-        assert_eq!(recovered, payload);
+        let mut encoded = serde_json::to_value(make_payload(&sk, &[0x77_u8; 32])).unwrap();
+        encoded.as_object_mut().unwrap().remove("sealed_payload");
+        assert!(serde_json::from_value::<InvitePayload>(encoded).is_err());
     }
 
     #[test]
@@ -610,7 +585,7 @@ mod tests {
         let sk = make_signing_key();
         let sealing = [0x77_u8; 32];
         let mut payload = make_payload(&sk, &sealing);
-        payload.sealed_payload = Some(make_sealed_payload());
+        payload.sealed_payload = make_sealed_payload();
         let invite = sign_payload(&sk, &payload);
 
         assert!(invite.verify().is_ok());
@@ -624,15 +599,15 @@ mod tests {
         // Tamper test: flip a byte in the inner ciphertext after
         // signing; the outer signature must reject it.
         let mut tampered = invite.clone();
-        let inner = tampered.payload.sealed_payload.as_mut().unwrap();
+        let inner = &mut tampered.payload.sealed_payload;
         let mut ct = BASE64URL_NOPAD.decode(inner.ciphertext_b64.as_bytes()).unwrap();
         ct[0] ^= 0xFF;
         inner.ciphertext_b64 = BASE64URL_NOPAD.encode(&ct);
         assert!(matches!(tampered.verify(), Err(InviteVerifyError::InvalidSignature)));
 
-        // Stripping the sealed payload after signing must also fail.
-        let mut stripped = invite;
-        stripped.payload.sealed_payload = None;
-        assert!(matches!(stripped.verify(), Err(InviteVerifyError::InvalidSignature)));
+        // Swapping in a different sealed payload after signing must also fail.
+        let mut swapped = invite;
+        swapped.payload.sealed_payload.plaintext_counts.profile_key_count += 1;
+        assert!(matches!(swapped.verify(), Err(InviteVerifyError::InvalidSignature)));
     }
 }

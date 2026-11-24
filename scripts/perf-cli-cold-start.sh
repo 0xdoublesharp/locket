@@ -21,6 +21,10 @@
 
 set -euo pipefail
 
+# Release binaries here must use the development instance; the OS keychain
+# ignores the temporary HOME these scripts set.
+export LOCKET_INSTANCE=dev
+
 cargo_bin="${CARGO:-cargo}"
 source "$(dirname "${BASH_SOURCE[0]}")/cargo-jobs.sh"
 jobs="$(cargo_jobs)"

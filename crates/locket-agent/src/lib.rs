@@ -6,14 +6,15 @@
 
 mod auditing;
 mod handlers;
+mod keys;
 mod protocol;
 mod state;
 mod transport;
 
 pub(crate) use auditing::{audit, audit_deny, audit_verify, degraded_audit};
 pub(crate) use handlers::{
-    auth, backup, clients, config, device_members, mutations, policies, prepare_exec, profile,
-    resolve, reveal, scan, secrets, set_secret, versions,
+    auth, backup, clients, config, device_members, discovery, mutations, policies, prepare_exec,
+    profile, resolve, reveal, scan, secrets, set_secret, versions,
 };
 pub(crate) use protocol::{envelope, error, framing, method};
 pub(crate) use state::{
@@ -43,6 +44,10 @@ pub use config::{
 };
 pub use device_members::{
     DeviceMemberKind, DeviceMemberRow, ListDeviceMembersRequest, ListDeviceMembersResponse,
+};
+pub use discovery::{
+    DiscoverSecretsRequest, DiscoveryError, DiscoveryFilters, ListProjectsRequest,
+    discover_secrets, list_projects,
 };
 pub use envelope::{ErrorEnvelope, RequestEnvelope, ResponseEnvelope, SuccessEnvelope};
 pub use error::ProtocolError;
@@ -83,7 +88,9 @@ pub use server::{AgentSocketState, dispatch};
 pub use session_lock::{
     SessionLockAudit, SessionLockOutcome, SessionLockSource, append_lock_audit, lock_audit_metadata,
 };
-pub use set_secret::{SetSecretRequest, SetSecretResponse};
+pub use set_secret::{
+    SetSecretRequest, SetSecretResponse, SetSecretWriteRequest, has_secret_fingerprint,
+};
 pub use status::{
     LockState, STATUS_HEARTBEAT_INTERVAL_SECS, StatusEvent, StatusEventKind, StatusEventSequence,
     StatusPayload,

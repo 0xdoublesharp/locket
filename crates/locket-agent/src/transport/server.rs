@@ -12,16 +12,17 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use locket_crypto::KeyBytes;
 #[cfg(not(test))]
 use locket_platform::KeyringMasterKeyStore;
 use locket_platform::{MasterKeyStore, PassphraseFallbackMasterKeyStore, PlatformError};
 use locket_store::{Store, StoreError};
-use tokio::io::AsyncReadExt;
 #[cfg(unix)]
 use tokio::io::AsyncWriteExt;
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Notify};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::DEFAULT_MAX_MESSAGE_SIZE;
 use crate::envelope::{ErrorEnvelope, RequestEnvelope, ResponseEnvelope, SuccessEnvelope};
@@ -29,6 +30,7 @@ use crate::error::ProtocolError;
 use crate::framing::decode_request_frame;
 #[cfg(unix)]
 use crate::framing::encode_frame;
+use crate::keys::{KeyError, cached_master_key, master_key_array, unwrap_audit_key_with_master};
 use crate::method::AgentMethod;
 use crate::session_lock::{
     SessionLockAudit, SessionLockOutcome, SessionLockSource, append_lock_audit,
@@ -46,7 +48,7 @@ type PeerCredentialValidator =
 /// resolve a project data dir; tests that don't perform passphrase
 /// unlocks never touch the filesystem regardless.
 fn default_passphrase_fallback_dir() -> PathBuf {
-    directories::ProjectDirs::from("dev", "0xdoublesharp", "Locket").map_or_else(
+    locket_platform::LocketInstance::current().project_dirs().map_or_else(
         || std::env::temp_dir().join("locket-agent-passphrase-fallback"),
         |dirs| dirs.data_dir().join("passphrase-fallback"),
     )
@@ -289,7 +291,7 @@ pub struct AgentSocketState {
     /// `RegisterIdeEnvSession` and consumed by `IdeEnvSession` lookups.
     /// Values never enter this map: only the env-name allow-list and
     /// TTL.
-    pub ide_env_sessions: crate::ide_env_session::IdeEnvSessionRegistry,
+    pub ide_env_sessions: Arc<Mutex<crate::ide_env_session::IdeEnvSessionRegistry>>,
     /// OS keychain (or test-injected) master-key store. The agent
     /// unwraps client-less unlocks against this store; the unwrapped
     /// key is then cached via `unlock_cache`.
@@ -561,7 +563,7 @@ impl AgentSocketState {
         metrics.recent_audit_status = RecentAuditStatus::Ok;
     }
 
-    /// Clears unlocked key material and live grants for a session-lock event.
+    /// Clears unlocked key material, grants, and IDE sessions for a lock event.
     ///
     /// # Errors
     ///
@@ -572,23 +574,56 @@ impl AgentSocketState {
         source: SessionLockSource,
         now_unix_nanos: i128,
     ) -> Result<SessionLockOutcome, StoreError> {
-        let cleared_entries = {
+        let gate = self.session_gate.lock().await;
+        let outcome = self.lock_projects(None, source, now_unix_nanos).await;
+        drop(gate);
+        outcome
+    }
+
+    // Called while holding the session gate to serialize eviction with unlock
+    // and IDE session registration.
+    async fn lock_projects(
+        &self,
+        project: Option<&str>,
+        source: SessionLockSource,
+        now: i128,
+    ) -> Result<SessionLockOutcome, StoreError> {
+        let entries = {
             let mut cache = self.unlock_cache.lock().await;
-            cache.drain()
+            match project {
+                Some(project) => cache
+                    .evict(project)
+                    .map(|entry| (project.to_owned(), entry))
+                    .into_iter()
+                    .collect(),
+                None => cache.drain(),
+            }
         };
-        let cached_keys_cleared = cleared_entries.len();
-        let audit_material = lock_audit_material(&cleared_entries);
+        let cached_keys_cleared = entries.len();
+        let material = lock_audit_material(&entries);
+        drop(entries);
         let live_grants_revoked = {
             let mut grants = self.grants.lock().await;
-            let count = grants.len();
-            grants.clear();
-            count
+            if let Some(project) = project {
+                grants.revoke_for_project(project)
+            } else {
+                let count = grants.len();
+                grants.clear();
+                count
+            }
         };
+        {
+            let mut sessions = self.ide_env_sessions.lock().await;
+            match project {
+                Some(project) => sessions.revoke_project(project),
+                None => sessions.clear(),
+            };
+        }
         let outcome = SessionLockOutcome { cached_keys_cleared, live_grants_revoked };
         if outcome.changed() {
-            self.publish_status_snapshot(now_unix_nanos).await;
+            self.publish_status_snapshot(now).await;
         }
-        append_lock_audits(source, now_unix_nanos, outcome, &audit_material)?;
+        append_lock_audits(source, now, outcome, &material)?;
         Ok(outcome)
     }
 
@@ -609,7 +644,7 @@ impl AgentSocketState {
         } else {
             gate.remove(source.as_str());
         }
-        let outcome = self.lock_for_session_event(source, now).await;
+        let outcome = self.lock_projects(None, source, now).await;
         drop(gate);
         outcome
     }
@@ -626,27 +661,10 @@ impl AgentSocketState {
         now: i128,
     ) -> Result<SessionLockOutcome, StoreError> {
         let gate = self.session_gate.lock().await;
-        let entries: Vec<_> = self
-            .unlock_cache
-            .lock()
-            .await
-            .evict(project)
-            .map(|entry| (project.to_owned(), entry))
-            .into_iter()
-            .collect();
-        let cached_keys_cleared = entries.len();
-        let material = lock_audit_material(&entries);
-        drop(entries);
-        let live_grants_revoked = self.grants.lock().await.revoke_for_project(project);
-        let outcome = SessionLockOutcome { cached_keys_cleared, live_grants_revoked };
-        if outcome.changed() {
-            self.publish_status_snapshot(now).await;
-        }
-        let result =
-            append_lock_audits(SessionLockSource::TeamSyncInvalidated, now, outcome, &material);
+        let outcome =
+            self.lock_projects(Some(project), SessionLockSource::TeamSyncInvalidated, now).await;
         drop(gate);
-        result?;
-        Ok(outcome)
+        outcome
     }
 
     // Production reads wall time; unit tests inject a per-agent clock jump.
@@ -760,10 +778,8 @@ fn append_lock_audits(
             sequence: 0,
             reason: "project audit key unavailable during lock".into(),
         };
-        let master_key = zeroize::Zeroizing::new(
-            master_key_bytes_to_array(&material.master_key).ok_or_else(key_error)?,
-        );
-        let audit_key = unwrap_project_audit_key(&store, &material.project_id, &master_key)
+        let master_key = master_key_array(&material.master_key).map_err(|_| key_error())?;
+        let audit_key = unwrap_audit_key_with_master(&store, &material.project_id, &master_key)
             .map_err(|_| key_error())?;
         append_lock_audit(
             &mut store,
@@ -833,7 +849,7 @@ pub async fn handle_connection(
     if let Err(error) = validate_connection_peer(&stream, &state) {
         return ConnectionOutcome::Rejected { reason: error };
     }
-    let mut buffer = Vec::with_capacity(4 * 1024);
+    let mut buffer = Zeroizing::new(Vec::with_capacity(FRAME_READ_CHUNK_SIZE));
     loop {
         match read_one_frame(&mut stream, &mut buffer).await {
             Ok(None) => return ConnectionOutcome::PeerClosed,
@@ -878,7 +894,7 @@ async fn stream_status(
     mut stream: UnixStream,
     state: AgentSocketState,
     request_id: String,
-    initial_buffer: Vec<u8>,
+    mut buffer: Zeroizing<Vec<u8>>,
 ) -> ConnectionOutcome {
     let mut subscriber = state.status_hub.subscribe().await;
     #[cfg(test)]
@@ -889,31 +905,7 @@ async fn stream_status(
     #[cfg(not(test))]
     let heartbeat = std::time::Duration::from_secs(crate::status::STATUS_HEARTBEAT_INTERVAL_SECS);
 
-    let mut buffer = initial_buffer;
     loop {
-        // Drain any already-buffered frames before blocking on the
-        // socket. A peer can send `CancelSubscription` immediately
-        // after `SubscribeStatus`, in which case it would already be
-        // sitting in `buffer`.
-        match decode_request_frame(&buffer, DEFAULT_MAX_MESSAGE_SIZE) {
-            Ok((envelope, consumed)) => {
-                buffer.drain(..consumed);
-                if matches!(envelope.method(), Ok(AgentMethod::CancelSubscription)) {
-                    return ConnectionOutcome::PeerClosed;
-                }
-                let response = error_response(
-                    &envelope,
-                    "ProtocolError",
-                    "only CancelSubscription is allowed mid-stream",
-                );
-                let _ = write_response(&mut stream, &response).await;
-                return ConnectionOutcome::Errored;
-            }
-            Err(ProtocolError::IncompleteFrame) => {}
-            Err(_) => return ConnectionOutcome::Errored,
-        }
-
-        let mut chunk = [0_u8; 1024];
         tokio::select! {
             event = subscriber.next_event_with_heartbeat(heartbeat) => {
                 let Some(event) = event else { return ConnectionOutcome::Errored; };
@@ -928,11 +920,20 @@ async fn stream_status(
                     return ConnectionOutcome::Errored;
                 }
             }
-            read = stream.read(&mut chunk) => {
+            read = read_one_frame(&mut stream, &mut buffer) => {
                 match read {
-                    Ok(0) => return ConnectionOutcome::PeerClosed,
-                    Ok(read) => {
-                        buffer.extend_from_slice(&chunk[..read]);
+                    Ok(None) => return ConnectionOutcome::PeerClosed,
+                    Ok(Some(envelope)) => {
+                        if matches!(envelope.method(), Ok(AgentMethod::CancelSubscription)) {
+                            return ConnectionOutcome::PeerClosed;
+                        }
+                        let response = error_response(
+                            &envelope,
+                            "ProtocolError",
+                            "only CancelSubscription is allowed mid-stream",
+                        );
+                        let _ = write_response(&mut stream, &response).await;
+                        return ConnectionOutcome::Errored;
                     }
                     Err(_) => return ConnectionOutcome::Errored,
                 }
@@ -941,27 +942,61 @@ async fn stream_status(
     }
 }
 
-// Shared by Unix sockets and Windows pipes. Only an incomplete frame can
-// become valid after another read; all other decode errors close the stream.
+pub(super) const FRAME_READ_CHUNK_SIZE: usize = 16 * 1024;
+
+// Shared by Unix sockets and Windows pipes. Reads are cancellation-safe:
+// an incomplete frame stays in the caller's buffer between polls.
 pub(super) async fn read_one_frame<R: tokio::io::AsyncRead + Unpin>(
     stream: &mut R,
-    buffer: &mut Vec<u8>,
+    buffer: &mut Zeroizing<Vec<u8>>,
 ) -> Result<Option<RequestEnvelope>, io::Error> {
     loop {
-        match decode_request_frame(buffer, DEFAULT_MAX_MESSAGE_SIZE) {
-            Ok((envelope, consumed)) => {
-                buffer.drain(..consumed);
-                return Ok(Some(envelope));
+        let read_limit = if let Some(prefix) = buffer.first_chunk::<4>() {
+            let length = u32::from_le_bytes(*prefix) as usize;
+            if length > DEFAULT_MAX_MESSAGE_SIZE {
+                let error =
+                    ProtocolError::MessageTooLarge { length, maximum: DEFAULT_MAX_MESSAGE_SIZE };
+                return Err(io::Error::new(io::ErrorKind::InvalidData, error));
             }
-            Err(ProtocolError::IncompleteFrame) => {}
-            Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
-        }
-        let mut chunk = [0_u8; 1024];
-        let read = stream.read(&mut chunk).await?;
+            let total_len = 4 + length;
+            if buffer.len() >= total_len {
+                let decoded = decode_request_frame(buffer, DEFAULT_MAX_MESSAGE_SIZE)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error));
+                // Wipe both the consumed bytes and any duplicate tail left
+                // by compacting queued bytes towards the start of the buffer.
+                buffer[..total_len].zeroize();
+                let remaining = buffer.len() - total_len;
+                buffer.copy_within(total_len.., 0);
+                buffer[remaining..].zeroize();
+                buffer.truncate(remaining);
+                return decoded.map(|(envelope, _)| Some(envelope));
+            }
+            let missing = total_len - buffer.len();
+            if buffer.capacity() < total_len {
+                // Move the incomplete frame into a pre-sized buffer. Dropping
+                // the previous wrapper wipes the old allocation before freeing it.
+                let mut reserved = Zeroizing::new(Vec::with_capacity(total_len));
+                reserved.extend_from_slice(buffer);
+                *buffer = reserved;
+            }
+            missing.min(FRAME_READ_CHUNK_SIZE)
+        } else {
+            FRAME_READ_CHUNK_SIZE.min(buffer.capacity() - buffer.len())
+        };
+        let read = std::future::poll_fn(|cx| {
+            // Keep the scratch array on the polling stack. A pending read
+            // retains only the bytes already appended to the connection buffer.
+            let mut chunk = Zeroizing::new([0_u8; FRAME_READ_CHUNK_SIZE]);
+            let mut read_buf = tokio::io::ReadBuf::new(&mut chunk[..read_limit]);
+            std::task::ready!(std::pin::Pin::new(&mut *stream).poll_read(cx, &mut read_buf))?;
+            let bytes = read_buf.filled();
+            buffer.extend_from_slice(bytes);
+            std::task::Poll::Ready(Ok::<_, io::Error>(bytes.len()))
+        })
+        .await?;
         if read == 0 {
             return Ok(None);
         }
-        buffer.extend_from_slice(&chunk[..read]);
     }
 }
 
@@ -973,8 +1008,8 @@ pub(super) async fn read_one_frame<R: tokio::io::AsyncRead + Unpin>(
 #[derive(serde::Deserialize)]
 struct UnlockPayload {
     project_id: String,
-    #[serde(default)]
-    passphrase: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_unlock_passphrase")]
+    passphrase: Option<Zeroizing<String>>,
     #[serde(default)]
     reuse_cached: bool,
     ttl_seconds: u64,
@@ -988,6 +1023,18 @@ struct UnlockPayload {
     audit: Option<UnlockAuditPayload>,
 }
 
+fn deserialize_unlock_passphrase<'de, D>(
+    deserializer: D,
+) -> Result<Option<Zeroizing<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+
+    Option::<&str>::deserialize(deserializer)
+        .map(|value| value.map(|value| Zeroizing::new(value.to_owned())))
+}
+
 #[derive(serde::Deserialize)]
 struct UnlockAuditPayload {
     store_path: PathBuf,
@@ -999,6 +1046,8 @@ struct UnlockAuditPayload {
 struct LockPayload {
     #[serde(default)]
     source: SessionLockSource,
+    #[serde(default)]
+    project_id: Option<String>,
 }
 
 /// Returns the current Unix wall-clock time in nanoseconds, clamped to
@@ -1052,14 +1101,20 @@ pub async fn dispatch(envelope: &RequestEnvelope, state: &AgentSocketState) -> R
         }
         Ok(AgentMethod::Unlock) => handle_unlock(envelope, state).await,
         Ok(AgentMethod::Lock) => {
-            let payload: LockPayload = match serde_json::from_value(envelope.payload.clone()) {
-                Ok(payload) => payload,
-                Err(_) => {
-                    return error_response(envelope, "ProtocolError", "invalid Lock payload");
-                }
+            let payload = match serde::Deserialize::deserialize(&envelope.payload) {
+                Ok(Some(payload)) => payload,
+                Ok(None) => LockPayload::default(),
+                Err(_) => return error_response(envelope, "ProtocolError", "invalid Lock payload"),
             };
-            let now = current_unix_nanos();
-            if state.lock_for_session_event(payload.source, now).await.is_err() {
+            if payload.project_id.as_deref().is_some_and(|project| project.trim().is_empty()) {
+                return error_response(envelope, "MetadataInvalid", "project_id must not be empty");
+            }
+            let gate = state.session_gate.lock().await;
+            let result = state
+                .lock_projects(payload.project_id.as_deref(), payload.source, current_unix_nanos())
+                .await;
+            drop(gate);
+            if result.is_err() {
                 return error_response(envelope, "CorruptDb", "failed to append LOCK audit row");
             }
             ResponseEnvelope::Success(SuccessEnvelope::new(
@@ -1108,7 +1163,7 @@ pub async fn dispatch(envelope: &RequestEnvelope, state: &AgentSocketState) -> R
         }
         Ok(AgentMethod::ExportBundle) => crate::backup::handle_export_bundle(envelope, state).await,
         Ok(AgentMethod::ImportBundle) => crate::backup::handle_import_bundle(envelope, state).await,
-        Ok(AgentMethod::VerifyBundle) => crate::backup::handle_verify_bundle(envelope),
+        Ok(AgentMethod::VerifyBundle) => crate::backup::handle_verify_bundle(envelope, state).await,
         Ok(AgentMethod::RecoveryRotate) => {
             crate::backup::handle_recovery_rotate(envelope, state).await
         }
@@ -1117,6 +1172,8 @@ pub async fn dispatch(envelope: &RequestEnvelope, state: &AgentSocketState) -> R
         }
         Ok(AgentMethod::PrepareExec) => prepare_exec_dispatch(envelope, state).await,
         Ok(AgentMethod::ListSecrets) => handle_list_secrets(envelope),
+        Ok(AgentMethod::ListProjects) => crate::discovery::handle_list_projects(envelope),
+        Ok(AgentMethod::DiscoverSecrets) => crate::discovery::handle_discover_secrets(envelope),
         Ok(AgentMethod::ListVersions) => handle_list_versions(envelope),
         Ok(AgentMethod::ImportDotenv) => {
             crate::mutations::handle_import_dotenv(envelope, state, current_unix_nanos()).await
@@ -1179,7 +1236,18 @@ async fn ide_env_session_dispatch(
 ) -> ResponseEnvelope {
     let now = current_unix_nanos();
     if matches!(method, AgentMethod::RegisterIdeEnvSession) {
-        crate::ide_env_session::handle_register_ide_env_session(envelope, state, now).await
+        let session = state.session_gate.lock().await;
+        if !session.is_empty() {
+            return error_response(envelope, "UnlockRequired", "OS session is locked or suspended");
+        }
+        let response = crate::ide_env_session::handle_register_ide_env_session(
+            envelope,
+            state,
+            current_unix_nanos(),
+        )
+        .await;
+        drop(session);
+        response
     } else {
         crate::ide_env_session::handle_ide_env_session(envelope, state, now).await
     }
@@ -1187,6 +1255,7 @@ async fn ide_env_session_dispatch(
 
 const AGENT_UNLOCK_CLIENT_KIND: &str = "agent";
 const AGENT_UNLOCK_COMMAND: &str = "unlock";
+const MAX_UNLOCK_TTL_SECONDS: u64 = 86_400;
 
 /// Server-side `Unlock` handler. The agent never trusts the client to
 /// supply key bytes; it pulls the master key from the OS keychain or
@@ -1204,10 +1273,18 @@ async fn handle_unlock(envelope: &RequestEnvelope, state: &AgentSocketState) -> 
     if state.expire_unlocks(now).await.is_err() {
         return error_response(envelope, "CorruptDb", "failed to audit expired unlock");
     }
-    let payload: UnlockPayload = match serde_json::from_value(envelope.payload.clone()) {
+    let payload: UnlockPayload = match serde::Deserialize::deserialize(&envelope.payload) {
         Ok(payload) => payload,
         Err(_) => return error_response(envelope, "ProtocolError", "invalid Unlock payload"),
     };
+
+    if !(1..=MAX_UNLOCK_TTL_SECONDS).contains(&payload.ttl_seconds) {
+        return error_response(
+            envelope,
+            "MetadataInvalid",
+            "unlock TTL must be between 1 and 86400 seconds",
+        );
+    }
 
     // Execution reuses an existing authorization without re-prompting or extending
     // its lifetime. An explicit unlock still authenticates through the key store.
@@ -1224,7 +1301,7 @@ async fn handle_unlock(envelope: &RequestEnvelope, state: &AgentSocketState) -> 
     let (master_key_bytes, resolved_method) = match resolve_master_key(
         envelope,
         state,
-        payload.passphrase.as_deref(),
+        payload.passphrase.as_ref().map(|passphrase| passphrase.as_str()),
         &payload.project_id,
     ) {
         Ok(resolved) => resolved,
@@ -1246,8 +1323,8 @@ async fn handle_unlock(envelope: &RequestEnvelope, state: &AgentSocketState) -> 
         return response;
     }
 
-    let mut entry = crate::unlock_cache::UnlockEntry::new(
-        master_key_bytes,
+    let mut entry = crate::unlock_cache::UnlockEntry::new_zeroizing(
+        Zeroizing::new(master_key_bytes.to_vec()),
         now,
         std::time::Duration::from_secs(payload.ttl_seconds),
         resolved_method,
@@ -1273,11 +1350,11 @@ fn resolve_master_key(
     state: &AgentSocketState,
     passphrase: Option<&str>,
     project_id: &str,
-) -> Result<(Vec<u8>, crate::unlock_cache::UnlockMethod), ResponseEnvelope> {
+) -> Result<(Zeroizing<KeyBytes>, crate::unlock_cache::UnlockMethod), ResponseEnvelope> {
     use crate::unlock_cache::UnlockMethod;
 
     match state.master_key_store.load_master_key(project_id) {
-        Ok(key) => Ok((key.to_vec(), UnlockMethod::OsKeychain)),
+        Ok(key) => Ok((key, UnlockMethod::OsKeychain)),
         Err(PlatformError::MasterKeyNotFound) => {
             let Some(passphrase) = passphrase else {
                 return Err(error_response(
@@ -1287,7 +1364,7 @@ fn resolve_master_key(
                 ));
             };
             match state.passphrase_store.load_master_key(project_id, passphrase.as_bytes()) {
-                Ok(key) => Ok((key.to_vec(), UnlockMethod::Passphrase)),
+                Ok(key) => Ok((key, UnlockMethod::Passphrase)),
                 Err(PlatformError::MasterKeyNotFound) => Err(error_response(
                     envelope,
                     "UnlockRequired",
@@ -1329,7 +1406,7 @@ fn append_unlock_audit_row(
     store_path: &Path,
     project_id: &str,
     profile_id: Option<&str>,
-    master_key_bytes: &[u8],
+    master_key: &KeyBytes,
     method: crate::unlock_cache::UnlockMethod,
     ttl_seconds: u64,
     now_unix_nanos: i128,
@@ -1339,13 +1416,10 @@ fn append_unlock_audit_row(
     // unwrapped, the unlock itself still succeeds — the row is skipped
     // rather than poisoning the unlock path. The cached master key
     // remains correct so subsequent RPCs can still authenticate.
-    let Some(master_key_array) = master_key_bytes_to_array(master_key_bytes) else {
-        return Ok(());
-    };
     let Ok(mut store) = Store::open(store_path) else {
         return Ok(());
     };
-    let Ok(audit_key) = unwrap_project_audit_key(&store, project_id, &master_key_array) else {
+    let Ok(audit_key) = unwrap_audit_key_with_master(&store, project_id, master_key) else {
         return Ok(());
     };
 
@@ -1386,38 +1460,6 @@ fn append_unlock_audit_row(
         return Err(error_response(envelope, "CorruptDb", "failed to append UNLOCK audit row"));
     }
     Ok(())
-}
-
-fn master_key_bytes_to_array(bytes: &[u8]) -> Option<locket_crypto::KeyBytes> {
-    bytes.try_into().ok()
-}
-
-fn unwrap_project_audit_key(
-    store: &Store,
-    project_id: &str,
-    master_key: &locket_crypto::KeyBytes,
-) -> Result<zeroize::Zeroizing<locket_crypto::KeyBytes>, locket_crypto::CryptoError> {
-    use locket_crypto::{
-        HkdfWrapInfo, KeyPurpose, KeyWrapAad, KeyWrapPurpose, WrappedKeyMaterial,
-        derive_wrapping_key_v1, key_wrap_aad_v1, unwrap_key_material_v1,
-    };
-
-    let purpose = KeyPurpose::Audit;
-    let record = store
-        .get_key_by_scope(project_id, None, purpose.as_str())
-        .map_err(|_| locket_crypto::CryptoError::DecryptionFailed)?
-        .ok_or(locket_crypto::CryptoError::DecryptionFailed)?;
-    let wrapping_key =
-        derive_wrapping_key_v1(master_key, &HkdfWrapInfo::new(project_id, None, purpose))?;
-    let aad = key_wrap_aad_v1(&KeyWrapAad::new(
-        project_id,
-        &record.id,
-        None,
-        0,
-        KeyWrapPurpose::from(purpose),
-    ))?;
-    let wrapped = WrappedKeyMaterial { ciphertext: record.wrapped_material, nonce: record.nonce };
-    unwrap_key_material_v1(&wrapping_key, &wrapped, &aad)
 }
 
 async fn handle_register_command_policies(
@@ -1549,30 +1591,13 @@ async fn handle_verify_audit(
                 return error_response(envelope, "ProtocolError", "invalid VerifyAudit payload");
             }
         };
-    let audit_key = {
-        let cache = state.unlock_cache.lock().await;
-        cache
-            .lookup(&payload.project_id, current_unix_nanos())
-            .map(|entry| entry.key_bytes().to_vec())
-    };
-    let response = audit_key.map_or_else(
-        || Ok(crate::audit_verify::VerifyAuditResponse::locked()),
-        |key| crate::audit_verify::verify_audit(&payload, &key),
-    );
+    let response = verify_audit(&payload, state).await;
     match response {
         Ok(response) => {
             let payload = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
             ResponseEnvelope::Success(SuccessEnvelope::new(envelope.id.clone(), payload))
         }
-        Err(error) => {
-            let locket_error = error.locket_error();
-            ResponseEnvelope::Error(ErrorEnvelope::new(
-                envelope.id.clone(),
-                format!("{locket_error:?}"),
-                error.to_string(),
-                false,
-            ))
-        }
+        Err(error) => error_response(envelope, &error.error_name(), &error.to_string()),
     }
 }
 
@@ -1587,27 +1612,57 @@ async fn handle_list_audit(
                 return error_response(envelope, "ProtocolError", "invalid ListAudit payload");
             }
         };
-    let audit_key = {
-        let cache = state.unlock_cache.lock().await;
-        cache
-            .lookup(&payload.project_id, current_unix_nanos())
-            .map(|entry| entry.key_bytes().to_vec())
-    };
-    match crate::audit::list_audit(&payload, audit_key.as_deref()) {
+    match list_audit(&payload, state).await {
         Ok(response) => {
             let payload = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
             ResponseEnvelope::Success(SuccessEnvelope::new(envelope.id.clone(), payload))
         }
-        Err(error) => {
-            let locket_error = error.locket_error();
-            ResponseEnvelope::Error(ErrorEnvelope::new(
-                envelope.id.clone(),
-                format!("{locket_error:?}"),
-                error.to_string(),
-                false,
-            ))
+        Err(error) => error_response(envelope, &error.error_name(), &error.to_string()),
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum AuditReadError {
+    #[error(transparent)]
+    Key(#[from] KeyError),
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+impl AuditReadError {
+    fn error_name(&self) -> String {
+        match self {
+            Self::Key(_) => "AuditIntegrityFailed".to_owned(),
+            Self::Store(error) => format!("{:?}", error.locket_error()),
         }
     }
+}
+
+async fn verify_audit(
+    payload: &crate::audit_verify::VerifyAuditRequest,
+    state: &AgentSocketState,
+) -> Result<crate::audit_verify::VerifyAuditResponse, AuditReadError> {
+    let Some(master_key) =
+        cached_master_key(state, &payload.project_id, current_unix_nanos()).await?
+    else {
+        return Ok(crate::audit_verify::VerifyAuditResponse::locked());
+    };
+    let store = Store::open(&payload.store_path)?;
+    let audit_key = unwrap_audit_key_with_master(&store, &payload.project_id, &master_key)?;
+    Ok(crate::audit_verify::verify_audit(&store, payload, audit_key.as_ref())?)
+}
+
+async fn list_audit(
+    payload: &crate::audit::ListAuditRequest,
+    state: &AgentSocketState,
+) -> Result<crate::audit::ListAuditResponse, AuditReadError> {
+    let master_key = cached_master_key(state, &payload.project_id, current_unix_nanos()).await?;
+    let store = Store::open(&payload.store_path)?;
+    let audit_key = master_key
+        .as_ref()
+        .map(|key| unwrap_audit_key_with_master(&store, &payload.project_id, key))
+        .transpose()?;
+    Ok(crate::audit::list_audit(&store, payload, audit_key.as_ref().map(AsRef::as_ref))?)
 }
 
 async fn handle_request_grant(
@@ -1625,6 +1680,13 @@ async fn handle_request_grant(
                 return error_response(envelope, "ProtocolError", "invalid RequestGrant payload");
             }
         };
+    if !crate::grant::valid_grant_ttl(payload.ttl_seconds) {
+        return error_response(
+            envelope,
+            "MetadataInvalid",
+            "grant TTL must be between 1 and 3600 seconds",
+        );
+    }
     if let Some(policy_name) = payload.policy_name.clone() {
         let policy_ttl_seconds = {
             let policies = state.command_policies.lock().await;
@@ -1638,6 +1700,13 @@ async fn handle_request_grant(
         let Some(policy_ttl_seconds) = policy_ttl_seconds else {
             return error_response(envelope, "PolicyNotFound", "command policy not found");
         };
+        if !crate::grant::valid_grant_ttl(policy_ttl_seconds) {
+            return error_response(
+                envelope,
+                "MetadataInvalid",
+                "policy grant TTL must be between 1 and 3600 seconds",
+            );
+        }
         payload.ttl_seconds = policy_ttl_seconds;
     }
     let now = current_unix_nanos();
@@ -1729,6 +1798,7 @@ async fn write_response(stream: &mut UnixStream, response: &ResponseEnvelope) ->
     let Ok(frame) = encode_frame(response, DEFAULT_MAX_MESSAGE_SIZE) else {
         return false;
     };
+    let frame = Zeroizing::new(frame);
     stream.write_all(&frame).await.is_ok() && stream.flush().await.is_ok()
 }
 
@@ -1984,5 +2054,51 @@ mod cache_status_tests {
 
         assert_eq!(snapshot.lock_state, LockState::Unlocked);
         assert_eq!(snapshot.unlock_ttl_seconds, Some(59));
+    }
+}
+
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+    use crate::encode_frame;
+
+    #[tokio::test]
+    async fn reads_a_large_frame_and_preserves_the_next_frame()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let first = RequestEnvelope::new(
+            "large",
+            AgentMethod::Status,
+            serde_json::json!({"text": "a".repeat(FRAME_READ_CHUNK_SIZE * 2)}),
+        );
+        let next = RequestEnvelope::new("next", AgentMethod::Status, serde_json::Value::Null);
+        let mut frames = encode_frame(&first, DEFAULT_MAX_MESSAGE_SIZE)?;
+        let first_len = frames.len();
+        frames.extend_from_slice(&encode_frame(&next, DEFAULT_MAX_MESSAGE_SIZE)?);
+
+        let mut stream = frames.as_slice();
+        let mut buffer = Zeroizing::new(Vec::with_capacity(FRAME_READ_CHUNK_SIZE));
+        assert_eq!(read_one_frame(&mut stream, &mut buffer).await?, Some(first));
+        assert!(buffer.capacity() >= first_len);
+        assert_eq!(read_one_frame(&mut stream, &mut buffer).await?, Some(next));
+        assert!(buffer.is_empty());
+        assert!(read_one_frame(&mut stream, &mut buffer).await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preserves_small_frames_sharing_a_read() -> Result<(), Box<dyn std::error::Error>> {
+        let first = RequestEnvelope::new("first", AgentMethod::Status, serde_json::Value::Null);
+        let next = RequestEnvelope::new("next", AgentMethod::Status, serde_json::Value::Null);
+        let mut frames = encode_frame(&first, DEFAULT_MAX_MESSAGE_SIZE)?;
+        let queued = encode_frame(&next, DEFAULT_MAX_MESSAGE_SIZE)?;
+        frames.extend_from_slice(&queued);
+
+        let mut stream = frames.as_slice();
+        let mut buffer = Zeroizing::new(Vec::with_capacity(FRAME_READ_CHUNK_SIZE));
+        assert_eq!(read_one_frame(&mut stream, &mut buffer).await?, Some(first));
+        assert_eq!(buffer.as_slice(), queued);
+        assert_eq!(read_one_frame(&mut stream, &mut buffer).await?, Some(next));
+        assert!(buffer.is_empty());
+        Ok(())
     }
 }

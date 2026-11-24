@@ -65,6 +65,8 @@ fn assert_dangerous_denial_audit_row(
 #[allow(clippy::fn_params_excessive_bools)]
 fn build_get_args(reveal: bool, force: bool, copy: bool, use_dangerous: bool) -> crate::GetArgs {
     crate::GetArgs {
+        project: None,
+        profile: None,
         key: "DATABASE_URL".to_owned(),
         source: crate::SourceArg { source: None },
         reveal,

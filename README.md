@@ -60,9 +60,9 @@ Locket targets local development. The desktop connects project folders, unlocks 
 
 Teams can [join a fresh machine and receive signed encrypted updates](docs/team-updates.md) through an existing shared folder. First join requires the owner's full fingerprint from a separate trusted channel. One owner publishes shared values, while personal overrides remain local. The unlocked agent publishes changed shared values and applies verified updates automatically. Status shows the last verified update; an offline or malicious folder provider can withhold newer files. Owner handover and real sync-provider/clean-OS acceptance remain separate qualification work.
 
-Manual version 1 export/import remains available. These older bundles encrypt for recipients but do **not** authenticate the issuer. Imported command proposals never grant local execution permission. Exports default to current shared values; personal overrides and history require explicit opt-in. Read [package validation](docs/distribution-validation.md) before preparing installers; unsigned local artifacts do not establish signing or notarization.
+Manual sealed export/import is also available. Sealed bundles encrypt for recipients but do **not** authenticate the issuer. Imported command proposals never grant local execution permission. Exports default to current shared values; personal overrides and history require explicit opt-in. Read [package validation](docs/distribution-validation.md) before preparing installers; unsigned local artifacts do not establish signing or notarization.
 
-For an older local signing identity, run `locket device rotate-signing` before enabling signed team delivery, then refresh your recovery backup. This preserves the sealing key needed to open earlier bundles. Once a team owner is pinned, identity replacement is refused; authenticated owner handover is not supported yet.
+Once a team owner is pinned, identity replacement is refused; authenticated owner handover is not supported yet.
 
 Scanners and redaction help prepare output before sharing it. They do not isolate code or intercept an AI application's outbound requests. Programs receiving a variable can read and transmit it. Original `.env` files stay plaintext until you explicitly remove them; keep a verified recovery path before doing so.
 
@@ -77,6 +77,8 @@ For repository development, run the CLI without installing it:
 ```bash
 cargo run -p locket-cli -- <command>
 ```
+
+Development builds use a separate development vault. Debug builds and anything started by `cargo run`, `cargo test`, or `cargo bench` in this repository have their own data directory, configuration, keychain entries, and agent. A release binary joins the development instance when `LOCKET_INSTANCE` is set to any value. The variable cannot select the installed vault, so `cargo install` binaries keep your real secrets apart from work in progress. Run `locket agent status` to see which instance a binary uses. Project files such as `locket.toml` and `.locket/recovery` are shared, so try development builds in scratch projects.
 
 ## Quick Start
 
@@ -291,7 +293,7 @@ Use `locket agent start --require-session-monitoring` to require an available na
 
 External FIDO2 keys with PIN verification and hmac-secret support can wrap the project master key from an interactive macOS or Linux terminal. Install libfido2 1.17 or newer (`brew install libfido2` on macOS), connect one key, then run `locket passkey register --label security-key`. Use `locket passkey unlock security-key` for subsequent recovery. Desktop and Windows external-key ceremonies are not yet supported. See [hardware acceptance checks](docs/operations/os-host-validation.md#external-fido2-key) before relying on this recovery path.
 
-Earlier `platform-keyring` credentials are software recovery factors stored in the OS keyring. `locket passkey list` identifies them; their existing recovery path requires fresh local verification. Keep your recovery code available independently of either factor.
+Keep your recovery code available independently of any passkey.
 
 `locket agent status` reports whether session monitoring is active. When monitoring is unavailable, lock the vault explicitly before leaving the device; TTL expiry still applies.
 
@@ -318,7 +320,7 @@ locket team publish
 
 The unlocked agent delivers signed encrypted updates automatically. Held values are shown by `locket team sync pending`; the desktop provides explicit collision resolution. Follow the [team onboarding and recovery guide](docs/team-updates.md) for the complete flow.
 
-Manual `export --sealed` / `import-bundle` and older invite commands remain available for compatibility. Version 1 bundles do not authenticate the issuer; use the signed team workflow for ongoing delivery.
+Manual `export --sealed` / `import-bundle` and the `team invite` / `team accept` commands are also available. Sealed bundles do not authenticate the issuer; use the signed team workflow for ongoing delivery.
 
 ### Audit And Diagnostics
 

@@ -1,9 +1,11 @@
 use super::{Result, nanos, reject};
 use locket_crypto::{
-    HkdfWrapInfo, KeyBytes, KeyPurpose, KeyWrapAad, KeyWrapPurpose, WrappedKeyMaterial,
-    derive_wrapping_key_v1, key_wrap_aad_v1, unwrap_key_material_v1, wrap_key_material_v1,
+    HkdfWrapInfo, KeyBytes, KeyPurpose, KeyWrapAad, KeyWrapPurpose, derive_wrapping_key_v1,
+    key_wrap_aad_v1, wrap_key_material_v1,
 };
 use locket_store::{KeyRecord, Store};
+
+use crate::keys::{KeyError, unwrap_profile_key_with_master, unwrap_project_key_with_master};
 /// # Errors
 /// Returns an error when trust, scope, cryptography, storage or folder validation fails.
 pub fn load_key(
@@ -13,22 +15,16 @@ pub fn load_key(
     purpose: KeyPurpose,
     master: &KeyBytes,
 ) -> Result<zeroize::Zeroizing<KeyBytes>> {
-    let key = store
-        .get_key_by_scope(project, profile, purpose.as_str())?
-        .ok_or_else(|| reject("required wrapping key missing"))?;
-    let wrapping = derive_wrapping_key_v1(master, &HkdfWrapInfo::new(project, profile, purpose))?;
-    let aad = key_wrap_aad_v1(&KeyWrapAad::new(
-        project,
-        &key.id,
-        profile,
-        0,
-        KeyWrapPurpose::from(purpose),
-    ))?;
-    Ok(unwrap_key_material_v1(
-        &wrapping,
-        &WrappedKeyMaterial { ciphertext: key.wrapped_material, nonce: key.nonce },
-        &aad,
-    )?)
+    let key = profile.map_or_else(
+        || unwrap_project_key_with_master(store, project, master, purpose),
+        |profile| unwrap_profile_key_with_master(store, project, profile, master, purpose),
+    );
+    key.map_err(|error| match error {
+        KeyError::Store(error) => error.into(),
+        KeyError::Metadata(error) | KeyError::Unwrap(error) => error.into(),
+        KeyError::Missing(_) => reject("required wrapping key missing"),
+        KeyError::InvalidMasterKey => reject("invalid cached key"),
+    })
 }
 /// # Errors
 /// Returns an error when trust, scope, cryptography, storage or folder validation fails.

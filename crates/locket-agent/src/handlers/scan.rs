@@ -17,17 +17,17 @@ use std::path::{Path, PathBuf};
 
 use locket_core::{LocketError, privacy_alias};
 use locket_crypto::{
-    EncryptedSecretValue, HkdfWrapInfo, KeyPurpose, KeyWrapAad, KeyWrapPurpose, WrappedKeyMaterial,
-    decrypt_secret_value_v1, derive_wrapping_key_v1, key_wrap_aad_v1, secret_blob_aad_v1,
-    unwrap_key_material_v1,
+    EncryptedSecretValue, KeyPurpose, KeyWrapAad, KeyWrapPurpose, decrypt_secret_value_v1,
+    key_wrap_aad_v1, secret_blob_aad_v1,
 };
-use locket_store::{AuditWrite, SecretRecord, SecretVersionRecord, Store};
+use locket_store::{AuditWrite, SecretBlobRecord, SecretRecord, SecretVersionRecord, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use zeroize::Zeroizing;
 
 use crate::envelope::{ErrorEnvelope, RequestEnvelope, ResponseEnvelope, SuccessEnvelope};
 use crate::grant::{GrantAction, GrantBinding, GrantValidation};
+use crate::keys::{master_key_array, unwrap_audit_key_with_master, unwrap_profile_key_with_master};
 
 const ERROR_GRANT_REQUIRED: &str = "GrantRequired";
 const ERROR_UNLOCK_REQUIRED: &str = "UnlockRequired";
@@ -43,11 +43,8 @@ const AGENT_SCAN_COMMAND: &str = "agent-scan-known-values";
 /// Request payload for `ScanKnownValues`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ScanRequest {
-    /// Legacy path-only labels. Real scans should populate `inputs`
-    /// so the agent never opens files on behalf of UI/editor callers.
-    #[serde(default)]
-    pub paths: Vec<String>,
-    /// Already-read text buffers to match against known values.
+    /// Already-read text buffers to match against known values. The agent
+    /// never opens files on behalf of UI or editor callers.
     #[serde(default)]
     pub inputs: Vec<ScanInput>,
     /// Project id whose unlock-cache entry and store rows are used.
@@ -120,10 +117,8 @@ pub struct ScanResponse {
 
 /// Handler for `ScanKnownValues`.
 ///
-/// Legacy calls that provide no project/store context still receive
-/// the original locked/empty shape so shipped UI stubs remain
-/// compatible. Covered scans require a live grant and unlock-cache
-/// entry before any store decryption occurs.
+/// Scans require project, profile and store context, a live grant, and an
+/// unlock-cache entry before any store decryption occurs.
 #[allow(clippy::too_many_lines)]
 pub async fn handle_scan(
     request: &RequestEnvelope,
@@ -154,25 +149,6 @@ pub async fn handle_scan(
     } else {
         None
     };
-    if typed.project_id.is_none()
-        && typed.profile_id.is_none()
-        && typed.store_path.is_none()
-        && typed.grant_id.is_none()
-        && typed.inputs.is_empty()
-    {
-        return if typed.require_known {
-            crate::degraded_audit::record_locked_refusal(
-                "SCAN",
-                None,
-                "agent.ScanKnownValues",
-                None,
-                now_unix_nanos,
-            );
-            unlock_required(request)
-        } else {
-            success_response(request, &ScanResponse { findings: Vec::new(), locked: true })
-        };
-    }
     let Some(project_id) = typed.project_id.as_deref() else {
         return protocol_error(request, "ScanKnownValues requires project_id");
     };
@@ -185,7 +161,9 @@ pub async fn handle_scan(
 
     let cached_master_key_for_denial = || async {
         let cache = state.unlock_cache.lock().await;
-        cache.lookup(project_id, now_unix_nanos).map(|entry| entry.key_bytes().to_vec())
+        cache
+            .lookup(project_id, now_unix_nanos)
+            .map(|entry| Zeroizing::new(entry.key_bytes().to_vec()))
     };
     let Some(grant_id) = typed.grant_id.as_deref() else {
         let key = cached_master_key_for_denial().await;
@@ -193,7 +171,7 @@ pub async fn handle_scan(
             project_id,
             profile_id,
             Some(store_path),
-            key.as_deref(),
+            key.as_ref().map(|key| key.as_slice()),
             GrantAction::ScanKnownValues,
             0,
             now_unix_nanos,
@@ -218,7 +196,7 @@ pub async fn handle_scan(
             project_id,
             profile_id,
             Some(store_path),
-            key.as_deref(),
+            key.as_ref().map(|key| key.as_slice()),
             GrantAction::ScanKnownValues,
             0,
             now_unix_nanos,
@@ -229,7 +207,9 @@ pub async fn handle_scan(
 
     let master_key = {
         let cache = state.unlock_cache.lock().await;
-        cache.lookup(project_id, now_unix_nanos).map(|entry| entry.key_bytes().to_vec())
+        cache
+            .lookup(project_id, now_unix_nanos)
+            .map(|entry| Zeroizing::new(entry.key_bytes().to_vec()))
     };
     let Some(master_key) = master_key else {
         return if typed.require_known {
@@ -357,7 +337,7 @@ fn scan_known_values(
     now_unix_nanos: i128,
     policy_name: Option<&str>,
 ) -> Result<ScanResponse, ScanFailure> {
-    let master_key = key_array(master_key).ok_or_else(corrupt_db)?;
+    let master_key = master_key_array(master_key).map_err(|_| corrupt_db())?;
     let mut store = Store::open(store_path).map_err(|_| corrupt_db())?;
     ensure_profile_exists(&store, project_id, profile_id)?;
     let allowed_secrets =
@@ -472,35 +452,48 @@ fn collect_known_values(
     allowed_secrets: Option<&BTreeSet<String>>,
 ) -> Result<Vec<KnownSecret>, ScanFailure> {
     let mut known = Vec::new();
+    // This request scans one profile. Unwrap its key lazily when the first
+    // eligible encrypted blob is found, then reuse it for the whole scan.
+    let mut profile_secret_key = None;
     let timestamp = i64::try_from(now_unix_nanos).map_err(|_| corrupt_db())?;
     for secret in store.list_secrets_by_profile(project_id, profile_id).map_err(|_| corrupt_db())? {
         if allowed_secrets.is_some_and(|allowed| !allowed.contains(&secret.name)) {
             continue;
         }
         for version in store.list_secret_versions(&secret.id).map_err(|_| corrupt_db())? {
-            if should_scan_known_version(&secret, &version, timestamp)
-                && store.get_blob(&secret.id, version.version).map_err(|_| corrupt_db())?.is_some()
-            {
-                let value = decrypt_secret(
-                    store,
-                    project_id,
-                    profile_id,
-                    &secret,
-                    version.version,
-                    master_key,
-                )
-                .map_err(|_| corrupt_db())?;
-                let label = if request.redact_names {
-                    privacy_alias("secret", &secret.id)
-                } else {
-                    secret.name.clone()
-                };
-                known.push(KnownSecret {
-                    value,
-                    secret_name: secret.name.clone(),
-                    rule_label: format!("known-value/{label}"),
-                });
+            if !should_scan_known_version(&secret, &version, timestamp) {
+                continue;
             }
+            let Some(blob) =
+                store.get_blob(&secret.id, version.version).map_err(|_| corrupt_db())?
+            else {
+                continue;
+            };
+            let key = match &profile_secret_key {
+                Some(key) => key,
+                None => profile_secret_key.insert(
+                    unwrap_profile_key_with_master(
+                        store,
+                        project_id,
+                        profile_id,
+                        master_key,
+                        KeyPurpose::ProfileSecret,
+                    )
+                    .map_err(|_| corrupt_db())?,
+                ),
+            };
+            let value = decrypt_secret(project_id, profile_id, &secret, version.version, blob, key)
+                .map_err(|_| corrupt_db())?;
+            let label = if request.redact_names {
+                privacy_alias("secret", &secret.id)
+            } else {
+                secret.name.clone()
+            };
+            known.push(KnownSecret {
+                value,
+                secret_name: secret.name.clone(),
+                rule_label: format!("known-value/{label}"),
+            });
         }
     }
     Ok(known)
@@ -554,8 +547,8 @@ fn append_scan_audit(
     matches: &ScanMatches,
     timestamp: i128,
 ) -> Result<(), ScanFailure> {
-    let audit_key = load_project_key_with_master(store, project_id, KeyPurpose::Audit, master_key)
-        .map_err(|_| corrupt_db())?;
+    let audit_key =
+        unwrap_audit_key_with_master(store, project_id, master_key).map_err(|_| corrupt_db())?;
     let timestamp = i64::try_from(timestamp).map_err(|_| corrupt_db())?;
     let mut metadata = Map::from_iter([
         ("schema_version".to_owned(), json!(1)),
@@ -602,24 +595,13 @@ fn should_scan_known_version(
 }
 
 fn decrypt_secret(
-    store: &Store,
     project_id: &str,
     profile_id: &str,
     secret: &SecretRecord,
     version: u32,
-    master_key: &locket_crypto::KeyBytes,
+    blob: SecretBlobRecord,
+    profile_secret_key: &locket_crypto::KeyBytes,
 ) -> Result<Zeroizing<String>, locket_crypto::CryptoError> {
-    let profile_secret_key = load_profile_key_with_master(
-        store,
-        project_id,
-        profile_id,
-        KeyPurpose::ProfileSecret,
-        master_key,
-    )?;
-    let blob = store
-        .get_blob(&secret.id, version)
-        .map_err(|_| locket_crypto::CryptoError::DecryptionFailed)?
-        .ok_or(locket_crypto::CryptoError::DecryptionFailed)?;
     let value_aad = secret_blob_aad_v1(&locket_crypto::SecretBlobAad::new(
         project_id,
         profile_id,
@@ -640,60 +622,7 @@ fn decrypt_secret(
         value_nonce: blob.value_nonce,
         aad_schema_version: blob.aad_schema_version,
     };
-    decrypt_secret_value_v1(&profile_secret_key, &encrypted, &value_aad, &wrap_aad)
-}
-
-fn load_profile_key_with_master(
-    store: &Store,
-    project_id: &str,
-    profile_id: &str,
-    purpose: KeyPurpose,
-    master_key: &locket_crypto::KeyBytes,
-) -> Result<Zeroizing<locket_crypto::KeyBytes>, locket_crypto::CryptoError> {
-    let record = store
-        .get_key_by_scope(project_id, Some(profile_id), purpose.as_str())
-        .map_err(|_| locket_crypto::CryptoError::DecryptionFailed)?
-        .ok_or(locket_crypto::CryptoError::DecryptionFailed)?;
-    let wrapping_key = derive_wrapping_key_v1(
-        master_key,
-        &HkdfWrapInfo::new(project_id, Some(profile_id), purpose),
-    )?;
-    let aad = key_wrap_aad_v1(&KeyWrapAad::new(
-        project_id,
-        &record.id,
-        Some(profile_id),
-        0,
-        KeyWrapPurpose::from(purpose),
-    ))?;
-    let wrapped = WrappedKeyMaterial { ciphertext: record.wrapped_material, nonce: record.nonce };
-    unwrap_key_material_v1(&wrapping_key, &wrapped, &aad)
-}
-
-fn load_project_key_with_master(
-    store: &Store,
-    project_id: &str,
-    purpose: KeyPurpose,
-    master_key: &locket_crypto::KeyBytes,
-) -> Result<Zeroizing<locket_crypto::KeyBytes>, locket_crypto::CryptoError> {
-    let record = store
-        .get_key_by_scope(project_id, None, purpose.as_str())
-        .map_err(|_| locket_crypto::CryptoError::DecryptionFailed)?
-        .ok_or(locket_crypto::CryptoError::DecryptionFailed)?;
-    let wrapping_key =
-        derive_wrapping_key_v1(master_key, &HkdfWrapInfo::new(project_id, None, purpose))?;
-    let aad = key_wrap_aad_v1(&KeyWrapAad::new(
-        project_id,
-        &record.id,
-        None,
-        0,
-        KeyWrapPurpose::from(purpose),
-    ))?;
-    let wrapped = WrappedKeyMaterial { ciphertext: record.wrapped_material, nonce: record.nonce };
-    unwrap_key_material_v1(&wrapping_key, &wrapped, &aad)
-}
-
-fn key_array(bytes: &[u8]) -> Option<locket_crypto::KeyBytes> {
-    bytes.try_into().ok()
+    decrypt_secret_value_v1(profile_secret_key, &encrypted, &value_aad, &wrap_aad)
 }
 
 const fn corrupt_db() -> ScanFailure {
@@ -780,7 +709,6 @@ mod tests {
     #[test]
     fn scan_request_round_trips_through_json() -> Result<(), serde_json::Error> {
         let request = ScanRequest {
-            paths: vec!["src/main.rs".to_owned(), ".env".to_owned()],
             inputs: vec![ScanInput { path: "src/main.rs".to_owned(), text: "text".to_owned() }],
             project_id: Some(PROJECT_ID.to_owned()),
             profile_id: Some(PROFILE_ID.to_owned()),
@@ -796,7 +724,6 @@ mod tests {
 
         assert_eq!(decoded, request);
         assert_eq!(value["require_known"], true);
-        assert_eq!(value["paths"][0], "src/main.rs");
         assert_eq!(value["inputs"][0]["path"], "src/main.rs");
         assert_eq!(value["project_id"], PROJECT_ID);
         Ok(())
@@ -836,31 +763,26 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn handle_scan_returns_locked_empty_response_for_legacy_request()
-    -> Result<(), serde_json::Error> {
+    async fn handle_scan_rejects_requests_without_project_context() {
         let state = AgentSocketState::locked("test-version");
         let envelope = RequestEnvelope::new(
             "req-scan",
             AgentMethod::ScanKnownValues,
-            json!({"paths": ["src/main.rs"], "require_known": false}),
+            json!({"inputs": [], "require_known": false}),
         );
 
         let response = handle_scan(&envelope, &state, 1).await;
-        let ResponseEnvelope::Success(success) = response else {
-            panic!("expected success envelope");
+        let ResponseEnvelope::Error(error) = response else {
+            panic!("expected error envelope");
         };
-        assert_eq!(success.id, "req-scan");
-        let decoded: ScanResponse = serde_json::from_value(success.payload)?;
-        assert!(decoded.locked);
-        assert_eq!(decoded.findings.len(), 0);
-        Ok(())
+        assert_eq!(error.error, "ProtocolError");
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn handle_scan_rejects_malformed_payload_with_protocol_error() {
         let state = AgentSocketState::locked("test-version");
         let envelope =
-            RequestEnvelope::new("req-bad", AgentMethod::ScanKnownValues, json!({"paths": 5}));
+            RequestEnvelope::new("req-bad", AgentMethod::ScanKnownValues, json!({"inputs": 5}));
 
         let response = handle_scan(&envelope, &state, 1).await;
         let ResponseEnvelope::Error(error) = response else {
@@ -1037,7 +959,6 @@ mod tests {
 
     fn scan_request(fixture: &ScanFixture, require_known: bool, redact_names: bool) -> ScanRequest {
         ScanRequest {
-            paths: Vec::new(),
             inputs: vec![ScanInput {
                 path: "src/main.rs".to_owned(),
                 text: format!("prefix\n{} then {}", fixture.current_value, fixture.grace_value),

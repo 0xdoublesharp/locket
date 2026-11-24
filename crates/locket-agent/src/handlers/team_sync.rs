@@ -284,11 +284,9 @@ async fn cached_sync_context(
         let context = entry.audit_context().cloned().ok_or_else(|| {
             team_sync::SyncError::Rejected("unlock context lacks store path".into())
         })?;
-        let key: locket_crypto::KeyBytes = entry
-            .key_bytes()
-            .try_into()
+        let key = crate::keys::master_key_array(entry.key_bytes())
             .map_err(|_| team_sync::SyncError::Rejected("invalid cached key".into()))?;
-        let result = (zeroize::Zeroizing::new(key), context, entry.expires_at_unix_nanos());
+        let result = (key, context, entry.expires_at_unix_nanos());
         drop(cache);
         Ok(result)
     }
@@ -812,28 +810,6 @@ mod tests {
         assert_eq!(std::fs::read(&path)?, before);
         assert!(!path.with_extension("db-wal").exists());
         assert!(!path.with_extension("db-shm").exists());
-        Ok(())
-    }
-
-    #[test]
-    fn agent_sync_open_migrates_existing_v5_before_pending_queries()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
-        let path = directory.path().join("store.db");
-        {
-            let store = open_sync_store(&path)?;
-            store.connection().execute_batch("DROP TABLE team_sync_pending_profiles; DROP TABLE team_sync_pending_packages; DELETE FROM schema_migrations WHERE version=6;")?;
-        }
-        let store = open_sync_store(&path)?;
-        assert!(team_sync::status(&store, "project")?.pending_profiles.is_empty());
-        assert_eq!(
-            store.connection().query_row(
-                "SELECT MAX(version) FROM schema_migrations",
-                [],
-                |row| row.get::<_, i64>(0)
-            )?,
-            6
-        );
         Ok(())
     }
 

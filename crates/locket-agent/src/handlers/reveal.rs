@@ -11,16 +11,17 @@ use std::path::{Path, PathBuf};
 
 use locket_core::{LocketError, SecretName};
 use locket_crypto::{
-    EncryptedSecretValue, HkdfWrapInfo, KeyPurpose, KeyWrapAad, KeyWrapPurpose, WrappedKeyMaterial,
-    decrypt_secret_value_v1, derive_wrapping_key_v1, key_wrap_aad_v1, secret_blob_aad_v1,
-    unwrap_key_material_v1,
+    EncryptedSecretValue, KeyPurpose, KeyWrapAad, KeyWrapPurpose, decrypt_secret_value_v1,
+    key_wrap_aad_v1, secret_blob_aad_v1,
 };
 use locket_store::{AuditWrite, SecretRecord, SecretVersionRecord, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use zeroize::Zeroizing;
 
 use crate::envelope::{ErrorEnvelope, RequestEnvelope, ResponseEnvelope, SuccessEnvelope};
 use crate::grant::{GrantAction, GrantBinding, GrantValidation};
+use crate::keys::{master_key_array, unwrap_audit_key_with_master, unwrap_profile_key_with_master};
 
 /// Wire `error` value used when the vault is locked.
 const ERROR_UNLOCK_REQUIRED: &str = "UnlockRequired";
@@ -66,12 +67,22 @@ pub struct RevealRequest {
 }
 
 /// Response payload for an authorized `Reveal` with a live unlock and grant.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RevealResponse {
     /// Plaintext secret value. Callers must limit its display lifetime.
     pub value: String,
     /// Time-to-live hint for any caller-side caching, in seconds.
     pub ttl_seconds: u32,
+}
+
+impl std::fmt::Debug for RevealResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RevealResponse")
+            .field("value", &"[REDACTED]")
+            .field("ttl_seconds", &self.ttl_seconds)
+            .finish()
+    }
 }
 
 /// Request payload for `Copy`.
@@ -100,12 +111,22 @@ pub struct CopyRequest {
 }
 
 /// Response payload for `Copy` once the unlock cache is wired.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CopyResponse {
     /// Resolved secret value. Treated as a redacted token by the UI.
     pub value: String,
     /// Time-to-live hint for any caller-side caching, in seconds.
     pub ttl_seconds: u32,
+}
+
+impl std::fmt::Debug for CopyResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CopyResponse")
+            .field("value", &"[REDACTED]")
+            .field("ttl_seconds", &self.ttl_seconds)
+            .finish()
+    }
 }
 
 /// Handler for `Reveal`.
@@ -182,13 +203,15 @@ async fn handle_value_access(
         {
             let key = {
                 let cache = state.unlock_cache.lock().await;
-                cache.lookup(project_id, now_unix_nanos).map(|entry| entry.key_bytes().to_vec())
+                cache
+                    .lookup(project_id, now_unix_nanos)
+                    .map(|entry| Zeroizing::new(entry.key_bytes().to_vec()))
             };
             crate::audit_deny::try_append_grant_denial(
                 project_id,
                 &profile_id,
                 Some(store_path),
-                key.as_deref(),
+                key.as_ref().map(|key| key.as_slice()),
                 access.grant_action(),
                 0,
                 now_unix_nanos,
@@ -225,13 +248,15 @@ async fn handle_value_access(
     if !matches!(grant_validation, GrantValidation::Valid) {
         let key = {
             let cache = state.unlock_cache.lock().await;
-            cache.lookup(project_id, now_unix_nanos).map(|entry| entry.key_bytes().to_vec())
+            cache
+                .lookup(project_id, now_unix_nanos)
+                .map(|entry| Zeroizing::new(entry.key_bytes().to_vec()))
         };
         crate::audit_deny::try_append_grant_denial(
             project_id,
             &profile_id,
             Some(store_path),
-            key.as_deref(),
+            key.as_ref().map(|key| key.as_slice()),
             access.grant_action(),
             ttl_seconds,
             now_unix_nanos,
@@ -242,7 +267,9 @@ async fn handle_value_access(
 
     let master_key = {
         let cache = state.unlock_cache.lock().await;
-        cache.lookup(project_id, now_unix_nanos).map(|entry| entry.key_bytes().to_vec())
+        cache
+            .lookup(project_id, now_unix_nanos)
+            .map(|entry| Zeroizing::new(entry.key_bytes().to_vec()))
     };
     let Some(master_key) = master_key else {
         crate::degraded_audit::record_locked_refusal(
@@ -363,7 +390,7 @@ fn read_secret_value(
     ttl_seconds: u32,
     timestamp: i128,
 ) -> Result<ResolvedValue, ValueAccessFailure> {
-    let master_key = key_array(master_key).ok_or_else(corrupt_db)?;
+    let master_key = master_key_array(master_key).map_err(|_| corrupt_db())?;
     let mut store = Store::open(store_path).map_err(|_| corrupt_db())?;
     match read_secret_value_inner(&store, project_id, profile_id, secret_name, &master_key) {
         Ok(details) => {
@@ -450,8 +477,8 @@ fn append_value_access_audit(
     ttl_seconds: u32,
     outcome: ValueAccessAuditOutcome<'_>,
 ) -> Result<(), ValueAccessFailure> {
-    let audit_key = load_project_key_with_master(store, project_id, KeyPurpose::Audit, master_key)
-        .map_err(|_| corrupt_db())?;
+    let audit_key =
+        unwrap_audit_key_with_master(store, project_id, master_key).map_err(|_| corrupt_db())?;
     let timestamp = i64::try_from(timestamp).map_err(|_| corrupt_db())?;
     let mut metadata = Map::from_iter([
         ("schema_version".to_owned(), json!(1)),
@@ -553,13 +580,14 @@ fn decrypt_secret(
     version: u32,
     master_key: &locket_crypto::KeyBytes,
 ) -> Result<zeroize::Zeroizing<String>, locket_crypto::CryptoError> {
-    let profile_secret_key = load_profile_key_with_master(
+    let profile_secret_key = unwrap_profile_key_with_master(
         store,
         project_id,
         profile_id,
-        KeyPurpose::ProfileSecret,
         master_key,
-    )?;
+        KeyPurpose::ProfileSecret,
+    )
+    .map_err(|_| locket_crypto::CryptoError::DecryptionFailed)?;
     let blob = store
         .get_blob(&secret.id, version)
         .map_err(|_| locket_crypto::CryptoError::DecryptionFailed)?
@@ -587,66 +615,8 @@ fn decrypt_secret(
     decrypt_secret_value_v1(&profile_secret_key, &encrypted, &value_aad, &wrap_aad)
 }
 
-fn load_profile_key_with_master(
-    store: &Store,
-    project_id: &str,
-    profile_id: &str,
-    purpose: KeyPurpose,
-    master_key: &locket_crypto::KeyBytes,
-) -> Result<zeroize::Zeroizing<locket_crypto::KeyBytes>, locket_crypto::CryptoError> {
-    let record = store
-        .get_key_by_scope(project_id, Some(profile_id), purpose.as_str())
-        .map_err(|_| locket_crypto::CryptoError::DecryptionFailed)?
-        .ok_or(locket_crypto::CryptoError::DecryptionFailed)?;
-    let wrapping_key = derive_wrapping_key_v1(
-        master_key,
-        &HkdfWrapInfo::new(project_id, Some(profile_id), purpose),
-    )?;
-    let aad = key_wrap_aad_v1(&KeyWrapAad::new(
-        project_id,
-        &record.id,
-        Some(profile_id),
-        0,
-        KeyWrapPurpose::from(purpose),
-    ))?;
-    let wrapped = WrappedKeyMaterial { ciphertext: record.wrapped_material, nonce: record.nonce };
-    unwrap_key_material_v1(&wrapping_key, &wrapped, &aad)
-}
-
-fn load_project_key_with_master(
-    store: &Store,
-    project_id: &str,
-    purpose: KeyPurpose,
-    master_key: &locket_crypto::KeyBytes,
-) -> Result<zeroize::Zeroizing<locket_crypto::KeyBytes>, locket_crypto::CryptoError> {
-    let record = store
-        .get_key_by_scope(project_id, None, purpose.as_str())
-        .map_err(|_| locket_crypto::CryptoError::DecryptionFailed)?
-        .ok_or(locket_crypto::CryptoError::DecryptionFailed)?;
-    let wrapping_key =
-        derive_wrapping_key_v1(master_key, &HkdfWrapInfo::new(project_id, None, purpose))?;
-    let aad = key_wrap_aad_v1(&KeyWrapAad::new(
-        project_id,
-        &record.id,
-        None,
-        0,
-        KeyWrapPurpose::from(purpose),
-    ))?;
-    let wrapped = WrappedKeyMaterial { ciphertext: record.wrapped_material, nonce: record.nonce };
-    unwrap_key_material_v1(&wrapping_key, &wrapped, &aad)
-}
-
-fn key_array(bytes: &[u8]) -> Option<locket_crypto::KeyBytes> {
-    bytes.try_into().ok()
-}
-
 const fn source_precedence(source: &str) -> u8 {
-    match source.as_bytes() {
-        b"team-managed" => 1,
-        b"user-local" => 2,
-        b"machine-local" => 3,
-        _ => 0,
-    }
+    locket_core::source_precedence(source)
 }
 
 const fn corrupt_db() -> ValueAccessFailure {
@@ -961,6 +931,17 @@ mod tests {
             return Err("expected error envelope".into());
         };
         Ok(error.error)
+    }
+
+    #[test]
+    fn plaintext_responses_redact_debug() {
+        let secret = "fixture-plaintext-never-in-debug";
+        let reveal = RevealResponse { value: secret.to_owned(), ttl_seconds: 30 };
+        let copy = CopyResponse { value: secret.to_owned(), ttl_seconds: 30 };
+        for formatted in [format!("{reveal:?}"), format!("{copy:?}")] {
+            assert!(!formatted.contains(secret));
+            assert!(formatted.contains("[REDACTED]"));
+        }
     }
 
     #[test]

@@ -43,7 +43,7 @@ pub struct StatusPayload {
     pub live_grant_count: u32,
     /// Agent version string.
     pub agent_version: String,
-    /// Native session observer availability, absent on older agents.
+    /// Native session observer availability, absent when unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_monitoring: Option<String>,
     /// Remaining unlock TTL, in whole seconds, when an unlock cache

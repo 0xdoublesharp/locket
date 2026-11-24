@@ -122,6 +122,10 @@ pub fn append_canonical_field(output: &mut Vec<u8>, name: &str, value: &str) -> 
     Ok(())
 }
 
+pub fn canonical_fields_len(fields: &[(&str, &str)]) -> usize {
+    fields.iter().map(|(name, value)| 2 + name.len() + 4 + value.len()).sum()
+}
+
 /// Returns the canonical v1 UTF-8 field encoding.
 ///
 /// # Errors
@@ -141,13 +145,18 @@ pub fn canonical_field(name: &str, value: &str) -> CryptoResult<Vec<u8>> {
 /// Returns an error if any field cannot be represented by the canonical v1
 /// length prefixes.
 pub fn secret_blob_aad_v1(metadata: &SecretBlobAad<'_>) -> CryptoResult<Vec<u8>> {
-    let mut aad = Vec::new();
+    let fields = [
+        ("project_id", metadata.project_id),
+        ("profile_id", metadata.profile_id),
+        ("secret_id", metadata.secret_id),
+        ("secret_name", metadata.secret_name),
+    ];
+    let mut aad = Vec::with_capacity(AAD_V1_PREFIX.len() + 6 + canonical_fields_len(&fields));
     aad.extend_from_slice(AAD_V1_PREFIX);
     append_u16_le(&mut aad, AAD_SCHEMA_V1);
-    append_canonical_field(&mut aad, "project_id", metadata.project_id)?;
-    append_canonical_field(&mut aad, "profile_id", metadata.profile_id)?;
-    append_canonical_field(&mut aad, "secret_id", metadata.secret_id)?;
-    append_canonical_field(&mut aad, "secret_name", metadata.secret_name)?;
+    for (name, value) in fields {
+        append_canonical_field(&mut aad, name, value)?;
+    }
     append_u32_le(&mut aad, metadata.version);
     Ok(aad)
 }
@@ -159,13 +168,21 @@ pub fn secret_blob_aad_v1(metadata: &SecretBlobAad<'_>) -> CryptoResult<Vec<u8>>
 /// Returns an error if any field cannot be represented by the canonical v1
 /// length prefixes.
 pub fn key_wrap_aad_v1(metadata: &KeyWrapAad<'_>) -> CryptoResult<Vec<u8>> {
-    let mut aad = Vec::new();
+    let profile_id = metadata.profile_id.unwrap_or("");
+    let purpose = metadata.purpose.as_str();
+    let fields = [
+        ("project_id", metadata.project_id),
+        ("key_id", metadata.key_id),
+        ("profile_id", profile_id),
+        ("purpose", purpose),
+    ];
+    let mut aad = Vec::with_capacity(KEY_WRAP_V1_PREFIX.len() + 6 + canonical_fields_len(&fields));
     aad.extend_from_slice(KEY_WRAP_V1_PREFIX);
     append_canonical_field(&mut aad, "project_id", metadata.project_id)?;
     append_canonical_field(&mut aad, "key_id", metadata.key_id)?;
-    append_canonical_field(&mut aad, "profile_id", metadata.profile_id.unwrap_or(""))?;
+    append_canonical_field(&mut aad, "profile_id", profile_id)?;
     append_u32_le(&mut aad, metadata.version);
-    append_canonical_field(&mut aad, "purpose", metadata.purpose.as_str())?;
+    append_canonical_field(&mut aad, "purpose", purpose)?;
     append_u16_le(&mut aad, KEY_WRAP_SCHEMA_V1);
     Ok(aad)
 }
@@ -177,12 +194,18 @@ pub fn key_wrap_aad_v1(metadata: &KeyWrapAad<'_>) -> CryptoResult<Vec<u8>> {
 /// Returns an error if any field cannot be represented by the canonical v1
 /// length prefixes.
 pub fn hkdf_wrap_info_v1(metadata: &HkdfWrapInfo<'_>) -> CryptoResult<Vec<u8>> {
-    let mut info = Vec::new();
+    let fields = [
+        ("project_id", metadata.project_id),
+        ("profile_id", metadata.profile_id.unwrap_or("")),
+        ("purpose", metadata.purpose.as_str()),
+    ];
+    let mut info =
+        Vec::with_capacity(HKDF_WRAP_INFO_V1_PREFIX.len() + 2 + canonical_fields_len(&fields));
     info.extend_from_slice(HKDF_WRAP_INFO_V1_PREFIX);
     append_u16_le(&mut info, HKDF_WRAP_INFO_SCHEMA_V1);
-    append_canonical_field(&mut info, "project_id", metadata.project_id)?;
-    append_canonical_field(&mut info, "profile_id", metadata.profile_id.unwrap_or(""))?;
-    append_canonical_field(&mut info, "purpose", metadata.purpose.as_str())?;
+    for (name, value) in fields {
+        append_canonical_field(&mut info, name, value)?;
+    }
     Ok(info)
 }
 
@@ -193,10 +216,14 @@ pub fn hkdf_wrap_info_v1(metadata: &HkdfWrapInfo<'_>) -> CryptoResult<Vec<u8>> {
 /// Returns an error if either field cannot be represented by the canonical v1
 /// length prefixes.
 pub fn passphrase_fallback_aad_v1(project_id: &str, kdf_profile_id: &str) -> CryptoResult<Vec<u8>> {
-    let mut aad = Vec::new();
+    let fields = [("project_id", project_id), ("kdf_profile_id", kdf_profile_id)];
+    let mut aad = Vec::with_capacity(
+        PASSPHRASE_FALLBACK_AAD_V1_PREFIX.len() + 2 + canonical_fields_len(&fields),
+    );
     aad.extend_from_slice(PASSPHRASE_FALLBACK_AAD_V1_PREFIX);
     append_u16_le(&mut aad, KEY_WRAP_SCHEMA_V1);
-    append_canonical_field(&mut aad, "project_id", project_id)?;
-    append_canonical_field(&mut aad, "kdf_profile_id", kdf_profile_id)?;
+    for (name, value) in fields {
+        append_canonical_field(&mut aad, name, value)?;
+    }
     Ok(aad)
 }

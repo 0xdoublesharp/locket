@@ -8,8 +8,10 @@ use locket_store::{AuditWrite, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use super::resolve::{preferred_active_secret, version_is_resolvable};
 use crate::envelope::{ErrorEnvelope, RequestEnvelope, ResponseEnvelope, SuccessEnvelope};
 use crate::grant::GrantBinding;
+use crate::keys::{master_key_array, unwrap_audit_key_with_master};
 
 /// Request for saved command policy metadata.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -342,7 +344,7 @@ pub async fn handle_register_command_policies(
             false,
         ));
     };
-    let Ok(master): Result<locket_crypto::KeyBytes, _> = entry.key_bytes().try_into() else {
+    let Ok(master) = master_key_array(entry.key_bytes()) else {
         return ResponseEnvelope::Error(ErrorEnvelope::new(
             request.id.clone(),
             "CorruptDb",
@@ -350,7 +352,6 @@ pub async fn handle_register_command_policies(
             false,
         ));
     };
-    let master = zeroize::Zeroizing::new(master);
     let policy_count = typed.policies.len();
     let metadata = json!({
         "schema_version": 1,
@@ -383,12 +384,7 @@ pub async fn handle_register_command_policies(
             false,
         ));
     };
-    let Ok(audit_key) = crate::set_secret::load_project_key_with_master(
-        &store,
-        &typed.project_id,
-        locket_crypto::KeyPurpose::Audit,
-        &master,
-    ) else {
+    let Ok(audit_key) = unwrap_audit_key_with_master(&store, &typed.project_id, &master) else {
         return ResponseEnvelope::Error(ErrorEnvelope::new(
             request.id.clone(),
             "CorruptDb",
@@ -488,7 +484,7 @@ pub async fn handle_policy_doctor(
             references_failed.push(reference.clone());
             continue;
         }
-        if reference_points_to_active_secret(&store, &typed, &parsed) {
+        if reference_points_to_active_secret(&store, &typed, &parsed, now_unix_nanos) {
             references_ok = references_ok.saturating_add(1);
             env_mode_resolve.insert(key);
         } else {
@@ -528,6 +524,7 @@ fn reference_points_to_active_secret(
     store: &Store,
     request: &PolicyDoctorRequest,
     parsed: &LkReferenceUri,
+    now_unix_nanos: i128,
 ) -> bool {
     let Ok(Some(profile)) =
         store.get_profile_by_name(&request.project_id, parsed.profile().as_str())
@@ -549,7 +546,7 @@ fn reference_points_to_active_secret(
         }
     } else {
         match store.list_secrets_by_name(&request.project_id, &profile.id, parsed.key().as_str()) {
-            Ok(secrets) => secrets.into_iter().find(|secret| secret.state == "active"),
+            Ok(secrets) => preferred_active_secret(secrets),
             Err(_) => return false,
         }
     };
@@ -559,7 +556,7 @@ fn reference_points_to_active_secret(
     let version = parsed.version().map_or(secret.current_version, locket_core::SecretVersion::get);
     matches!(
         store.get_secret_version(&secret.id, version),
-        Ok(Some(record)) if record.state == "current" || record.grace_until.is_some()
+        Ok(Some(record)) if version_is_resolvable(&record, parsed.version().is_some(), now_unix_nanos)
     )
 }
 

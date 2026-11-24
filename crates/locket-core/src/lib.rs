@@ -13,7 +13,7 @@ pub mod error;
 pub mod policy;
 
 pub use configuration::{env, metadata, privacy, project, time};
-pub use formats::{audit, bundle, dotenv, invite, pgp_word_list, update_manifest};
+pub use formats::{audit, audit_witness, bundle, dotenv, invite, pgp_word_list, update_manifest};
 pub use identity::{id, profile_name, reference_uri, secret_name};
 
 pub use audit::{
@@ -21,11 +21,17 @@ pub use audit::{
     AuditHmacInput, audit_checkpoint_v1_bytes, audit_hmac_v1_bytes, bytes, canonical_json,
     canonical_json_bytes, canonical_json_string, field, insert_convenience_metadata,
 };
+pub use audit_witness::{
+    AUDIT_WITNESS_DOMAIN, AUDIT_WITNESS_SCHEMA_VERSION, AuditWitnessError, AuditWitnessReceipt,
+    AuditWitnessStatement, canonical_witness_statement_bytes, sign_audit_witness_statement,
+    verify_audit_witness_receipt,
+};
 pub use bundle::{
     BUNDLE_MAGIC, BUNDLE_MANIFEST_ALLOWED_FIELDS, BUNDLE_MAX_MANIFEST_LEN, BUNDLE_MAX_PAYLOAD_LEN,
     BUNDLE_SCHEMA_V1, BundleContainer, BundleContainerError, BundleContainerResult,
     BundleEncryptionError, BundleEncryptionResult, BundleManifest,
     decrypt_bundle_payload_with_age_identity, decrypt_bundle_payload_with_x25519_secret,
+    decrypt_bundle_payload_with_x25519_secret_zeroizing, decrypt_bundle_payload_zeroizing,
     encrypt_bundle_payload_for_age_recipients, verify_age_payload_structure,
 };
 pub use env::{
@@ -57,6 +63,7 @@ pub use profile_name::{InvalidProfileName, MAX_PROFILE_NAME_LEN, ProfileName};
 pub use project::{PROJECT_CONFIG_SCHEMA_VERSION, ProjectConfig};
 pub use reference_uri::{
     InvalidReferenceUri, InvalidSecretSource, LkReferenceUri, SecretSource, SecretVersion,
+    source_precedence,
 };
 pub use secret_name::{InvalidSecretName, SecretName};
 pub use time::{Duration, InvalidDuration, Timestamp};

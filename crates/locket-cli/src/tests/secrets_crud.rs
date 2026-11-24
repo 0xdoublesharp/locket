@@ -252,6 +252,7 @@ fn set_list_get_and_rm_secret_value() -> Result<(), Box<dyn std::error::Error>> 
     )?;
 
     let args = crate::SecretWriteArgs {
+        target: crate::commands::secrets::set::WriteTargetArgs::default(),
         key: "DATABASE_URL".to_owned(),
         source: crate::SourceArg { source: Some(crate::SecretSourceArg::UserLocal) },
         metadata: crate::SecretMetadataFlags {
@@ -315,6 +316,8 @@ fn get_copy_writes_metadata_only_audit_without_value_leakage()
     crate::set_secret_value(&context, &args, "postgres://localhost/app", "manual", 1_000)?;
 
     let copy_args = crate::GetArgs {
+        project: None,
+        profile: None,
         key: "DATABASE_URL".to_owned(),
         source: crate::SourceArg { source: None },
         reveal: false,
@@ -375,6 +378,8 @@ fn get_copy_wayland_limit_emits_targeted_warning_and_audit_reason()
     crate::set_secret_value(&context, &args, "postgres://localhost/app", "manual", 1_000)?;
 
     let copy_args = crate::GetArgs {
+        project: None,
+        profile: None,
         key: "DATABASE_URL".to_owned(),
         source: crate::SourceArg { source: None },
         reveal: false,
@@ -427,6 +432,8 @@ fn get_copy_direct_cli_limit_records_audit_reason() -> Result<(), Box<dyn std::e
     crate::set_secret_value(&context, &args, "postgres://localhost/app", "manual", 1_000)?;
 
     let copy_args = crate::GetArgs {
+        project: None,
+        profile: None,
         key: "DATABASE_URL".to_owned(),
         source: crate::SourceArg { source: None },
         reveal: false,
@@ -474,6 +481,8 @@ fn get_copy_unavailable_audits_unsupported_state_without_value_leakage()
     crate::set_secret_value(&context, &args, "postgres://localhost/app", "manual", 1_000)?;
 
     let copy_args = crate::GetArgs {
+        project: None,
+        profile: None,
         key: "DATABASE_URL".to_owned(),
         source: crate::SourceArg { source: None },
         reveal: false,
@@ -538,6 +547,8 @@ fn get_copy_verify_user_denial_audits_without_decrypting_or_copying()
     crate::set_secret_value(&context, &args, "postgres://localhost/app", "manual", 1_000)?;
 
     let copy_args = crate::GetArgs {
+        project: None,
+        profile: None,
         key: "DATABASE_URL".to_owned(),
         source: crate::SourceArg { source: None },
         reveal: false,
@@ -945,6 +956,7 @@ fn meta_requires_source_for_multiple_active_sources_and_updates_explicit_source(
     let user_args = test_secret_write_args("DATABASE_URL");
     crate::set_secret_value(&context, &user_args, "postgres://localhost/user", "manual", 1_000)?;
     let machine_args = crate::SecretWriteArgs {
+        target: crate::commands::secrets::set::WriteTargetArgs::default(),
         key: "DATABASE_URL".to_owned(),
         source: crate::SourceArg { source: Some(crate::SecretSourceArg::MachineLocal) },
         metadata: crate::SecretMetadataFlags {

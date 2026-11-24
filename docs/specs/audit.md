@@ -11,7 +11,7 @@ Design:
 - Every audit row includes a sequence number, previous-row HMAC, and current-row HMAC.
 - Project audit/metadata keys and profile secret/fingerprint keys are random keys stored only as wrapped material. The master key derives purpose-separated wrapping keys via HKDF; it does not directly derive project or profile keys. No project/profile key may be derivable from, or substitutable with, another, and none may be derivable from any device key.
 - The HMAC covers sequence, timestamp, project/profile ids, action, status, safe metadata, previous HMAC, and the schema version recorded on the row at write time.
-- Verification recomputes each row's HMAC using the schema version stored on that row, not the current binary's schema version, so a `SCHEMA_MIGRATE` does not break the chain.
+- Verification recomputes each row's HMAC using the schema version stored on that row, not the current binary's schema version, so changing the audit row schema does not break the chain.
 - Audit append must run inside the same SQLite transaction as the metadata/blob change it records. Sequence numbers are assigned at commit so a rolled-back transaction never produces a gap or a phantom row.
 - Audit verification detects gaps, insertion, mutation, and reordering within the retained chain. It cannot detect deletion of a valid suffix, an emptied chain, or whole-database rollback without an independently retained checkpoint. Local audit verification establishes integrity of the rows present, not completeness against an external history.
 - Audit metadata never includes plaintext secret values.
@@ -52,7 +52,7 @@ Every audit row stores a typed JSON object in `metadata_json`. The object must i
 | Agent/grants: `UNLOCK`, `LOCK`, `AGENT_GRANT`, `AGENT_REVOKE`, `GRANT_EXPIRED` | `client_kind`, `grant_actions`, `ttl_seconds`, `directory_hash` where relevant, `process_id` and `process_start_time` where relevant |
 | Passkeys/automation clients: `PASSKEY_REGISTER`, `PASSKEY_REMOVE`, `PASSKEY_AUTH`, `CLIENT_ADD`, `CLIENT_REVOKE`, `CLIENT_AUTH` | `passkey_id` or `client_id`; credential id prefix or public-key fingerprint; capabilities/transports and backup state for passkeys; storage mode, allowed actions, and allowed policies for clients; `revoked_at` for removals; request id, requested action/policy, nonce freshness result, and authentication result for client/passkey auth |
 | Team/device/recovery/bundle: `TEAM_INIT`, `TEAM_INVITE`, `TEAM_ACCEPT`, `TEAM_REMOVE`, `DEVICE_ADD`, `DEVICE_REVOKE`, `BACKUP_EXPORT`, `BACKUP_IMPORT`, `RECOVER`, `RECOVERY_ROTATE`, `BUNDLE_VERIFY` | `team_id`/`member_id`/`device_id` or fingerprints where relevant, selected profile ids, role, expiry, bundle digest/checkpoint, and result summary |
-| Diagnostics/integrity/schema: `DOCTOR`, `AUDIT_VERIFY`, `SCHEMA_MIGRATE`, `HOOK_INSTALL` | check names, pass/warn/fail/skip counts, first failure location where relevant, schema versions, and hook path kind/hash |
+| Diagnostics/integrity/schema: `DOCTOR`, `AUDIT_VERIFY`, `HOOK_INSTALL` | check names, pass/warn/fail/skip counts, first failure location where relevant, and hook path kind/hash |
 
 HMAC-covered audit metadata stores exact canonical names and ids, never privacy aliases. Privacy aliases may be applied only when rendering audit output, status views, debug bundles, or redacted transcripts. `secret_names` and `redacted_secret_names` never contain values. Large collections must be capped and summarized before reaching the 64 KiB audit metadata limit.
 

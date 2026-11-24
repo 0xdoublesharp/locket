@@ -10,15 +10,19 @@ use locket_crypto::{
     EncryptedSecretValue, KeyPurpose, KeyWrapAad, KeyWrapPurpose, decrypt_secret_value_v1,
     encrypt_secret_value_v1, key_wrap_aad_v1, secret_blob_aad_v1, secret_fingerprint_v1,
 };
-use locket_store::{AuditWrite, ProfileRecord, SecretRecord, SecretVersionRecord, Store};
+#[cfg(test)]
+use locket_store::SecretVersionRecord;
+use locket_store::{AuditWrite, ProfileRecord, SecretRecord, Store};
 use serde_json::{Value, json};
 
 use crate::commands::config::spec::{config_get_value, read_user_config};
 use crate::runtime::RuntimeContext;
+#[cfg(test)]
+use crate::runtime::error::secret_version_expired_error;
 use crate::runtime::error::{
     CliError, corrupt_db_error, invalid_profile_name_error, invalid_reference_error,
     invalid_secret_name_error, metadata_invalid_error, profile_not_found_error,
-    secret_deleted_error, secret_not_found_error, secret_version_expired_error,
+    secret_deleted_error, secret_not_found_error,
 };
 use crate::runtime::key_access::{default_profile, load_profile_key, load_project_key};
 use crate::runtime::user_verification::UserVerificationAudit;
@@ -41,9 +45,20 @@ pub struct PolicySecretSelection {
     pub selected: Option<SecretRecord>,
 }
 
+pub struct ValueAccessTarget {
+    pub profile: ProfileRecord,
+    pub secret: SecretRecord,
+}
+
+impl From<ResolvedSecret> for ValueAccessTarget {
+    fn from(resolved: ResolvedSecret) -> Self {
+        Self { profile: resolved.profile, secret: resolved.secret }
+    }
+}
+
 pub struct ValueAccessAudit<'a> {
     pub context: &'a RuntimeContext,
-    pub resolved: &'a ResolvedSecret,
+    pub resolved: &'a ValueAccessTarget,
     pub action: &'static str,
     pub status: &'static str,
     pub access_mode: &'static str,
@@ -86,6 +101,14 @@ pub fn encrypt_secret_version(
         request.profile_id,
         KeyPurpose::ProfileFingerprint,
     )?;
+    encrypt_secret_version_with_keys(&profile_secret_key, &profile_fingerprint_key, request)
+}
+
+pub fn encrypt_secret_version_with_keys(
+    profile_secret_key: &locket_crypto::KeyBytes,
+    profile_fingerprint_key: &locket_crypto::KeyBytes,
+    request: SecretEncryptRequest<'_>,
+) -> Result<(EncryptedSecretValue, Vec<u8>), CliError> {
     let value_aad = secret_blob_aad_v1(&locket_crypto::SecretBlobAad::new(
         request.project_id,
         request.profile_id,
@@ -101,8 +124,8 @@ pub fn encrypt_secret_version(
         KeyWrapPurpose::SecretDek,
     ))?;
     let encrypted =
-        encrypt_secret_value_v1(&profile_secret_key, request.value, &value_aad, &wrap_aad)?;
-    let fingerprint = secret_fingerprint_v1(&profile_fingerprint_key, request.value)?;
+        encrypt_secret_value_v1(profile_secret_key, request.value, &value_aad, &wrap_aad)?;
+    let fingerprint = secret_fingerprint_v1(profile_fingerprint_key, request.value)?;
     Ok((encrypted, fingerprint.to_vec()))
 }
 
@@ -202,7 +225,7 @@ pub fn resolve_active_secret_for_source(
 /// Returns [`CliError::Typed`] tagged with [`locket_core::LocketError::SecretVersionExpired`]
 /// when the version is past grace; [`locket_core::LocketError::SecretDeleted`] when the
 /// secret source is deleted.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn resolve_pinned_version(
     secret: &SecretRecord,
     version: &SecretVersionRecord,
@@ -372,7 +395,7 @@ pub fn write_value_access_audit_if_available(
     request: &ValueAccessAudit<'_>,
 ) -> Result<(), CliError> {
     let mut store = open_store(request.context)?;
-    let project_id = request.resolved.project.config.project_id.as_str();
+    let project_id = request.resolved.secret.project_id.as_str();
     if store.get_project(project_id)?.is_none() {
         return Ok(());
     }
@@ -470,7 +493,7 @@ pub fn policy_secret_selection(
     PolicySecretSelection { name: name.to_owned(), required, sources, selected }
 }
 
-fn select_highest_precedence_secret(
+pub fn select_highest_precedence_secret(
     secrets: impl IntoIterator<Item = SecretRecord>,
 ) -> Option<SecretRecord> {
     secrets.into_iter().max_by_key(|secret| source_precedence(&secret.source))

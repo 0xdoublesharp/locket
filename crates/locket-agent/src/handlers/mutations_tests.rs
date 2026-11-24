@@ -2,7 +2,7 @@
 use super::*;
 use crate::{GrantRecord, GrantRecordFields, UnlockEntry, UnlockMethod};
 use locket_crypto::{
-    HkdfWrapInfo, KeyWrapAad, KeyWrapPurpose, derive_wrapping_key_v1, key_wrap_aad_v1,
+    HkdfWrapInfo, KeyPurpose, KeyWrapAad, KeyWrapPurpose, derive_wrapping_key_v1, key_wrap_aad_v1,
     wrap_key_material_v1,
 };
 use std::time::Duration;

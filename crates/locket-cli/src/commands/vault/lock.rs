@@ -6,7 +6,7 @@ use locket_crypto::KeyPurpose;
 use locket_store::AuditWrite;
 use serde_json::json;
 
-use crate::runtime::user_verification::{UserVerificationAudit, require_user_verification};
+use crate::runtime::user_verification::require_user_verification;
 use crate::{
     CliError, MasterKeySource, RuntimeContext, UnlockArgs, default_profile, ensure_project_exists,
     load_project_key_with_source, now_unix_nanos, open_store, require_project, resolve_project,
@@ -87,13 +87,17 @@ pub fn unlock_command(
     output: &mut impl Write,
     args: &UnlockArgs,
 ) -> Result<(), CliError> {
+    let resolved = require_project(context)?;
     let user_verification = if args.verify_user {
         require_user_verification(context, "vault unlock", "unlock vault")?
     } else {
-        UserVerificationAudit::not_required()
+        crate::runtime::user_verification::configured_user_verification(
+            context,
+            "user_verification_required_for.unlock",
+            "vault unlock",
+            "unlock vault",
+        )?
     };
-
-    let resolved = require_project(context)?;
     let mut store = open_store(context)?;
     let project_id = resolved.config.project_id.as_str();
     ensure_project_exists(&store, project_id)?;
@@ -128,7 +132,7 @@ pub fn unlock_command(
     };
     store.append_audit(audit_key.as_ref(), &audit)?;
 
-    let verify_status = if args.verify_user { "satisfied" } else { "not requested" };
+    let verify_status = if user_verification.satisfied { "satisfied" } else { "not requested" };
     writeln!(output, "unlock: metadata-only direct CLI unlock succeeded")?;
     writeln!(output, "project_id: {project_id}")?;
     writeln!(output, "active_profile: {} ({})", resolved.config.default_profile, profile.id)?;

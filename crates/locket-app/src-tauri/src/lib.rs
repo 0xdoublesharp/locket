@@ -8,10 +8,11 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use directories::ProjectDirs;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use tauri::Manager as _;
 use tauri::{Emitter as _, RunEvent};
+use zeroize::Zeroizing;
 
 // Test-only dev-deps; suppress `unused_crate_dependencies` for the lib-test target.
 #[cfg(test)]
@@ -210,8 +211,10 @@ fn resolve_path(
 }
 
 fn project_dirs() -> Result<ProjectDirs, AgentClientError> {
-    ProjectDirs::from("dev", "0xdoublesharp", "Locket").ok_or_else(|| AgentClientError::Protocol {
-        reason: "could not resolve the default Locket data directory".to_owned(),
+    locket_platform::LocketInstance::current().project_dirs().ok_or_else(|| {
+        AgentClientError::Protocol {
+            reason: "could not resolve the default Locket data directory".to_owned(),
+        }
     })
 }
 
@@ -345,30 +348,36 @@ async fn agent_lock() -> Result<(), AgentClientError> {
 /// Source describing how the agent should derive the unwrapped key.
 ///
 /// Stays distinct from the agent's wire format so we can grow the set
-/// of unlock paths without leaking key material to the webview. Only
-/// `passphrase` is wired today; the other variants are placeholders for
-/// later slices and currently surface a typed `unsupported-source`
-/// protocol error.
-#[derive(Debug, Deserialize)]
+/// of unlock paths without leaking unwrapped keys to the webview.
+#[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 enum UnlockSource {
     Passphrase {
-        passphrase: String,
+        #[serde(deserialize_with = "deserialize_secret")]
+        passphrase: Zeroizing<String>,
     },
     Recovery {
-        #[allow(dead_code)]
-        recovery: String,
+        #[serde(deserialize_with = "deserialize_secret")]
+        recovery: Zeroizing<String>,
     },
     OsKeychain,
 }
 
-#[derive(Debug, Deserialize)]
+fn deserialize_secret<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Zeroizing<String>, D::Error> {
+    String::deserialize(deserializer).map(Zeroizing::new)
+}
+
+#[derive(Deserialize, Serialize)]
 struct DesktopUnlockAudit {
+    #[serde(skip_serializing_if = "Option::is_none")]
     store_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     profile_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct DesktopUnlockRequest {
     project_id: String,
     ttl_seconds: u64,
@@ -377,36 +386,40 @@ struct DesktopUnlockRequest {
     audit: Option<DesktopUnlockAudit>,
 }
 
+#[derive(Serialize)]
+struct AgentUnlockPayload<'a> {
+    project_id: &'a str,
+    ttl_seconds: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    passphrase: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    method: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audit: Option<&'a DesktopUnlockAudit>,
+}
+
 impl DesktopUnlockRequest {
-    fn into_agent_payload(self) -> Result<serde_json::Value, AgentClientError> {
-        let passphrase: Option<String> = match self.source {
-            UnlockSource::Passphrase { passphrase } => Some(passphrase),
+    fn agent_payload(&self) -> Result<AgentUnlockPayload<'_>, AgentClientError> {
+        let passphrase = match &self.source {
+            UnlockSource::Passphrase { passphrase } => Some(passphrase.as_str()),
             UnlockSource::OsKeychain => None,
-            UnlockSource::Recovery { .. } => {
+            UnlockSource::Recovery { recovery } => {
                 return Err(AgentClientError::Protocol {
-                    reason: "unsupported unlock source".to_owned(),
+                    reason: if recovery.trim().is_empty() {
+                        "recovery code is required".to_owned()
+                    } else {
+                        "unsupported unlock source".to_owned()
+                    },
                 });
             }
         };
-        let mut payload = serde_json::json!({
-            "project_id": self.project_id,
-            "ttl_seconds": self.ttl_seconds,
-        });
-        if let Some(passphrase) = passphrase {
-            payload["passphrase"] = serde_json::json!(passphrase);
-            payload["method"] = serde_json::json!("passphrase");
-        }
-        if let Some(audit) = self.audit {
-            let mut audit_value = serde_json::json!({});
-            if let Some(store_path) = audit.store_path {
-                audit_value["store_path"] = serde_json::json!(store_path.display().to_string());
-            }
-            if let Some(profile_id) = audit.profile_id {
-                audit_value["profile_id"] = serde_json::json!(profile_id);
-            }
-            payload["audit"] = audit_value;
-        }
-        Ok(payload)
+        Ok(AgentUnlockPayload {
+            project_id: &self.project_id,
+            ttl_seconds: self.ttl_seconds,
+            passphrase,
+            method: passphrase.map(|_| "passphrase"),
+            audit: self.audit.as_ref(),
+        })
     }
 }
 
@@ -417,7 +430,7 @@ impl DesktopUnlockRequest {
 /// unwrapped key.
 #[tauri::command]
 async fn agent_unlock(request: DesktopUnlockRequest) -> Result<(), AgentClientError> {
-    let payload = request.into_agent_payload()?;
+    let payload = request.agent_payload()?;
     let path = agent_client::resolve_socket_path();
     agent_client::invoke_method(&path, locket_agent::AgentMethod::Unlock, &payload).await
 }
@@ -704,11 +717,7 @@ async fn agent_list_secrets(
     agent_client::invoke_method(&path, locket_agent::AgentMethod::ListSecrets, &request).await
 }
 
-/// Desktop wrapper for `SetSecret`. Wraps `locket_agent::SetSecretRequest`
-/// with a webview-friendly default for `store_path` and the
-/// metadata-only `rotate` flag forced to `false`. The desktop never
-/// holds the unwrapped key; the agent enforces the live grant + unlock
-/// cache on its side.
+/// Webview input for the agent's `SetSecret` RPC.
 #[derive(Deserialize)]
 struct DesktopSetSecretRequest {
     store_path: Option<PathBuf>,
@@ -717,30 +726,69 @@ struct DesktopSetSecretRequest {
     secret_name: String,
     #[serde(default)]
     source: Option<String>,
-    value: String,
+    #[serde(deserialize_with = "deserialize_secret")]
+    value: Zeroizing<String>,
     #[serde(default)]
     grace_until: Option<i64>,
-    #[serde(default)]
+}
+
+#[derive(Serialize)]
+struct AgentSetSecretPayload<'a> {
+    store_path: String,
+    project_id: &'a str,
+    profile_id: &'a str,
+    secret_name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<&'a str>,
+    value: &'a str,
+    rotate: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grace_until: Option<i64>,
     grant_id: Option<String>,
+    binding: Option<locket_agent::GrantBinding>,
+}
+
+impl desktop_actions::GrantPayload for AgentSetSecretPayload<'_> {
+    fn authorize(
+        &mut self,
+        grant: &locket_agent::GrantIdPayload,
+        binding: locket_agent::GrantBinding,
+    ) {
+        self.grant_id = Some(grant.grant_id.clone());
+        self.binding = Some(binding);
+    }
 }
 
 impl DesktopSetSecretRequest {
-    fn into_agent_request(
-        self,
-        rotate: bool,
-    ) -> Result<locket_agent::SetSecretRequest, AgentClientError> {
-        Ok(locket_agent::SetSecretRequest {
-            store_path: resolve_path(self.store_path, default_store_path)?.display().to_string(),
-            project_id: self.project_id,
-            profile_id: self.profile_id,
-            secret_name: self.secret_name,
-            source: self.source,
-            value: self.value,
+    fn agent_payload(&self, store: &std::path::Path, rotate: bool) -> AgentSetSecretPayload<'_> {
+        AgentSetSecretPayload {
+            store_path: store.display().to_string(),
+            project_id: &self.project_id,
+            profile_id: &self.profile_id,
+            secret_name: &self.secret_name,
+            source: self.source.as_deref(),
+            value: self.value.as_str(),
             rotate,
             grace_until: self.grace_until,
-            grant_id: self.grant_id,
-            binding: Some(desktop_actions::native_binding()?),
-        })
+            grant_id: None,
+            binding: None,
+        }
+    }
+
+    async fn submit(
+        mut self,
+        rotate: bool,
+    ) -> Result<locket_agent::SetSecretResponse, AgentClientError> {
+        let store = resolve_path(self.store_path.take(), default_store_path)?;
+        desktop_actions::invoke_granted(
+            locket_agent::AgentMethod::SetSecret,
+            locket_agent::GrantAction::SetSecret,
+            self.agent_payload(&store, rotate),
+            &store,
+            &self.project_id,
+            &self.profile_id,
+        )
+        .await
     }
 }
 
@@ -754,17 +802,7 @@ impl DesktopSetSecretRequest {
 async fn agent_set_secret(
     request: DesktopSetSecretRequest,
 ) -> Result<locket_agent::SetSecretResponse, AgentClientError> {
-    let agent_request = request.into_agent_request(false)?;
-    desktop_actions::invoke_granted(
-        locket_agent::AgentMethod::SetSecret,
-        locket_agent::GrantAction::SetSecret,
-        serde_json::to_value(&agent_request)
-            .map_err(|_| AgentClientError::Protocol { reason: "Invalid secret request.".into() })?,
-        std::path::Path::new(&agent_request.store_path),
-        &agent_request.project_id,
-        &agent_request.profile_id,
-    )
-    .await
+    request.submit(false).await
 }
 
 /// Tauri command bridging the desktop secret editor to the agent's
@@ -775,17 +813,7 @@ async fn agent_set_secret(
 async fn agent_rotate_secret(
     request: DesktopSetSecretRequest,
 ) -> Result<locket_agent::SetSecretResponse, AgentClientError> {
-    let agent_request = request.into_agent_request(true)?;
-    desktop_actions::invoke_granted(
-        locket_agent::AgentMethod::SetSecret,
-        locket_agent::GrantAction::SetSecret,
-        serde_json::to_value(&agent_request)
-            .map_err(|_| AgentClientError::Protocol { reason: "Invalid secret request.".into() })?,
-        std::path::Path::new(&agent_request.store_path),
-        &agent_request.project_id,
-        &agent_request.profile_id,
-    )
-    .await
+    request.submit(true).await
 }
 
 /// Tauri command exposing metadata-only desktop settings.
@@ -1058,10 +1086,11 @@ mod tests {
         DesktopListAuditRequest, DesktopListDeviceMembersRequest, DesktopListSecretsRequest,
         DesktopListVersionsRequest, DesktopPolicyDoctorRequest,
         DesktopRegisterCommandPoliciesRequest, DesktopSetActiveProfileRequest,
-        DesktopSetSecretRequest, DesktopUnlockAudit, DesktopUnlockRequest,
-        DesktopVerifyAuditRequest, DesktopWriteConfigRequest, UnlockSource, default_true,
+        DesktopSetSecretRequest, DesktopUnlockRequest, DesktopVerifyAuditRequest,
+        DesktopWriteConfigRequest, UnlockSource, default_true,
     };
     use crate::AgentClientError;
+    use crate::desktop_actions::GrantPayload as _;
 
     #[test]
     fn explicit_path_does_not_require_default_directory() -> Result<(), AgentClientError> {
@@ -1130,30 +1159,27 @@ mod tests {
 
     #[test]
     fn unlock_request_builds_passphrase_and_keychain_payloads() -> Result<(), Box<dyn Error>> {
-        let payload = DesktopUnlockRequest {
-            project_id: "lk_proj_test".to_owned(),
-            ttl_seconds: 900,
-            source: UnlockSource::Passphrase { passphrase: "secret".to_owned() },
-            audit: Some(DesktopUnlockAudit {
-                store_path: Some(PathBuf::from("/tmp/store.db")),
-                profile_id: Some("lk_prof_test".to_owned()),
-            }),
-        }
-        .into_agent_payload()?;
+        let request: DesktopUnlockRequest = serde_json::from_value(serde_json::json!({
+            "project_id": "lk_proj_test",
+            "ttl_seconds": 900,
+            "source": {"kind": "passphrase", "passphrase": "secret"},
+            "audit": {"store_path": "/vault/store.db", "profile_id": "lk_prof_test"}
+        }))?;
+        let payload = serde_json::to_value(request.agent_payload()?)?;
         assert_eq!(payload["project_id"], "lk_proj_test");
         assert_eq!(payload["ttl_seconds"], 900);
         assert_eq!(payload["method"], "passphrase");
         assert_eq!(payload["passphrase"], "secret");
-        assert_eq!(payload["audit"]["store_path"], "/tmp/store.db");
+        assert_eq!(payload["audit"]["store_path"], "/vault/store.db");
         assert_eq!(payload["audit"]["profile_id"], "lk_prof_test");
 
-        let payload = DesktopUnlockRequest {
+        let request = DesktopUnlockRequest {
             project_id: "lk_proj_test".to_owned(),
             ttl_seconds: 60,
             source: UnlockSource::OsKeychain,
             audit: None,
-        }
-        .into_agent_payload()?;
+        };
+        let payload = serde_json::to_value(request.agent_payload()?)?;
         assert!(payload.get("passphrase").is_none());
         assert!(payload.get("method").is_none());
         assert!(payload.get("audit").is_none());
@@ -1162,17 +1188,20 @@ mod tests {
     }
 
     #[test]
-    fn unlock_request_rejects_recovery_source_until_wired() {
-        let error = DesktopUnlockRequest {
-            project_id: "lk_proj_test".to_owned(),
-            ttl_seconds: 60,
-            source: UnlockSource::Recovery { recovery: "code".to_owned() },
-            audit: None,
+    fn unlock_request_rejects_recovery_source_until_wired() -> Result<(), Box<dyn Error>> {
+        for (recovery, expected) in
+            [("code", "unsupported unlock source"), (" ", "recovery code is required")]
+        {
+            let request: DesktopUnlockRequest = serde_json::from_value(serde_json::json!({
+                "project_id": "lk_proj_test",
+                "ttl_seconds": 60,
+                "source": {"kind": "recovery", "recovery": recovery},
+            }))?;
+            assert!(
+                matches!(request.agent_payload(), Err(AgentClientError::Protocol { reason }) if reason == expected)
+            );
         }
-        .into_agent_payload();
-        assert!(
-            matches!(error, Err(AgentClientError::Protocol { reason }) if reason == "unsupported unlock source")
-        );
+        Ok(())
     }
 
     #[test]
@@ -1304,18 +1333,24 @@ mod tests {
     #[test]
     fn desktop_set_secret_and_verify_audit_requests_convert() -> Result<(), Box<dyn Error>> {
         for rotate in [false, true] {
-            let set_secret = DesktopSetSecretRequest {
-                store_path: Some(PathBuf::from("/tmp/store.db")),
-                project_id: "lk_proj_test".to_owned(),
-                profile_id: "lk_prof_test".to_owned(),
-                secret_name: "DATABASE_URL".to_owned(),
-                source: Some("machine-local".to_owned()),
-                value: "postgres://localhost/dev".to_owned(),
-                grace_until: Some(123),
-                grant_id: Some("grant-1".to_owned()),
-            }
-            .into_agent_request(rotate)?;
-            assert_eq!(set_secret.store_path, "/tmp/store.db");
+            let request: DesktopSetSecretRequest = serde_json::from_value(json!({
+                "project_id": "lk_proj_test",
+                "profile_id": "lk_prof_test",
+                "secret_name": "DATABASE_URL",
+                "source": "machine-local",
+                "value": "postgres://localhost/dev",
+                "grace_until": 123,
+                "grant_id": "ignored",
+            }))?;
+            let mut payload =
+                request.agent_payload(std::path::Path::new("/vault/store.db"), rotate);
+            payload.authorize(
+                &locket_agent::GrantIdPayload { grant_id: "grant-1".into() },
+                locket_agent::GrantBinding::new(std::process::id(), "42"),
+            );
+            let set_secret: locket_agent::SetSecretRequest =
+                serde_json::from_value(serde_json::to_value(payload)?)?;
+            assert_eq!(set_secret.store_path, "/vault/store.db");
             assert_eq!(set_secret.source.as_deref(), Some("machine-local"));
             assert_eq!(set_secret.rotate, rotate);
             assert_eq!(set_secret.grace_until, Some(123));

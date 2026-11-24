@@ -2,14 +2,14 @@
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::aad::AAD_SCHEMA_V1;
 use crate::aead::{aead_decrypt, aead_encrypt, validate_secret_value};
 use crate::error::{CryptoError, CryptoResult};
 use crate::key_wrap::{unwrap_dek_v1, wrap_dek_v1};
-use crate::random::random_bytes;
-use crate::{FingerprintBytes, KEY_LEN, KeyBytes, NONCE_LEN, NonceBytes};
+use crate::random::{generate_key, random_bytes};
+use crate::{FingerprintBytes, KeyBytes, NONCE_LEN, NonceBytes};
 
 /// Encrypted secret value material for a `SecretBlob` row.
 #[derive(Clone, Eq, PartialEq)]
@@ -58,7 +58,7 @@ pub fn encrypt_secret_value_v1(
 ) -> CryptoResult<EncryptedSecretValue> {
     validate_secret_value(value)?;
 
-    let dek = Zeroizing::new(random_bytes::<KEY_LEN>()?);
+    let dek = generate_key()?;
     let value_nonce = random_bytes::<NONCE_LEN>()?;
     let ciphertext = aead_encrypt(&dek, &value_nonce, value.as_bytes(), value_aad)?;
     let encrypted_dek = wrap_dek_v1(profile_secret_key, &dek, dek_wrap_aad)?;
@@ -87,22 +87,17 @@ pub fn decrypt_secret_value_v1(
         return Err(CryptoError::DecryptionFailed);
     }
     let dek = unwrap_dek_v1(profile_secret_key, &encrypted.encrypted_dek, dek_wrap_aad)?;
-    let mut plaintext = Zeroizing::new(aead_decrypt(
-        &dek,
-        &encrypted.value_nonce,
-        &encrypted.ciphertext,
-        value_aad,
-    )?);
+    let mut plaintext =
+        aead_decrypt(&dek, &encrypted.value_nonce, &encrypted.ciphertext, value_aad)?;
 
     let value = match String::from_utf8(std::mem::take(&mut *plaintext)) {
-        Ok(value) => value,
+        Ok(value) => Zeroizing::new(value),
         Err(error) => {
-            let mut bytes = Zeroizing::new(error.into_bytes());
-            bytes.zeroize();
+            drop(Zeroizing::new(error.into_bytes()));
             return Err(CryptoError::DecryptionFailed);
         }
     };
 
     validate_secret_value(&value)?;
-    Ok(Zeroizing::new(value))
+    Ok(value)
 }

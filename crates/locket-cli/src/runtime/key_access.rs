@@ -292,9 +292,6 @@ pub fn default_profile(store: &Store, config: &ProjectConfig) -> Result<ProfileR
 ///
 /// Returns [`CliError`] if HKDF derivation, AAD construction, or
 /// AEAD encryption fails.
-// Wired by the bundle/team-accept apply chain, which lands in a follow-up
-// slice; tests below exercise the round trip today.
-#[allow(dead_code)]
 pub fn rewrap_imported_profile_key(
     receiver_master_key: &locket_crypto::KeyBytes,
     receiver_project_id: &str,

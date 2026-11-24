@@ -2,7 +2,8 @@ use std::error::Error;
 
 use crate::{
     AuditContext, AuditWrite, SecretBlobRecord, SecretCopyTarget, SecretFingerprintRecord,
-    SecretRecord, SecretVersionRecord, Store, StoreError, VersionDeprecation,
+    SecretInitialMetadata, SecretMutableMetadata, SecretRecord, SecretVersionRecord, Store,
+    StoreError, VersionDeprecation,
 };
 
 use super::{
@@ -298,7 +299,13 @@ impl ConcurrentSecretChange {
                 Ok(3)
             }
             Self::Purge => {
-                assert!(store.purge_secret_version(&secret.id, 1, 200)?);
+                // Simulate a store written before the active-current purge guard.
+                store.connection().execute_batch(
+                    "UPDATE secret_versions SET state = 'purged', purged_at = 200
+                     WHERE secret_id = 'lk_sec_test' AND version = 1;
+                     DELETE FROM blobs WHERE secret_id = 'lk_sec_test' AND version = 1;
+                     DELETE FROM fingerprints WHERE secret_id = 'lk_sec_test' AND version = 1;",
+                )?;
                 Ok(2)
             }
         }
@@ -527,6 +534,15 @@ fn purge_secret_versions_removes_material_but_keeps_version_rows() -> Result<(),
         Some(500),
     )?;
 
+    let result =
+        test_store.store.purge_secret_versions_with_audit("lk_sec_test", &[1, 2], 550, None);
+    assert!(matches!(
+        result,
+        Err(StoreError::ActiveSecretVersionPurge { ref secret_id, version: 2 })
+            if secret_id == "lk_sec_test"
+    ));
+    assert!(test_store.store.get_blob("lk_sec_test", 1)?.is_some());
+    assert!(test_store.store.get_blob("lk_sec_test", 2)?.is_some());
     assert!(test_store.store.purge_secret_version("lk_sec_test", 1, 600)?);
     assert!(!test_store.store.purge_secret_version("lk_sec_test", 1, 700)?);
 
@@ -544,6 +560,10 @@ fn purge_secret_versions_removes_material_but_keeps_version_rows() -> Result<(),
         |row| row.get::<_, i64>(0),
     )?;
     assert_eq!(fingerprint_rows, 0);
+
+    test_store.store.tombstone_secret("lk_sec_test", 800)?;
+    assert!(test_store.store.purge_secret_versions_with_audit("lk_sec_test", &[2], 900, None)?);
+    assert_eq!(test_store.store.get_blob("lk_sec_test", 2)?, None);
 
     Ok(())
 }
@@ -571,5 +591,276 @@ fn secret_version_range_constraints_are_enforced() -> Result<(), Box<dyn Error>>
     )?;
     assert_eq!(rows, 1);
 
+    Ok(())
+}
+
+fn secret_audit_metadata(action: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "action": action,
+        "status": "SUCCESS",
+        "secret_name": "DATABASE_URL",
+        "profile_id": "lk_prof_test",
+        "source": "user-local",
+    })
+}
+
+fn secret_audit<'a>(action: &'a str, metadata: &'a serde_json::Value) -> AuditWrite<'a> {
+    AuditWrite {
+        project_id: "lk_proj_test",
+        profile_id: Some("lk_prof_test"),
+        action,
+        status: "SUCCESS",
+        secret_name: Some("DATABASE_URL"),
+        command: None,
+        metadata_json: metadata,
+        timestamp: 200,
+    }
+}
+
+#[test]
+fn create_secret_metadata_commits_with_audit_and_rolls_back_on_error() -> Result<(), Box<dyn Error>>
+{
+    let mut fixture = open_initialized_store()?;
+    let store = &mut fixture.store;
+    insert_project_profile(store)?;
+    let (secret, version, blob, fingerprint) =
+        (test_secret(), test_secret_version(), test_secret_blob(), test_secret_fingerprint());
+    let tags = ["on-call".to_owned(), "données".to_owned()];
+    let metadata = SecretInitialMetadata {
+        description: Some("Production"),
+        owner: Some("Infra"),
+        tags: &tags,
+        required: true,
+    };
+    let bad_json = serde_json::json!({});
+    let rejected_audit = secret_audit("SET", &bad_json);
+    let key = [42; 32];
+    assert!(matches!(
+        store.create_active_secret_with_metadata_and_audit(
+            &secret,
+            &version,
+            &blob,
+            &fingerprint,
+            metadata,
+            Some(AuditContext { key: &key, write: &rejected_audit }),
+        ),
+        Err(StoreError::AuditMetadataInvalid { .. })
+    ));
+    assert!(store.get_secret_mutable_metadata(&secret.id)?.is_none());
+    assert!(store.get_secret_version(&secret.id, 1)?.is_none());
+    assert!(store.get_blob(&secret.id, 1)?.is_none());
+
+    let audit_json = secret_audit_metadata("SET");
+    let audit = secret_audit("SET", &audit_json);
+    store.create_active_secret_with_metadata_and_audit(
+        &secret,
+        &version,
+        &blob,
+        &fingerprint,
+        metadata,
+        Some(AuditContext { key: &key, write: &audit }),
+    )?;
+    assert_eq!(
+        store.get_secret_mutable_metadata(&secret.id)?,
+        Some(SecretMutableMetadata {
+            description: Some("Production".into()),
+            owner: Some("Infra".into()),
+            tags: tags.to_vec(),
+            required: true,
+        })
+    );
+    let rows = store.list_audit_rows_since(&secret.project_id, &secret.profile_id, 0)?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].action, "SET");
+    Ok(())
+}
+
+#[test]
+fn rotate_secret_metadata_is_preserved_or_replaced_atomically() -> Result<(), Box<dyn Error>> {
+    let mut fixture = open_initialized_store()?;
+    let store = &mut fixture.store;
+    insert_project_profile(store)?;
+    let mut secret = test_secret();
+    store.create_active_secret(
+        &secret,
+        &test_secret_version(),
+        &test_secret_blob(),
+        &test_secret_fingerprint(),
+    )?;
+    assert_eq!(
+        store.get_secret_mutable_metadata(&secret.id)?,
+        Some(SecretMutableMetadata {
+            description: None,
+            owner: None,
+            tags: Vec::new(),
+            required: false
+        })
+    );
+    let tags = ["tag".to_owned()];
+    store.update_secret_metadata(
+        &secret.id,
+        Some("initial"),
+        Some("old"),
+        Some(&tags),
+        Some(true),
+    )?;
+    let previous = store.get_secret_mutable_metadata(&secret.id)?;
+
+    let version = SecretVersionRecord { version: 2, created_at: 200, ..test_secret_version() };
+    let blob = SecretBlobRecord { version: 2, created_at: 200, ..test_secret_blob() };
+    let fingerprint =
+        SecretFingerprintRecord { version: 2, created_at: 200, ..test_secret_fingerprint() };
+    let deprecation = VersionDeprecation { deprecated_at: 200, grace_until: None };
+    store.rotate_secret_with_audit(&secret, &version, &blob, &fingerprint, deprecation, None)?;
+    assert_eq!(store.get_secret_mutable_metadata(&secret.id)?, previous);
+
+    secret.current_version = 2;
+    let version = SecretVersionRecord { version: 3, created_at: 300, ..version };
+    let blob = SecretBlobRecord { version: 3, created_at: 300, ..blob };
+    let fingerprint = SecretFingerprintRecord { version: 3, created_at: 300, ..fingerprint };
+    let deprecation = VersionDeprecation { deprecated_at: 300, grace_until: Some(400) };
+    let bad_json = serde_json::json!({});
+    let rejected_audit = secret_audit("ROTATE", &bad_json);
+    let key = [42; 32];
+    let replacement = Some(SecretInitialMetadata { owner: Some("new"), ..Default::default() });
+    assert!(matches!(
+        store.rotate_secret_with_metadata_and_audit(
+            &secret,
+            &version,
+            &blob,
+            &fingerprint,
+            deprecation,
+            replacement,
+            Some(AuditContext { key: &key, write: &rejected_audit }),
+        ),
+        Err(StoreError::AuditMetadataInvalid { .. })
+    ));
+    assert_eq!(store.get_secret_mutable_metadata(&secret.id)?, previous);
+    assert_eq!(
+        store.get_secret_version(&secret.id, 2)?.ok_or("old version absent")?.state,
+        "current"
+    );
+    assert!(store.get_secret_version(&secret.id, 3)?.is_none());
+    assert!(store.get_blob(&secret.id, 3)?.is_none());
+
+    let audit_json = secret_audit_metadata("ROTATE");
+    let audit = secret_audit("ROTATE", &audit_json);
+    store.rotate_secret_with_metadata_and_audit(
+        &secret,
+        &version,
+        &blob,
+        &fingerprint,
+        deprecation,
+        replacement,
+        Some(AuditContext { key: &key, write: &audit }),
+    )?;
+    assert_eq!(
+        store.get_secret_mutable_metadata(&secret.id)?,
+        Some(SecretMutableMetadata {
+            description: None,
+            owner: Some("new".into()),
+            tags: Vec::new(),
+            required: false,
+        })
+    );
+    let stored = store
+        .get_active_secret(&secret.project_id, &secret.profile_id, &secret.name, &secret.source)?
+        .ok_or("active secret absent")?;
+    assert_eq!(
+        (stored.current_version, stored.updated_at, stored.last_rotated_at),
+        (3, 300, Some(300))
+    );
+    let rows = store.list_audit_rows_since(&secret.project_id, &secret.profile_id, 0)?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].action, "ROTATE");
+    Ok(())
+}
+
+#[test]
+fn secret_expiry_policy_round_trips_and_can_be_cleared() -> Result<(), Box<dyn Error>> {
+    use crate::SecretExpiryPolicy;
+
+    let test_store = open_initialized_store()?;
+    let store = &test_store.store;
+    insert_project_profile_secret(store)?;
+    let secret = "lk_sec_test";
+    assert_eq!(store.get_secret_expiry_policy(secret)?, Some(SecretExpiryPolicy::default()));
+    assert_eq!(store.get_secret_expiry_policy("missing")?, None);
+
+    let policy = SecretExpiryPolicy { expires_at: Some(200), rotate_after_days: Some(3) };
+    assert!(!store.set_secret_expiry_policy("missing", policy, 100)?);
+    assert!(store.set_secret_expiry_policy(secret, policy, 100)?);
+    assert_eq!(store.get_secret_expiry_policy(secret)?, Some(policy));
+    let stored_updated_at: i64 = store.connection().query_row(
+        "SELECT updated_at FROM secrets WHERE id = ?1",
+        [secret],
+        |row| row.get(0),
+    )?;
+    assert_eq!(stored_updated_at, 100);
+
+    assert!(store.set_secret_expiry_policy(secret, SecretExpiryPolicy::default(), 150)?);
+    assert_eq!(store.get_secret_expiry_policy(secret)?, Some(SecretExpiryPolicy::default()));
+    assert_eq!(store.list_expiring_or_stale_secrets(None, 300, 0)?, []);
+    Ok(())
+}
+
+#[test]
+fn secret_expiry_notices_respect_boundaries_rotation_and_project_scope()
+-> Result<(), Box<dyn Error>> {
+    use crate::{SecretExpiryPolicy, SecretExpiryStatus};
+
+    const DAY: i64 = 86_400_000_000_000;
+    let test_store = open_initialized_store()?;
+    let store = &test_store.store;
+    insert_project_profile(store)?;
+    let connection = store.connection();
+    connection.execute_batch(
+        "INSERT INTO projects(id, name, created_at) VALUES ('other', 'other', 0);
+         INSERT INTO profiles(id, project_id, name, dangerous, created_at)
+         VALUES ('other-profile', 'other', 'default', 0, 0);",
+    )?;
+    let now = 2 * DAY;
+
+    for (id, project, profile, state, expiry, rotate_days, rotated_at) in [
+        ("a-expired", "lk_proj_test", "lk_prof_test", "active", Some(now), Some(2_u32), None),
+        ("b-soon", "lk_proj_test", "lk_prof_test", "active", Some(now + 5), Some(2), Some(DAY)),
+        ("c-stale", "lk_proj_test", "lk_prof_test", "active", None, Some(1), Some(DAY)),
+        ("d-later", "lk_proj_test", "lk_prof_test", "active", Some(now + 6), Some(u32::MAX), None),
+        ("e-deleted", "lk_proj_test", "lk_prof_test", "deleted", Some(1), Some(1), None),
+        ("f-other", "other", "other-profile", "active", Some(now - 1), None, None),
+    ] {
+        connection.execute(
+            "INSERT INTO secrets(
+               id, project_id, profile_id, name, source, origin, required,
+               current_version, state, created_at, updated_at, last_rotated_at
+             ) VALUES (?1, ?2, ?3, ?1, 'user-local', 'manual', 0, 1, ?4, 0, 0, ?5)",
+            rusqlite::params![id, project, profile, state, rotated_at],
+        )?;
+        assert!(store.set_secret_expiry_policy(
+            id,
+            SecretExpiryPolicy { expires_at: expiry, rotate_after_days: rotate_days },
+            DAY,
+        )?);
+    }
+
+    let notices = store.list_expiring_or_stale_secrets(Some("lk_proj_test"), now, 5)?;
+    let summarized = notices
+        .iter()
+        .map(|row| (row.secret_id.as_str(), row.expiry_status, row.stale))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        summarized,
+        [
+            ("a-expired", Some(SecretExpiryStatus::Expired), true),
+            ("b-soon", Some(SecretExpiryStatus::ExpiringSoon), false),
+            ("c-stale", None, true),
+        ]
+    );
+    assert_eq!(store.list_expiring_or_stale_secrets(None, now, -1)?.len(), 3);
+    let other = store.list_expiring_or_stale_secrets(Some("other"), now, 0)?;
+    assert_eq!(other.len(), 1);
+    assert_eq!(other[0].secret_id, "f-other");
+    assert_eq!(store.list_expiring_or_stale_secrets(Some("missing"), now, 0)?, []);
     Ok(())
 }

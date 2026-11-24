@@ -15,10 +15,9 @@ use serde_json::{Value, json};
 use crate::commands::config::spec::{CONFIG_KEY_SPECS, config_get_value, read_user_config};
 use crate::runtime::error::corrupt_db_error;
 use crate::{
-    BACKUP_SKIPPED_PREFIX, CliError, GITIGNORE_ENTRIES, GITIGNORE_FILE, HOOK_BEGIN, LOCKET_TOML,
-    RuntimeContext, agent_log_path, agent_pid_path, agent_socket_path, format_hex,
-    git_dir_for_worktree, invalid_reference_error, load_project_key, metadata_invalid_error,
-    now_unix_nanos, open_store, pre_migration_backup_relative_label, pre_migration_backup_root,
+    CliError, GITIGNORE_ENTRIES, GITIGNORE_FILE, HOOK_BEGIN, LOCKET_TOML, RuntimeContext,
+    agent_log_path, agent_pid_path, agent_socket_path, format_hex, git_dir_for_worktree,
+    invalid_reference_error, load_project_key, metadata_invalid_error, now_unix_nanos, open_store,
     privacy_alias, privacy_redact_names_enabled, read_project_config, resolve_project, root_hash,
 };
 
@@ -407,7 +406,6 @@ fn collect_diagnostics(
             }
             checks.push(check_gitignore(&project.root));
             checks.push(check_pre_commit_hook(&project.root));
-            checks.push(check_schema_migration_backups(context));
         }
         Ok(None) => {
             checks.push(DiagnosticCheck::fail(
@@ -426,11 +424,9 @@ fn collect_diagnostics(
                     error.to_string(),
                 )),
             }
-            checks.push(check_schema_migration_backups(context));
         }
         Err(error) => {
             checks.push(DiagnosticCheck::fail("project_resolution", true, error.to_string()));
-            checks.push(check_schema_migration_backups(context));
         }
     }
 
@@ -656,67 +652,6 @@ fn runtime_session_secret_name_cutoff(
     }
 }
 
-fn check_schema_migration_backups(context: &RuntimeContext) -> DiagnosticCheck {
-    let backup_root = match pre_migration_backup_root(context) {
-        Ok(path) => path,
-        Err(error) => {
-            return DiagnosticCheck::fail("schema_migration_backups", false, error.to_string());
-        }
-    };
-    let entries = match fs::read_dir(&backup_root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return DiagnosticCheck::pass(
-                "schema_migration_backups",
-                "backup_skipped=0 latest_backup=none",
-            );
-        }
-        Err(error) => {
-            return DiagnosticCheck::fail("schema_migration_backups", false, error.to_string());
-        }
-    };
-
-    let mut skipped_count = 0_u32;
-    let mut latest_backup: Option<PathBuf> = None;
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                return DiagnosticCheck::fail("schema_migration_backups", false, error.to_string());
-            }
-        };
-        let file_name = entry.file_name();
-        let file_name = file_name.to_string_lossy();
-        if file_name.starts_with(BACKUP_SKIPPED_PREFIX) {
-            skipped_count += 1;
-            continue;
-        }
-        let file_type = match entry.file_type() {
-            Ok(file_type) => file_type,
-            Err(error) => {
-                return DiagnosticCheck::fail("schema_migration_backups", false, error.to_string());
-            }
-        };
-        if file_type.is_dir() {
-            let path = entry.path();
-            if latest_backup.as_ref().is_none_or(|latest| path.as_os_str() > latest.as_os_str()) {
-                latest_backup = Some(path);
-            }
-        }
-    }
-
-    let latest_label = latest_backup.as_ref().map_or_else(
-        || "none".to_owned(),
-        |path| pre_migration_backup_relative_label(context, path),
-    );
-    let detail = format!("backup_skipped={skipped_count} latest_backup={latest_label}");
-    if skipped_count == 0 {
-        DiagnosticCheck::pass("schema_migration_backups", detail)
-    } else {
-        DiagnosticCheck::warn("schema_migration_backups", detail)
-    }
-}
-
 fn check_automation_client_nonces_pruning(store: &locket_store::Store) -> DiagnosticCheck {
     let now = match now_unix_nanos() {
         Ok(now) => now,
@@ -798,6 +733,9 @@ fn check_agent_placeholder(context: &RuntimeContext) -> DiagnosticCheck {
 /// - Windows: `\\.\pipe\locket-agent-<sid>` with a protected
 ///   current-user-only DACL SDDL available for startup.
 ///
+/// The development instance uses `locket-dev`, `.locket-dev`, and
+/// `locket-dev-agent-<sid>` instead.
+///
 /// Tests build a `RuntimeContext` with `agent_data_dir = None` and a
 /// tempdir-local `store_path`; the check is reported as `skipped` in
 /// that case so legacy fixtures continue to pass without forcing every
@@ -858,20 +796,15 @@ fn check_agent_socket_path_matches_spec(context: &RuntimeContext) -> DiagnosticC
         let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
             return DiagnosticCheck::warn(NAME, "HOME unset; cannot validate spec path");
         };
-        #[cfg(target_os = "linux")]
-        let expected_candidates: Vec<PathBuf> = {
-            let mut candidates = Vec::new();
-            if let Some(value) = std::env::var_os("XDG_RUNTIME_DIR") {
-                candidates.push(PathBuf::from(value).join("locket"));
-            }
-            candidates.push(home.join(".locket"));
-            candidates
-        };
-        #[cfg(target_os = "macos")]
-        let expected_candidates: Vec<PathBuf> =
-            vec![home.join("Library").join("Application Support").join("locket")];
-        #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
-        let expected_candidates: Vec<PathBuf> = vec![home.join(".locket")];
+        let instance = locket_platform::LocketInstance::current();
+        let mut expected_candidates = vec![instance.agent_data_dir(
+            std::env::consts::OS,
+            &home,
+            std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+        )];
+        if std::env::consts::OS == "linux" {
+            expected_candidates.push(instance.agent_data_dir("linux", &home, None));
+        }
 
         if expected_candidates.iter().any(|candidate| candidate == configured) {
             DiagnosticCheck::pass(

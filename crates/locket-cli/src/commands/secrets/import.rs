@@ -6,29 +6,25 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 
+use locket_core::ProfileName;
+#[cfg(test)]
+use locket_core::SecretName;
 use locket_core::dotenv::{DotenvOptions, parse_dotenv};
-use locket_core::{LocketError, ProfileName, SecretName};
-use locket_crypto::KeyPurpose;
-use locket_store::{
-    AuditContext, AuditWrite, ProfileRecord, SecretBlobRecord, SecretFingerprintRecord,
-    SecretVersionRecord, Store, VersionDeprecation,
-};
-use serde_json::json;
+use locket_store::{ProfileRecord, Store};
+use zeroize::Zeroizing;
 
-use super::set::{SecretWriteRequest, set_secret_value_in_profile};
+use super::set::{NewSecret, Rotation, SecretWriteKeys, create_value, rotate_value};
 use crate::runtime::RuntimeContext;
 use crate::runtime::error::{
-    CliError, confirmation_failed_error, invalid_profile_name_error, invalid_secret_name_error,
-    metadata_invalid_error, profile_not_found_error, secret_not_found_error,
+    CliError, confirmation_failed_error, invalid_profile_name_error, metadata_invalid_error,
+    profile_not_found_error,
 };
-use crate::runtime::key_access::load_project_key;
 use crate::runtime::prompts::ConfirmationReader;
 use crate::support::project_files::{ensure_gitignore, refresh_example_for_project_if_enabled};
-use crate::support::secret_helpers::{SecretEncryptRequest, encrypt_secret_version};
 use crate::{
-    ImportArgs, ResolvedProject, SecretSourceArg, absolutize, active_profile_secret_names,
-    ensure_trusted_project_root, next_secret_version, now_unix_nanos, open_store, require_project,
-    secret_deleted_error, source_arg_to_str,
+    ImportArgs, ResolvedProject, SecretMetadataFlags, SecretSourceArg, absolutize,
+    active_profile_secret_names, ensure_trusted_project_root, now_unix_nanos, open_store,
+    require_project, secret_deleted_error, source_arg_to_str,
 };
 
 pub fn import_command(
@@ -44,61 +40,22 @@ pub fn import_command(
         confirm_dangerous_import_overwrite(output, &profile, context.confirmation_reader.as_ref())?;
     }
     let path = absolutize(&context.cwd, Path::new(&args.file));
-    let env_file_text = fs::read_to_string(&path)?;
+    let env_file_text = Zeroizing::new(fs::read_to_string(&path)?);
     let source = args.source.unwrap_or(SecretSourceArg::UserLocal);
     let source_name = source_arg_to_str(source);
     let parsed = validated_import_entries(&env_file_text, args.literal, output)?;
-    let env_names = parsed.iter().map(|entry| entry.key.clone()).collect::<BTreeSet<_>>();
-    let mut imported = 0_u32;
-    let mut overwritten = 0_u32;
-    let mut skipped = 0_u32;
-    let mut skipped_names = BTreeSet::new();
-
-    store.with_atomic_write(|store| -> Result<(), CliError> {
-        for entry in parsed {
-            let locket_core::dotenv::DotenvEntry { key, value, .. } = entry;
-            match set_secret_value_in_profile(
-                context,
-                store,
-                SecretWriteRequest {
-                    resolved: &resolved,
-                    profile: &profile,
-                    key: &key,
-                    source: source_name,
-                    value: &value,
-                    origin: "imported",
-                    audit_action: "IMPORT",
-                    timestamp: now_unix_nanos()?,
-                },
-            ) {
-                Ok(()) => imported += 1,
-                Err(CliError::Typed { kind: LocketError::SecretAlreadyExists, .. })
-                    if args.overwrite =>
-                {
-                    rotate_import_secret_value_in_profile(
-                        context,
-                        store,
-                        ImportRotateRequest {
-                            resolved: &resolved,
-                            profile: &profile,
-                            key: &key,
-                            source: source_name,
-                            value: &value,
-                            timestamp: now_unix_nanos()?,
-                        },
-                    )?;
-                    overwritten += 1;
-                }
-                Err(CliError::Typed { kind: LocketError::SecretAlreadyExists, .. }) => {
-                    skipped += 1;
-                    skipped_names.insert(key);
-                }
-                Err(error) => return Err(error),
-            }
-        }
-
-        Ok(())
-    })?;
+    drop(env_file_text);
+    let env_names = parsed.iter().map(|(name, _)| name.clone()).collect::<BTreeSet<_>>();
+    let ImportCounts { imported, overwritten, skipped_names } = import_entries(
+        context,
+        &mut store,
+        &resolved,
+        &profile,
+        source_name,
+        args.overwrite,
+        parsed,
+    )?;
+    let skipped = skipped_names.len();
 
     refresh_example_for_project_if_enabled(context)?;
     ensure_gitignore(&resolved.root)?;
@@ -126,12 +83,102 @@ pub fn import_command(
     Ok(())
 }
 
+struct ImportCounts {
+    imported: u32,
+    overwritten: u32,
+    skipped_names: BTreeSet<String>,
+}
+
+fn import_entries(
+    context: &RuntimeContext,
+    store: &mut Store,
+    resolved: &ResolvedProject,
+    profile: &ProfileRecord,
+    source_name: &str,
+    overwrite: bool,
+    parsed: Vec<(String, Zeroizing<String>)>,
+) -> Result<ImportCounts, CliError> {
+    let mut imported = 0_u32;
+    let mut overwritten = 0_u32;
+    let mut skipped_names = BTreeSet::new();
+
+    let project_id = resolved.config.project_id.as_str();
+    let metadata = SecretMetadataFlags::default();
+    store.with_atomic_write(|store| -> Result<(), CliError> {
+        let mut keys = None;
+        for (name, value) in parsed {
+            if value.contains('\0') {
+                return Err(metadata_invalid_error("imported value contains NUL bytes"));
+            }
+            let existing =
+                store.get_secret_by_source(project_id, &profile.id, &name, source_name)?;
+            if let Some(secret) = &existing {
+                if secret.state != "active" {
+                    return Err(secret_deleted_error("secret source is deleted"));
+                }
+                if !overwrite {
+                    skipped_names.insert(name);
+                    continue;
+                }
+            }
+            let keys = match &keys {
+                Some(keys) => keys,
+                None => {
+                    keys.insert(SecretWriteKeys::load(context, store, project_id, &profile.id)?)
+                }
+            };
+            let timestamp = now_unix_nanos()?;
+            if let Some(secret) = existing {
+                rotate_value(
+                    store,
+                    keys,
+                    &secret,
+                    &Rotation {
+                        value: &value,
+                        origin: "imported",
+                        timestamp,
+                        grace_until: None,
+                        metadata: &metadata,
+                        action: "ROTATE",
+                    },
+                )?;
+                overwritten += 1;
+            } else {
+                create_value(
+                    store,
+                    keys,
+                    &NewSecret {
+                        project_id,
+                        profile_id: &profile.id,
+                        name: &name,
+                        source: source_name,
+                        value: &value,
+                        origin: "imported",
+                        timestamp,
+                        metadata: &metadata,
+                        action: "IMPORT",
+                    },
+                )?;
+                imported += 1;
+            }
+        }
+        Ok(())
+    })?;
+
+    Ok(ImportCounts { imported, overwritten, skipped_names })
+}
+
 fn validated_import_entries(
     text: &str,
     literal: bool,
     output: &mut impl Write,
-) -> Result<Vec<locket_core::dotenv::DotenvEntry>, CliError> {
+) -> Result<Vec<(String, Zeroizing<String>)>, CliError> {
     let document = parse_dotenv(text, DotenvOptions { literal });
+    let entries = document
+        .entries
+        .into_iter()
+        .map(|entry| (entry.key, Zeroizing::new(entry.value)))
+        .collect();
     for warning in &document.warnings {
         writeln!(output, "warning: line {}: {}", warning.line, warning.message)?;
     }
@@ -149,7 +196,7 @@ fn validated_import_entries(
                 .join("; "),
         ));
     }
-    Ok(document.entries)
+    Ok(entries)
 }
 
 fn import_target_profile(
@@ -280,108 +327,4 @@ fn unquote_env_value(value: &str) -> String {
         }
     }
     value.to_owned()
-}
-
-#[derive(Clone, Copy)]
-struct ImportRotateRequest<'a> {
-    resolved: &'a ResolvedProject,
-    profile: &'a ProfileRecord,
-    key: &'a str,
-    source: &'a str,
-    value: &'a str,
-    timestamp: i64,
-}
-
-fn rotate_import_secret_value_in_profile(
-    context: &RuntimeContext,
-    store: &mut Store,
-    request: ImportRotateRequest<'_>,
-) -> Result<u32, CliError> {
-    let name = SecretName::new(request.key.to_owned())
-        .map_err(|err| invalid_secret_name_error(err.to_string()))?;
-    let secret = store
-        .get_secret_by_source(
-            request.resolved.config.project_id.as_str(),
-            &request.profile.id,
-            name.as_str(),
-            request.source,
-        )?
-        .ok_or_else(|| secret_not_found_error("secret does not exist"))?;
-    if secret.state == "deleted" {
-        return Err(secret_deleted_error("secret source is deleted"));
-    }
-    let new_version = next_secret_version(secret.current_version)?;
-    let audit_key = load_project_key(
-        context,
-        store,
-        request.resolved.config.project_id.as_str(),
-        KeyPurpose::Audit,
-    )?;
-    let (encrypted, fingerprint) = encrypt_secret_version(
-        context,
-        store,
-        SecretEncryptRequest {
-            project_id: request.resolved.config.project_id.as_str(),
-            profile_id: &request.profile.id,
-            secret_id: &secret.id,
-            secret_name: &secret.name,
-            version: new_version,
-            value: request.value,
-        },
-    )?;
-    let metadata = json!({
-        "schema_version": 1,
-        "action": "ROTATE",
-        "status": "SUCCESS",
-        "secret_name": &secret.name,
-        "profile_id": &request.profile.id,
-        "source": &secret.source,
-        "prior_version": secret.current_version,
-        "deprecated_version": secret.current_version,
-        "target_version": new_version,
-        "deprecated_at": request.timestamp,
-        "grace_until": null,
-    });
-    let audit = AuditWrite {
-        project_id: request.resolved.config.project_id.as_str(),
-        profile_id: Some(&request.profile.id),
-        action: "ROTATE",
-        status: "SUCCESS",
-        secret_name: Some(&secret.name),
-        command: None,
-        metadata_json: &metadata,
-        timestamp: request.timestamp,
-    };
-    store.rotate_secret_with_audit(
-        &secret,
-        &SecretVersionRecord {
-            secret_id: secret.id.clone(),
-            version: new_version,
-            source: secret.source.clone(),
-            origin: "imported".to_owned(),
-            state: "current".to_owned(),
-            created_at: request.timestamp,
-            deprecated_at: None,
-            grace_until: None,
-            purged_at: None,
-        },
-        &SecretBlobRecord {
-            secret_id: secret.id.clone(),
-            version: new_version,
-            encrypted_dek: encrypted.encrypted_dek,
-            ciphertext: encrypted.ciphertext,
-            value_nonce: encrypted.value_nonce,
-            aad_schema_version: encrypted.aad_schema_version,
-            created_at: request.timestamp,
-        },
-        &SecretFingerprintRecord {
-            secret_id: secret.id.clone(),
-            version: new_version,
-            fingerprint,
-            created_at: request.timestamp,
-        },
-        VersionDeprecation { deprecated_at: request.timestamp, grace_until: None },
-        Some(AuditContext { key: audit_key.as_ref(), write: &audit }),
-    )?;
-    Ok(new_version)
 }

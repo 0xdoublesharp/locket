@@ -6,20 +6,24 @@ use std::path::PathBuf;
 use data_encoding::BASE64URL_NOPAD;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use locket_core::LocketError;
-use locket_store::{AuditWrite, AutomationClientNonceRecord, AutomationClientRecord, Store};
+use locket_store::{
+    AuditWrite, AutomationClientNonceRecord, AutomationClientRecord, Store, StoreError,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::envelope::{ErrorEnvelope, RequestEnvelope, ResponseEnvelope, SuccessEnvelope};
 use crate::grant::GrantAction;
+use crate::keys::{KeyError, cached_master_key, unwrap_audit_key_with_master};
 use crate::method::AgentMethod;
 
 const SIGNING_CONTEXT: &[u8] = b"locket-client-auth-v1";
 const CHALLENGE_NONCE_LEN: usize = 24;
 const CHALLENGE_ID_LEN: usize = 16;
+const MAX_AUTOMATION_CHALLENGES: usize = 1024;
 const SIGNATURE_LEN: usize = 64;
-const REQUEST_FRESHNESS_NANOS: i128 = 5 * 60 * 1_000_000_000;
+const REQUEST_FRESHNESS_NANOS: u128 = 5 * 60 * 1_000_000_000;
 const NONCE_RETENTION_NANOS: i128 = 10 * 60 * 1_000_000_000;
 
 /// `ClientHello` payload.
@@ -43,10 +47,8 @@ pub struct ClientHelloResponse {
 /// In-memory challenge issued by `ClientHello`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IssuedChallenge {
-    /// Automation-client id.
-    pub client_id: String,
-    /// Challenge id.
-    pub challenge_id: String,
+    /// Digest of the automation-client id, keeping retained entries fixed-size.
+    pub client_id_digest: [u8; 32],
     /// Raw challenge nonce.
     pub nonce: [u8; CHALLENGE_NONCE_LEN],
     /// Issue timestamp in nanoseconds.
@@ -86,13 +88,17 @@ pub async fn handle_client_hello(
     let nonce: [u8; CHALLENGE_NONCE_LEN] = rand::random();
     let challenge_bytes: [u8; CHALLENGE_ID_LEN] = rand::random();
     let challenge_id = BASE64URL_NOPAD.encode(&challenge_bytes);
-    let issued = IssuedChallenge {
-        client_id: payload.client_id.clone(),
-        challenge_id: challenge_id.clone(),
-        nonce,
-        issued_at: crate::server::current_unix_nanos(),
-    };
-    state.automation_challenges.lock().await.insert(challenge_id.clone(), issued);
+    let client_id_digest = Sha256::digest(payload.client_id.as_bytes()).into();
+    let mut challenges = state.automation_challenges.lock().await;
+    let now = crate::server::current_unix_nanos();
+    challenges.retain(|_, challenge| !timestamp_is_stale(challenge.issued_at, now));
+    if challenges.len() >= MAX_AUTOMATION_CHALLENGES {
+        let error = AuthError::ChallengeCapacity;
+        return error_response(request, error.error_name(), error.to_string());
+    }
+    let issued = IssuedChallenge { client_id_digest, nonce, issued_at: now };
+    challenges.insert(challenge_id.clone(), issued);
+    drop(challenges);
     success_response(
         request,
         ClientHelloResponse {
@@ -116,7 +122,7 @@ pub async fn authenticate_request_if_present(
     };
     match authenticate_request(request, state, now_unix_nanos, context).await {
         Ok(()) => None,
-        Err(error) => Some(error_response(request, error.error_name(), error.safe_message())),
+        Err(error) => Some(error_response(request, error.error_name(), error.to_string())),
     }
 }
 
@@ -149,7 +155,8 @@ async fn authenticate_request(
     }
     let nonce = decode_nonce(&context.auth.nonce)?;
     let challenge = take_challenge(state, &context.auth.challenge_id).await?;
-    if challenge.client_id != context.auth.client_id || challenge.nonce != nonce {
+    let client_id_digest: [u8; 32] = Sha256::digest(context.auth.client_id.as_bytes()).into();
+    if challenge.client_id_digest != client_id_digest || challenge.nonce != nonce {
         write_denial_audit(&mut store, state, &context, &client, now, "challenge_mismatch").await?;
         return Err(AuthError::NotTrusted("challenge mismatch"));
     }
@@ -157,11 +164,15 @@ async fn authenticate_request(
         write_denial_audit(&mut store, state, &context, &client, now, "expired").await?;
         return Err(AuthError::NotTrusted("challenge expired"));
     }
-    verify_signature(request, &context, &client.public_key, &nonce)?;
+    if let Err(error) = verify_signature(request, &context, &client.public_key, &nonce) {
+        write_denial_audit(&mut store, state, &context, &client, now, "invalid_signature").await?;
+        return Err(error);
+    }
 
-    let audit_key = audit_key_for_project(state, &context.project_id, now_unix_nanos)
-        .await
+    let master_key = cached_master_key(state, &context.project_id, now_unix_nanos)
+        .await?
         .ok_or(AuthError::UnlockRequired)?;
+    let audit_key = unwrap_audit_key_with_master(&store, &context.project_id, &master_key)?;
     let nonce_record = AutomationClientNonceRecord {
         client_id: client.id.clone(),
         nonce,
@@ -184,8 +195,8 @@ async fn authenticate_request(
         timestamp: now,
     };
     store
-        .record_automation_client_auth_with_audit(&nonce_record, now, &audit_key, &audit)
-        .map_err(|_| AuthError::Replay)?;
+        .record_automation_client_auth_with_audit(&nonce_record, now, audit_key.as_ref(), &audit)
+        .map_err(classify_auth_write_error)?;
     Ok(())
 }
 
@@ -355,20 +366,24 @@ fn write_canonical_json(value: &Value, out: &mut Vec<u8>) -> Result<(), AuthErro
 }
 
 const fn timestamp_is_stale(timestamp: i128, now: i128) -> bool {
-    now.saturating_sub(timestamp).abs() > REQUEST_FRESHNESS_NANOS
+    now.abs_diff(timestamp) > REQUEST_FRESHNESS_NANOS
 }
 
-async fn audit_key_for_project(
-    state: &crate::server::AgentSocketState,
-    project_id: &str,
-    now_unix_nanos: i128,
-) -> Option<Vec<u8>> {
-    state
-        .unlock_cache
-        .lock()
-        .await
-        .lookup(project_id, now_unix_nanos)
-        .map(|entry| entry.key_bytes().to_vec())
+fn classify_auth_write_error(error: StoreError) -> AuthError {
+    // This transaction also updates client usage and appends an audit row.
+    // Only a duplicate of the nonce table's composite key proves replay.
+    if matches!(
+        &error,
+        StoreError::Sqlite(rusqlite::Error::SqliteFailure(failure, Some(message)))
+            if matches!(
+                failure.extended_code,
+                rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY | rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+            ) && message == "UNIQUE constraint failed: automation_client_nonces.client_id, automation_client_nonces.nonce"
+    ) {
+        AuthError::Replay
+    } else {
+        AuthError::Store(error)
+    }
 }
 
 async fn write_denial_audit(
@@ -379,11 +394,13 @@ async fn write_denial_audit(
     now: i64,
     result: &str,
 ) -> Result<(), AuthError> {
-    let Some(audit_key) = audit_key_for_project(state, &context.project_id, i128::from(now)).await
+    let Some(master_key) = cached_master_key(state, &context.project_id, i128::from(now)).await?
     else {
         return Ok(());
     };
-    let metadata = client_auth_metadata(context, client, "DENIED", result, result);
+    let audit_key = unwrap_audit_key_with_master(store, &context.project_id, &master_key)?;
+    let mut metadata = client_auth_metadata(context, client, "DENIED", result, result);
+    metadata["failure_reason"] = json!(result);
     let audit = AuditWrite {
         project_id: &context.project_id,
         profile_id: None,
@@ -394,7 +411,7 @@ async fn write_denial_audit(
         metadata_json: &metadata,
         timestamp: now,
     };
-    store.append_audit(&audit_key, &audit)?;
+    store.append_audit(audit_key.as_ref(), &audit)?;
     Ok(())
 }
 
@@ -434,39 +451,107 @@ fn error_response(
     ResponseEnvelope::Error(ErrorEnvelope::new(request.id.clone(), error, message, false))
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 enum AuthError {
+    #[error("invalid automation auth payload")]
     Protocol,
+    #[error("{0}")]
     NotTrusted(&'static str),
+    #[error("automation client replay detected")]
     Replay,
+    #[error("too many outstanding automation challenges")]
+    ChallengeCapacity,
+    #[error("{}", LocketError::UnlockRequired)]
     UnlockRequired,
-    Store(locket_store::StoreError),
+    #[error("automation authentication storage failed")]
+    Store(#[from] StoreError),
+    #[error(transparent)]
+    Key(#[from] KeyError),
 }
 
 impl AuthError {
-    const fn error_name(&self) -> &'static str {
+    fn error_name(&self) -> &'static str {
         match self {
             Self::Protocol => "ProtocolError",
             Self::NotTrusted(_) => "AutomationClientNotTrusted",
             Self::Replay => "AutomationClientReplayDetected",
             Self::UnlockRequired => "UnlockRequired",
-            Self::Store(_) => "CorruptDb",
-        }
-    }
-
-    fn safe_message(&self) -> String {
-        match self {
-            Self::Protocol => "invalid automation auth payload".to_owned(),
-            Self::NotTrusted(message) => (*message).to_owned(),
-            Self::Replay => "automation client replay detected".to_owned(),
-            Self::UnlockRequired => LocketError::UnlockRequired.to_string(),
-            Self::Store(error) => error.to_string(),
+            Self::ChallengeCapacity => "AutomationChallengeCapacity",
+            Self::Store(error) => match error.locket_error() {
+                LocketError::StorageBusy => "StorageBusy",
+                LocketError::AuditIntegrityFailed => "AuditIntegrityFailed",
+                LocketError::MetadataInvalid => "MetadataInvalid",
+                LocketError::SchemaNewerThanBinary => "SchemaNewerThanBinary",
+                _ => "CorruptDb",
+            },
+            Self::Key(_) => "AuditIntegrityFailed",
         }
     }
 }
 
-impl From<locket_store::StoreError> for AuthError {
-    fn from(error: locket_store::StoreError) -> Self {
-        Self::Store(error)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::{AgentSocketState, current_unix_nanos};
+
+    fn hello() -> RequestEnvelope {
+        RequestEnvelope::new("hello", AgentMethod::ClientHello, json!({"client_id": "client"}))
+    }
+
+    fn challenge(issued_at: i128) -> IssuedChallenge {
+        IssuedChallenge {
+            client_id_digest: Sha256::digest(b"client").into(),
+            nonce: [0; CHALLENGE_NONCE_LEN],
+            issued_at,
+        }
+    }
+
+    #[tokio::test]
+    async fn client_hello_prunes_expired_challenges() {
+        let state = AgentSocketState::locked("auth-test");
+        {
+            let now = current_unix_nanos();
+            let mut challenges = state.automation_challenges.lock().await;
+            challenges.insert("expired".to_owned(), challenge(0));
+            challenges.insert("live".to_owned(), challenge(now));
+        }
+        assert!(matches!(
+            handle_client_hello(&hello(), &state).await,
+            ResponseEnvelope::Success(_)
+        ));
+        let challenges = state.automation_challenges.lock().await;
+        assert_eq!(challenges.len(), 2);
+        assert!(challenges.contains_key("live"));
+        assert!(!challenges.contains_key("expired"));
+        drop(challenges);
+    }
+
+    #[tokio::test]
+    async fn client_hello_rejects_when_live_challenges_fill_capacity() -> Result<(), &'static str> {
+        let state = AgentSocketState::locked("auth-test");
+        let now = current_unix_nanos();
+        {
+            let mut challenges = state.automation_challenges.lock().await;
+            for index in 0..MAX_AUTOMATION_CHALLENGES {
+                let id = index.to_string();
+                challenges.insert(id, challenge(now));
+            }
+        }
+        let ResponseEnvelope::Error(error) = handle_client_hello(&hello(), &state).await else {
+            return Err("ClientHello accepted a challenge over the cap");
+        };
+        assert_eq!(error.error, "AutomationChallengeCapacity");
+        {
+            let mut challenges = state.automation_challenges.lock().await;
+            assert_eq!(challenges.len(), MAX_AUTOMATION_CHALLENGES);
+            assert!(challenges.values().all(|row| row.issued_at == now));
+            challenges.get_mut("0").ok_or("missing original challenge")?.issued_at = 0;
+        }
+        assert!(matches!(
+            handle_client_hello(&hello(), &state).await,
+            ResponseEnvelope::Success(_)
+        ));
+        assert_eq!(state.automation_challenges.lock().await.len(), MAX_AUTOMATION_CHALLENGES);
+        Ok(())
     }
 }

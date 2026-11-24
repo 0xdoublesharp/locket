@@ -189,7 +189,7 @@ fn parses_core_secret_commands() {
         &["locket", "device", "init"],
         &["locket", "device", "init", "--force"],
         &["locket", "device", "pubkey"],
-        &["locket", "device", "add", "work-laptop", "--device", "lkdev1_abc"],
+        &["locket", "device", "add", "work-laptop", "--device", "lkdev2_abc"],
         &["locket", "device", "list", "--all"],
         &["locket", "device", "remove", "work-laptop", "--force"],
         &["locket", "client", "create", "ci", "--action", "run-policy", "--policy", "dev"],
@@ -204,7 +204,7 @@ fn parses_core_secret_commands() {
             "export",
             "--sealed",
             "--recipient",
-            "lkdev1_abc",
+            "lkdev2_abc",
             "--profile",
             "dev",
             "--include-audit",
@@ -446,7 +446,7 @@ fn memory_clipboard_schedules_ttl_clear_only_for_original_value()
 fn cli_handoff_helpers_quote_commands_and_avoid_heredoc_delimiter_collisions() {
     use crate::support::handoff::{heredoc_command, shell_quote, shell_words_command};
 
-    assert_eq!(shell_quote("lkdev1_abc.DEF-123:/@%+"), "lkdev1_abc.DEF-123:/@%+");
+    assert_eq!(shell_quote("lkdev2_abc.DEF-123:/@%+"), "lkdev2_abc.DEF-123:/@%+");
     assert_eq!(shell_quote(""), "''");
     assert_eq!(shell_quote("Build Agent 'West'"), "'Build Agent '\\''West'\\'''");
 
@@ -507,7 +507,7 @@ fn parses_profile_project_and_agent_commands() {
             "invite",
             "request",
             "--device",
-            "lkdev1_abc",
+            "lkdev2_abc",
             "--label",
             "build-agent",
             "--profile",
@@ -524,7 +524,7 @@ fn parses_profile_project_and_agent_commands() {
             "create",
             "build-agent",
             "--device",
-            "lkdev1_abc",
+            "lkdev2_abc",
             "--profile",
             "dev",
             "--role",

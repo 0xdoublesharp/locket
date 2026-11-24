@@ -44,8 +44,8 @@ struct ProjectKeySet {
     audit_key_id: KeyId,
 }
 
-// In-memory deserialization model for recovery/kdf.toml only; v1 does not
-// persist KDF profiles in SQLite.
+// In-memory model for the KDF metadata embedded in recovery/envelope.bin;
+// KDF profiles are not persisted in SQLite.
 struct KdfProfile {
     id: KdfProfileId,
     algorithm: String, // "argon2id" for v1
@@ -490,7 +490,6 @@ AUDIT_VERIFY
 HOOK_INSTALL
 AGENT_REVOKE
 GRANT_EXPIRED
-SCHEMA_MIGRATE
 BUNDLE_VERIFY
 POLICY_UPDATE
 EXAMPLE_EMIT

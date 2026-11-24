@@ -26,6 +26,7 @@ pub use audit::{
     AuditLogRecord, AuditWrite, ExportableAuditRow, ImportedAuditChainRow,
     ImportedAuditChainVerification, verify_imported_audit_chain_structure,
 };
+pub use auditing::witness::AuditWitnessReceiptRecord;
 pub use command_policy::CommandPolicyIndexRecord;
 pub use device::DeviceRecord;
 pub use error::StoreError;
@@ -37,17 +38,19 @@ pub use passkey::{
 pub use profile::{
     ProfileDangerousAudit, ProfileDangerousChange, ProfileRecord, archive_empty_profile_for_import,
 };
-pub use project::ProjectRecord;
+pub use project::{ProjectRecord, ProjectSelectorResolution, ProjectSummaryRecord};
 pub use roots::ProjectRootRecord;
 pub use runtime_session::{
     AutomationClientNonceRecord, AutomationClientPrivateKeyRefRecord, AutomationClientRecord,
     InvalidRuntimeSessionSecretNameRetention, RuntimeSessionRecord,
     RuntimeSessionSecretNameRetention,
 };
-pub use schema::{AUDIT_ACTION_SCHEMA_MIGRATE, SCHEMA_VERSION, SchemaMigrationOutcome};
+pub use schema::SCHEMA_VERSION;
 pub use secret::{
-    SecretBlobRecord, SecretCopyTarget, SecretFingerprintRecord, SecretMetadataRecord,
-    SecretMetadataUpdate, SecretRecord, SecretVersionRecord, VersionDeprecation,
+    DiscoveredSecretRecord, SecretBlobRecord, SecretCopyTarget, SecretDiscoveryFilter,
+    SecretExpirationNotice, SecretExpiryPolicy, SecretExpiryStatus, SecretFingerprintRecord,
+    SecretInitialMetadata, SecretMetadataRecord, SecretMetadataUpdate, SecretMutableMetadata,
+    SecretRecord, SecretVersionRecord, VersionDeprecation,
 };
 pub use team::{
     PendingTeamInviteRecord, StoredTeamInviteRecord, TeamInviteRecord, TeamMemberListRecord,
@@ -90,21 +93,16 @@ impl Store {
         Ok(Self { connection })
     }
 
-    /// Runs the idempotent v1 schema bootstrap and reports which migration steps
-    /// actually advanced the ledger.
-    ///
-    /// Callers that hold a project audit key should pass the returned
-    /// [`SchemaMigrationOutcome`] to [`Self::record_schema_migrate_audit`] so a
-    /// `SCHEMA_MIGRATE` audit row is appended for any real version change. A
-    /// no-op re-initialization returns an outcome with no applied steps and
-    /// must not be audited.
+    /// Creates a fresh store at [`SCHEMA_VERSION`], opens one already at it, or
+    /// upgrades a version 6 store in place.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::UnsupportedSchema`] when the database has already been
-    /// migrated by a newer Locket binary. Returns [`StoreError::Sqlite`] for `SQLite`
+    /// Returns [`StoreError::UnsupportedSchema`] for a store from a newer Locket
+    /// binary and [`StoreError::OutdatedSchema`] for an older store, which
+    /// Locket does not migrate. Returns [`StoreError::Sqlite`] for `SQLite`
     /// failures while creating or recording the schema.
-    pub fn initialize_schema(&mut self) -> Result<SchemaMigrationOutcome, StoreError> {
+    pub fn initialize_schema(&mut self) -> Result<(), StoreError> {
         schema::initialize_schema(&mut self.connection)
     }
 

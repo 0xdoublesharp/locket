@@ -11,10 +11,20 @@ pub use locket_core::{
 };
 use thiserror::Error;
 
+mod egress_proxy;
 mod ephemeral_env_file;
+mod secret_encoding;
+mod streaming_redactor;
 
+pub use egress_proxy::{
+    EgressBlockReason, EgressEvent, EgressProxyBroker, EgressProxyConfig, EgressProxyError,
+    EgressSecretBinding,
+};
 pub use ephemeral_env_file::{
     EphemeralEnvFile, EphemeralEnvFileError, secure_erase_supported, write_ephemeral_env_file,
+};
+pub use streaming_redactor::{
+    StreamingRedactionStats, StreamingRedactor, StreamingRedactorConfig, redact_child_output,
 };
 
 /// Parent environment names considered safe in [`EnvMode::Minimal`].

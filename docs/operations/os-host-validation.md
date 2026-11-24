@@ -63,8 +63,7 @@ locket passkey unlock validation-key
 - Confirm registration requires local OS verification and the key's PIN/touch,
   and reports a successful PRF wrap.
 - Lock and unlock twice with the same key; both must recover the same project.
-- Unplug the key and repeat unlock; it must fail without falling back to a
-  software keyring credential.
+- Unplug the key and repeat unlock; it must fail.
 - Cancel a new enrollment and confirm it leaves no credential or successful
   registration audit row. Interrupt or time out a PIN prompt and verify terminal
   echo is restored.

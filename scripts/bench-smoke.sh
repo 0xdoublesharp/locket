@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Release binaries here must use the development instance; the OS keychain
+# ignores the temporary HOME these scripts set.
+export LOCKET_INSTANCE=dev
+
 mode="${1:-ci}"
 repo_root="$(pwd)"
 cargo_bin="${CARGO:-cargo}"

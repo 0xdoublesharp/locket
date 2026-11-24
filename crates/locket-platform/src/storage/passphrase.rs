@@ -56,6 +56,7 @@ impl PassphraseFallbackMasterKeyStore {
         passphrase: &[u8],
         created_at: i64,
     ) -> Result<(), PlatformError> {
+        let path = self.envelope_path(project_id)?;
         let salt = generate_passphrase_salt()?;
         let kdf_profile_id = kdf_profile_id_from_salt(&salt);
         let params = PassphraseKdfParams::fallback_v1();
@@ -77,12 +78,8 @@ impl PassphraseFallbackMasterKeyStore {
         };
 
         secure_directory(&self.directory)?;
-        let path = self.envelope_path(project_id)?;
-        let temp_path = self.temp_envelope_path(project_id)?;
         let rendered = toml::to_string_pretty(&envelope)?;
-        write_user_only_file(&temp_path, rendered.as_bytes())?;
-        fs::rename(temp_path, path)?;
-        Ok(())
+        write_user_only_file(&path, rendered.as_bytes())
     }
 
     /// Loads a master key from the passphrase fallback envelope for `project_id`.
@@ -149,11 +146,6 @@ impl PassphraseFallbackMasterKeyStore {
     fn envelope_path(&self, project_id: &str) -> Result<PathBuf, PlatformError> {
         validate_path_component(project_id)?;
         Ok(self.directory.join(format!("{project_id}.toml")))
-    }
-
-    fn temp_envelope_path(&self, project_id: &str) -> Result<PathBuf, PlatformError> {
-        validate_path_component(project_id)?;
-        Ok(self.directory.join(format!("{project_id}.tmp")))
     }
 }
 

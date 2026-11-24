@@ -1653,3 +1653,102 @@ fn append_audit_enforces_required_fields_for_each_action_family() -> Result<(), 
 
     Ok(())
 }
+
+#[test]
+fn witness_receipts_persist_with_project_chain_cas() -> Result<(), Box<dyn Error>> {
+    use locket_core::{
+        AUDIT_WITNESS_SCHEMA_VERSION, AuditWitnessError, AuditWitnessStatement,
+        sign_audit_witness_statement,
+    };
+
+    const PROJECT: &str = "lk_proj_test";
+    const OTHER_PROJECT: &str = "lk_proj_other";
+    let test_store = open_initialized_store()?;
+    let store = &test_store.store;
+    insert_project_profile(store)?;
+    store.insert_project_if_absent(OTHER_PROJECT, "other", 1)?;
+    let other_connection = crate::Store::open(test_store.directory.path().join("store.db"))?;
+    assert_eq!(store.get_latest_audit_witness_receipt(PROJECT)?, None);
+
+    let key = (&[23; 32]).into();
+    let sign = |seq_no, previous, nonce: &str| {
+        sign_audit_witness_statement(
+            AuditWitnessStatement {
+                schema_version: AUDIT_WITNESS_SCHEMA_VERSION,
+                project_id: PROJECT.to_owned(),
+                seq_no,
+                checkpoint_hmac_hex: "ab".repeat(32),
+                prev_receipt_sha256_hex: previous,
+                signer_id: "device".to_owned(),
+                witness_id: "external".to_owned(),
+                nonce_hex: nonce.to_owned(),
+                issued_at_unix_nanos: 17,
+            },
+            &key,
+        )
+    };
+    let public_key = key.verifying_key();
+    let public_key = public_key.as_bytes();
+    let first_receipt = sign(4, None, "01")?;
+    assert!(matches!(
+        store.insert_audit_witness_receipt(
+            "receipt-1",
+            OTHER_PROJECT,
+            &first_receipt,
+            public_key,
+            30
+        ),
+        Err(StoreError::AuditWitness(AuditWitnessError::ProjectMismatch))
+    ));
+    let first =
+        store.insert_audit_witness_receipt("receipt-1", PROJECT, &first_receipt, public_key, 30)?;
+    assert_eq!(first.receipt, first_receipt);
+    assert_eq!(first.recorded_at, 30);
+    let first_digest = Some(first.receipt_sha256_hex.clone());
+    let second = other_connection.insert_audit_witness_receipt(
+        "receipt-2",
+        PROJECT,
+        &sign(9, first_digest.clone(), "02")?,
+        public_key,
+        31,
+    )?;
+
+    let second_digest = Some(second.receipt_sha256_hex.clone());
+    assert!(matches!(
+        store.insert_audit_witness_receipt(
+            "rollback",
+            PROJECT,
+            &sign(8, second_digest.clone(), "03")?,
+            public_key,
+            32,
+        ),
+        Err(StoreError::AuditWitness(AuditWitnessError::SequenceNotAdvanced))
+    ));
+    assert!(matches!(
+        store.insert_audit_witness_receipt(
+            "fork",
+            PROJECT,
+            &sign(10, first_digest, "03")?,
+            public_key,
+            32,
+        ),
+        Err(StoreError::AuditWitness(AuditWitnessError::PreviousReceiptMismatch))
+    ));
+    assert!(matches!(
+        store.insert_audit_witness_receipt(
+            "old-nonce",
+            PROJECT,
+            &sign(10, second_digest, "01")?,
+            public_key,
+            32,
+        ),
+        Err(StoreError::AuditWitness(AuditWitnessError::DuplicateNonce))
+    ));
+
+    assert_eq!(store.get_latest_audit_witness_receipt(PROJECT)?, Some(second.clone()));
+    assert_eq!(store.list_audit_witness_receipts(PROJECT)?, [first, second]);
+    assert_eq!(store.list_audit_witness_receipts(OTHER_PROJECT)?, []);
+    store.connection().execute("DELETE FROM projects WHERE id = ?1", [PROJECT])?;
+    assert_eq!(other_connection.list_audit_witness_receipts(PROJECT)?, []);
+    Ok(())
+}

@@ -129,7 +129,7 @@ pub fn secret_version_overflow_error(message: impl Into<String>) -> CliError {
     typed_cli_error(LocketError::SecretVersionOverflow, message)
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn secret_version_expired_error(message: impl Into<String>) -> CliError {
     typed_cli_error(LocketError::SecretVersionExpired, message)
 }

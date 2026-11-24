@@ -4,7 +4,9 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
-use crate::aad::{HkdfWrapInfo, append_canonical_field, append_u16_le, hkdf_wrap_info_v1};
+use crate::aad::{
+    HkdfWrapInfo, append_canonical_field, append_u16_le, canonical_fields_len, hkdf_wrap_info_v1,
+};
 use crate::aead::{aead_decrypt, aead_encrypt};
 use crate::error::{CryptoError, CryptoResult};
 use crate::random::random_bytes;
@@ -23,7 +25,9 @@ pub const PASSKEY_PRF_WRAP_SCHEMA_V1: u16 = 1;
 /// Returns an error if any field cannot be represented by the canonical v1
 /// length prefixes.
 pub fn passkey_prf_wrap_aad_v1(project_id: &str) -> CryptoResult<Vec<u8>> {
-    let mut aad = Vec::new();
+    let mut aad = Vec::with_capacity(
+        PASSKEY_PRF_WRAP_V1_PREFIX.len() + 2 + canonical_fields_len(&[("project_id", project_id)]),
+    );
     aad.extend_from_slice(PASSKEY_PRF_WRAP_V1_PREFIX);
     append_u16_le(&mut aad, PASSKEY_PRF_WRAP_SCHEMA_V1);
     append_canonical_field(&mut aad, "project_id", project_id)?;
@@ -80,8 +84,16 @@ pub fn unwrap_key_material_v1(
     wrapped: &WrappedKeyMaterial,
     aad: &[u8],
 ) -> CryptoResult<Zeroizing<KeyBytes>> {
-    let plaintext =
-        Zeroizing::new(aead_decrypt(wrapping_key, &wrapped.nonce, &wrapped.ciphertext, aad)?);
+    decrypt_key(wrapping_key, &wrapped.nonce, &wrapped.ciphertext, aad)
+}
+
+fn decrypt_key(
+    wrapping_key: &KeyBytes,
+    nonce: &NonceBytes,
+    ciphertext: &[u8],
+    aad: &[u8],
+) -> CryptoResult<Zeroizing<KeyBytes>> {
+    let plaintext = aead_decrypt(wrapping_key, nonce, ciphertext, aad)?;
     if plaintext.len() != KEY_LEN {
         return Err(CryptoError::InvalidWrappedKey);
     }
@@ -126,14 +138,7 @@ pub fn unwrap_dek_v1(
     let (wrap_nonce, wrap_ciphertext) = encrypted_dek.split_at(NONCE_LEN);
     let wrap_nonce: &NonceBytes =
         wrap_nonce.try_into().map_err(|_| CryptoError::InvalidWrappedKey)?;
-    let plaintext = Zeroizing::new(aead_decrypt(wrapping_key, wrap_nonce, wrap_ciphertext, aad)?);
-    if plaintext.len() != KEY_LEN {
-        return Err(CryptoError::InvalidWrappedKey);
-    }
-
-    let mut dek = Zeroizing::new([0_u8; KEY_LEN]);
-    dek.copy_from_slice(&plaintext);
-    Ok(dek)
+    decrypt_key(wrapping_key, wrap_nonce, wrap_ciphertext, aad)
 }
 
 /// Wraps a master key under the 32-byte `WebAuthn` PRF output for `project_id`.
@@ -153,9 +158,7 @@ pub fn wrap_master_key_with_passkey_prf(
     project_id: &str,
 ) -> CryptoResult<WrappedKeyMaterial> {
     let aad = passkey_prf_wrap_aad_v1(project_id)?;
-    let nonce = random_bytes::<NONCE_LEN>()?;
-    let ciphertext = aead_encrypt(prf_output, &nonce, master_key, &aad)?;
-    Ok(WrappedKeyMaterial { ciphertext, nonce })
+    wrap_key_material_v1(prf_output, master_key, &aad)
 }
 
 /// Unwraps a master key previously wrapped under a passkey PRF output.
@@ -172,12 +175,5 @@ pub fn unwrap_master_key_with_passkey_prf(
     project_id: &str,
 ) -> CryptoResult<Zeroizing<KeyBytes>> {
     let aad = passkey_prf_wrap_aad_v1(project_id)?;
-    let plaintext =
-        Zeroizing::new(aead_decrypt(prf_output, &wrapped.nonce, &wrapped.ciphertext, &aad)?);
-    if plaintext.len() != KEY_LEN {
-        return Err(CryptoError::InvalidWrappedKey);
-    }
-    let mut key = Zeroizing::new([0_u8; KEY_LEN]);
-    key.copy_from_slice(&plaintext);
-    Ok(key)
+    unwrap_key_material_v1(prf_output, wrapped, &aad)
 }

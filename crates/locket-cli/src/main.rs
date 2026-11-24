@@ -103,16 +103,15 @@ use locket_crypto::{
 };
 use locket_platform::RecoveryEnvelopeEntry;
 #[cfg(test)]
-use locket_platform::{RecoveryEnvelope, RecoveryKdfToml, save_recovery_kdf_toml};
+use locket_platform::{RecoveryEnvelope, RecoveryKdfToml};
 #[cfg(test)]
 use locket_platform::{load_recovery_envelope, load_recovery_kdf_toml};
 use locket_scan::{FindingKind, redact_text, scan_text};
 #[cfg(test)]
 use locket_store::DeviceRecord;
 use locket_store::{
-    AuditContext, AuditWrite, KeyRecord, ProfileRecord, SCHEMA_VERSION, SecretBlobRecord,
-    SecretCopyTarget, SecretFingerprintRecord, SecretRecord, SecretVersionRecord, Store,
-    VersionDeprecation,
+    AuditContext, AuditWrite, KeyRecord, ProfileRecord, SecretBlobRecord, SecretCopyTarget,
+    SecretFingerprintRecord, SecretRecord, SecretVersionRecord, Store, VersionDeprecation,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -139,8 +138,6 @@ const AGENT_LOG_RETAINED_FILES: u8 = 5;
 const AGENT_LOG_FOLLOW_SLEEP_MS: u64 = 250;
 const AI_SAFE_READ_CHUNK_BYTES: usize = 8 * 1024;
 const AI_SAFE_PARTIAL_LINE_MAX_BYTES: usize = 64 * 1024;
-const PRE_MIGRATION_BACKUP_DIR: &str = "pre-migration-backups";
-const BACKUP_SKIPPED_PREFIX: &str = "backup-skipped-";
 
 pub(crate) fn next_secret_version(current_version: u32) -> Result<u32, CliError> {
     current_version
@@ -194,6 +191,19 @@ enum Command {
     Init(InitArgs),
     /// Store a new secret.
     Set(SecretWriteArgs),
+    /// Generate and store a secret without displaying its value.
+    Generate(commands::secrets::generate::GenerateArgs),
+    /// Discover metadata across the local vault.
+    Discover(commands::discovery::DiscoverArgs),
+    /// Manage the shared local vault.
+    Shared {
+        #[command(subcommand)]
+        command: commands::discovery::SharedCommand,
+    },
+    /// Check profile parity and workspace plaintext drift.
+    Parity(commands::parity::ParityArgs),
+    /// Serve tools over stdio using MCP.
+    Mcp,
     /// Import secrets from an env file.
     Import(ImportArgs),
     /// Get secret metadata, reveal, or copy.
@@ -434,6 +444,8 @@ struct CompletionArgs {
 
 #[derive(Debug, Args)]
 struct SecretWriteArgs {
+    #[command(flatten)]
+    target: commands::secrets::set::WriteTargetArgs,
     /// Secret key name.
     key: String,
     #[command(flatten)]
@@ -463,6 +475,12 @@ struct ImportArgs {
 #[derive(Debug, Args)]
 #[allow(clippy::struct_excessive_bools)]
 struct GetArgs {
+    /// Project id, name, or trusted root.
+    #[arg(long)]
+    project: Option<String>,
+    /// Profile name.
+    #[arg(long)]
+    profile: Option<String>,
     /// Secret key name.
     key: String,
     #[command(flatten)]
@@ -571,13 +589,22 @@ pub struct ExecArgs {
 }
 
 /// Arguments for the `locket run` command.
-#[derive(Debug, Args)]
+#[derive(Debug, Default, Args)]
 #[command(after_help = "With one argument, runs [commands.<policy>] from locket.toml.\n\
                         With a supported runner and target, such as `locket run npm dev`,\n\
                         Locket expands the runner command and applies any matching path scope.\n\
                         Secret ACLs in [secrets.<NAME>] can further limit delivery by command identity,\n\
                         structured argv pattern, and project-relative path.")]
 pub struct RunArgs {
+    /// Redact resolved secrets and recognized provider tokens from child output.
+    #[arg(long, env = "LOCKET_REDACT_OUTPUT", value_parser = clap::builder::BoolishValueParser::new())]
+    pub redact_output: bool,
+    /// Replace a secret env value with a host-bound HTTP proxy token. Repeat for more hosts.
+    #[arg(long, value_name = "SECRET_NAME=HOST_PATTERN")]
+    pub egress_host: Vec<String>,
+    /// Permit CONNECT tunnels to hosts outside the binding allowlist.
+    #[arg(long, requires = "egress_host")]
+    pub egress_allow_unlisted_connect: bool,
     /// Command policy name, or a runner adapter such as npm, pnpm, yarn, bun, cargo, make, just, task, poetry, uv, or python.
     #[arg(default_value = "")]
     pub policy: String,
@@ -703,7 +730,10 @@ struct ShellenvArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(args_conflicts_with_subcommands = true)]
 struct HookArgs {
+    #[command(subcommand)]
+    command: Option<commands::hook::HookCommand>,
     /// Shell syntax to emit.
     #[arg(long, value_enum)]
     shell: Option<ShellArg>,
@@ -731,6 +761,13 @@ enum ShellArg {
 
 #[derive(Debug, Subcommand)]
 enum ProjectCommand {
+    /// List local vault projects.
+    List {
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        redact_names: bool,
+    },
     /// Trust the current project root.
     TrustRoot,
     /// List trusted roots.
@@ -743,6 +780,7 @@ enum ProjectCommand {
 }
 
 #[derive(Debug, Args)]
+#[allow(clippy::struct_excessive_bools)] // Independent CLI switches.
 struct ScanArgs {
     /// Scan staged Git content.
     #[arg(long)]
@@ -750,6 +788,8 @@ struct ScanArgs {
     /// Require known-value coverage.
     #[arg(long)]
     require_known: bool,
+    #[arg(long, hide = true)]
+    known_if_unlocked: bool,
     /// Ignore .gitignore rules.
     #[arg(long)]
     no_gitignore: bool,
@@ -1073,8 +1113,6 @@ struct PasskeyRegisterArgs {
 enum DeviceCommand {
     /// Initialize or rotate the local device descriptor.
     Init(DeviceInitArgs),
-    /// Migrate legacy signing material while preserving bundle decryption keys.
-    RotateSigning,
     /// Print the active local device descriptor.
     Pubkey,
     /// Add a trusted device descriptor.
@@ -1245,7 +1283,7 @@ pub(crate) enum TeamRoleArg {
     Owner,
     Maintainer,
     Developer,
-    #[value(name = "read-only", alias = "read_only")]
+    #[value(name = "read-only")]
     ReadOnly,
 }
 
@@ -1456,7 +1494,7 @@ pub(crate) enum SecretSourceArg {
     MachineLocal,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Default, Args)]
 struct SecretMetadataFlags {
     /// Metadata description.
     #[arg(long)]
@@ -1552,13 +1590,26 @@ fn run_with_context(
         }
         Command::Debug { command } => debug::debug_command(context, output, command)?,
         Command::Init(args) => project::init::init(context, output, args)?,
-        Command::Set(args) => secrets::set::set_command(context, output, &args)?,
+        Command::Set(args) => return secrets::set::set_command(context, output, &args),
+        Command::Generate(args) => {
+            return secrets::generate::generate_command(context, output, &args);
+        }
+        Command::Discover(args) => {
+            return commands::discovery::discover_command(context, output, args);
+        }
+        Command::Shared { command } => {
+            return commands::discovery::shared_command(context, output, command);
+        }
+        Command::Parity(args) => return commands::parity::parity_command(context, output, &args),
+        Command::Mcp => commands::mcp::serve(&mut io::stdin().lock(), output, context)?,
         Command::Import(args) => secrets::import::import_command(context, output, &args)?,
         Command::Get(args) => secrets::get::get_command(context, output, &args)?,
         Command::Reveal(args) => secrets::get::get_command(
             context,
             output,
             &GetArgs {
+                project: None,
+                profile: None,
                 key: args.key,
                 source: args.source,
                 reveal: true,
@@ -1572,6 +1623,8 @@ fn run_with_context(
             context,
             output,
             &GetArgs {
+                project: None,
+                profile: None,
                 key: args.key,
                 source: args.source,
                 reveal: false,
@@ -1602,7 +1655,13 @@ fn run_with_context(
         Command::Policy { command } => policy::command(context, output, command)?,
         Command::Project { command } => trust::project::project_command(context, output, command)?,
         Command::Shellenv(args) => shell::shellenv_command(output, &args)?,
-        Command::Hook(args) => shell::hook_command(context, output, &args)?,
+        Command::Hook(args) => {
+            if let Some(command) = args.command {
+                commands::hook::hook_command(context, output, command)?;
+            } else {
+                shell::hook_command(context, output, &args)?;
+            }
+        }
         Command::Allow => shell::allow_command(context, output)?,
         Command::Deny(args) => shell::deny_command(context, output, &args)?,
         Command::Agent { command } => agent::agent_command(context, output, command)?,
@@ -1937,7 +1996,7 @@ fn preflight_rotate_secret_value(
     let name = SecretName::new(args.key.clone())
         .map_err(|err| invalid_secret_name_error(err.to_string()))?;
     resolve_active_secret_for_source(context, name.as_str(), args.source.source)?;
-    Ok(())
+    commands::secrets::set::validate_write_metadata(&args.metadata, None)
 }
 
 fn rotate_secret_value(
@@ -1952,85 +2011,28 @@ fn rotate_secret_value(
     validate_secret_value_str(value)?;
     let resolved_secret =
         resolve_active_secret_for_source(context, name.as_str(), args.source.source)?;
-    let new_version = next_secret_version(resolved_secret.secret.current_version)?;
     let mut store = open_store(context)?;
-    let audit_key = load_project_key(
+    commands::secrets::set::validate_write_metadata(&args.metadata, Some(value))?;
+    let keys = commands::secrets::set::SecretWriteKeys::load(
         context,
         &store,
-        resolved_secret.project.config.project_id.as_str(),
-        KeyPurpose::Audit,
+        &resolved_secret.secret.project_id,
+        &resolved_secret.profile.id,
     )?;
-    let (encrypted, fingerprint) = encrypt_secret_version(
-        context,
-        &store,
-        SecretEncryptRequest {
-            project_id: resolved_secret.project.config.project_id.as_str(),
-            profile_id: &resolved_secret.profile.id,
-            secret_id: &resolved_secret.secret.id,
-            secret_name: &resolved_secret.secret.name,
-            version: new_version,
-            value,
-        },
-    )?;
-    let source = resolved_secret.secret.source.clone();
-    let origin = resolved_secret.secret.origin.clone();
-    let metadata = json!({
-        "schema_version": 1,
-        "action": "ROTATE",
-        "status": "SUCCESS",
-        "secret_name": &resolved_secret.secret.name,
-        "profile_id": &resolved_secret.profile.id,
-        "source": &source,
-        "prior_version": resolved_secret.secret.current_version,
-        "deprecated_version": resolved_secret.secret.current_version,
-        "target_version": new_version,
-        "deprecated_at": timestamp,
-        "grace_until": grace_until,
-    });
-    let audit = AuditWrite {
-        project_id: resolved_secret.project.config.project_id.as_str(),
-        profile_id: Some(&resolved_secret.profile.id),
-        action: "ROTATE",
-        status: "SUCCESS",
-        secret_name: Some(&resolved_secret.secret.name),
-        command: None,
-        metadata_json: &metadata,
-        timestamp,
-    };
-
-    store.rotate_secret_with_audit(
+    let version = commands::secrets::set::rotate_value(
+        &mut store,
+        &keys,
         &resolved_secret.secret,
-        &SecretVersionRecord {
-            secret_id: resolved_secret.secret.id.clone(),
-            version: new_version,
-            source: source.clone(),
-            origin,
-            state: "current".to_owned(),
-            created_at: timestamp,
-            deprecated_at: None,
-            grace_until: None,
-            purged_at: None,
+        &commands::secrets::set::Rotation {
+            value,
+            origin: &resolved_secret.secret.origin,
+            timestamp,
+            grace_until,
+            metadata: &args.metadata,
+            action: "ROTATE",
         },
-        &SecretBlobRecord {
-            secret_id: resolved_secret.secret.id.clone(),
-            version: new_version,
-            encrypted_dek: encrypted.encrypted_dek,
-            ciphertext: encrypted.ciphertext,
-            value_nonce: encrypted.value_nonce,
-            aad_schema_version: encrypted.aad_schema_version,
-            created_at: timestamp,
-        },
-        &SecretFingerprintRecord {
-            secret_id: resolved_secret.secret.id.clone(),
-            version: new_version,
-            fingerprint,
-            created_at: timestamp,
-        },
-        VersionDeprecation { deprecated_at: timestamp, grace_until },
-        Some(AuditContext { key: audit_key.as_ref(), write: &audit }),
     )?;
-
-    Ok((source, new_version))
+    Ok((resolved_secret.secret.source, version))
 }
 
 struct CopySecretResult {
@@ -2379,115 +2381,9 @@ pub(crate) fn open_store(context: &RuntimeContext) -> Result<Store, CliError> {
     if let Some(parent) = context.store_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let existing_store_len = match fs::metadata(&context.store_path) {
-        Ok(metadata) if metadata.is_file() => metadata.len(),
-        Ok(_) => 0,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
-        Err(error) => return Err(error.into()),
-    };
     let mut store = Store::open(&context.store_path)?;
-    maybe_create_pre_migration_backup(context, &store, existing_store_len)?;
     store.initialize_schema()?;
     Ok(store)
-}
-
-fn maybe_create_pre_migration_backup(
-    context: &RuntimeContext,
-    store: &Store,
-    existing_store_len: u64,
-) -> Result<(), CliError> {
-    if existing_store_len == 0 {
-        return Ok(());
-    }
-
-    let current_version = store.current_schema_version()?;
-    if current_version.is_some_and(|version| version >= i64::from(SCHEMA_VERSION)) {
-        return Ok(());
-    }
-
-    create_pre_migration_backup(context, current_version)
-}
-
-fn create_pre_migration_backup(
-    context: &RuntimeContext,
-    current_version: Option<i64>,
-) -> Result<(), CliError> {
-    let backup_root = pre_migration_backup_root(context)?;
-    fs::create_dir_all(&backup_root)?;
-    set_user_only_dir_permissions(&backup_root)?;
-
-    let from_version =
-        current_version.map_or_else(|| "none".to_owned(), |version| version.to_string());
-    let backup_dir = backup_root.join(format!(
-        "{}-schema-v{}-to-v{}",
-        now_unix_nanos()?,
-        from_version,
-        SCHEMA_VERSION
-    ));
-    fs::create_dir(&backup_dir)?;
-    set_user_only_dir_permissions(&backup_dir)?;
-
-    copy_backup_file(&context.store_path, &backup_dir.join("store.db"))?;
-    copy_backup_file_if_present(
-        &sqlite_sidecar_path(&context.store_path, "wal"),
-        &backup_dir.join("store.db-wal"),
-    )?;
-    copy_backup_file_if_present(
-        &sqlite_sidecar_path(&context.store_path, "shm"),
-        &backup_dir.join("store.db-shm"),
-    )?;
-
-    let recovery_dir = context.cwd.join(".locket").join("recovery");
-    if recovery_dir.exists() {
-        let backup_recovery_dir = backup_dir.join("recovery");
-        fs::create_dir(&backup_recovery_dir)?;
-        set_user_only_dir_permissions(&backup_recovery_dir)?;
-        copy_backup_file_if_present(
-            &recovery_dir.join("kdf.toml"),
-            &backup_recovery_dir.join("kdf.toml"),
-        )?;
-        copy_backup_file_if_present(
-            &recovery_dir.join("envelope.bin"),
-            &backup_recovery_dir.join("envelope.bin"),
-        )?;
-    }
-
-    Ok(())
-}
-
-fn copy_backup_file_if_present(source: &Path, destination: &Path) -> Result<(), CliError> {
-    match fs::metadata(source) {
-        Ok(metadata) if metadata.is_file() => copy_backup_file(source, destination),
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn copy_backup_file(source: &Path, destination: &Path) -> Result<(), CliError> {
-    fs::copy(source, destination)?;
-    set_user_only_file_permissions(destination)?;
-    Ok(())
-}
-
-fn sqlite_sidecar_path(store_path: &Path, suffix: &str) -> PathBuf {
-    PathBuf::from(format!("{}-{suffix}", store_path.display()))
-}
-
-fn pre_migration_backup_root(context: &RuntimeContext) -> Result<PathBuf, CliError> {
-    let parent = context
-        .store_path
-        .parent()
-        .ok_or_else(|| corrupt_db_error("could not resolve pre-migration backup directory"))?;
-    Ok(parent.join(PRE_MIGRATION_BACKUP_DIR))
-}
-
-fn pre_migration_backup_relative_label(context: &RuntimeContext, path: &Path) -> String {
-    let Some(parent) = context.store_path.parent() else {
-        return path.display().to_string();
-    };
-    path.strip_prefix(parent)
-        .map_or_else(|_| path.display().to_string(), |relative| relative.display().to_string())
 }
 
 pub(crate) fn ensure_trusted_project_root(
@@ -2549,6 +2445,7 @@ fn agent_log_paths_oldest_first(context: &RuntimeContext) -> Vec<PathBuf> {
 }
 
 fn write_agent_paths(context: &RuntimeContext, output: &mut impl Write) -> Result<(), CliError> {
+    writeln!(output, "instance: {}", locket_platform::LocketInstance::current().label())?;
     writeln!(output, "socket: {}", agent_socket_path(context).display())?;
     writeln!(output, "pid_file: {}", agent_pid_path(context).display())?;
     writeln!(output, "log_file: {}", agent_log_path(context).display())?;
@@ -3329,12 +3226,7 @@ pub(crate) const fn source_arg_to_str(source: SecretSourceArg) -> &'static str {
 }
 
 pub(crate) const fn source_precedence(source: &str) -> u8 {
-    match source.as_bytes() {
-        b"team-managed" => 1,
-        b"user-local" => 2,
-        b"machine-local" => 3,
-        _ => 0,
-    }
+    locket_core::source_precedence(source)
 }
 
 pub(crate) fn fallback_project_name(root: &Path) -> String {

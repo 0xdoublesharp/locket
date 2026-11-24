@@ -83,6 +83,7 @@ async fn verify_audit_returns_hmac_status_when_unlocked() -> Result<(), Box<dyn 
     let mut store = Store::open(&store_path)?;
     store.initialize_schema()?;
     store.insert_project_if_absent("lk_proj_agent_verify", "agent verify", 100)?;
+    insert_wrapped_audit_key(&store, "lk_proj_agent_verify", &[42; 32], &[11; 32])?;
     let metadata = json!({
         "schema_version": 1,
         "action": "AUDIT_VERIFY",
@@ -95,7 +96,7 @@ async fn verify_audit_returns_hmac_status_when_unlocked() -> Result<(), Box<dyn 
         "rows_verified": 0,
     });
     store.append_audit(
-        &[42; 32],
+        &[11; 32],
         &AuditWrite {
             project_id: "lk_proj_agent_verify",
             profile_id: None,
@@ -176,6 +177,7 @@ async fn verify_audit_reports_first_hmac_break() -> Result<(), Box<dyn std::erro
     let mut store = Store::open(&store_path)?;
     store.initialize_schema()?;
     store.insert_project_if_absent("lk_proj_agent_verify", "agent verify", 100)?;
+    insert_wrapped_audit_key(&store, "lk_proj_agent_verify", &[42; 32], &[11; 32])?;
     let metadata = json!({
         "schema_version": 1,
         "action": "AUDIT_VERIFY",
@@ -188,7 +190,7 @@ async fn verify_audit_reports_first_hmac_break() -> Result<(), Box<dyn std::erro
         "rows_verified": 0,
     });
     store.append_audit(
-        &[42; 32],
+        &[11; 32],
         &AuditWrite {
             project_id: "lk_proj_agent_verify",
             profile_id: None,
@@ -270,6 +272,7 @@ async fn list_audit_returns_filtered_metadata_and_chain_status()
          VALUES ('lk_prof_test', 'lk_proj_test', 'default', 0, 1)",
         [],
     )?;
+    insert_wrapped_audit_key(&store, "lk_proj_test", &[7; 32], &[11; 32])?;
     for (timestamp, action, secret_name) in
         [(100, "SET", "DATABASE_URL"), (200, "COPY", "DATABASE_URL"), (300, "ROTATE", "API_TOKEN")]
     {
@@ -286,7 +289,7 @@ async fn list_audit_returns_filtered_metadata_and_chain_status()
             metadata["access_mode"] = json!("clipboard");
         }
         store.append_audit(
-            &[7; 32],
+            &[11; 32],
             &AuditWrite {
                 project_id: "lk_proj_test",
                 profile_id: Some("lk_prof_test"),
@@ -2157,6 +2160,7 @@ fn seed_automation_client_store(
     let mut store = locket_store::Store::open(store_path)?;
     store.initialize_schema()?;
     store.insert_project_if_absent("lk_proj_auth", "auth", 1)?;
+    insert_snapshot_fixture_audit_key(&store, "lk_proj_auth")?;
     store.insert_automation_client(&locket_store::AutomationClientRecord {
         id: "lk_client_auth".to_owned(),
         project_id: "lk_proj_auth".to_owned(),
@@ -2203,6 +2207,7 @@ fn seed_profile_test_store(
     store.insert_profile_if_absent("lk_prof_dev", project_id, "dev", false, 1)?;
     store.insert_profile_if_absent("lk_prof_prod", project_id, "prod", true, 2)?;
     store.insert_profile_if_absent("lk_prof_staging", project_id, "staging", false, 3)?;
+    insert_snapshot_fixture_audit_key(&store, project_id)?;
     Ok(store)
 }
 
@@ -2219,6 +2224,10 @@ async fn unlock_auth_project(state: &crate::server::AgentSocketState) {
             UnlockMethod::Passphrase,
         ),
     );
+    install_automation_test_policy(state).await;
+}
+
+async fn install_automation_test_policy(state: &crate::server::AgentSocketState) {
     state
         .set_command_policies_for_tests(vec![crate::CommandPolicySnapshot {
             project_id: "lk_proj_auth".to_owned(),
@@ -2344,20 +2353,25 @@ fn sign_auth_payload(
 
 async fn sign_automation_request(
     state: &crate::server::AgentSocketState,
-    mut request: RequestEnvelope,
+    request: RequestEnvelope,
 ) -> Result<RequestEnvelope, Box<dyn std::error::Error>> {
-    let hello = RequestEnvelope::new(
-        "hello",
-        AgentMethod::ClientHello,
-        json!({ "client_id": "lk_client_auth" }),
-    );
+    sign_automation_request_for_client(state, request, "lk_client_auth").await
+}
+
+async fn sign_automation_request_for_client(
+    state: &crate::server::AgentSocketState,
+    mut request: RequestEnvelope,
+    client_id: &str,
+) -> Result<RequestEnvelope, Box<dyn std::error::Error>> {
+    let hello =
+        RequestEnvelope::new("hello", AgentMethod::ClientHello, json!({ "client_id": client_id }));
     let ResponseEnvelope::Success(challenge) = crate::server::dispatch(&hello, state).await else {
         return Err("ClientHello should succeed".into());
     };
     let auth = sign_auth_payload(
         &automation_signing_key(),
         &request,
-        "lk_client_auth",
+        client_id,
         challenge.payload["challenge_id"].as_str().ok_or("challenge id")?,
         challenge.payload["nonce"].as_str().ok_or("challenge nonce")?,
         auth_now_i64(),
@@ -2870,8 +2884,7 @@ async fn automation_client_auth_rejects_policy_mismatch_and_replay()
     state.automation_challenges.lock().await.insert(
         "deny-challenge".to_owned(),
         IssuedChallenge {
-            client_id: "lk_client_auth".to_owned(),
-            challenge_id: "deny-challenge".to_owned(),
+            client_id_digest: <sha2::Sha256 as sha2::Digest>::digest(b"lk_client_auth").into(),
             nonce: [1; 24],
             issued_at: crate::server::current_unix_nanos(),
         },
@@ -2909,8 +2922,7 @@ async fn automation_client_auth_rejects_policy_mismatch_and_replay()
     state.automation_challenges.lock().await.insert(
         "replay-challenge".to_owned(),
         IssuedChallenge {
-            client_id: "lk_client_auth".to_owned(),
-            challenge_id: "replay-challenge".to_owned(),
+            client_id_digest: <sha2::Sha256 as sha2::Digest>::digest(b"lk_client_auth").into(),
             nonce: [2; 24],
             issued_at: crate::server::current_unix_nanos(),
         },
@@ -4324,6 +4336,7 @@ async fn register_client_inserts_record_and_appends_audit() -> Result<(), Box<dy
     let mut store = locket_store::Store::open(&store_path)?;
     store.initialize_schema()?;
     store.insert_project_if_absent("p-clients", "clients project", 1)?;
+    insert_snapshot_fixture_audit_key(&store, "p-clients")?;
     drop(store);
 
     let state = AgentSocketState::locked("test-version");
@@ -4446,6 +4459,7 @@ async fn revoke_client_marks_row_and_appends_audit() -> Result<(), Box<dyn std::
     let mut store = locket_store::Store::open(&store_path)?;
     store.initialize_schema()?;
     store.insert_project_if_absent("p-rev", "revoke project", 1)?;
+    insert_snapshot_fixture_audit_key(&store, "p-rev")?;
     drop(store);
 
     let state = AgentSocketState::locked("test-version");
@@ -4530,6 +4544,7 @@ async fn revoke_client_returns_policy_not_found_for_unknown_client()
     let mut store = locket_store::Store::open(&store_path)?;
     store.initialize_schema()?;
     store.insert_project_if_absent("p-missing", "missing", 1)?;
+    insert_snapshot_fixture_audit_key(&store, "p-missing")?;
     drop(store);
 
     let state = AgentSocketState::locked("test-version");
@@ -4577,16 +4592,25 @@ fn insert_snapshot_fixture_audit_key(
     store: &locket_store::Store,
     project: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    insert_wrapped_audit_key(store, project, &[42; 32], &[11; 32])
+}
+
+pub fn insert_wrapped_audit_key(
+    store: &locket_store::Store,
+    project: &str,
+    master_key: &locket_crypto::KeyBytes,
+    audit_key: &locket_crypto::KeyBytes,
+) -> Result<(), Box<dyn std::error::Error>> {
     use locket_crypto::{
         HkdfWrapInfo, KeyPurpose, KeyWrapAad, KeyWrapPurpose, derive_wrapping_key_v1,
         key_wrap_aad_v1, wrap_key_material_v1,
     };
     let id = format!("lk_key_snapshot_{project}");
     let purpose = KeyPurpose::Audit;
-    let wrapping = derive_wrapping_key_v1(&[42; 32], &HkdfWrapInfo::new(project, None, purpose))?;
+    let wrapping = derive_wrapping_key_v1(master_key, &HkdfWrapInfo::new(project, None, purpose))?;
     let aad =
         key_wrap_aad_v1(&KeyWrapAad::new(project, &id, None, 0, KeyWrapPurpose::from(purpose)))?;
-    let wrapped = wrap_key_material_v1(&wrapping, &[11; 32], &aad)?;
+    let wrapped = wrap_key_material_v1(&wrapping, audit_key, &aad)?;
     store.insert_key(&locket_store::KeyRecord {
         id,
         project_id: project.into(),
@@ -4606,5 +4630,436 @@ fn pending_profile_reconcile_is_a_registered_typed_method() -> Result<(), Box<dy
         serde_json::json!({"v":1,"id":"reconcile","kind":"TeamSyncReconcile","payload":{"project_id":"project","incoming_profile_id":"incoming","action":{"kind":"rename_profile","local_profile_id":"local","new_name":"local-preserved"}}}),
     )?;
     assert_eq!(request.method()?.as_str(), "TeamSyncReconcile");
+    Ok(())
+}
+
+struct AgentAuditFixture {
+    _directory: tempfile::TempDir,
+    config_path: std::path::PathBuf,
+    store_path: std::path::PathBuf,
+    state: crate::server::AgentSocketState,
+}
+
+impl AgentAuditFixture {
+    const PROJECT: &str = "lk_proj_auth";
+    const AUDIT_KEY: locket_crypto::KeyBytes = [11; 32];
+
+    async fn unlocked() -> Result<Self, Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let config_path = directory.path().join("locket.toml");
+        let store_path = directory.path().join("store.db");
+        seed_profile_test_store(&store_path, Self::PROJECT)?;
+        write_profile_test_config(&config_path, Self::PROJECT, "dev")?;
+        let state = crate::server::AgentSocketState::locked("audit-test");
+        state.seed_master_key(Self::PROJECT, &[42; 32])?;
+        let fixture = Self { _directory: directory, config_path, store_path, state };
+        fixture
+            .success(
+                AgentMethod::Unlock,
+                json!({
+                    "ttl_seconds": 60,
+                    "audit": {"store_path": fixture.store_path, "profile_id": "lk_prof_dev"},
+                }),
+            )
+            .await;
+        install_automation_test_policy(&fixture.state).await;
+        Ok(fixture)
+    }
+
+    fn request(&self, method: AgentMethod, mut payload: serde_json::Value) -> RequestEnvelope {
+        payload["project_id"] = json!(Self::PROJECT);
+        payload["store_path"] = json!(self.store_path);
+        RequestEnvelope::new(method.as_str(), method, payload)
+    }
+
+    async fn success(&self, method: AgentMethod, payload: serde_json::Value) -> serde_json::Value {
+        match crate::dispatch(&self.request(method, payload), &self.state).await {
+            ResponseEnvelope::Success(response) => response.payload,
+            ResponseEnvelope::Error(error) => panic!("{} failed: {error:?}", method.as_str()),
+        }
+    }
+
+    fn client_payload() -> serde_json::Value {
+        json!({
+            "name": "ci",
+            "storage": "external",
+            "public_key": automation_signing_key().verifying_key().to_bytes(),
+            "allowed_actions": ["run-policy"],
+            "allowed_policies": ["deploy"],
+        })
+    }
+
+    async fn signed_grant(
+        &self,
+        client_id: &str,
+    ) -> Result<RequestEnvelope, Box<dyn std::error::Error>> {
+        let mut grant = automation_grant_request(&self.store_path, "RunPolicy");
+        grant.payload["profile_id"] = json!("lk_prof_staging");
+        sign_automation_request_for_client(&self.state, grant, client_id).await
+    }
+
+    fn profile_change(&self) -> serde_json::Value {
+        json!({"config_path": self.config_path, "profile_name": "staging"})
+    }
+
+    fn config_change(&self) -> serde_json::Value {
+        json!({
+            "config_path": self.config_path,
+            "profile_name": "staging",
+            "changes": {"privacy_redact_names": true, "dangerous_profile": true},
+        })
+    }
+
+    fn ide_session() -> serde_json::Value {
+        json!({"session_id": "ide-test", "profile_id": "lk_prof_staging", "env_names": ["API_KEY"]})
+    }
+}
+
+#[tokio::test]
+async fn lock_evicts_registered_ide_sessions() -> Result<(), Box<dyn std::error::Error>> {
+    for source in ["project", "all", "sleep"] {
+        let fixture = AgentAuditFixture::unlocked().await?;
+        fixture.success(AgentMethod::RegisterIdeEnvSession, AgentAuditFixture::ide_session()).await;
+        let lookup = json!({"session_id": "ide-test"});
+        fixture.success(AgentMethod::IdeEnvSession, lookup.clone()).await;
+        fixture.state.ide_env_sessions.lock().await.insert(
+            "other-session".to_owned(),
+            crate::IdeEnvSessionEntry {
+                project_id: "other-project".to_owned(),
+                env_names: Vec::new(),
+                expires_at_unix_nanos: i128::MAX,
+            },
+        );
+        match source {
+            "sleep" => {
+                fixture
+                    .state
+                    .lock_for_native_session_event(
+                        crate::session_lock::SessionLockSource::SystemSleep,
+                        true,
+                        crate::server::current_unix_nanos(),
+                    )
+                    .await?;
+            }
+            "project" => {
+                fixture.success(AgentMethod::Lock, json!({})).await;
+            }
+            _ => {
+                let lock =
+                    RequestEnvelope::new("lock-all", AgentMethod::Lock, serde_json::Value::Null);
+                assert!(matches!(
+                    crate::dispatch(&lock, &fixture.state).await,
+                    ResponseEnvelope::Success(_)
+                ));
+            }
+        }
+        assert_eq!(fixture.state.ide_env_sessions.lock().await.is_empty(), source != "project");
+        let response =
+            crate::dispatch(&fixture.request(AgentMethod::IdeEnvSession, lookup), &fixture.state)
+                .await;
+        assert!(
+            matches!(response, ResponseEnvelope::Error(error) if error.error == "IdeEnvSessionUnavailable")
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn unlock_and_grant_reject_invalid_ttls() -> Result<(), Box<dyn std::error::Error>> {
+    let state = crate::server::AgentSocketState::locked("ttl-test");
+    state.seed_master_key("ttl-project", &[42; 32])?;
+    for (method, invalid, maximum) in
+        [(AgentMethod::Unlock, 86_401, 86_400), (AgentMethod::RequestGrant, 3_601, 3_600)]
+    {
+        for ttl in [0, invalid, u64::MAX, maximum] {
+            let request = RequestEnvelope::new(
+                method.as_str(),
+                method,
+                json!({
+                    "project_id": "ttl-project",
+                    "profile_id": "ttl-profile",
+                    "action": "Reveal",
+                    "binding": {"pid": 42, "process_start_time": "test"},
+                    "ttl_seconds": ttl,
+                }),
+            );
+            let response = crate::dispatch(&request, &state).await;
+            if ttl == maximum {
+                assert!(matches!(response, ResponseEnvelope::Success(_)), "{response:?}");
+            } else {
+                assert!(
+                    matches!(response, ResponseEnvelope::Error(error) if error.error == "MetadataInvalid")
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn audit_rpcs_share_the_wrapped_project_audit_key() -> Result<(), Box<dyn std::error::Error>>
+{
+    let fixture = AgentAuditFixture::unlocked().await?;
+    fixture.success(AgentMethod::SetActiveProfile, fixture.profile_change()).await;
+    fixture.success(AgentMethod::WriteConfig, fixture.config_change()).await;
+    let client: crate::RegisterClientResponse = serde_json::from_value(
+        fixture.success(AgentMethod::RegisterClient, AgentAuditFixture::client_payload()).await,
+    )?;
+    let signed_grant = fixture.signed_grant(&client.client_id).await?;
+    assert!(matches!(
+        crate::dispatch(&signed_grant, &fixture.state).await,
+        ResponseEnvelope::Success(_)
+    ));
+    fixture.success(AgentMethod::RevokeClient, json!({"client": client.client_id})).await;
+    fixture.success(AgentMethod::RegisterIdeEnvSession, AgentAuditFixture::ide_session()).await;
+
+    let verified: VerifyAuditResponse =
+        serde_json::from_value(fixture.success(AgentMethod::VerifyAudit, json!({})).await)?;
+    let listed: ListAuditResponse =
+        serde_json::from_value(fixture.success(AgentMethod::ListAudit, json!({})).await)?;
+    let expected = [
+        "UNLOCK",
+        "PROFILE_CHANGE",
+        "CONFIG_UPDATE",
+        "PROFILE_CHANGE",
+        "CLIENT_ADD",
+        "CLIENT_AUTH",
+        "CLIENT_REVOKE",
+        "AGENT_GRANT",
+    ];
+    assert_eq!(listed.rows.iter().map(|row| row.action.as_str()).collect::<Vec<_>>(), expected);
+    assert_eq!((verified.hmac_ok, verified.rows_verified), (Some(true), 8));
+    assert_eq!((listed.chain_status.hmac_ok, listed.chain_status.rows_verified), (Some(true), 8));
+    let mut store = locket_store::Store::open(&fixture.store_path)?;
+    assert_eq!(
+        store.verify_audit_chain_and_append(
+            AgentAuditFixture::PROJECT,
+            &AgentAuditFixture::AUDIT_KEY,
+            auth_now_i64(),
+        )?,
+        8,
+    );
+    let chain = store
+        .verify_audit_chain_read_only(AgentAuditFixture::PROJECT, &AgentAuditFixture::AUDIT_KEY)?;
+    assert_eq!((chain.hmac_ok, chain.rows_verified), (true, 9));
+    Ok(())
+}
+
+#[tokio::test]
+async fn audit_rpcs_fail_closed_with_missing_or_invalid_project_audit_key()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = AgentAuditFixture::unlocked().await?;
+    let client: crate::RegisterClientResponse = serde_json::from_value(
+        fixture.success(AgentMethod::RegisterClient, AgentAuditFixture::client_payload()).await,
+    )?;
+    let store = locket_store::Store::open(&fixture.store_path)?;
+    let original_config = std::fs::read(&fixture.config_path)?;
+    for (sql, reason) in [
+        (
+            "UPDATE keys SET wrapped_material = zeroblob(length(wrapped_material))",
+            "authentication failed",
+        ),
+        ("DELETE FROM keys", "is missing"),
+    ] {
+        store.connection().execute(sql, [])?;
+        let mut new_client = AgentAuditFixture::client_payload();
+        new_client["name"] = json!("other-ci");
+        for request in [
+            fixture.request(AgentMethod::VerifyAudit, json!({})),
+            fixture.request(AgentMethod::ListAudit, json!({})),
+            fixture.request(AgentMethod::SetActiveProfile, fixture.profile_change()),
+            fixture.request(AgentMethod::WriteConfig, fixture.config_change()),
+            fixture.request(AgentMethod::RegisterClient, new_client),
+            fixture.request(AgentMethod::RevokeClient, json!({"client": client.client_id})),
+            fixture.request(AgentMethod::RegisterIdeEnvSession, AgentAuditFixture::ide_session()),
+            fixture.signed_grant(&client.client_id).await?,
+            {
+                let mut denied = fixture.signed_grant(&client.client_id).await?;
+                denied.payload["auth"]["signature"] = json!("invalid");
+                denied
+            },
+        ] {
+            let ResponseEnvelope::Error(error) = crate::dispatch(&request, &fixture.state).await
+            else {
+                panic!("{} succeeded without an audit key", request.kind);
+            };
+            assert_eq!(error.error, "AuditIntegrityFailed", "{}", request.kind);
+            assert!(error.message.contains(reason), "{}", error.message);
+        }
+    }
+    assert_eq!(std::fs::read(&fixture.config_path)?, original_config);
+    assert!(fixture.state.ide_env_sessions.lock().await.is_empty());
+    assert!(fixture.state.grants.lock().await.is_empty());
+    let (clients, revoked_at, last_used_at, nonces, audit_rows): (i64, Option<i64>, Option<i64>, i64, i64) =
+        store.connection().query_row(
+            "SELECT (SELECT COUNT(*) FROM automation_clients), revoked_at, last_used_at,
+                    (SELECT COUNT(*) FROM automation_client_nonces), (SELECT COUNT(*) FROM audit_log)
+             FROM automation_clients WHERE id = ?1",
+            [&client.client_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )?;
+    assert_eq!((clients, revoked_at, last_used_at, nonces, audit_rows), (1, None, None, 0, 2));
+    let staging = store
+        .get_profile_by_name(AgentAuditFixture::PROJECT, "staging")?
+        .ok_or("missing staging fixture")?;
+    assert!(!staging.dangerous);
+    Ok(())
+}
+
+#[tokio::test]
+async fn automation_auth_audits_an_invalid_signature() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let store_path = directory.path().join("store.db");
+    let store = seed_automation_client_store(
+        &store_path,
+        automation_signing_key().verifying_key().as_bytes(),
+    )?;
+    let state = crate::server::AgentSocketState::locked("auth-test");
+    unlock_auth_project(&state).await;
+    let mut request =
+        sign_automation_request(&state, automation_grant_request(&store_path, "RunPolicy")).await?;
+    request.payload["auth"]["signature"] = json!(data_encoding::BASE64URL_NOPAD.encode(&[0; 64]));
+
+    let ResponseEnvelope::Error(error) = crate::dispatch(&request, &state).await else {
+        panic!("invalid signature authenticated");
+    };
+    assert_eq!(error.error, "AutomationClientNotTrusted");
+    assert_no_successful_automation_auth(&store)?;
+    assert!(state.grants.lock().await.is_empty());
+    let metadata: String = store.connection().query_row(
+        "SELECT metadata_json FROM audit_log WHERE action = 'CLIENT_AUTH' AND status = 'DENIED'",
+        [],
+        |row| row.get(0),
+    )?;
+    let metadata: serde_json::Value = serde_json::from_str(&metadata)?;
+    assert_eq!(metadata["failure_reason"], "invalid_signature");
+    assert!(
+        store.verify_audit_chain_read_only("lk_proj_auth", &AgentAuditFixture::AUDIT_KEY)?.hmac_ok
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn automation_auth_reports_audit_storage_error_without_misclassifying_replay()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let store_path = directory.path().join("store.db");
+    let store = seed_automation_client_store(
+        &store_path,
+        automation_signing_key().verifying_key().as_bytes(),
+    )?;
+    let state = crate::server::AgentSocketState::locked("auth-test");
+    unlock_auth_project(&state).await;
+    let first_request =
+        sign_automation_request(&state, automation_grant_request(&store_path, "RunPolicy")).await?;
+    assert!(matches!(crate::dispatch(&first_request, &state).await, ResponseEnvelope::Success(_)));
+    let first_used = store
+        .get_automation_client("lk_proj_auth", "lk_client_auth")?
+        .ok_or("missing client fixture")?
+        .last_used_at;
+    store.connection().execute(
+        "CREATE UNIQUE INDEX one_auth_audit ON audit_log(action) WHERE action = 'CLIENT_AUTH'",
+        [],
+    )?;
+
+    let second_request =
+        sign_automation_request(&state, automation_grant_request(&store_path, "RunPolicy")).await?;
+    let ResponseEnvelope::Error(error) = crate::dispatch(&second_request, &state).await else {
+        panic!("authentication succeeded despite failed audit write");
+    };
+    assert_eq!(error.error, "CorruptDb");
+    assert_eq!(state.grants.lock().await.len(), 1);
+    let (nonce_count, last_used_at): (i64, Option<i64>) = store.connection().query_row(
+        "SELECT (SELECT COUNT(*) FROM automation_client_nonces), last_used_at
+         FROM automation_clients WHERE id = 'lk_client_auth'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!((nonce_count, last_used_at), (1, first_used));
+    Ok(())
+}
+
+#[tokio::test]
+async fn policy_doctor_respects_source_precedence_and_deprecation_grace()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let store_path = directory.path().join("store.db");
+    let project_id = "p-doctor-precedence";
+    let mut store = locket_store::Store::open(&store_path)?;
+    store.initialize_schema()?;
+    store.insert_project_if_absent(project_id, "doctor project", 1)?;
+    store.insert_profile_if_absent("prof-dev", project_id, "dev", false, 1)?;
+    for (id, name, source, version, state, grace_until) in [
+        ("machine", "SOURCE_KEY", "machine-local", 2, "current", None),
+        ("team", "SOURCE_KEY", "team-managed", 1, "current", None),
+        ("user-first", "USER_KEY", "user-local", 2, "current", None),
+        ("team-second", "USER_KEY", "team-managed", 1, "current", None),
+        ("expired", "EXPIRED_KEY", "user-local", 1, "deprecated", Some(1)),
+        ("graced", "GRACED_KEY", "user-local", 1, "deprecated", Some(i64::MAX)),
+    ] {
+        store.connection().execute(
+            "INSERT INTO secrets(
+               id, project_id, profile_id, name, source, origin, required, current_version,
+               state, created_at, updated_at
+             ) VALUES (?1, ?2, 'prof-dev', ?3, ?4, 'manual', 0, ?5, 'active', 1, 1)",
+            (id, project_id, name, source, version),
+        )?;
+        store.connection().execute(
+            "INSERT INTO secret_versions(secret_id, version, source, origin, state, created_at, grace_until)
+             VALUES (?1, ?2, ?3, 'manual', ?4, 1, ?5)",
+            (id, version, source, state, grace_until),
+        )?;
+    }
+    let state = crate::server::AgentSocketState::locked("doctor-test");
+    unlock_profile_test_state(&state, project_id).await;
+    let failures = [
+        "lk://dev/SOURCE_KEY@v1",
+        "lk://dev/USER_KEY@v1",
+        "lk://dev/EXPIRED_KEY@v1",
+        "lk://dev/GRACED_KEY",
+    ];
+    let references = failures
+        .into_iter()
+        .chain([
+            "lk://dev/SOURCE_KEY",
+            "lk://dev/SOURCE_KEY@v1?source=team-managed",
+            "lk://dev/USER_KEY@v2",
+            "lk://dev/GRACED_KEY@v1",
+        ])
+        .collect::<Vec<_>>();
+    let request = RequestEnvelope::new(
+        "doctor-precedence",
+        AgentMethod::PolicyDoctor,
+        json!({
+            "project_id": project_id,
+            "profile_id": "prof-dev",
+            "store_path": store_path,
+            "policy": {
+                "project_id": project_id,
+                "name": "deploy",
+                "command_kind": "argv",
+                "command_preview": "deploy",
+                "required_secrets": [],
+                "optional_secrets": [],
+                "allowed_secrets": ["SOURCE_KEY", "USER_KEY", "EXPIRED_KEY", "GRACED_KEY"],
+                "confirm": false,
+                "require_user_verification": false,
+                "require_agent": true,
+                "allow_remote_docker": false,
+                "ttl_seconds": 60,
+                "env_mode": "minimal",
+                "override_mode": "locket",
+                "updated_at_unix_nanos": 1,
+            },
+            "references": references,
+        }),
+    );
+    let ResponseEnvelope::Success(success) = crate::dispatch(&request, &state).await else {
+        return Err("PolicyDoctor did not return a report".into());
+    };
+    let report: crate::PolicyDoctorResponse = serde_json::from_value(success.payload)?;
+    assert_eq!(report.status, "fail");
+    assert_eq!(report.references_failed, failures);
+    assert_eq!(report.references_ok, 4);
     Ok(())
 }
