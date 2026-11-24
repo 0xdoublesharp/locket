@@ -1,8 +1,119 @@
 use std::io::{self, Write};
 
+use proptest::prelude::*;
+
 use super::{StreamingRedactionStats, StreamingRedactor, StreamingRedactorConfig};
 use crate::env_value;
 use crate::secret_encoding::Form;
+
+#[derive(Debug)]
+enum StreamPart {
+    Noise(Vec<u8>),
+    Slice { secret: prop::sample::Index, start: usize, end: usize },
+}
+
+fn stream_parts() -> impl Strategy<Value = Vec<StreamPart>> {
+    prop::collection::vec(
+        prop_oneof![
+            prop::collection::vec(any::<u8>(), 0..16).prop_map(StreamPart::Noise),
+            (any::<prop::sample::Index>(), 0..32_usize, 0..32_usize)
+                .prop_map(|(secret, start, end)| StreamPart::Slice { secret, start, end }),
+        ],
+        0..24,
+    )
+}
+
+fn short_secret() -> impl Strategy<Value = String> {
+    prop_oneof![
+        "[a-d]{2,8}",
+        prop::collection::vec(any::<char>(), 1..9).prop_map(|chars| chars.into_iter().collect()),
+        prop::sample::select(vec![
+            "[REDACTED]",
+            "x[REDACTED]y",
+            "D]",
+            "[R",
+            "x[",
+            "]x",
+            "\0a",
+            "秘密"
+        ])
+        .prop_map(str::to_owned),
+    ]
+}
+
+fn contains_secret(payload: &[u8], secret: &str) -> bool {
+    payload.windows(secret.len()).any(|window| window == secret.as_bytes())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(96))]
+
+    // TLA+ NoUnredactedSecretInChildOutput and ChunkingMatchesBatch, and
+    // Lean redacted_output_free_of_pattern, streaming_eq_batch and clean_stream_identity.
+    #[test]
+    fn known_secret_redaction_conforms_across_byte_partitions(
+        mut secrets in prop::collection::btree_set(short_secret(), 0..8),
+        overlap in "[a-d]{2,4}",
+        parts in stream_parts(),
+        cuts in prop::collection::vec(any::<prop::sample::Index>(), 0..40),
+        clean in any::<bool>(),
+        labels in any::<bool>(),
+        frame in ("[a-d]{0,4}", "[a-d]{0,4}"),
+    ) {
+        secrets.extend([format!("a{overlap}"), format!("{overlap}b")]);
+        let secrets: Vec<_> = secrets.into_iter().collect();
+        let mut input = Vec::new();
+        for part in parts {
+            match part {
+                StreamPart::Noise(bytes) => input.extend(bytes),
+                StreamPart::Slice { secret, start, end } => {
+                    let bytes = secrets[secret.index(secrets.len())].as_bytes();
+                    let (start, end) = (start % (bytes.len() + 1), end % (bytes.len() + 1));
+                    input.extend_from_slice(&bytes[start.min(end)..start.max(end)]);
+                }
+            }
+        }
+        if clean {
+            // 0xff cannot occur in a registered UTF-8 secret. Insert it before
+            // each byte to construct clean streams with arbitrary binary data.
+            input = input.into_iter().flat_map(|byte| [0xff, byte]).collect();
+            // A one-byte secret still needs to be removed from the clean input.
+            input.retain(|byte| !secrets.iter().any(|s| s.as_bytes() == [*byte]));
+        } else {
+            // Force overlapping matches and adjacent matches amid partial
+            // secret bytes, with no separator to mask a replacement splice.
+            input.extend_from_slice(format!("{}a{overlap}b{overlap}b{}", frame.0, frame.1).as_bytes());
+            for secret in &secrets {
+                input.extend_from_slice(secret.as_bytes());
+            }
+        }
+        let config = StreamingRedactorConfig {
+            known_secrets: secrets.iter().enumerate()
+                .map(|(index, secret)| (format!("KEY_{index}"), env_value(secret)))
+                .collect(),
+            replacement: "[REDACTED]".into(),
+            label_replacements: labels,
+            include_encoded_variants: false,
+            min_secret_len: 1,
+            ..StreamingRedactorConfig::default()
+        };
+        let cut_points: std::collections::BTreeSet<_> = cuts.into_iter()
+            .map(|cut| cut.index(input.len() + 1))
+            .chain([0, input.len()])
+            .collect();
+        let cuts: Vec<_> = cut_points.into_iter().collect();
+        let chunks: Vec<_> = cuts.windows(2).map(|ends| &input[ends[0]..ends[1]]).collect();
+        let bytes: Vec<_> = input.chunks(1).collect();
+        let batch = redact(&[&input], config.clone())?;
+        prop_assert_eq!(&redact(&chunks, config.clone())?, &batch);
+        prop_assert_eq!(&redact(&bytes, config)?, &batch);
+        let (output, _) = batch;
+        prop_assert!(!secrets.iter().any(|secret| contains_secret(&output, secret)));
+        if clean || !secrets.iter().any(|secret| contains_secret(&input, secret)) {
+            prop_assert_eq!(output, input);
+        }
+    }
+}
 
 fn config(secrets: &[(&str, &str)]) -> StreamingRedactorConfig {
     StreamingRedactorConfig {

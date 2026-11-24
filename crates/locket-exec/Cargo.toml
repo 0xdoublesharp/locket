@@ -29,3 +29,6 @@ zeroize = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 locket-platform = { version = "0.1.1", path = "../locket-platform" }
+
+[dev-dependencies]
+proptest = { workspace = true }

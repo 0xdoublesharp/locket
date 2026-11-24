@@ -1,9 +1,10 @@
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use data_encoding::BASE64;
+use proptest::prelude::*;
 
 use super::destination::{Authority, HostRule, permitted};
 use super::wire::{Framing, Wire, framing, parse_head};
@@ -13,6 +14,161 @@ use super::{
 };
 use crate::env_value;
 use crate::secret_encoding::Form;
+
+fn mixed_case(host: &str, mask: u64) -> String {
+    host.bytes()
+        .enumerate()
+        .map(|(index, byte)| {
+            char::from(if mask & (1 << (index % 64)) == 0 {
+                byte
+            } else {
+                byte.to_ascii_uppercase()
+            })
+        })
+        .collect()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    #[test]
+    fn wildcard_host_policy_respects_dns_labels_and_canonical_authority(
+        label in "[a-z][a-z0-9]{0,10}",
+        port in 1..u16::MAX,
+        mask in any::<u64>(),
+    ) {
+        let raw_rule = format!("*.{}.:{port}", mixed_case("example.com", mask));
+        let rule = HostRule::parse(&raw_rule).ok_or_else(|| TestCaseError::fail("invalid rule"))?;
+        let plain = HostRule::parse("*.example.com")
+            .ok_or_else(|| TestCaseError::fail("invalid plain rule"))?;
+        for (host, expected) in [
+            (format!("{label}.example.com"), true),
+            (format!("deep.{label}.example.com"), true),
+            ("example.com".to_owned(), false),
+            (format!("{label}example.com"), false),
+            (format!("{label}.notexample.com"), false),
+            (format!("{label}.example.com.invalid"), false),
+        ] {
+            let raw = format!("{}.:{port}", mixed_case(&host, !mask));
+            let normalized = Authority::parse(&raw, None)
+                .ok_or_else(|| TestCaseError::fail("invalid normalized authority"))?;
+            let canonical = Authority::parse(&host, Some(port))
+                .ok_or_else(|| TestCaseError::fail("invalid canonical authority"))?;
+            prop_assert!(normalized == canonical, "normalization changed {}", raw);
+            prop_assert_eq!(rule.matches(&normalized), expected, "{}", raw);
+            prop_assert_eq!(plain.matches(&canonical), expected, "{}", host);
+        }
+        let wrong_port = Authority::parse(&format!("{label}.example.com"), Some(port + 1))
+            .ok_or_else(|| TestCaseError::fail("invalid wrong-port authority"))?;
+        prop_assert!(!rule.matches(&wrong_port));
+    }
+
+    #[test]
+    fn default_destination_screening_blocks_special_use_addresses(
+        [a, b, c] in any::<[u8; 3]>(),
+        private_second in 16..32_u8,
+        port in 1..=u16::MAX,
+    ) {
+        let private = [
+            Ipv4Addr::new(127, a, b, c),
+            Ipv4Addr::new(169, 254, b, c),
+            Ipv4Addr::new(169, 254, 169, 254),
+            Ipv4Addr::new(10, a, b, c),
+            Ipv4Addr::new(172, private_second, b, c),
+            Ipv4Addr::new(192, 168, b, c),
+        ];
+        let stopping = std::sync::atomic::AtomicBool::new(false);
+        let resolver = super::Resolver::new();
+        for ip in private.into_iter().flat_map(|ip| [
+            IpAddr::V4(ip), IpAddr::V6(ip.to_ipv6_mapped()),
+        ]).chain([
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, u16::from(b), u16::from(c))),
+        ]) {
+            let raw = SocketAddr::new(ip, port).to_string();
+            let target = Authority::parse(&raw, None)
+                .ok_or_else(|| TestCaseError::fail("invalid literal authority"))?;
+            prop_assert!(!permitted(ip, false), "screening allowed {}", ip);
+            prop_assert_eq!(
+                resolver.pin(&target, false, &stopping),
+                Err(EgressBlockReason::PrivateDestination),
+            );
+        }
+        let public = SocketAddr::new(Ipv4Addr::new(8, 8, b, c).into(), port);
+        let target = Authority::parse(&public.to_string(), None)
+            .ok_or_else(|| TestCaseError::fail("invalid public authority"))?;
+        prop_assert_eq!(resolver.pin(&target, false, &stopping), Ok(vec![public]));
+    }
+
+    #[test]
+    fn broker_rejects_non_single_line_values_and_empty_host_rules(
+        before in r"[^\r\n\x00]{0,24}",
+        after in r"[^\r\n\x00]{0,24}",
+    ) {
+        let clean = format!("fixture-{before}-{after}");
+        let config = EgressProxyConfig { tls_mitm_enabled: false, ..EgressProxyConfig::default() };
+        let valid = binding("API_KEY", &clean, "example.com".into());
+        let broker = EgressProxyBroker::start(vec![valid], config.clone())
+            .map_err(|error| TestCaseError::fail(format!("valid binding rejected: {error}")))?;
+        prop_assert!(broker.shutdown().is_empty());
+
+        let empty = EgressSecretBinding {
+            env_name: "API_KEY".into(),
+            secret_value: env_value(&clean),
+            allowed_hosts: vec![],
+        };
+        let result = EgressProxyBroker::start(vec![empty], config);
+        prop_assert!(matches!(result, Err(EgressProxyError::InvalidBinding)));
+
+        for tls_mitm_enabled in [false, true] {
+            let config = EgressProxyConfig { tls_mitm_enabled, ..EgressProxyConfig::default() };
+            for invalid in ['\r', '\n', '\0'] {
+                let raw = format!("{before}{invalid}{after}");
+                let result = EgressProxyBroker::start(
+                    vec![binding("API_KEY", &raw, "example.com".into())],
+                    config.clone(),
+                );
+                prop_assert!(matches!(result, Err(EgressProxyError::InvalidBinding)));
+            }
+        }
+    }
+
+    // TLA+ OnlyScreenedRequestsForward and Lean host_authority_mismatch_rejected.
+    #[test]
+    fn mismatched_host_header_never_delivers_a_binding(
+        label in "[a-z][a-z0-9]{0,10}",
+        secret in "fixture-secret-[0-9a-f]{16}",
+        mask in any::<u64>(),
+        wrong_port in any::<bool>(),
+    ) {
+        let server = listener()?;
+        let upstream = server.local_addr()?;
+        let broker = EgressProxyBroker::start(
+            vec![binding("API_KEY", &secret, upstream.to_string())],
+            EgressProxyConfig { tls_mitm_enabled: false, ..allow_loopback() },
+        ).map_err(|error| TestCaseError::fail(format!("broker startup failed: {error}")))?;
+        let env = broker.child_env_overrides();
+        let token = env.get("API_KEY")
+            .ok_or_else(|| TestCaseError::fail("missing placeholder"))?.as_str();
+        let auth = proxy_auth(&broker)?;
+        let host = if wrong_port {
+            format!("127.0.0.1.:{}", if upstream.port() == 80 { 81 } else { 80 })
+        } else {
+            format!("{}.:{}", mixed_case(&format!("{label}.example.com"), mask), upstream.port())
+        };
+        let response = request(&broker, format!(
+            "GET http://{upstream}/ HTTP/1.1\r\nHost: {host}\r\nProxy-Authorization: Basic {auth}\r\nAuthorization: Bearer {token}\r\n\r\n",
+        ).as_bytes())?;
+        prop_assert!(response.starts_with(b"HTTP/1.1 400 "));
+        prop_assert!(!response.windows(secret.len()).any(|window| window == secret.as_bytes()));
+        prop_assert!(!response.windows(auth.len()).any(|window| window == auth.as_bytes()));
+        prop_assert_eq!(server.accept().err().map(|error| error.kind()), Some(io::ErrorKind::WouldBlock));
+        let events = broker.shutdown();
+        prop_assert!(matches!(events.as_slice(), [EgressEvent::Blocked {
+            env_name, reason: EgressBlockReason::InvalidRequest, ..
+        }] if env_name.is_empty()), "unexpected broker events: {:?}", events);
+    }
+}
 
 pub(super) const SECRET: &str = "synthetic-&echo=\"value\"";
 pub(super) const WAIT: Duration = Duration::from_secs(5);

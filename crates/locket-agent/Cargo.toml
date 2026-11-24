@@ -42,5 +42,6 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync"
 rustix = { workspace = true, features = ["net"] }
 
 [dev-dependencies]
+proptest = { workspace = true }
 x25519-dalek = { workspace = true, features = ["static_secrets"] }
 tempfile = { workspace = true }

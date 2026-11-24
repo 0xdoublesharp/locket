@@ -3,6 +3,8 @@
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::panic)]
 
+mod authz_conformance;
+
 use super::{
     AgentMethod, DEFAULT_MAX_MESSAGE_SIZE, ErrorEnvelope, ListAuditResponse, ListSecretsResponse,
     LockState, PROTOCOL_VERSION, ProtocolError, RequestEnvelope, ResponseEnvelope,
