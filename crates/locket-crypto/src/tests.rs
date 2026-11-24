@@ -573,6 +573,7 @@ fn recovery_code_round_trips_with_and_without_checksum() -> Result<(), CryptoErr
     assert_eq!(recovery_code_decode(&encoded)?, code_bytes);
     assert_eq!(recovery_code_decode(&encoded[..RECOVERY_CODE_DATA_CHARS])?, code_bytes);
     assert_eq!(recovery_code_decode(&grouped)?, code_bytes);
+    assert_eq!(recovery_code_decode(&grouped.replace('-', " ").to_ascii_lowercase())?, code_bytes);
     Ok(())
 }
 
@@ -886,7 +887,7 @@ fn xchacha20_poly1305_reads_0_10_ciphertext_and_wrapped_key() -> Result<(), Cryp
         141, 39, 41, 127, 62, 94, 237, 178, 44, 186, 201, 154, 206, 140, 252, 183, 94, 19, 233,
     ];
     let plaintext = b"synthetic legacy secret";
-    assert_eq!(super::aead::aead_decrypt(&key, &nonce, &ciphertext, aad)?, plaintext);
+    assert_eq!(super::aead::aead_decrypt(&key, &nonce, &ciphertext, aad)?.as_slice(), plaintext);
     assert_eq!(super::aead::aead_encrypt(&key, &nonce, plaintext, aad)?, ciphertext);
 
     let wrapped = super::WrappedKeyMaterial {

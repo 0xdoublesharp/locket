@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use data_encoding::BASE64URL_NOPAD;
 use keyring_core::Entry;
 use locket_crypto::{KEY_LEN, KeyBytes};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::error::PlatformError;
 
@@ -56,10 +56,10 @@ impl MasterKeyStore for KeyringMasterKeyStore {
         entry.set_password(&encode_key(master_key)).map_err(PlatformError::Keyring)
     }
 
-    #[allow(clippy::significant_drop_tightening)]
     fn load_master_key(&self, project_id: &str) -> Result<Zeroizing<KeyBytes>, PlatformError> {
         let entry = master_key_entry(project_id)?;
-        let encoded = entry.get_password().map_err(map_keyring_get_error)?;
+        let encoded = Zeroizing::new(entry.get_secret().map_err(map_keyring_get_error)?);
+        drop(entry);
         decode_key(&encoded)
     }
 
@@ -72,7 +72,7 @@ impl MasterKeyStore for KeyringMasterKeyStore {
 /// In-memory master-key store for short-lived operations and deterministic tests.
 #[derive(Default)]
 pub struct MemoryMasterKeyStore {
-    key: Mutex<Option<(String, KeyBytes)>>,
+    key: Mutex<Option<(String, Zeroizing<KeyBytes>)>>,
 }
 
 impl std::fmt::Debug for MemoryMasterKeyStore {
@@ -80,54 +80,33 @@ impl std::fmt::Debug for MemoryMasterKeyStore {
         formatter.debug_struct("MemoryMasterKeyStore").finish_non_exhaustive()
     }
 }
-impl Drop for MemoryMasterKeyStore {
-    fn drop(&mut self) {
-        let key = self.key.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((_, bytes)) = key.as_mut() {
-            bytes.zeroize();
-        }
-    }
-}
-
 impl MasterKeyStore for MemoryMasterKeyStore {
     fn store_master_key(
         &self,
         project_id: &str,
         master_key: &KeyBytes,
     ) -> Result<(), PlatformError> {
-        {
-            let mut guard = self.key.lock().map_err(|_| PlatformError::MemoryPoisoned)?;
-            if let Some((_, old_key)) = guard.as_mut() {
-                old_key.zeroize();
-            }
-            *guard = Some((project_id.to_owned(), *master_key));
-        }
+        *self.key.lock().map_err(|_| PlatformError::MemoryPoisoned)? =
+            Some((project_id.to_owned(), Zeroizing::new(*master_key)));
         Ok(())
     }
 
     fn load_master_key(&self, project_id: &str) -> Result<Zeroizing<KeyBytes>, PlatformError> {
-        let loaded = {
-            let guard = self.key.lock().map_err(|_| PlatformError::MemoryPoisoned)?;
-            let Some((stored_project_id, key)) = guard.as_ref() else {
-                return Err(PlatformError::MasterKeyNotFound);
-            };
-            let loaded = if stored_project_id == project_id { Some(*key) } else { None };
-            drop(guard);
-            loaded
-        };
-
-        loaded.map(Zeroizing::new).ok_or(PlatformError::MasterKeyNotFound)
+        let guard = self.key.lock().map_err(|_| PlatformError::MemoryPoisoned)?;
+        let loaded = guard
+            .as_ref()
+            .filter(|(stored_project_id, _)| stored_project_id == project_id)
+            .map(|(_, key)| key.clone());
+        drop(guard);
+        loaded.ok_or(PlatformError::MasterKeyNotFound)
     }
 
     fn delete_master_key(&self, project_id: &str) -> Result<(), PlatformError> {
-        {
-            let mut guard = self.key.lock().map_err(|_| PlatformError::MemoryPoisoned)?;
-            if guard.as_ref().is_some_and(|(stored_project_id, _)| stored_project_id == project_id)
-                && let Some((_, mut key)) = guard.take()
-            {
-                key.zeroize();
-            }
+        let mut guard = self.key.lock().map_err(|_| PlatformError::MemoryPoisoned)?;
+        if guard.as_ref().is_some_and(|(stored_project_id, _)| stored_project_id == project_id) {
+            *guard = None;
         }
+        drop(guard);
         Ok(())
     }
 }
@@ -135,7 +114,7 @@ impl MasterKeyStore for MemoryMasterKeyStore {
 /// Deterministic master-key store mock with per-operation failure injection.
 #[derive(Debug, Default)]
 pub struct MockMasterKeyStore {
-    key: Mutex<Option<(String, KeyBytes)>>,
+    store: MemoryMasterKeyStore,
     failures: Mutex<MockMasterKeyStoreFailures>,
 }
 
@@ -225,46 +204,21 @@ impl MasterKeyStore for MockMasterKeyStore {
         if let Some(error) = self.configured_failure(|failures| failures.store)? {
             return Err(error);
         }
-        let mut guard = self.key.lock().map_err(|_| PlatformError::MemoryPoisoned)?;
-        if let Some((_, old_key)) = guard.as_mut() {
-            old_key.zeroize();
-        }
-        *guard = Some((project_id.to_owned(), *master_key));
-        drop(guard);
-        Ok(())
+        self.store.store_master_key(project_id, master_key)
     }
 
     fn load_master_key(&self, project_id: &str) -> Result<Zeroizing<KeyBytes>, PlatformError> {
         if let Some(error) = self.configured_failure(|failures| failures.load)? {
             return Err(error);
         }
-        let loaded = {
-            let guard = self.key.lock().map_err(|_| PlatformError::MemoryPoisoned)?;
-            let Some((stored_project_id, key)) = guard.as_ref() else {
-                return Err(PlatformError::MasterKeyNotFound);
-            };
-            if stored_project_id != project_id {
-                return Err(PlatformError::MasterKeyNotFound);
-            }
-            let loaded = *key;
-            drop(guard);
-            loaded
-        };
-        Ok(Zeroizing::new(loaded))
+        self.store.load_master_key(project_id)
     }
 
     fn delete_master_key(&self, project_id: &str) -> Result<(), PlatformError> {
         if let Some(error) = self.configured_failure(|failures| failures.delete)? {
             return Err(error);
         }
-        let mut guard = self.key.lock().map_err(|_| PlatformError::MemoryPoisoned)?;
-        if guard.as_ref().is_some_and(|(stored_project_id, _)| stored_project_id == project_id)
-            && let Some((_, mut key)) = guard.take()
-        {
-            key.zeroize();
-        }
-        drop(guard);
-        Ok(())
+        self.store.delete_master_key(project_id)
     }
 }
 
@@ -276,21 +230,17 @@ pub fn master_key_account(project_id: &str) -> String {
     format!("{MASTER_KEY_ACCOUNT_PREFIX}{project_id}")
 }
 
-pub fn encode_key(master_key: &KeyBytes) -> String {
-    BASE64URL_NOPAD.encode(master_key)
+pub fn encode_key(key: &KeyBytes) -> Zeroizing<String> {
+    Zeroizing::new(BASE64URL_NOPAD.encode(key))
 }
 
-pub fn decode_key(encoded: &str) -> Result<Zeroizing<KeyBytes>, PlatformError> {
-    let mut decoded = Zeroizing::new(
-        BASE64URL_NOPAD.decode(encoded.as_bytes()).map_err(|_| PlatformError::InvalidMasterKey)?,
-    );
-    if decoded.len() != KEY_LEN {
-        decoded.zeroize();
+pub fn decode_key(encoded: &[u8]) -> Result<Zeroizing<KeyBytes>, PlatformError> {
+    if encoded.len() != BASE64URL_NOPAD.encode_len(KEY_LEN) {
         return Err(PlatformError::InvalidMasterKey);
     }
 
     let mut key = Zeroizing::new([0_u8; KEY_LEN]);
-    key.copy_from_slice(&decoded);
+    BASE64URL_NOPAD.decode_mut(encoded, &mut *key).map_err(|_| PlatformError::InvalidMasterKey)?;
     Ok(key)
 }
 

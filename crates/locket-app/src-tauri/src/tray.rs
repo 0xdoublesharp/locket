@@ -401,9 +401,9 @@ pub const fn tray_state_for_status(status: &StatusPayload) -> TrayIconState {
 }
 
 /// Metadata-only tooltip for a status-derived tray update.
-#[allow(dead_code)]
+#[cfg(test)]
 #[must_use]
-pub fn tooltip_for_status(status: &StatusPayload) -> String {
+fn tooltip_for_status(status: &StatusPayload) -> String {
     tooltip_for_status_context(status, &TrayPrivacyContext::default())
 }
 

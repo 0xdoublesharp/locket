@@ -1,9 +1,10 @@
 //! Internal AEAD encrypt/decrypt helpers and shared input validation.
 
 use chacha20poly1305::{
-    Key, XChaCha20Poly1305, XNonce,
+    XChaCha20Poly1305,
     aead::{Aead, KeyInit, Payload},
 };
+use zeroize::Zeroizing;
 
 use crate::error::{CryptoError, CryptoResult};
 use crate::{KeyBytes, NonceBytes};
@@ -18,9 +19,9 @@ pub fn aead_encrypt(
     plaintext: &[u8],
     aad: &[u8],
 ) -> CryptoResult<Vec<u8>> {
-    let cipher = XChaCha20Poly1305::new(&Key::from(*key));
+    let cipher = XChaCha20Poly1305::new(key.into());
     cipher
-        .encrypt(&XNonce::from(*nonce), Payload { msg: plaintext, aad })
+        .encrypt(nonce.into(), Payload { msg: plaintext, aad })
         .map_err(|_| CryptoError::EncryptionFailed)
 }
 
@@ -29,9 +30,10 @@ pub fn aead_decrypt(
     nonce: &NonceBytes,
     ciphertext: &[u8],
     aad: &[u8],
-) -> CryptoResult<Vec<u8>> {
-    let cipher = XChaCha20Poly1305::new(&Key::from(*key));
+) -> CryptoResult<Zeroizing<Vec<u8>>> {
+    let cipher = XChaCha20Poly1305::new(key.into());
     cipher
-        .decrypt(&XNonce::from(*nonce), Payload { msg: ciphertext, aad })
+        .decrypt(nonce.into(), Payload { msg: ciphertext, aad })
+        .map(Zeroizing::new)
         .map_err(|_| CryptoError::DecryptionFailed)
 }

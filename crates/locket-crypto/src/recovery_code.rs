@@ -1,5 +1,7 @@
 //! Recovery code encoding/decoding using Crockford Base32.
 
+use zeroize::Zeroizing;
+
 use crate::error::{CryptoError, CryptoResult};
 use crate::{RECOVERY_CODE_BYTES, RECOVERY_CODE_DATA_CHARS, RECOVERY_CODE_TOTAL_CHARS};
 
@@ -16,8 +18,6 @@ const CROCKFORD_CHECK: &[u8; 37] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ*~$=U";
 pub fn recovery_code_encode(bytes: &[u8; RECOVERY_CODE_BYTES]) -> [u8; RECOVERY_CODE_TOTAL_CHARS] {
     let mut out = [0u8; RECOVERY_CODE_TOTAL_CHARS];
     // Encode 160 bits as 32 x 5-bit Crockford Base32 symbols.
-    // acc is always < 32, usize cast is safe.
-    #[allow(clippy::cast_possible_truncation)]
     for (i, slot) in out[..RECOVERY_CODE_DATA_CHARS].iter_mut().enumerate() {
         let bit_offset = i * 5;
         let byte_idx = bit_offset / 8;
@@ -26,36 +26,21 @@ pub fn recovery_code_encode(bytes: &[u8; RECOVERY_CODE_BYTES]) -> [u8; RECOVERY_
             (bytes[byte_idx] >> (3 - bit_shift)) & 0x1F
         } else {
             let lo = (bytes[byte_idx] << (bit_shift - 3)) & 0x1F;
-            let hi = if byte_idx + 1 < RECOVERY_CODE_BYTES {
-                bytes[byte_idx + 1] >> (11 - bit_shift)
-            } else {
-                0
-            };
+            let hi = bytes[byte_idx + 1] >> (11 - bit_shift);
             lo | hi
         };
-        *slot = CROCKFORD_ALPHABET[bits as usize];
-    }
-    // Crockford checksum: treat bytes as a big-endian integer mod 37.
-    // For 160-bit values, accumulate mod 37 byte by byte.
-    let mut acc: u64 = 0;
-    for &b in bytes {
-        // acc = (acc * 256 + b) mod 37
-        acc = (acc * 256 + u64::from(b)) % 37;
+        *slot = CROCKFORD_ALPHABET[usize::from(bits)];
     }
     // The checksum is one symbol for (acc mod 37). We store two checksum chars
     // for forward compatibility: char 33 is the primary checksum, char 34 is 0-padded.
-    // acc is always < 37 after mod, usize cast is safe.
-    #[allow(clippy::cast_possible_truncation)]
-    {
-        out[RECOVERY_CODE_DATA_CHARS] = CROCKFORD_CHECK[acc as usize];
-    }
+    out[RECOVERY_CODE_DATA_CHARS] = checksum_symbol(bytes);
     out[RECOVERY_CODE_DATA_CHARS + 1] = CROCKFORD_CHECK[0]; // reserved, always '0'
     out
 }
 
 /// Decodes 32 or 34 Crockford Base32 characters back into 20 raw bytes.
 ///
-/// Accepts uppercase and lowercase input. Ignores hyphens (grouping separators).
+/// Accepts uppercase and lowercase input. Ignores spaces and hyphens.
 /// Returns `Err(CryptoError::InvalidSecretValue)` on invalid characters or checksum mismatch.
 ///
 /// # Errors
@@ -63,24 +48,13 @@ pub fn recovery_code_encode(bytes: &[u8; RECOVERY_CODE_BYTES]) -> [u8; RECOVERY_
 /// Returns [`CryptoError::InvalidSecretValue`] if the input is too short, contains
 /// invalid characters, or the checksum does not match.
 pub fn recovery_code_decode(input: &str) -> CryptoResult<[u8; RECOVERY_CODE_BYTES]> {
-    // Strip grouping separators, normalize to uppercase.
-    let chars: Vec<u8> =
-        input.bytes().filter(|&b| b != b'-' && b != b' ').map(|b| b.to_ascii_uppercase()).collect();
-
-    if !matches!(chars.len(), RECOVERY_CODE_DATA_CHARS | RECOVERY_CODE_TOTAL_CHARS) {
-        return Err(CryptoError::InvalidSecretValue);
-    }
-
-    // Decode 32 data characters into 160 bits.
-    let mut bits = [0u8; RECOVERY_CODE_DATA_CHARS];
-    for (i, &c) in chars[..RECOVERY_CODE_DATA_CHARS].iter().enumerate() {
-        let val = crockford_decode_char(c)?;
-        bits[i] = val;
-    }
+    let mut chars =
+        input.bytes().filter(|&b| b != b'-' && b != b' ').map(|b| b.to_ascii_uppercase());
 
     // Pack 32 x 5-bit values into 20 bytes.
-    let mut bytes = [0u8; RECOVERY_CODE_BYTES];
-    for (i, &val) in bits.iter().enumerate().take(RECOVERY_CODE_DATA_CHARS) {
+    let mut bytes = Zeroizing::new([0u8; RECOVERY_CODE_BYTES]);
+    for i in 0..RECOVERY_CODE_DATA_CHARS {
+        let val = crockford_decode_char(chars.next().ok_or(CryptoError::InvalidSecretValue)?)?;
         let bit_offset = i * 5;
         let byte_idx = bit_offset / 8;
         let bit_shift = bit_offset % 8;
@@ -88,28 +62,27 @@ pub fn recovery_code_decode(input: &str) -> CryptoResult<[u8; RECOVERY_CODE_BYTE
             bytes[byte_idx] |= val << (3 - bit_shift);
         } else {
             bytes[byte_idx] |= val >> (bit_shift - 3);
-            if byte_idx + 1 < RECOVERY_CODE_BYTES {
-                bytes[byte_idx + 1] |= val << (11 - bit_shift);
-            }
+            bytes[byte_idx + 1] |= val << (11 - bit_shift);
         }
     }
 
     // Verify checksum if provided.
-    if chars.len() == RECOVERY_CODE_TOTAL_CHARS {
-        let expected_check = chars[RECOVERY_CODE_DATA_CHARS];
-        let mut acc: u64 = 0;
-        for &b in &bytes {
-            acc = (acc * 256 + u64::from(b)) % 37;
-        }
-        // acc is always < 37 after mod, usize cast is safe.
-        #[allow(clippy::cast_possible_truncation)]
-        let computed_symbol = CROCKFORD_CHECK[acc as usize];
-        if expected_check != computed_symbol || chars[RECOVERY_CODE_DATA_CHARS + 1] != b'0' {
-            return Err(CryptoError::InvalidSecretValue);
-        }
+    if let Some(check) = chars.next()
+        && (check != checksum_symbol(&bytes)
+            || chars.next() != Some(b'0')
+            || chars.next().is_some())
+    {
+        return Err(CryptoError::InvalidSecretValue);
     }
 
-    Ok(bytes)
+    Ok(*bytes)
+}
+
+fn checksum_symbol(bytes: &[u8; RECOVERY_CODE_BYTES]) -> u8 {
+    // Treat the code as a big-endian integer modulo the checksum alphabet length.
+    let remainder =
+        bytes.iter().fold(0, |acc, &byte| (acc * 256 + usize::from(byte)) % CROCKFORD_CHECK.len());
+    CROCKFORD_CHECK[remainder]
 }
 
 const fn crockford_decode_char(c: u8) -> CryptoResult<u8> {

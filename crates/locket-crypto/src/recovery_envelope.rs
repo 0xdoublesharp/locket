@@ -7,7 +7,7 @@ use zeroize::Zeroizing;
 
 use crate::aad::{
     RECOVERY_ENTRY_AAD_V1_PREFIX, RECOVERY_ENTRY_HKDF_V1_PREFIX, append_canonical_field,
-    append_u16_le,
+    append_u16_le, canonical_fields_len,
 };
 use crate::aead::{aead_decrypt, aead_encrypt};
 use crate::error::{CryptoError, CryptoResult};
@@ -86,11 +86,14 @@ pub fn recovery_entry_key_v1(
     entry_id: &str,
     kdf_profile_id: &str,
 ) -> CryptoResult<Zeroizing<KeyBytes>> {
-    let mut info = Vec::new();
+    let fields =
+        [("entry_kind", entry_kind), ("entry_id", entry_id), ("kdf_profile_id", kdf_profile_id)];
+    let mut info =
+        Vec::with_capacity(RECOVERY_ENTRY_HKDF_V1_PREFIX.len() + canonical_fields_len(&fields));
     info.extend_from_slice(RECOVERY_ENTRY_HKDF_V1_PREFIX);
-    append_canonical_field(&mut info, "entry_kind", entry_kind)?;
-    append_canonical_field(&mut info, "entry_id", entry_id)?;
-    append_canonical_field(&mut info, "kdf_profile_id", kdf_profile_id)?;
+    for (name, value) in fields {
+        append_canonical_field(&mut info, name, value)?;
+    }
     let hkdf = Hkdf::<Sha256>::new(None, unwrap_root);
     let mut key = Zeroizing::new([0u8; KEY_LEN]);
     hkdf.expand(&info, &mut *key).map_err(|_| CryptoError::KeyDerivationFailed)?;
@@ -109,12 +112,15 @@ pub fn recovery_entry_aad_v1(
     entry_kind: &str,
     entry_id: &str,
 ) -> CryptoResult<Vec<u8>> {
-    let mut aad = Vec::new();
+    let fields =
+        [("kdf_profile_id", kdf_profile_id), ("entry_kind", entry_kind), ("entry_id", entry_id)];
+    let mut aad =
+        Vec::with_capacity(RECOVERY_ENTRY_AAD_V1_PREFIX.len() + 2 + canonical_fields_len(&fields));
     aad.extend_from_slice(RECOVERY_ENTRY_AAD_V1_PREFIX);
     append_u16_le(&mut aad, RECOVERY_ENVELOPE_SCHEMA_V1);
-    append_canonical_field(&mut aad, "kdf_profile_id", kdf_profile_id)?;
-    append_canonical_field(&mut aad, "entry_kind", entry_kind)?;
-    append_canonical_field(&mut aad, "entry_id", entry_id)?;
+    for (name, value) in fields {
+        append_canonical_field(&mut aad, name, value)?;
+    }
     Ok(aad)
 }
 
@@ -152,5 +158,5 @@ pub fn open_recovery_entry_v1(
 ) -> CryptoResult<Zeroizing<Vec<u8>>> {
     let entry_key = recovery_entry_key_v1(unwrap_root, entry_kind, entry_id, kdf_profile_id)?;
     let aad = recovery_entry_aad_v1(kdf_profile_id, entry_kind, entry_id)?;
-    Ok(Zeroizing::new(aead_decrypt(&entry_key, nonce, ciphertext, &aad)?))
+    aead_decrypt(&entry_key, nonce, ciphertext, &aad)
 }

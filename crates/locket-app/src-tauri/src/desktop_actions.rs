@@ -804,7 +804,7 @@ pub(crate) fn native_binding() -> Result<locket_agent::GrantBinding, super::Agen
 pub(crate) async fn invoke_granted<R: serde::de::DeserializeOwned>(
     method: locket_agent::AgentMethod,
     action: locket_agent::GrantAction,
-    payload: serde_json::Value,
+    payload: impl GrantPayload,
     store: &Path,
     project_id: &str,
     profile_id: &str,
@@ -826,11 +826,30 @@ pub(crate) async fn invoke_granted<R: serde::de::DeserializeOwned>(
     invoke_granted_at(&super::resolve_socket_path(), method, action, payload, store, &context).await
 }
 
+pub(crate) trait GrantPayload: serde::Serialize {
+    fn authorize(
+        &mut self,
+        grant: &locket_agent::GrantIdPayload,
+        binding: locket_agent::GrantBinding,
+    );
+}
+
+impl GrantPayload for serde_json::Value {
+    fn authorize(
+        &mut self,
+        grant: &locket_agent::GrantIdPayload,
+        binding: locket_agent::GrantBinding,
+    ) {
+        self["grant_id"] = serde_json::json!(grant.grant_id);
+        self["binding"] = serde_json::json!(binding);
+    }
+}
+
 async fn invoke_granted_at<R: serde::de::DeserializeOwned>(
     socket: &Path,
     method: locket_agent::AgentMethod,
     action: locket_agent::GrantAction,
-    mut payload: serde_json::Value,
+    mut payload: impl GrantPayload,
     store: &Path,
     context: &DesktopProjectContext,
 ) -> Result<R, super::AgentClientError> {
@@ -859,8 +878,7 @@ async fn invoke_granted_at<R: serde::de::DeserializeOwned>(
             reason: "Project metadata changed before authorization. Refresh and retry.".into(),
         });
     }
-    payload["grant_id"] = serde_json::json!(grant.grant_id);
-    payload["binding"] = serde_json::json!(binding);
+    payload.authorize(&grant, binding);
     let result = super::invoke_method(socket, method, &payload).await;
     // The grant belongs only to this explicit user action, including a failed action.
     let _: Result<serde_json::Value, _> =

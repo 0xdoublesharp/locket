@@ -63,6 +63,9 @@ pub enum DockerError {
         /// Variable name only; never its value.
         name: String,
     },
+    /// A secret name is unsafe as an environment variable or Docker env argument.
+    #[error("invalid Docker environment variable name")]
+    InvalidEnvironmentName,
     /// No Docker or Compose argv was supplied.
     #[error("empty Docker command")]
     EmptyCommand,
@@ -179,7 +182,8 @@ fn valid_remote_address(scheme: &str, address: &str) -> bool {
 ///
 /// # Errors
 ///
-/// Returns [`DockerError::RoutingSecretDenied`] for a Docker routing variable.
+/// Returns [`DockerError::RoutingSecretDenied`] for a Docker routing variable
+/// or [`DockerError::InvalidEnvironmentName`] for an invalid name.
 pub fn validate_injected_names<'a>(
     names: impl IntoIterator<Item = &'a str>,
 ) -> Result<(), DockerError> {
@@ -196,6 +200,9 @@ pub fn validate_injected_names<'a>(
     for name in names {
         if ROUTING_VARIABLES.iter().any(|reserved| name.eq_ignore_ascii_case(reserved)) {
             return Err(DockerError::RoutingSecretDenied { name: name.to_owned() });
+        }
+        if name.is_empty() || name.starts_with('-') || name.contains(['=', '\0']) {
+            return Err(DockerError::InvalidEnvironmentName);
         }
     }
     Ok(())
@@ -214,6 +221,7 @@ pub fn validate_injected_names<'a>(
 /// [`DockerError::RemoteContextDenied`] when a remote endpoint is detected
 /// without explicit policy permission. Unknown endpoints and routing secrets
 /// return [`DockerError::UnknownEndpoint`] and [`DockerError::RoutingSecretDenied`].
+/// Invalid secret names return [`DockerError::InvalidEnvironmentName`].
 pub fn prepare_docker_run(
     argv: &[String],
     base_env: &EnvMap,
@@ -221,7 +229,7 @@ pub fn prepare_docker_run(
     endpoint: Option<&str>,
     allow_remote: bool,
 ) -> Result<DockerInjectionPlan, DockerError> {
-    validate_remote(endpoint, allow_remote)?;
+    let context_class = validate_remote(endpoint, allow_remote)?;
     validate_injected_names(locket_env.keys().map(String::as_str))?;
     validate_program(argv, "docker")?;
     validate_subcommand(argv, "run")?;
@@ -240,7 +248,7 @@ pub fn prepare_docker_run(
         env: merged_env(base_env, locket_env),
         injected_names,
         delivery_mode: DockerDeliveryMode::EnvironmentNames,
-        context_class: classify_docker_endpoint(endpoint),
+        context_class,
     })
 }
 
@@ -254,6 +262,7 @@ pub fn prepare_docker_run(
 /// [`DockerError::RemoteContextDenied`] when a remote endpoint is detected
 /// without explicit policy permission. Unknown endpoints and routing secrets
 /// return [`DockerError::UnknownEndpoint`] and [`DockerError::RoutingSecretDenied`].
+/// Invalid secret names return [`DockerError::InvalidEnvironmentName`].
 pub fn prepare_compose(
     argv: &[String],
     base_env: &EnvMap,
@@ -261,7 +270,7 @@ pub fn prepare_compose(
     endpoint: Option<&str>,
     allow_remote: bool,
 ) -> Result<DockerInjectionPlan, DockerError> {
-    validate_remote(endpoint, allow_remote)?;
+    let context_class = validate_remote(endpoint, allow_remote)?;
     validate_injected_names(locket_env.keys().map(String::as_str))?;
     validate_program(argv, "docker")?;
     validate_subcommand(argv, "compose")?;
@@ -272,15 +281,18 @@ pub fn prepare_compose(
         env: merged_env(base_env, locket_env),
         injected_names,
         delivery_mode: DockerDeliveryMode::EnvironmentNames,
-        context_class: classify_docker_endpoint(endpoint),
+        context_class,
     })
 }
 
-fn validate_remote(endpoint: Option<&str>, allow_remote: bool) -> Result<(), DockerError> {
+fn validate_remote(
+    endpoint: Option<&str>,
+    allow_remote: bool,
+) -> Result<DockerContextClass, DockerError> {
     match classify_docker_endpoint(endpoint) {
         DockerContextClass::Unknown => Err(DockerError::UnknownEndpoint),
         DockerContextClass::Remote if !allow_remote => Err(DockerError::RemoteContextDenied),
-        _ => Ok(()),
+        class => Ok(class),
     }
 }
 
@@ -308,7 +320,7 @@ fn validate_subcommand(argv: &[String], expected: &str) -> Result<(), DockerErro
 
 fn merged_env(base_env: &EnvMap, locket_env: &EnvMap) -> EnvMap {
     let mut env = base_env.clone();
-    env.extend(locket_env.clone());
+    env.extend(locket_env.iter().map(|(name, value)| (name.clone(), value.clone())));
     env
 }
 
@@ -373,6 +385,21 @@ mod tests {
         assert!(!plan.argv.iter().any(|item| item.contains("postgres://secret")));
         assert!(!plan.argv.iter().any(|item| item.contains("hidden")));
         Ok(())
+    }
+
+    #[test]
+    fn docker_helpers_reject_invalid_environment_names() {
+        for name in ["", "INVALID=NAME", "INVALID\0NAME", "-INVALID"] {
+            for subcommand in ["run", "compose"] {
+                let prepare =
+                    if subcommand == "run" { prepare_docker_run } else { prepare_compose };
+                let argv = ["docker".to_owned(), subcommand.to_owned()];
+                assert_eq!(
+                    prepare(&argv, &EnvMap::new(), &env(&[(name, "value")]), None, false),
+                    Err(DockerError::InvalidEnvironmentName)
+                );
+            }
+        }
     }
 
     #[test]

@@ -7,6 +7,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use data_encoding::BASE64URL_NOPAD;
+use locket_crypto::{NONCE_LEN, NonceBytes};
 
 use crate::error::PlatformError;
 
@@ -18,9 +19,15 @@ pub fn decode_bytes(encoded: &str) -> Result<Vec<u8>, PlatformError> {
     BASE64URL_NOPAD.decode(encoded.as_bytes()).map_err(|_| PlatformError::InvalidPassphraseFallback)
 }
 
-pub fn decode_nonce(encoded: &str) -> Result<[u8; 24], PlatformError> {
-    let decoded = decode_bytes(encoded)?;
-    decoded.try_into().map_err(|_| PlatformError::InvalidPassphraseFallback)
+pub fn decode_nonce(encoded: &str) -> Result<NonceBytes, PlatformError> {
+    if encoded.len() != BASE64URL_NOPAD.encode_len(NONCE_LEN) {
+        return Err(PlatformError::InvalidPassphraseFallback);
+    }
+    let mut nonce = [0; NONCE_LEN];
+    BASE64URL_NOPAD
+        .decode_mut(encoded.as_bytes(), &mut nonce)
+        .map_err(|_| PlatformError::InvalidPassphraseFallback)?;
+    Ok(nonce)
 }
 
 pub fn validate_path_component(value: &str) -> Result<(), PlatformError> {
@@ -61,5 +68,19 @@ pub fn write_user_only_file(path: &Path, contents: &[u8]) -> Result<(), Platform
     let mut file = options.open(path)?;
     file.write_all(contents)?;
     file.sync_all()?;
+    Ok(())
+}
+
+pub fn replace_user_only_file(path: &Path, contents: &[u8]) -> Result<(), PlatformError> {
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+    temporary.write_all(contents)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    #[cfg(unix)]
+    fs::File::open(directory)?.sync_all()?;
     Ok(())
 }

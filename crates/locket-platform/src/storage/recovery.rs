@@ -8,7 +8,7 @@ use locket_crypto::NONCE_LEN;
 use serde::{Deserialize, Serialize};
 
 use crate::error::PlatformError;
-use crate::fs_helpers::{secure_directory, write_user_only_file};
+use crate::fs_helpers::{replace_user_only_file, secure_directory};
 
 /// Schema version for recovery KDF TOML files.
 pub const RECOVERY_KDF_TOML_VERSION: u32 = 1;
@@ -270,30 +270,14 @@ fn read_exact<'a>(cur: &mut usize, n: usize, data: &'a [u8]) -> Result<&'a [u8],
 }
 
 fn read_field_string(cur: &mut usize, data: &[u8]) -> Result<String, PlatformError> {
-    let err = || PlatformError::InvalidRecoveryEnvelope("truncated field".into());
-    if *cur + 2 > data.len() {
-        return Err(err());
-    }
-    let name_len = u16::from_le_bytes([data[*cur], data[*cur + 1]]) as usize;
-    *cur += 2;
-    if *cur + name_len > data.len() {
-        return Err(err());
-    }
-    *cur += name_len; // skip name bytes (we do not validate them here)
-    if *cur + 4 > data.len() {
-        return Err(err());
-    }
-    let value_len =
-        u32::from_le_bytes([data[*cur], data[*cur + 1], data[*cur + 2], data[*cur + 3]]) as usize;
-    *cur += 4;
-    if *cur + value_len > data.len() {
-        return Err(err());
-    }
-    let s = std::str::from_utf8(&data[*cur..*cur + value_len])
-        .map_err(|_| PlatformError::InvalidRecoveryEnvelope("non-utf8 field value".into()))?
-        .to_owned();
-    *cur += value_len;
-    Ok(s)
+    let name = read_exact(cur, 2, data)?;
+    let name_len = usize::from(u16::from_le_bytes([name[0], name[1]]));
+    read_exact(cur, name_len, data)?;
+    let value = read_exact(cur, 4, data)?;
+    let value_len = u32::from_le_bytes([value[0], value[1], value[2], value[3]]) as usize;
+    std::str::from_utf8(read_exact(cur, value_len, data)?)
+        .map(str::to_owned)
+        .map_err(|_| PlatformError::InvalidRecoveryEnvelope("non-utf8 field value".into()))
 }
 
 /// Loads and parses `kdf.toml` from a recovery directory.
@@ -335,7 +319,7 @@ pub fn save_recovery_kdf_toml(
     let path = recovery_dir.join("kdf.toml");
     let text =
         toml::to_string(kdf).map_err(|e| PlatformError::InvalidRecoveryEnvelope(e.to_string()))?;
-    write_user_only_file(&path, text.as_bytes())
+    replace_user_only_file(&path, text.as_bytes())
 }
 
 /// Loads and deserializes `envelope.bin` from a recovery directory.
@@ -436,28 +420,5 @@ pub fn decode_recovery_state(
 
 fn write_recovery_atomically(recovery_dir: &Path, data: &[u8]) -> Result<(), PlatformError> {
     secure_directory(recovery_dir)?;
-    let path = recovery_dir.join("envelope.bin");
-    let suffix = BASE64URL_NOPAD.encode(&locket_crypto::random_bytes::<16>()?);
-    let temporary = recovery_dir.join(format!(".envelope-{suffix}.tmp"));
-    let mut options = fs::OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let result = (|| -> Result<(), PlatformError> {
-        use std::io::Write;
-        let mut file = options.open(&temporary)?;
-        file.write_all(data)?;
-        file.sync_all()?;
-        fs::rename(&temporary, &path)?;
-        #[cfg(unix)]
-        fs::File::open(recovery_dir)?.sync_all()?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
+    replace_user_only_file(&recovery_dir.join("envelope.bin"), data)
 }

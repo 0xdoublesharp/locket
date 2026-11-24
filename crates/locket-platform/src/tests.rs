@@ -26,18 +26,41 @@ fn encodes_master_key_without_padding() -> Result<(), PlatformError> {
     let encoded = encode_key(&MASTER_KEY);
 
     assert!(!encoded.contains('='));
-    assert_eq!(&*decode_key(&encoded)?, &MASTER_KEY);
+    assert_eq!(&*decode_key(encoded.as_bytes())?, &MASTER_KEY);
     Ok(())
 }
 
 #[test]
 fn rejects_invalid_encoded_key_length() {
-    assert!(matches!(decode_key("AA"), Err(PlatformError::InvalidMasterKey)));
+    assert!(matches!(decode_key(b"AA"), Err(PlatformError::InvalidMasterKey)));
 }
 
 #[test]
 fn rejects_invalid_encoded_key_alphabet() {
-    assert!(matches!(decode_key("not valid base64"), Err(PlatformError::InvalidMasterKey)));
+    assert!(matches!(decode_key(b"not valid base64"), Err(PlatformError::InvalidMasterKey)));
+    let mut malformed = encode_key(&MASTER_KEY);
+    let last = malformed.len() - 1;
+    malformed.replace_range(last.., "!");
+    assert!(matches!(decode_key(malformed.as_bytes()), Err(PlatformError::InvalidMasterKey)));
+}
+
+#[cfg(unix)]
+#[test]
+fn replace_user_only_file_restricts_existing_permissions() -> Result<(), PlatformError> {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("envelope");
+    fs::write(&path, b"previous")?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
+
+    super::fs_helpers::replace_user_only_file(&path, b"replacement")?;
+
+    assert_eq!(fs::read(&path)?, b"replacement");
+    assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+    assert_eq!(fs::read_dir(directory.path())?.count(), 1);
+    Ok(())
 }
 
 #[test]
@@ -234,7 +257,7 @@ fn passphrase_fallback_round_trips_master_key() -> Result<(), PlatformError> {
 
     let envelope = std::fs::read_to_string(directory.path().join(format!("{PROJECT_ID}.toml")))?;
     assert!(!envelope.contains("fallback passphrase"));
-    assert!(!envelope.contains(&encode_key(&MASTER_KEY)));
+    assert!(!envelope.contains(encode_key(&MASTER_KEY).as_str()));
     assert!(envelope.contains("algorithm = \"argon2id\""));
     assert!(envelope.contains("m_cost = 32768"));
     Ok(())

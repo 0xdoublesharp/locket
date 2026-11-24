@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use locket_agent::{
-    AgentMethod, DEFAULT_MAX_MESSAGE_SIZE, ProtocolError, RequestEnvelope, ResponseEnvelope,
-    StatusEvent, StatusPayload, decode_response_frame, encode_frame,
+    AgentMethod, DEFAULT_MAX_MESSAGE_SIZE, PROTOCOL_VERSION, ProtocolError, ResponseEnvelope,
+    StatusEvent, StatusPayload, decode_response_frame,
 };
 use locket_core::{ErrorDisplayCopy, LocketError};
 use serde::{Serialize, de::DeserializeOwned};
@@ -20,6 +20,10 @@ type AgentStream = tokio::net::UnixStream;
 #[cfg(target_os = "windows")]
 type AgentStream = tokio::net::windows::named_pipe::NamedPipeClient;
 use tokio::sync::{Notify, mpsc};
+use zeroize::{Zeroize, Zeroizing};
+
+const FRAME_PREFIX_LEN: usize = size_of::<u32>();
+const FRAME_READ_CHUNK_SIZE: usize = 16 * 1024;
 
 /// Fallback socket subdirectory when no platform runtime directory is available.
 const DEFAULT_DATA_DIR: &str = ".locket";
@@ -219,12 +223,9 @@ pub async fn invoke_method<P: Serialize, R: DeserializeOwned>(
     method: AgentMethod,
     payload: &P,
 ) -> Result<R, AgentClientError> {
-    let payload_value = serde_json::to_value(payload).map_err(|error| {
-        AgentClientError::Protocol { reason: format!("payload serialization failed: {error}") }
-    })?;
+    let frame = encode_request(&new_request_id(), method, payload)?;
     let stream = connect(socket_path).await?;
-    let request = RequestEnvelope::new(new_request_id(), method, payload_value);
-    let response = round_trip(stream, &request).await?;
+    let response = round_trip(stream, method, frame).await?;
     decode_payload(response)
 }
 
@@ -287,16 +288,12 @@ async fn stream_unix_status_events_with_cancel(
 ) -> Result<(), AgentClientError> {
     let mut stream = connect(socket_path).await?;
     let subscribe_id = new_request_id();
-    let request = RequestEnvelope::new(
-        subscribe_id.clone(),
-        AgentMethod::SubscribeStatus,
-        serde_json::Value::Null,
-    );
-    let frame = encode_frame(&request, DEFAULT_MAX_MESSAGE_SIZE)?;
+    let frame = encode_request(&subscribe_id, AgentMethod::SubscribeStatus, &())?;
     stream
         .write_all(&frame)
         .await
         .map_err(|error| AgentClientError::Protocol { reason: format!("write failed: {error}") })?;
+    drop(frame);
     stream
         .flush()
         .await
@@ -307,12 +304,11 @@ async fn stream_unix_status_events_with_cancel(
         // observe the close to free the subscriber. The cancellation
         // path returns `Ok(())` regardless of whether the agent saw the
         // envelope before the socket closed.
-        let cancel_request = RequestEnvelope::new(
-            new_request_id(),
+        if let Ok(frame) = encode_request(
+            &new_request_id(),
             AgentMethod::CancelSubscription,
-            serde_json::json!({ "subscription_id": subscribe_id }),
-        );
-        if let Ok(frame) = encode_frame(&cancel_request, DEFAULT_MAX_MESSAGE_SIZE) {
+            &serde_json::json!({ "subscription_id": subscribe_id }),
+        ) {
             let _ = stream.write_all(&frame).await;
             let _ = stream.flush().await;
         }
@@ -361,13 +357,15 @@ async fn connect(socket_path: &Path) -> Result<AgentStream, AgentClientError> {
 
 async fn round_trip(
     mut stream: AgentStream,
-    request: &RequestEnvelope,
+    method: AgentMethod,
+    frame: Zeroizing<Vec<u8>>,
 ) -> Result<ResponseEnvelope, AgentClientError> {
-    let frame = encode_frame(request, DEFAULT_MAX_MESSAGE_SIZE)?;
-
-    let mutation = matches!(request.kind.as_str(), "ImportDotenv" | "ApplyPolicy" | "SetSecret");
+    let mutation = matches!(
+        method,
+        AgentMethod::ImportDotenv | AgentMethod::ApplyPolicy | AgentMethod::SetSecret
+    );
     let timeout = if mutation { Duration::from_secs(30) } else { REQUEST_TIMEOUT };
-    let result = tokio::time::timeout(timeout, exchange_frame(&mut stream, &frame)).await;
+    let result = tokio::time::timeout(timeout, exchange_frame(&mut stream, frame)).await;
     match result {
         Ok(Ok(envelope)) => Ok(envelope),
         Ok(Err(error)) => Err(error),
@@ -383,39 +381,106 @@ async fn round_trip(
 
 async fn exchange_frame(
     stream: &mut AgentStream,
-    frame: &[u8],
+    frame: Zeroizing<Vec<u8>>,
 ) -> Result<ResponseEnvelope, AgentClientError> {
     stream
-        .write_all(frame)
+        .write_all(&frame)
         .await
         .map_err(|error| AgentClientError::Protocol { reason: format!("write failed: {error}") })?;
+    drop(frame);
     stream
         .flush()
         .await
         .map_err(|error| AgentClientError::Protocol { reason: format!("flush failed: {error}") })?;
-    read_response_frame(stream).await
+    let mut buffer = Zeroizing::new(Vec::with_capacity(FRAME_READ_CHUNK_SIZE));
+    read_response_frame(stream, &mut buffer).await?.ok_or_else(|| AgentClientError::Protocol {
+        reason: "agent closed connection before response".to_owned(),
+    })
+}
+
+#[derive(Serialize)]
+struct Request<'a, P> {
+    v: u16,
+    id: &'a str,
+    kind: &'static str,
+    payload: &'a P,
+}
+
+fn encode_request<P: Serialize>(
+    id: &str,
+    method: AgentMethod,
+    payload: &P,
+) -> Result<Zeroizing<Vec<u8>>, ProtocolError> {
+    let mut frame = RequestFrame(Zeroizing::new(Vec::with_capacity(128)));
+    frame.0.extend_from_slice(&[0; FRAME_PREFIX_LEN]);
+    serde_json::to_writer(
+        &mut frame,
+        &Request { v: PROTOCOL_VERSION, id, kind: method.as_str(), payload },
+    )?;
+    let mut bytes = frame.0;
+    let length = bytes.len() - FRAME_PREFIX_LEN;
+    if length > DEFAULT_MAX_MESSAGE_SIZE {
+        return Err(ProtocolError::MessageTooLarge { length, maximum: DEFAULT_MAX_MESSAGE_SIZE });
+    }
+    let length = u32::try_from(length).map_err(|_| ProtocolError::LengthPrefixOverflow)?;
+    bytes[..FRAME_PREFIX_LEN].copy_from_slice(&length.to_le_bytes());
+    Ok(bytes)
+}
+
+struct RequestFrame(Zeroizing<Vec<u8>>);
+
+impl std::io::Write for RequestFrame {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let needed = self.0.len() + bytes.len();
+        let capacity = self.0.capacity();
+        if needed > capacity {
+            grow_buffer(&mut self.0, needed.max(capacity * 2));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn grow_buffer(buffer: &mut Zeroizing<Vec<u8>>, capacity: usize) {
+    // Replacing the wrapper wipes the old allocation before it is freed.
+    let mut replacement = Zeroizing::new(Vec::with_capacity(capacity));
+    replacement.extend_from_slice(buffer);
+    *buffer = replacement;
 }
 
 async fn read_response_frame(
     stream: &mut AgentStream,
-) -> Result<ResponseEnvelope, AgentClientError> {
-    let mut buffer: Vec<u8> = Vec::with_capacity(4096);
-    let mut chunk = [0_u8; 4096];
+    buffer: &mut Zeroizing<Vec<u8>>,
+) -> Result<Option<ResponseEnvelope>, AgentClientError> {
     loop {
-        match decode_response_frame(&buffer, DEFAULT_MAX_MESSAGE_SIZE) {
-            Ok((envelope, _consumed)) => return Ok(envelope),
+        match decode_response_frame(buffer, DEFAULT_MAX_MESSAGE_SIZE) {
+            Ok((envelope, consumed)) => {
+                let remaining = buffer.len() - consumed;
+                buffer.copy_within(consumed.., 0);
+                buffer[remaining..].zeroize();
+                buffer.truncate(remaining);
+                return Ok(Some(envelope));
+            }
             Err(ProtocolError::IncompleteFrame) => {}
             Err(error) => return Err(error.into()),
         }
-        let read = stream.read(&mut chunk).await.map_err(|error| AgentClientError::Protocol {
-            reason: format!("read failed: {error}"),
+        if let Some(prefix) = buffer.first_chunk::<FRAME_PREFIX_LEN>() {
+            // The decoder already checked this length against the protocol maximum.
+            let needed = FRAME_PREFIX_LEN + u32::from_le_bytes(*prefix) as usize;
+            if needed > buffer.capacity() {
+                grow_buffer(buffer, needed);
+            }
+        }
+        let read = stream.read_buf(&mut **buffer).await.map_err(|error| {
+            AgentClientError::Protocol { reason: format!("read failed: {error}") }
         })?;
         if read == 0 {
-            return Err(AgentClientError::Protocol {
-                reason: "agent closed connection before response".to_owned(),
-            });
+            return Ok(None);
         }
-        buffer.extend_from_slice(&chunk[..read]);
     }
 }
 
@@ -425,37 +490,22 @@ async fn read_status_stream(
     sender: mpsc::Sender<StatusEvent>,
     cancel: &CancelToken,
 ) -> Result<(), AgentClientError> {
-    let mut buffer: Vec<u8> = Vec::with_capacity(4096);
-    let mut chunk = [0_u8; 4096];
+    let mut buffer = Zeroizing::new(Vec::with_capacity(FRAME_READ_CHUNK_SIZE));
     loop {
-        match decode_response_frame(&buffer, DEFAULT_MAX_MESSAGE_SIZE) {
-            Ok((response, consumed)) => {
-                buffer.drain(..consumed);
-                let event = decode_payload::<StatusEvent>(response)?;
-                if sender.send(event).await.is_err() {
-                    return Ok(());
-                }
-                continue;
-            }
-            Err(ProtocolError::IncompleteFrame) => {}
-            Err(error) => return Err(error.into()),
-        }
-        if cancel.is_cancelled() {
-            return Ok(());
-        }
-        let read = tokio::select! {
+        let response = tokio::select! {
             biased;
             () = cancel.cancelled() => return Ok(()),
-            result = stream.read(&mut chunk) => result.map_err(|error| AgentClientError::Protocol {
-                reason: format!("read failed: {error}"),
-            })?,
+            result = read_response_frame(stream, &mut buffer) => result?,
         };
-        if read == 0 {
+        let Some(response) = response else {
             return Err(AgentClientError::Protocol {
                 reason: "agent closed status stream".to_owned(),
             });
+        };
+        let event = decode_payload::<StatusEvent>(response)?;
+        if sender.send(event).await.is_err() {
+            return Ok(());
         }
-        buffer.extend_from_slice(&chunk[..read]);
     }
 }
 
@@ -589,10 +639,24 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        CancelToken, RECONNECT_INITIAL_BACKOFF, RECONNECT_MAX_BACKOFF, display_copy_for_agent_code,
-        next_reconnect_delay,
+        AgentMethod, CancelToken, DEFAULT_MAX_MESSAGE_SIZE, RECONNECT_INITIAL_BACKOFF,
+        RECONNECT_MAX_BACKOFF, display_copy_for_agent_code, encode_request, next_reconnect_delay,
     };
     use std::time::Duration;
+
+    #[test]
+    fn encoded_request_matches_agent_framing() -> Result<(), Box<dyn std::error::Error>> {
+        let value = "test input\n".repeat(2_000);
+        let frame =
+            encode_request("test", AgentMethod::Unlock, &serde_json::json!({"passphrase": value}))?;
+        let (request, consumed) =
+            locket_agent::decode_request_frame(&frame, DEFAULT_MAX_MESSAGE_SIZE)?;
+        assert_eq!(consumed, frame.len());
+        assert_eq!(request.id, "test");
+        assert_eq!(request.method()?, AgentMethod::Unlock);
+        assert_eq!(request.payload["passphrase"], value);
+        Ok(())
+    }
 
     #[test]
     fn agent_error_codes_use_shared_locket_error_copy() -> Result<(), Box<dyn std::error::Error>> {
