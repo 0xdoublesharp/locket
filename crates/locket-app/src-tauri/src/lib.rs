@@ -211,8 +211,10 @@ fn resolve_path(
 }
 
 fn project_dirs() -> Result<ProjectDirs, AgentClientError> {
-    ProjectDirs::from("dev", "0xdoublesharp", "Locket").ok_or_else(|| AgentClientError::Protocol {
-        reason: "could not resolve the default Locket data directory".to_owned(),
+    locket_platform::LocketInstance::current().project_dirs().ok_or_else(|| {
+        AgentClientError::Protocol {
+            reason: "could not resolve the default Locket data directory".to_owned(),
+        }
     })
 }
 

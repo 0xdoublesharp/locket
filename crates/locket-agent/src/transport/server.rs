@@ -48,7 +48,7 @@ type PeerCredentialValidator =
 /// resolve a project data dir; tests that don't perform passphrase
 /// unlocks never touch the filesystem regardless.
 fn default_passphrase_fallback_dir() -> PathBuf {
-    directories::ProjectDirs::from("dev", "0xdoublesharp", "Locket").map_or_else(
+    locket_platform::LocketInstance::current().project_dirs().map_or_else(
         || std::env::temp_dir().join("locket-agent-passphrase-fallback"),
         |dirs| dirs.data_dir().join("passphrase-fallback"),
     )

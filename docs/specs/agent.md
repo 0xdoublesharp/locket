@@ -19,6 +19,7 @@ Socket and pipe locations:
 - macOS: `~/Library/Application Support/locket/agent.sock` with the same permission posture; the directory is created on first run.
 - Windows: `\\.\pipe\locket-agent-<sid>` where `<sid>` is the current user's SID. The pipe DACL grants the current user only.
 - Locket resolves these paths via the `directories` crate and rejects any path that is world- or group-accessible.
+- The development instance, used by debug builds and by release builds with `LOCKET_INSTANCE` set, replaces `locket` with `locket-dev`, `.locket` with `.locket-dev`, and `locket-agent-` with `locket-dev-agent-`. It also uses the `Locket Dev` data and configuration directories and the `dev.0xdoublesharp.locket-dev` keychain services.
 
 Responsibilities:
 

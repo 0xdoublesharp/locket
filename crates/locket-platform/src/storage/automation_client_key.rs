@@ -7,9 +7,9 @@ use keyring_core::Entry;
 use locket_crypto::KeyBytes;
 use zeroize::Zeroizing;
 
+use crate::LocketInstance;
 use crate::error::PlatformError;
 
-pub const AUTOMATION_CLIENT_KEYRING_SERVICE: &str = "dev.0xdoublesharp.locket";
 const AUTOMATION_CLIENT_ACCOUNT_PREFIX: &str = "automation-client:";
 
 /// OS-keychain reference for a stored automation-client private key.
@@ -121,7 +121,7 @@ impl AutomationClientKeyStore for MemoryAutomationClientKeyStore {
 #[must_use]
 pub fn automation_client_keychain_ref(client_id: &str) -> AutomationClientKeychainRef {
     AutomationClientKeychainRef {
-        service: AUTOMATION_CLIENT_KEYRING_SERVICE.to_owned(),
+        service: LocketInstance::current().keyring_service().to_owned(),
         account: automation_client_key_account(client_id),
     }
 }
@@ -152,7 +152,7 @@ mod tests {
     fn keychain_reference_uses_metadata_only_account() {
         let reference = automation_client_keychain_ref(CLIENT_ID);
 
-        assert_eq!(reference.service, AUTOMATION_CLIENT_KEYRING_SERVICE);
+        assert_eq!(reference.service, crate::LocketInstance::current().keyring_service());
         assert_eq!(reference.account, "automation-client:lk_client_test");
     }
 

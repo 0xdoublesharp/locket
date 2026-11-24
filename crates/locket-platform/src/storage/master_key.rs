@@ -7,9 +7,9 @@ use keyring_core::Entry;
 use locket_crypto::{KEY_LEN, KeyBytes};
 use zeroize::Zeroizing;
 
+use crate::LocketInstance;
 use crate::error::PlatformError;
 
-const KEYRING_SERVICE: &str = "dev.0xdoublesharp.locket";
 const MASTER_KEY_ACCOUNT_PREFIX: &str = "master:";
 
 /// Interface for local master-key storage.
@@ -223,7 +223,8 @@ impl MasterKeyStore for MockMasterKeyStore {
 }
 
 pub fn master_key_entry(project_id: &str) -> Result<Entry, PlatformError> {
-    Entry::new(KEYRING_SERVICE, &master_key_account(project_id)).map_err(PlatformError::Keyring)
+    Entry::new(LocketInstance::current().keyring_service(), &master_key_account(project_id))
+        .map_err(PlatformError::Keyring)
 }
 
 pub fn master_key_account(project_id: &str) -> String {

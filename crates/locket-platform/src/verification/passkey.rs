@@ -14,9 +14,9 @@ use sha2::Digest;
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
+use crate::LocketInstance;
 use crate::error::PlatformError;
 
-const PASSKEY_KEYRING_SERVICE: &str = "dev.0xdoublesharp.locket.passkey";
 const PASSKEY_ACCOUNT_PREFIX: &str = "prf:";
 #[cfg(test)]
 const PASSKEY_PUBLIC_KEY_DOMAIN: &[u8] = b"locket-platform-passkey-public-v1";
@@ -380,7 +380,7 @@ pub const fn default_platform_passkey_registrar() -> DefaultPlatformPasskeyRegis
 }
 
 fn passkey_entry(credential_id: &[u8]) -> Result<Entry, PlatformError> {
-    Entry::new(PASSKEY_KEYRING_SERVICE, &passkey_account(credential_id))
+    Entry::new(LocketInstance::current().passkey_keyring_service(), &passkey_account(credential_id))
         .map_err(|_| PlatformError::PasskeyUnsupported)
 }
 

@@ -6,6 +6,7 @@
 
 mod error;
 mod hardening;
+mod instance;
 mod ipc;
 mod session;
 mod storage;
@@ -25,7 +26,10 @@ pub(crate) use verification::{passkey, user_verification};
 #[cfg(target_os = "windows")]
 pub(crate) use verification::{windows_local_authentication, windows_user_verifier};
 
-pub use agent_pipe::{AGENT_PIPE_PREFIX, agent_pipe_dacl_sddl_for_sid, agent_pipe_name_for_sid};
+pub use agent_pipe::{
+    AGENT_PIPE_PREFIX, agent_pipe_dacl_sddl_for_sid, agent_pipe_name_for_instance,
+    agent_pipe_name_for_sid,
+};
 pub use automation_client_key::{
     AutomationClientKeyStore, AutomationClientKeychainRef, KeyringAutomationClientKeyStore,
     MemoryAutomationClientKeyStore,
@@ -37,6 +41,7 @@ pub use device_private_key::{
 };
 pub use error::PlatformError;
 pub use fs_helpers::{secure_directory, write_user_only_file};
+pub use instance::{INSTANCE_ENV, LocketInstance};
 pub use locked_vault_audit::{
     DEGRADED_AUDIT_LOG_FILENAME, DEGRADED_AUDIT_LOG_MAX_ROTATIONS, DEGRADED_AUDIT_LOG_ROTATE_BYTES,
     DEGRADED_AUDIT_LOG_SCHEMA_VERSION, LockedVaultAuditLogger, LockedVaultDenialRow,

@@ -798,6 +798,9 @@ fn check_agent_placeholder(context: &RuntimeContext) -> DiagnosticCheck {
 /// - Windows: `\\.\pipe\locket-agent-<sid>` with a protected
 ///   current-user-only DACL SDDL available for startup.
 ///
+/// The development instance uses `locket-dev`, `.locket-dev`, and
+/// `locket-dev-agent-<sid>` instead.
+///
 /// Tests build a `RuntimeContext` with `agent_data_dir = None` and a
 /// tempdir-local `store_path`; the check is reported as `skipped` in
 /// that case so legacy fixtures continue to pass without forcing every
@@ -858,20 +861,15 @@ fn check_agent_socket_path_matches_spec(context: &RuntimeContext) -> DiagnosticC
         let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
             return DiagnosticCheck::warn(NAME, "HOME unset; cannot validate spec path");
         };
-        #[cfg(target_os = "linux")]
-        let expected_candidates: Vec<PathBuf> = {
-            let mut candidates = Vec::new();
-            if let Some(value) = std::env::var_os("XDG_RUNTIME_DIR") {
-                candidates.push(PathBuf::from(value).join("locket"));
-            }
-            candidates.push(home.join(".locket"));
-            candidates
-        };
-        #[cfg(target_os = "macos")]
-        let expected_candidates: Vec<PathBuf> =
-            vec![home.join("Library").join("Application Support").join("locket")];
-        #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
-        let expected_candidates: Vec<PathBuf> = vec![home.join(".locket")];
+        let instance = locket_platform::LocketInstance::current();
+        let mut expected_candidates = vec![instance.agent_data_dir(
+            std::env::consts::OS,
+            &home,
+            std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+        )];
+        if std::env::consts::OS == "linux" {
+            expected_candidates.push(instance.agent_data_dir("linux", &home, None));
+        }
 
         if expected_candidates.iter().any(|candidate| candidate == configured) {
             DiagnosticCheck::pass(

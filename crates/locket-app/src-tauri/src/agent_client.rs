@@ -13,6 +13,7 @@ use locket_agent::{
     StatusEvent, StatusPayload, decode_response_frame,
 };
 use locket_core::{ErrorDisplayCopy, LocketError};
+use locket_platform::LocketInstance;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(unix)]
@@ -25,10 +26,7 @@ use zeroize::{Zeroize, Zeroizing};
 const FRAME_PREFIX_LEN: usize = size_of::<u32>();
 const FRAME_READ_CHUNK_SIZE: usize = 16 * 1024;
 
-/// Fallback socket subdirectory when no platform runtime directory is available.
-const DEFAULT_DATA_DIR: &str = ".locket";
-
-/// Default socket file name relative to [`DEFAULT_DATA_DIR`].
+/// Socket file name inside the instance's agent directory.
 const DEFAULT_SOCKET_FILE: &str = "agent.sock";
 
 /// Environment variable that overrides the agent socket path.
@@ -184,6 +182,7 @@ pub fn resolve_socket_path() -> PathBuf {
     #[cfg(not(target_os = "windows"))]
     let windows_pipe: Option<PathBuf> = None;
     endpoint_from_inputs(
+        LocketInstance::current(),
         std::env::consts::OS,
         explicit.as_deref(),
         &home,
@@ -547,6 +546,7 @@ fn new_request_id() -> String {
 
 // Platform-testable endpoint resolver.
 fn endpoint_from_inputs(
+    instance: LocketInstance,
     platform: &str,
     explicit: Option<&std::ffi::OsStr>,
     home: &Path,
@@ -556,19 +556,10 @@ fn endpoint_from_inputs(
     if let Some(explicit) = explicit.filter(|value| !value.is_empty()) {
         return explicit.into();
     }
-    match platform {
-        "windows" => windows_pipe.map_or_else(PathBuf::new, Path::to_path_buf),
-        "macos" => home
-            .join("Library")
-            .join("Application Support")
-            .join("locket")
-            .join(DEFAULT_SOCKET_FILE),
-        "linux" => runtime.filter(|value| !value.is_empty()).map_or_else(
-            || home.join(DEFAULT_DATA_DIR).join(DEFAULT_SOCKET_FILE),
-            |runtime| Path::new(runtime).join("locket").join(DEFAULT_SOCKET_FILE),
-        ),
-        _ => home.join(DEFAULT_DATA_DIR).join(DEFAULT_SOCKET_FILE),
+    if platform == "windows" {
+        return windows_pipe.map_or_else(PathBuf::new, Path::to_path_buf);
     }
+    instance.agent_data_dir(platform, home, runtime).join(DEFAULT_SOCKET_FILE)
 }
 
 // Windows status polling core, also tested without a real endpoint.

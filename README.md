@@ -78,6 +78,8 @@ For repository development, run the CLI without installing it:
 cargo run -p locket-cli -- <command>
 ```
 
+Development builds use a separate development vault. Debug builds and anything started by `cargo run`, `cargo test`, or `cargo bench` in this repository have their own data directory, configuration, keychain entries, and agent. A release binary joins the development instance when `LOCKET_INSTANCE` is set to any value. The variable cannot select the installed vault, so `cargo install` binaries keep your real secrets apart from work in progress. Run `locket agent status` to see which instance a binary uses. Project files such as `locket.toml` and `.locket/recovery` are shared, so try development builds in scratch projects.
+
 ## Quick Start
 
 In your application folder, initialize Locket and migrate your variables:

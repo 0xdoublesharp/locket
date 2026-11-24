@@ -2549,6 +2549,7 @@ fn agent_log_paths_oldest_first(context: &RuntimeContext) -> Vec<PathBuf> {
 }
 
 fn write_agent_paths(context: &RuntimeContext, output: &mut impl Write) -> Result<(), CliError> {
+    writeln!(output, "instance: {}", locket_platform::LocketInstance::current().label())?;
     writeln!(output, "socket: {}", agent_socket_path(context).display())?;
     writeln!(output, "pid_file: {}", agent_pid_path(context).display())?;
     writeln!(output, "log_file: {}", agent_log_path(context).display())?;

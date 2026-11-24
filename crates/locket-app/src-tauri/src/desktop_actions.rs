@@ -3,6 +3,7 @@
 #[cfg(not(any(target_os = "windows", test)))]
 use base64 as _;
 use locket_core::ProjectConfig;
+use locket_platform::{INSTANCE_ENV, LocketInstance};
 use locket_store::Store;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -295,7 +296,13 @@ fn resolve_cli() -> Result<PathBuf, String> {
         parent.join("../Resources").join(filename),
         parent.join("resources").join(filename),
     ]);
-    let cli = find_cli_from(&candidates, std::env::var_os("PATH").as_deref())?;
+    // The development desktop uses only the CLI built beside it; the CLI on
+    // PATH is usually the installed one.
+    let search_path = match LocketInstance::current() {
+        LocketInstance::Installed => std::env::var_os("PATH"),
+        LocketInstance::Dev => None,
+    };
+    let cli = find_cli_from(&candidates, search_path.as_deref())?;
     verify_cli_version(&cli, Duration::from_secs(2))?;
     Ok(cli)
 }
@@ -308,7 +315,13 @@ fn execute_cli(executable: &Path, plan: &CliPlan, timeout: Duration) -> Result<(
     }
     // CLI output may include init/recovery material or malformed user input. Keep
     // it out of logs and IPC entirely; this action returns only process status.
-    let mut child = Command::new(executable)
+    let mut command = Command::new(executable);
+    // A development desktop must never drive the installed vault, even
+    // through a release-built CLI.
+    if LocketInstance::current() == LocketInstance::Dev {
+        command.env(INSTANCE_ENV, LocketInstance::Dev.label());
+    }
+    let mut child = command
         .args(&plan.args)
         .current_dir(&plan.cwd)
         .stdin(if plan.input.is_some() { Stdio::piped() } else { Stdio::null() })
@@ -373,6 +386,22 @@ fn terminal_script(cli: &Path, root: &Path, args: &[&str]) -> String {
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn terminal_command_script(cli: &Path, root: &Path, args: &[&str]) -> String {
+    terminal_command_script_for(LocketInstance::current(), cli, root, args)
+}
+
+// Terminal applications do not reliably pass the desktop's environment to the
+// command, so a development desktop names its instance in the command itself.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn terminal_command_script_for(
+    instance: LocketInstance,
+    cli: &Path,
+    root: &Path,
+    args: &[&str],
+) -> String {
+    let instance_line = match instance {
+        LocketInstance::Installed => String::new(),
+        LocketInstance::Dev => format!("export {INSTANCE_ENV}={}\n", posix_quote(instance.label())),
+    };
     let command = format!(
         "{} {}",
         posix_quote(&cli.to_string_lossy()),
@@ -381,20 +410,43 @@ fn terminal_command_script(cli: &Path, root: &Path, args: &[&str]) -> String {
     let root = posix_quote(&root.to_string_lossy());
     if args.first() == Some(&"scan") {
         format!(
-            "cd -- {root} && {command}\nscan_status=$?\nprintf '\\nScan finished (exit %s). Press Enter to close.\\n' \"$scan_status\"\nIFS= read -r scan_dismiss\nexit \"$scan_status\"\n"
+            "{instance_line}cd -- {root} && {command}\nscan_status=$?\nprintf '\\nScan finished (exit %s). Press Enter to close.\\n' \"$scan_status\"\nIFS= read -r scan_dismiss\nexit \"$scan_status\"\n"
         )
     } else {
-        format!("cd -- {root} || exit 1\n{command}\n")
+        format!("{instance_line}cd -- {root} || exit 1\n{command}\n")
     }
 }
 
 #[cfg(any(target_os = "linux", all(test, unix)))]
 fn posix_terminal_command(cli: &Path, root: &Path, args: &[&str]) -> Vec<std::ffi::OsString> {
+    posix_terminal_command_for(LocketInstance::current(), cli, root, args)
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn posix_terminal_command_for(
+    instance: LocketInstance,
+    cli: &Path,
+    root: &Path,
+    args: &[&str],
+) -> Vec<std::ffi::OsString> {
     if args.first() == Some(&"scan") {
-        vec!["/bin/sh".into(), "-c".into(), terminal_command_script(cli, root, args).into()]
-    } else {
-        std::iter::once(cli.as_os_str().to_owned()).chain(args.iter().map(Into::into)).collect()
+        return vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            terminal_command_script_for(instance, cli, root, args).into(),
+        ];
     }
+    let instance_prefix = match instance {
+        LocketInstance::Installed => Vec::new(),
+        LocketInstance::Dev => {
+            vec!["/usr/bin/env".into(), format!("{INSTANCE_ENV}={}", instance.label()).into()]
+        }
+    };
+    instance_prefix
+        .into_iter()
+        .chain(std::iter::once(cli.as_os_str().to_owned()))
+        .chain(args.iter().map(Into::into))
+        .collect()
 }
 
 #[cfg(target_os = "macos")]
@@ -691,8 +743,14 @@ fn windows_terminal_args(cli: &Path, root: &Path, args: &[&str]) -> Vec<String> 
     } else {
         "exit $LASTEXITCODE"
     };
+    let instance = match LocketInstance::current() {
+        LocketInstance::Installed => String::new(),
+        LocketInstance::Dev => {
+            format!("$env:{INSTANCE_ENV} = {}; ", quote(LocketInstance::Dev.label()))
+        }
+    };
     let script = format!(
-        "Set-Location -LiteralPath {} -ErrorAction Stop; & {} {}; {ending}",
+        "{instance}Set-Location -LiteralPath {} -ErrorAction Stop; & {} {}; {ending}",
         quote(&root.to_string_lossy()),
         quote(&cli.to_string_lossy()),
         args.iter().map(|arg| quote(arg)).collect::<Vec<_>>().join(" ")

@@ -18,7 +18,7 @@ use locket_platform::{LockedVaultAuditLogger, LockedVaultDenialRow};
 
 /// Resolves `${LOCKET_HOME}` for the agent. Prefers `store_path.parent()`
 /// when the request supplied a store path, then the `LOCKET_HOME`
-/// environment variable, and finally the same `directories::ProjectDirs`
+/// environment variable, and finally the current instance's platform
 /// data directory the rest of the agent uses for production stores.
 fn locket_home(store_path: Option<&Path>) -> Option<PathBuf> {
     if let Some(parent) = store_path.and_then(Path::parent)
@@ -31,7 +31,8 @@ fn locket_home(store_path: Option<&Path>) -> Option<PathBuf> {
     {
         return Some(PathBuf::from(value));
     }
-    directories::ProjectDirs::from("dev", "0xdoublesharp", "Locket")
+    locket_platform::LocketInstance::current()
+        .project_dirs()
         .map(|dirs| dirs.data_dir().to_path_buf())
 }
 

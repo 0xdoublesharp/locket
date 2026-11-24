@@ -3058,7 +3058,6 @@ name = "locket-agent"
 version = "0.1.1"
 dependencies = [
  "data-encoding",
- "directories",
  "ed25519-dalek",
  "libc",
  "locket-core",
@@ -3208,6 +3207,7 @@ dependencies = [
  "apple-native-keyring-store",
  "block2",
  "data-encoding",
+ "directories",
  "futures-util",
  "hmac 0.13.0",
  "keyring-core",
