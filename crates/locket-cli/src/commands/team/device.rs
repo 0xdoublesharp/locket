@@ -7,7 +7,7 @@ use locket_crypto::{
 use locket_platform::{
     LocalDevicePrivateKeyStorage, PlatformError, RecoveryEnvelope, RecoveryKdfToml,
     WrappedLocalFileDevicePrivateKeyStorage, load_recovery_envelope, load_recovery_kdf_toml,
-    save_recovery_envelope, save_recovery_kdf_toml,
+    save_recovery_envelope,
 };
 use locket_store::{AuditContext, AuditWrite, DeviceRecord, Store};
 use serde::{Deserialize, Serialize};
@@ -524,7 +524,7 @@ pub fn join_request(context: &RuntimeContext, output: &mut impl Write) -> Result
     storage.for_signing().store(&record.fingerprint, &signing_private_key)?;
     store.insert_device(&record)?;
     trust_root(&store, &resolved.config, &resolved.root, now)?;
-    let material = create_bootstrap_recovery_material(&resolved.root, now)?;
+    let material = create_bootstrap_recovery_material(now)?;
     let material = BootstrapRecoveryMaterial { master_key: master, ..material };
     save_bootstrap_recovery_envelope_with_device(
         &resolved.root,
@@ -770,7 +770,7 @@ fn maybe_bootstrap_first_run_on_machine(
 
 fn recovery_envelope_present(root: &Path) -> bool {
     let recovery_dir = root.join(".locket").join("recovery");
-    recovery_dir.join("envelope.bin").exists() || recovery_dir.join("kdf.toml").exists()
+    recovery_dir.join("envelope.bin").exists()
 }
 
 fn team_row_exists(store: &Store, project_id: &str) -> Result<bool, CliError> {
@@ -851,7 +851,7 @@ fn bootstrap_first_run_on_machine(
         timestamp,
     )?;
 
-    let bootstrap_recovery = create_bootstrap_recovery_material(&resolved.root, timestamp)?;
+    let bootstrap_recovery = create_bootstrap_recovery_material(timestamp)?;
 
     trust_root(store, config, &resolved.root, timestamp)?;
 
@@ -868,17 +868,13 @@ struct BootstrapRecoveryMaterial {
 }
 
 fn create_bootstrap_recovery_material(
-    root: &Path,
     timestamp: i64,
 ) -> Result<BootstrapRecoveryMaterial, CliError> {
-    let recovery_dir = root.join(".locket").join("recovery");
     let code_bytes = generate_recovery_code_bytes()?;
     let salt = generate_recovery_salt()?;
     let kdf_profile_id = format!("lk_kdf_{}", format_hex(&salt[..16]));
     let kdf = RecoveryKdfToml::new_v1(kdf_profile_id, &salt, timestamp);
     let recovery_root = derive_recovery_key_v1(&code_bytes, &salt, kdf.to_crypto_params())?;
-    save_recovery_kdf_toml(&recovery_dir, &kdf)
-        .map_err(|error| metadata_invalid_error(format!("save recovery kdf: {error}")))?;
     Ok(BootstrapRecoveryMaterial {
         code_bytes,
         kdf,
@@ -961,7 +957,7 @@ fn update_recovery_envelope_for_replacement_device(
         return Ok(());
     }
     let kdf = load_recovery_kdf_toml(&recovery_dir)
-        .map_err(|error| metadata_invalid_error(format!("recovery/kdf.toml: {error}")))?;
+        .map_err(|error| metadata_invalid_error(format!("recovery/envelope.bin: {error}")))?;
     let old_envelope = load_recovery_envelope(&recovery_dir)
         .map_err(|error| metadata_invalid_error(format!("recovery/envelope.bin: {error}")))?;
     let code = context.recovery_code_reader.read_recovery_code("current recovery code")?;

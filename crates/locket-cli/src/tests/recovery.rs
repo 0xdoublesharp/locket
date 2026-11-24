@@ -500,7 +500,6 @@ fn recovery_rotate_requires_fresh_user_verification_before_writing()
         recovery_code_from_output(&String::from_utf8(init_output)?)?.to_owned();
     let recovery_dir = directory.path().join(".locket").join("recovery");
     let envelope_before = fs::read(recovery_dir.join("envelope.bin"))?;
-    let kdf_before = fs::read_to_string(recovery_dir.join("kdf.toml"))?;
     let rejecting_context = context_with_user_verifier(
         &context_with_recovery_code(&context, &format!("{initial_recovery_code}\n")),
         Arc::new(MemoryLocalUserVerifier::denying()),
@@ -519,7 +518,6 @@ fn recovery_rotate_requires_fresh_user_verification_before_writing()
     assert_eq!(error.exit_code(), locket_core::LocketError::UserVerificationFailed.exit_code());
     assert_eq!(rotate_output.len(), 0);
     assert_eq!(fs::read(recovery_dir.join("envelope.bin"))?, envelope_before);
-    assert_eq!(fs::read_to_string(recovery_dir.join("kdf.toml"))?, kdf_before);
     let store = locket_store::Store::open(directory.path().join("store.db"))?;
     let rotate_rows: i64 = store.connection().query_row(
         "SELECT COUNT(*) FROM audit_log WHERE action = 'RECOVERY_ROTATE'",
@@ -611,7 +609,7 @@ fn recovery_rotate_carries_device_keys_and_recover_restores_device_envelope()
 }
 
 #[test]
-fn recover_with_corrupted_kdf_file_exits_with_metadata_invalid()
+fn recover_without_recovery_container_exits_with_metadata_invalid()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempdir()?;
     let context = test_context(&directory);
@@ -631,11 +629,9 @@ fn recover_with_corrupted_kdf_file_exits_with_metadata_invalid()
         &mut Vec::new(),
     )?;
     let recovery_dir = directory.path().join(".locket/recovery");
-    // A legacy two-file backup must still reject a damaged KDF.
-    let legacy = crate::load_recovery_envelope(&recovery_dir)?;
-    fs::write(recovery_dir.join("envelope.bin"), legacy.serialize()?)?;
-    let kdf_path = recovery_dir.join("kdf.toml");
-    std::fs::write(&kdf_path, "this-is-not-valid-toml = = = corrupted\n")?;
+    // An envelope without the container header carries no KDF metadata.
+    let bare = crate::load_recovery_envelope(&recovery_dir)?;
+    fs::write(recovery_dir.join("envelope.bin"), bare.serialize()?)?;
 
     let recover_context = context_with_recovery_code(&context, "ignored-code\n");
     let result = run_with_context(
@@ -645,10 +641,11 @@ fn recover_with_corrupted_kdf_file_exits_with_metadata_invalid()
     );
 
     let Err(error) = result else {
-        return Err("recover with corrupted kdf.toml must fail".into());
+        return Err("recover without a recovery container must fail".into());
     };
     assert_eq!(error.exit_code(), 64, "MetadataInvalid is in the input/config band");
-    assert!(error.to_string().contains("recovery/kdf.toml"));
+    assert!(error.to_string().contains("recovery/envelope.bin"), "{error}");
+    assert!(error.to_string().contains("not a recovery container"), "{error}");
     Ok(())
 }
 

@@ -66,8 +66,8 @@ pub use process::{
 pub use process::{terminate_windows_process, windows_process_is_live};
 pub use recovery::{
     RECOVERY_KDF_TOML_VERSION, RecoveryEnvelope, RecoveryEnvelopeEntry, RecoveryKdfToml,
-    decode_recovery_state, load_recovery_envelope, load_recovery_kdf_toml, save_recovery_envelope,
-    save_recovery_kdf_toml, save_recovery_state,
+    decode_recovery_state, load_recovery_envelope, load_recovery_kdf_toml, load_recovery_state,
+    save_recovery_envelope, save_recovery_state,
 };
 pub use session::{
     NativeSessionEvent, NativeSessionNotification, SessionObserver, run_with_native_session_loop,

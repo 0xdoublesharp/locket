@@ -14,9 +14,7 @@ use locket_crypto::{
     KeyPurpose, derive_recovery_key_v1, generate_key, generate_recovery_code_bytes,
     generate_recovery_salt,
 };
-use locket_platform::{
-    RecoveryEnvelope, RecoveryKdfToml, save_recovery_envelope, save_recovery_kdf_toml,
-};
+use locket_platform::{RecoveryEnvelope, RecoveryKdfToml, save_recovery_state};
 use locket_store::{AuditWrite, Store};
 use serde_json::json;
 
@@ -280,7 +278,6 @@ impl InitRollback {
             FileSnapshot::capture(root.join(LOCKET_TOML))?,
             FileSnapshot::capture(root.join(GITIGNORE_FILE))?,
             FileSnapshot::capture(root.join(EXAMPLE_FILE))?,
-            FileSnapshot::capture(recovery_dir.join("kdf.toml"))?,
             FileSnapshot::capture(recovery_dir.join("envelope.bin"))?,
         ];
         Ok(Self {
@@ -658,9 +655,7 @@ fn ensure_initial_recovery_envelope(
         created_at_unix_nanos: i128::from(timestamp),
         entries,
     };
-    save_recovery_kdf_toml(&recovery_dir, &kdf)
-        .map_err(|error| metadata_invalid_error(format!("save recovery kdf: {error}")))?;
-    save_recovery_envelope(&recovery_dir, &envelope)
+    save_recovery_state(&recovery_dir, &kdf, &envelope)
         .map_err(|error| metadata_invalid_error(format!("save recovery envelope: {error}")))?;
     Ok(Some(code_bytes))
 }

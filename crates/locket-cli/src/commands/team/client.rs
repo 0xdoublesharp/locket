@@ -374,7 +374,7 @@ fn write_client_private_key_recovery_envelope(
     let project_id = resolved.config.project_id.as_str();
     let recovery_dir = resolved.root.join(".locket").join("recovery");
     let kdf = load_recovery_kdf_toml(&recovery_dir)
-        .map_err(|error| metadata_invalid_error(format!("recovery/kdf.toml: {error}")))?;
+        .map_err(|error| metadata_invalid_error(format!("recovery/envelope.bin: {error}")))?;
     let envelope = load_recovery_envelope(&recovery_dir)
         .map_err(|error| metadata_invalid_error(format!("recovery/envelope.bin: {error}")))?;
     kdf.validate()?;

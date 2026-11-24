@@ -103,7 +103,7 @@ use locket_crypto::{
 };
 use locket_platform::RecoveryEnvelopeEntry;
 #[cfg(test)]
-use locket_platform::{RecoveryEnvelope, RecoveryKdfToml, save_recovery_kdf_toml};
+use locket_platform::{RecoveryEnvelope, RecoveryKdfToml};
 #[cfg(test)]
 use locket_platform::{load_recovery_envelope, load_recovery_kdf_toml};
 use locket_scan::{FindingKind, redact_text, scan_text};

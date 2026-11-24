@@ -34,7 +34,7 @@ pub fn recover_command(
     let resolved = require_project(context)?;
     let recovery_dir = recovery_dir(&resolved);
     let kdf = load_recovery_kdf_toml(&recovery_dir)
-        .map_err(|error| metadata_invalid_error(format!("recovery/kdf.toml: {error}")))?;
+        .map_err(|error| metadata_invalid_error(format!("recovery/envelope.bin: {error}")))?;
     let envelope = load_recovery_envelope(&recovery_dir)
         .map_err(|error| metadata_invalid_error(format!("recovery/envelope.bin: {error}")))?;
     let code = context.recovery_code_reader.read_recovery_code("recovery code")?;
@@ -70,7 +70,7 @@ pub fn recovery_rotate_command(
 
     let entries = if recovery_dir.join("envelope.bin").exists() {
         let old_kdf = load_recovery_kdf_toml(&recovery_dir)
-            .map_err(|error| metadata_invalid_error(format!("recovery/kdf.toml: {error}")))?;
+            .map_err(|error| metadata_invalid_error(format!("recovery/envelope.bin: {error}")))?;
         let old_envelope = load_recovery_envelope(&recovery_dir)
             .map_err(|error| metadata_invalid_error(format!("recovery/envelope.bin: {error}")))?;
         validate_recovery_metadata(project_id, &old_kdf, &old_envelope)?;

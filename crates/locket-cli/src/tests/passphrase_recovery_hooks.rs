@@ -146,7 +146,7 @@ fn recovery_rotate_creates_envelope_and_recover_restores_master_key()
     let recovery_code_bytes = locket_crypto::recovery_code_decode(recovery_code)?;
 
     let recovery_dir = directory.path().join(".locket/recovery");
-    assert!(recovery_dir.join("kdf.toml").exists());
+    assert!(!recovery_dir.join("kdf.toml").exists());
     assert!(recovery_dir.join("envelope.bin").exists());
 
     let recovered_key_store = Arc::new(MemoryMasterKeyStore::default());

@@ -457,7 +457,6 @@ pub(super) fn setup_recovery_envelope(
         entries: vec![entry],
     };
     let recovery_dir = context.cwd.join(".locket").join("recovery");
-    super::save_recovery_kdf_toml(&recovery_dir, &kdf)?;
     locket_platform::save_recovery_state(&recovery_dir, &kdf, &envelope)?;
     Ok((kdf, envelope, code_bytes))
 }

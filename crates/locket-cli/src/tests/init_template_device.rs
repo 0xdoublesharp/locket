@@ -1862,7 +1862,7 @@ fn init_writes_recovery_envelope_and_metadata_only_audit() -> Result<(), Box<dyn
     assert!(output.contains("recovery_code_init: success"));
     assert!(output.contains("terminal scrollback may retain this code"));
     assert!(output.contains("metadata_only: yes"));
-    assert!(directory.path().join(".locket/recovery/kdf.toml").exists());
+    assert!(!directory.path().join(".locket/recovery/kdf.toml").exists());
     assert!(directory.path().join(".locket/recovery/envelope.bin").exists());
 
     let store = crate::open_store(&context)?;
@@ -4822,7 +4822,7 @@ fn device_init_bootstraps_when_master_key_and_envelope_are_absent()
         directory.path().join(".locket/recovery/envelope.bin").exists(),
         "recovery envelope must exist after bootstrap"
     );
-    assert!(directory.path().join(".locket/recovery/kdf.toml").exists());
+    assert!(!directory.path().join(".locket/recovery/kdf.toml").exists());
     let envelope = crate::load_recovery_envelope(&directory.path().join(".locket/recovery"))?;
     assert!(envelope.entries.iter().any(|entry| entry.entry_kind == "master_key"));
     assert!(envelope.entries.iter().any(|entry| entry.entry_kind == "device_signing_private_key"));
@@ -4909,7 +4909,6 @@ fn device_init_returns_ambiguous_state_when_recovery_envelope_exists_without_mas
     let recovery_dir = directory.path().join(".locket").join("recovery");
     std::fs::create_dir_all(&recovery_dir)?;
     std::fs::write(recovery_dir.join("envelope.bin"), b"placeholder")?;
-    std::fs::write(recovery_dir.join("kdf.toml"), b"placeholder")?;
 
     let result = run_with_context(
         Cli::try_parse_from(["locket", "device", "init"])?,

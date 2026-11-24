@@ -18,7 +18,7 @@ Use SQLite through `rusqlite`. Encrypted secret blobs live in the SQLite `blobs`
 
 Each project stores recovery material under `<project>/.locket/recovery/`, outside the shared user store. Its `envelope.bin` contains the KDF metadata plus the encrypted master, device and managed automation-client keys. Keep an independent backup of this encrypted file and its recovery code. The directory must never contain plaintext keys, plaintext secrets, or the recovery code itself.
 
-New recovery state embeds KDF TOML and the inner encrypted envelope in one `envelope.bin`, using the container specified in [crypto.md](crypto.md). Rotation syncs a new file, then atomically replaces the prior file. A crash cannot commit only one half of a pair. Legacy backups with separate `kdf.toml` and raw `envelope.bin` remain readable; for those backups both files are required. Any legacy `kdf.toml` beside a modern container is non-authoritative. KDF and inner envelope profile IDs must match or recovery fails closed. SQLite stores no recovery-code salt, recovery-code verifier, or recovery unwrap key.
+Recovery state embeds KDF TOML and the inner encrypted envelope in one `envelope.bin`, using the container specified in [crypto.md](crypto.md). Rotation syncs a new file, then atomically replaces the prior file. A crash cannot commit only one half of a pair. An `envelope.bin` without the container header, or a separate `kdf.toml`, is not read. KDF and inner envelope profile IDs must match or recovery fails closed. SQLite stores no recovery-code salt, recovery-code verifier, or recovery unwrap key.
 
 Required tables:
 

@@ -16,7 +16,7 @@ pub const RECOVERY_KDF_TOML_VERSION: u32 = 1;
 const MIN_SERIALIZED_RECOVERY_ENTRY_LEN: usize =
     2 + "entry_kind".len() + 4 + 2 + "entry_id".len() + 4 + NONCE_LEN + 4;
 
-/// Persisted KDF parameters for the recovery envelope (stored in `recovery/kdf.toml`).
+/// KDF parameters for the recovery envelope, embedded in `recovery/envelope.bin`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecoveryKdfToml {
     /// Unique identifier for this KDF parameter set.
@@ -146,7 +146,7 @@ pub struct RecoveryEnvelopeEntry {
 /// Stored at `recovery/envelope.bin`. All integers are little-endian.
 #[derive(Debug, Clone)]
 pub struct RecoveryEnvelope {
-    /// KDF profile identifier matching the `kdf.toml` file.
+    /// KDF profile identifier matching the embedded KDF metadata.
     pub kdf_profile_id: String,
     /// Creation timestamp in Unix nanoseconds (i128 LE).
     pub created_at_unix_nanos: i128,
@@ -280,89 +280,56 @@ fn read_field_string(cur: &mut usize, data: &[u8]) -> Result<String, PlatformErr
         .map_err(|_| PlatformError::InvalidRecoveryEnvelope("non-utf8 field value".into()))
 }
 
-/// Loads and parses `kdf.toml` from a recovery directory.
+/// Loads the KDF metadata and encrypted entries from `envelope.bin`.
 ///
 /// # Errors
 ///
 /// Returns [`PlatformError::Io`] if the file cannot be read, or
-/// [`PlatformError::InvalidRecoveryEnvelope`] if the TOML is malformed.
-pub fn load_recovery_kdf_toml(recovery_dir: &Path) -> Result<RecoveryKdfToml, PlatformError> {
-    match fs::read(recovery_dir.join("envelope.bin")) {
-        Ok(data) => {
-            if let Some((kdf, _)) = decode_recovery_state(&data)? {
-                return Ok(kdf);
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    let path = recovery_dir.join("kdf.toml");
-    let text = fs::read_to_string(&path).map_err(PlatformError::Io)?;
-    let kdf: RecoveryKdfToml =
-        toml::from_str(&text).map_err(|e| PlatformError::InvalidRecoveryEnvelope(e.to_string()))?;
-    kdf.validate()?;
-    Ok(kdf)
-}
-
-/// Saves `kdf.toml` to a recovery directory (creates the directory if absent).
-///
-/// # Errors
-///
-/// Returns [`PlatformError::Io`] on filesystem errors, or
-/// [`PlatformError::InvalidRecoveryEnvelope`] if TOML serialization fails.
-pub fn save_recovery_kdf_toml(
+/// [`PlatformError::InvalidRecoveryEnvelope`] if it is not a valid recovery
+/// container.
+pub fn load_recovery_state(
     recovery_dir: &Path,
-    kdf: &RecoveryKdfToml,
-) -> Result<(), PlatformError> {
-    kdf.validate()?;
-    secure_directory(recovery_dir)?;
-    let path = recovery_dir.join("kdf.toml");
-    let text =
-        toml::to_string(kdf).map_err(|e| PlatformError::InvalidRecoveryEnvelope(e.to_string()))?;
-    write_user_only_file(&path, text.as_bytes())
+) -> Result<(RecoveryKdfToml, RecoveryEnvelope), PlatformError> {
+    let data = fs::read(recovery_dir.join("envelope.bin")).map_err(PlatformError::Io)?;
+    decode_recovery_state(&data)
 }
 
-/// Loads and deserializes `envelope.bin` from a recovery directory.
+/// Loads the KDF metadata embedded in `envelope.bin`.
 ///
 /// # Errors
 ///
-/// Returns [`PlatformError::Io`] if the file cannot be read, or propagates
-/// [`RecoveryEnvelope::deserialize`] errors.
+/// Propagates [`load_recovery_state`] errors.
+pub fn load_recovery_kdf_toml(recovery_dir: &Path) -> Result<RecoveryKdfToml, PlatformError> {
+    Ok(load_recovery_state(recovery_dir)?.0)
+}
+
+/// Loads the encrypted entries embedded in `envelope.bin`.
+///
+/// # Errors
+///
+/// Propagates [`load_recovery_state`] errors.
 pub fn load_recovery_envelope(recovery_dir: &Path) -> Result<RecoveryEnvelope, PlatformError> {
-    let path = recovery_dir.join("envelope.bin");
-    let data = fs::read(&path).map_err(PlatformError::Io)?;
-    if let Some((_, envelope)) = decode_recovery_state(&data)? {
-        return Ok(envelope);
-    }
-    RecoveryEnvelope::deserialize(&data)
+    Ok(load_recovery_state(recovery_dir)?.1)
 }
 
-/// Atomically writes `envelope.bin` to a recovery directory.
+/// Replaces the encrypted entries while keeping the stored KDF metadata,
+/// including its salt. Callers replacing the KDF use [`save_recovery_state`].
 ///
 /// # Errors
 ///
-/// Returns [`PlatformError::Io`] on filesystem errors or propagates
-/// [`RecoveryEnvelope::serialize`] errors.
+/// Fails when no recovery container exists yet, or propagates
+/// [`save_recovery_state`] errors.
 pub fn save_recovery_envelope(
     recovery_dir: &Path,
     envelope: &RecoveryEnvelope,
 ) -> Result<(), PlatformError> {
-    if recovery_dir.join("kdf.toml").exists()
-        || fs::read(recovery_dir.join("envelope.bin"))
-            .is_ok_and(|bytes| bytes.starts_with(RECOVERY_STATE_MAGIC))
-    {
-        // Entry updates must preserve the authoritative KDF, including its salt.
-        // Callers replacing the KDF must supply the full pair to save_recovery_state.
-        let kdf = load_recovery_kdf_toml(recovery_dir)?;
-        return save_recovery_state(recovery_dir, &kdf, envelope);
-    }
-    write_recovery_atomically(recovery_dir, &envelope.serialize()?)
+    let kdf = load_recovery_kdf_toml(recovery_dir)?;
+    save_recovery_state(recovery_dir, &kdf, envelope)
 }
 
 const RECOVERY_STATE_MAGIC: &[u8] = b"LOCKET-RECOVERY-STATE-V1\0";
 
 /// Saves KDF metadata and encrypted entries as one durable atomic replacement.
-/// Legacy separate KDF/envelope files remain readable. Embedded metadata is authoritative.
 ///
 /// # Errors
 /// Rejects mismatched metadata or filesystem failures without truncating the old envelope.
@@ -386,16 +353,17 @@ pub fn save_recovery_state(
     write_recovery_atomically(recovery_dir, &bytes)
 }
 
-/// Decodes a modern atomic recovery container, returning `None` for legacy input.
+/// Decodes an atomic recovery container.
 ///
 /// # Errors
-/// Rejects truncated containers, oversized KDF metadata, unsupported parameters,
-/// invalid inner envelopes and mismatched KDF profile identifiers.
+/// Rejects input without the container header, truncated containers, oversized
+/// KDF metadata, unsupported parameters, invalid inner envelopes and mismatched
+/// KDF profile identifiers.
 pub fn decode_recovery_state(
     bytes: &[u8],
-) -> Result<Option<(RecoveryKdfToml, RecoveryEnvelope)>, PlatformError> {
+) -> Result<(RecoveryKdfToml, RecoveryEnvelope), PlatformError> {
     if !bytes.starts_with(RECOVERY_STATE_MAGIC) {
-        return Ok(None);
+        return Err(PlatformError::InvalidRecoveryEnvelope("not a recovery container".into()));
     }
     let mut cursor = RECOVERY_STATE_MAGIC.len();
     let length = u32::from_le_bytes(
@@ -415,7 +383,7 @@ pub fn decode_recovery_state(
     if kdf.kdf_profile_id != envelope.kdf_profile_id {
         return Err(PlatformError::InvalidRecoveryEnvelope("kdf profile mismatch".into()));
     }
-    Ok(Some((kdf, envelope)))
+    Ok((kdf, envelope))
 }
 
 fn write_recovery_atomically(recovery_dir: &Path, data: &[u8]) -> Result<(), PlatformError> {

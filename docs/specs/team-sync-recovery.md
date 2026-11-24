@@ -164,7 +164,7 @@ Recovery error mapping:
 | --- | --- |
 | Recovery code checksum or format is invalid | `BackupRecoveryFailed` |
 | Recovery code is well-formed but cannot decrypt the envelope | `BackupRecoveryFailed` |
-| embedded KDF metadata (or legacy `recovery/kdf.toml`) is missing, unparsable, unsupported, or mismatches the inner envelope | `BackupRecoveryFailed` |
+| embedded KDF metadata is missing, unparsable, unsupported, or mismatches the inner envelope | `BackupRecoveryFailed` |
 | `recovery/envelope.bin` has a schema version newer than this binary understands | `ConfigError` with upgrade-required guidance |
 | `recovery/envelope.bin` is missing, corrupt, truncated, or fails AAD/authentication checks | `BackupRecoveryFailed` |
 | Required `master_key`, `device_signing_private_key`, or `device_sealing_private_key` entry is missing after successful envelope parse | `LocalVaultUnrecoverable` |
