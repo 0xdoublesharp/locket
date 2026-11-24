@@ -24,13 +24,13 @@ const FILE_MODE: u32 = 0o600;
 /// Error returned when writing or cleaning up an ephemeral env file.
 #[derive(Debug, Error)]
 pub enum EphemeralEnvFileError {
-    /// An env name contained an `=` or NUL byte.
+    /// An env name was empty or contained an equals sign, NUL, or line break.
     #[error("ephemeral env-file env name {name:?} is invalid")]
     InvalidEnvName {
         /// The invalid env variable name.
         name: String,
     },
-    /// An env value contained a NUL byte or newline that would break parsing.
+    /// An env value contained a NUL byte or line break that would break parsing.
     #[error("ephemeral env-file value for {name:?} contains an unsupported byte")]
     InvalidEnvValue {
         /// The env variable whose value was invalid.
@@ -144,11 +144,10 @@ fn write_ephemeral_env_file_with(
 
 fn validate_env(env: &EnvMap) -> Result<(), EphemeralEnvFileError> {
     for (name, value) in env {
-        if name.is_empty() || name.contains('=') || name.as_bytes().contains(&0) {
+        if name.is_empty() || name.contains(['=', '\0', '\n', '\r']) {
             return Err(EphemeralEnvFileError::InvalidEnvName { name: name.clone() });
         }
-        let value_bytes = value.as_str().as_bytes();
-        if value_bytes.contains(&0) || value_bytes.contains(&b'\n') {
+        if value.as_str().contains(['\0', '\n', '\r']) {
             return Err(EphemeralEnvFileError::InvalidEnvValue { name: name.clone() });
         }
     }
@@ -335,6 +334,23 @@ mod tests {
             Err(EphemeralEnvFileError::InvalidEnvValue { .. })
         ));
         Ok(())
+    }
+
+    #[test]
+    fn rejects_line_breaks_in_env_names() {
+        for name in ["BAD\nNAME", "BAD\rNAME"] {
+            let env = make_env(&[(name, "value")]);
+            assert!(matches!(
+                validate_env(&env),
+                Err(EphemeralEnvFileError::InvalidEnvName { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_carriage_return_in_env_values() {
+        let env = make_env(&[("KEY", "line-1\rline-2")]);
+        assert!(matches!(validate_env(&env), Err(EphemeralEnvFileError::InvalidEnvValue { .. })));
     }
 
     #[test]

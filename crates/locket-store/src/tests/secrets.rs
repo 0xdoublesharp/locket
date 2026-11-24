@@ -2,7 +2,8 @@ use std::error::Error;
 
 use crate::{
     AuditContext, AuditWrite, SecretBlobRecord, SecretCopyTarget, SecretFingerprintRecord,
-    SecretRecord, SecretVersionRecord, Store, StoreError, VersionDeprecation,
+    SecretInitialMetadata, SecretMutableMetadata, SecretRecord, SecretVersionRecord, Store,
+    StoreError, VersionDeprecation,
 };
 
 use super::{
@@ -571,5 +572,188 @@ fn secret_version_range_constraints_are_enforced() -> Result<(), Box<dyn Error>>
     )?;
     assert_eq!(rows, 1);
 
+    Ok(())
+}
+
+fn secret_audit_metadata(action: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "action": action,
+        "status": "SUCCESS",
+        "secret_name": "DATABASE_URL",
+        "profile_id": "lk_prof_test",
+        "source": "user-local",
+    })
+}
+
+fn secret_audit<'a>(action: &'a str, metadata: &'a serde_json::Value) -> AuditWrite<'a> {
+    AuditWrite {
+        project_id: "lk_proj_test",
+        profile_id: Some("lk_prof_test"),
+        action,
+        status: "SUCCESS",
+        secret_name: Some("DATABASE_URL"),
+        command: None,
+        metadata_json: metadata,
+        timestamp: 200,
+    }
+}
+
+#[test]
+fn create_secret_metadata_commits_with_audit_and_rolls_back_on_error() -> Result<(), Box<dyn Error>>
+{
+    let mut fixture = open_initialized_store()?;
+    let store = &mut fixture.store;
+    insert_project_profile(store)?;
+    let (secret, version, blob, fingerprint) =
+        (test_secret(), test_secret_version(), test_secret_blob(), test_secret_fingerprint());
+    let tags = ["on-call".to_owned(), "données".to_owned()];
+    let metadata = SecretInitialMetadata {
+        description: Some("Production"),
+        owner: Some("Infra"),
+        tags: &tags,
+        required: true,
+    };
+    let bad_json = serde_json::json!({});
+    let rejected_audit = secret_audit("SET", &bad_json);
+    let key = [42; 32];
+    assert!(matches!(
+        store.create_active_secret_with_metadata_and_audit(
+            &secret,
+            &version,
+            &blob,
+            &fingerprint,
+            metadata,
+            Some(AuditContext { key: &key, write: &rejected_audit }),
+        ),
+        Err(StoreError::AuditMetadataInvalid { .. })
+    ));
+    assert!(store.get_secret_mutable_metadata(&secret.id)?.is_none());
+    assert!(store.get_secret_version(&secret.id, 1)?.is_none());
+    assert!(store.get_blob(&secret.id, 1)?.is_none());
+
+    let audit_json = secret_audit_metadata("SET");
+    let audit = secret_audit("SET", &audit_json);
+    store.create_active_secret_with_metadata_and_audit(
+        &secret,
+        &version,
+        &blob,
+        &fingerprint,
+        metadata,
+        Some(AuditContext { key: &key, write: &audit }),
+    )?;
+    assert_eq!(
+        store.get_secret_mutable_metadata(&secret.id)?,
+        Some(SecretMutableMetadata {
+            description: Some("Production".into()),
+            owner: Some("Infra".into()),
+            tags: tags.to_vec(),
+            required: true,
+        })
+    );
+    let rows = store.list_audit_rows_since(&secret.project_id, &secret.profile_id, 0)?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].action, "SET");
+    Ok(())
+}
+
+#[test]
+fn rotate_secret_metadata_is_preserved_or_replaced_atomically() -> Result<(), Box<dyn Error>> {
+    let mut fixture = open_initialized_store()?;
+    let store = &mut fixture.store;
+    insert_project_profile(store)?;
+    let mut secret = test_secret();
+    store.create_active_secret(
+        &secret,
+        &test_secret_version(),
+        &test_secret_blob(),
+        &test_secret_fingerprint(),
+    )?;
+    assert_eq!(
+        store.get_secret_mutable_metadata(&secret.id)?,
+        Some(SecretMutableMetadata {
+            description: None,
+            owner: None,
+            tags: Vec::new(),
+            required: false
+        })
+    );
+    let tags = ["tag".to_owned()];
+    store.update_secret_metadata(
+        &secret.id,
+        Some("initial"),
+        Some("old"),
+        Some(&tags),
+        Some(true),
+    )?;
+    let previous = store.get_secret_mutable_metadata(&secret.id)?;
+
+    let version = SecretVersionRecord { version: 2, created_at: 200, ..test_secret_version() };
+    let blob = SecretBlobRecord { version: 2, created_at: 200, ..test_secret_blob() };
+    let fingerprint =
+        SecretFingerprintRecord { version: 2, created_at: 200, ..test_secret_fingerprint() };
+    let deprecation = VersionDeprecation { deprecated_at: 200, grace_until: None };
+    store.rotate_secret_with_audit(&secret, &version, &blob, &fingerprint, deprecation, None)?;
+    assert_eq!(store.get_secret_mutable_metadata(&secret.id)?, previous);
+
+    secret.current_version = 2;
+    let version = SecretVersionRecord { version: 3, created_at: 300, ..version };
+    let blob = SecretBlobRecord { version: 3, created_at: 300, ..blob };
+    let fingerprint = SecretFingerprintRecord { version: 3, created_at: 300, ..fingerprint };
+    let deprecation = VersionDeprecation { deprecated_at: 300, grace_until: Some(400) };
+    let bad_json = serde_json::json!({});
+    let rejected_audit = secret_audit("ROTATE", &bad_json);
+    let key = [42; 32];
+    let replacement = Some(SecretInitialMetadata { owner: Some("new"), ..Default::default() });
+    assert!(matches!(
+        store.rotate_secret_with_metadata_and_audit(
+            &secret,
+            &version,
+            &blob,
+            &fingerprint,
+            deprecation,
+            replacement,
+            Some(AuditContext { key: &key, write: &rejected_audit }),
+        ),
+        Err(StoreError::AuditMetadataInvalid { .. })
+    ));
+    assert_eq!(store.get_secret_mutable_metadata(&secret.id)?, previous);
+    assert_eq!(
+        store.get_secret_version(&secret.id, 2)?.ok_or("old version absent")?.state,
+        "current"
+    );
+    assert!(store.get_secret_version(&secret.id, 3)?.is_none());
+    assert!(store.get_blob(&secret.id, 3)?.is_none());
+
+    let audit_json = secret_audit_metadata("ROTATE");
+    let audit = secret_audit("ROTATE", &audit_json);
+    store.rotate_secret_with_metadata_and_audit(
+        &secret,
+        &version,
+        &blob,
+        &fingerprint,
+        deprecation,
+        replacement,
+        Some(AuditContext { key: &key, write: &audit }),
+    )?;
+    assert_eq!(
+        store.get_secret_mutable_metadata(&secret.id)?,
+        Some(SecretMutableMetadata {
+            description: None,
+            owner: Some("new".into()),
+            tags: Vec::new(),
+            required: false,
+        })
+    );
+    let stored = store
+        .get_active_secret(&secret.project_id, &secret.profile_id, &secret.name, &secret.source)?
+        .ok_or("active secret absent")?;
+    assert_eq!(
+        (stored.current_version, stored.updated_at, stored.last_rotated_at),
+        (3, 300, Some(300))
+    );
+    let rows = store.list_audit_rows_since(&secret.project_id, &secret.profile_id, 0)?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].action, "ROTATE");
     Ok(())
 }

@@ -5,13 +5,29 @@ use rusqlite::{OptionalExtension, params};
 use crate::Store;
 use crate::error::StoreError;
 use crate::secret::{
-    SecretBlobRecord, SecretMetadataRecord, SecretRecord, SecretVersionMetadataRecord,
-    SecretVersionRecord, secret_blob_record_from_row, secret_metadata_record_from_row,
-    secret_record_from_row, secret_version_metadata_record_from_row,
-    secret_version_record_from_row,
+    SecretBlobRecord, SecretMetadataRecord, SecretMutableMetadata, SecretRecord,
+    SecretVersionMetadataRecord, SecretVersionRecord, mutable_metadata_from_row,
+    secret_blob_record_from_row, secret_metadata_record_from_row, secret_record_from_row,
+    secret_version_metadata_record_from_row, secret_version_record_from_row,
 };
 
 impl Store {
+    /// Returns mutable metadata by secret id, including for deleted secrets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the row cannot be queried or its tags cannot be decoded.
+    pub fn get_secret_mutable_metadata(
+        &self,
+        secret_id: &str,
+    ) -> Result<Option<SecretMutableMetadata>, StoreError> {
+        let mut statement = self.connection.prepare_cached(
+            "SELECT description, owner, tags_json, required FROM secrets WHERE id = ?1",
+        )?;
+        let mut rows = statement.query([secret_id])?;
+        rows.next()?.map(|row| mutable_metadata_from_row(row, 0)).transpose()
+    }
+
     /// Returns an active secret by project/profile/name/source.
     ///
     /// # Errors
@@ -25,7 +41,7 @@ impl Store {
         source: &str,
     ) -> Result<Option<SecretRecord>, StoreError> {
         self.connection
-            .query_row(
+            .prepare_cached(
                 "SELECT id, project_id, profile_id, name, source, origin, current_version, state,
                         created_at, updated_at, last_rotated_at, deleted_at
                  FROM secrets
@@ -34,9 +50,8 @@ impl Store {
                    AND name = ?3
                    AND source = ?4
                    AND state = 'active'",
-                (project_id, profile_id, name, source),
-                secret_record_from_row,
-            )
+            )?
+            .query_row((project_id, profile_id, name, source), secret_record_from_row)
             .optional()
             .map_err(StoreError::from)
     }
@@ -54,7 +69,7 @@ impl Store {
         source: &str,
     ) -> Result<Option<SecretRecord>, StoreError> {
         self.connection
-            .query_row(
+            .prepare_cached(
                 "SELECT id, project_id, profile_id, name, source, origin, current_version, state,
                         created_at, updated_at, last_rotated_at, deleted_at
                  FROM secrets
@@ -62,9 +77,8 @@ impl Store {
                    AND profile_id = ?2
                    AND name = ?3
                    AND source = ?4",
-                (project_id, profile_id, name, source),
-                secret_record_from_row,
-            )
+            )?
+            .query_row((project_id, profile_id, name, source), secret_record_from_row)
             .optional()
             .map_err(StoreError::from)
     }
@@ -80,7 +94,7 @@ impl Store {
         profile_id: &str,
         name: &str,
     ) -> Result<Vec<SecretRecord>, StoreError> {
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare_cached(
             "SELECT id, project_id, profile_id, name, source, origin, current_version, state,
                     created_at, updated_at, last_rotated_at, deleted_at
              FROM secrets
@@ -104,7 +118,7 @@ impl Store {
         project_id: &str,
         profile_id: &str,
     ) -> Result<Vec<SecretRecord>, StoreError> {
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare_cached(
             "SELECT id, project_id, profile_id, name, source, origin, current_version, state,
                     created_at, updated_at, last_rotated_at, deleted_at
              FROM secrets
@@ -128,7 +142,7 @@ impl Store {
         project_id: &str,
         profile_id: &str,
     ) -> Result<Vec<SecretMetadataRecord>, StoreError> {
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare_cached(
             "SELECT id, project_id, profile_id, name, source,
                     CASE source
                       WHEN 'machine-local' THEN 3
@@ -161,7 +175,7 @@ impl Store {
         project_id: &str,
         profile_id: &str,
     ) -> Result<Vec<SecretRecord>, StoreError> {
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare_cached(
             "SELECT id, project_id, profile_id, name, source, origin, current_version, state,
                     created_at, updated_at, last_rotated_at, deleted_at
              FROM secrets
@@ -184,7 +198,7 @@ impl Store {
         &self,
         secret_id: &str,
     ) -> Result<Vec<SecretVersionRecord>, StoreError> {
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare_cached(
             "SELECT secret_id, version, source, origin, state, created_at,
                     deprecated_at, grace_until, purged_at
              FROM secret_versions
@@ -208,7 +222,7 @@ impl Store {
         project_id: &str,
         profile_id: &str,
     ) -> Result<Vec<SecretVersionMetadataRecord>, StoreError> {
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare_cached(
             "SELECT s.id, s.project_id, s.profile_id, s.name, s.source,
                     CASE s.source
                       WHEN 'machine-local' THEN 3
@@ -244,14 +258,13 @@ impl Store {
         version: u32,
     ) -> Result<Option<SecretVersionRecord>, StoreError> {
         self.connection
-            .query_row(
+            .prepare_cached(
                 "SELECT secret_id, version, source, origin, state, created_at,
                         deprecated_at, grace_until, purged_at
                  FROM secret_versions
                  WHERE secret_id = ?1 AND version = ?2",
-                params![secret_id, version],
-                secret_version_record_from_row,
-            )
+            )?
+            .query_row(params![secret_id, version], secret_version_record_from_row)
             .optional()
             .map_err(StoreError::from)
     }
@@ -267,14 +280,13 @@ impl Store {
         version: u32,
     ) -> Result<Option<SecretBlobRecord>, StoreError> {
         self.connection
-            .query_row(
+            .prepare_cached(
                 "SELECT secret_id, version, encrypted_dek, ciphertext, value_nonce,
                         aad_schema_version, created_at
                  FROM blobs
                  WHERE secret_id = ?1 AND version = ?2",
-                params![secret_id, version],
-                secret_blob_record_from_row,
-            )
+            )?
+            .query_row(params![secret_id, version], secret_blob_record_from_row)
             .optional()
             .map_err(StoreError::from)
     }

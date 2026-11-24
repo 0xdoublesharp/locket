@@ -538,3 +538,31 @@ fn strict_partition_propagates_reason_validation_errors() -> Result<(), Box<dyn 
     assert!(matches!(error, SuppressionParseError::ReasonTooShort { line: 1, .. }));
     Ok(())
 }
+
+#[test]
+fn streaming_scan_and_redaction_preserve_punctuation_and_overlaps() {
+    let text = "🦀=[\"ghp_abcd\",'`sk_test_xyz`']\r\nkey=ghp_123";
+    let findings = scan_text("quoted.txt", text);
+    let positions: Vec<_> = findings
+        .iter()
+        .map(|finding| (finding.line, finding.column, finding.token_length, finding.kind.rule_id()))
+        .collect();
+    assert_eq!(
+        positions,
+        [
+            (1, 5, 8, RULE_ID_PROVIDER_TOKEN),
+            (1, 17, 11, RULE_ID_PROVIDER_TOKEN),
+            (2, 5, 7, RULE_ID_PROVIDER_TOKEN)
+        ]
+    );
+    let redacted = redact_text_with_known_values(
+        text,
+        &[KnownRedaction { value: "abcd\",", marker: "[KNOWN]" }],
+    );
+    assert_eq!(
+        redacted.text,
+        "🦀=[\"[KNOWN]'`lk_redacted_PROVIDER_TOKEN`']\r\nkey=lk_redacted_PROVIDER_TOKEN"
+    );
+    assert_eq!(redacted.counts.get(&FindingKind::KnownSecretValue), Some(&1));
+    assert_eq!(redacted.counts.get(&FindingKind::ProviderTokenPattern), Some(&2));
+}

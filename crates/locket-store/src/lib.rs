@@ -37,7 +37,7 @@ pub use passkey::{
 pub use profile::{
     ProfileDangerousAudit, ProfileDangerousChange, ProfileRecord, archive_empty_profile_for_import,
 };
-pub use project::ProjectRecord;
+pub use project::{ProjectRecord, ProjectSelectorResolution, ProjectSummaryRecord};
 pub use roots::ProjectRootRecord;
 pub use runtime_session::{
     AutomationClientNonceRecord, AutomationClientPrivateKeyRefRecord, AutomationClientRecord,
@@ -46,8 +46,9 @@ pub use runtime_session::{
 };
 pub use schema::{AUDIT_ACTION_SCHEMA_MIGRATE, SCHEMA_VERSION, SchemaMigrationOutcome};
 pub use secret::{
-    SecretBlobRecord, SecretCopyTarget, SecretFingerprintRecord, SecretMetadataRecord,
-    SecretMetadataUpdate, SecretRecord, SecretVersionRecord, VersionDeprecation,
+    DiscoveredSecretRecord, SecretBlobRecord, SecretCopyTarget, SecretDiscoveryFilter,
+    SecretFingerprintRecord, SecretInitialMetadata, SecretMetadataRecord, SecretMetadataUpdate,
+    SecretMutableMetadata, SecretRecord, SecretVersionRecord, VersionDeprecation,
 };
 pub use team::{
     PendingTeamInviteRecord, StoredTeamInviteRecord, TeamInviteRecord, TeamMemberListRecord,

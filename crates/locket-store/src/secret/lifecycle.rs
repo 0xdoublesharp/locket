@@ -8,8 +8,8 @@ use crate::Store;
 use crate::audit::{AuditContext, append_optional_audit};
 use crate::error::StoreError;
 use crate::secret::{
-    SecretBlobRecord, SecretCopyTarget, SecretFingerprintRecord, SecretMetadataUpdate,
-    SecretRecord, SecretVersionRecord, VersionDeprecation,
+    SecretBlobRecord, SecretCopyTarget, SecretFingerprintRecord, SecretInitialMetadata,
+    SecretMetadataUpdate, SecretRecord, SecretVersionRecord, VersionDeprecation,
 };
 
 fn advance_secret_current_version(
@@ -67,13 +67,39 @@ impl Store {
         fingerprint: &SecretFingerprintRecord,
         audit: Option<AuditContext<'_>>,
     ) -> Result<(), StoreError> {
+        self.create_active_secret_with_metadata_and_audit(
+            secret,
+            version,
+            blob,
+            fingerprint,
+            SecretInitialMetadata::default(),
+            audit,
+        )
+    }
+
+    /// Creates a secret, its initial metadata and version, and any audit row atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when metadata encoding, a database write, or the audit append fails.
+    pub fn create_active_secret_with_metadata_and_audit(
+        &mut self,
+        secret: &SecretRecord,
+        version: &SecretVersionRecord,
+        blob: &SecretBlobRecord,
+        fingerprint: &SecretFingerprintRecord,
+        metadata: SecretInitialMetadata<'_>,
+        audit: Option<AuditContext<'_>>,
+    ) -> Result<(), StoreError> {
+        let tags_json = serde_json::to_string(metadata.tags)?;
         let transaction = self.connection.savepoint()?;
         transaction.execute(
             "INSERT INTO secrets(
-               id, project_id, profile_id, name, source, origin, required,
-               current_version, state, created_at, updated_at, last_rotated_at, deleted_at
+               id, project_id, profile_id, name, source, origin, current_version, state,
+               created_at, updated_at, last_rotated_at, deleted_at,
+               description, owner, tags_json, required
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, ?10, ?11, ?12)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 secret.id.as_str(),
                 secret.project_id.as_str(),
@@ -87,6 +113,10 @@ impl Store {
                 secret.updated_at,
                 secret.last_rotated_at,
                 secret.deleted_at,
+                metadata.description,
+                metadata.owner,
+                tags_json,
+                metadata.required,
             ],
         )?;
         transaction.execute(
@@ -252,6 +282,37 @@ impl Store {
         deprecation: VersionDeprecation,
         audit: Option<AuditContext<'_>>,
     ) -> Result<(), StoreError> {
+        self.rotate_secret_with_metadata_and_audit(
+            secret,
+            new_version,
+            blob,
+            fingerprint,
+            deprecation,
+            None,
+            audit,
+        )
+    }
+
+    /// Rotates a secret, optionally replacing its mutable metadata and appending an audit row.
+    ///
+    /// When supplied, `metadata` replaces the full set of mutable fields. Passing
+    /// `None` preserves them. All writes share the rotation savepoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::SecretStateConflict`] when the stored active/current state
+    /// has changed, or another [`StoreError`] when metadata encoding, a write, or the audit fails.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rotate_secret_with_metadata_and_audit(
+        &mut self,
+        secret: &SecretRecord,
+        new_version: &SecretVersionRecord,
+        blob: &SecretBlobRecord,
+        fingerprint: &SecretFingerprintRecord,
+        deprecation: VersionDeprecation,
+        metadata: Option<SecretInitialMetadata<'_>>,
+        audit: Option<AuditContext<'_>>,
+    ) -> Result<(), StoreError> {
         let transaction = self.connection.savepoint()?;
         let deprecated = transaction.execute(
             "UPDATE secret_versions
@@ -315,6 +376,20 @@ impl Store {
             ],
         )?;
         advance_secret_current_version(&transaction, secret, new_version)?;
+        if let Some(metadata) = metadata {
+            let tags_json = serde_json::to_string(metadata.tags)?;
+            transaction.execute(
+                "UPDATE secrets SET description = ?2, owner = ?3, tags_json = ?4, required = ?5
+                 WHERE id = ?1",
+                params![
+                    secret.id,
+                    metadata.description,
+                    metadata.owner,
+                    tags_json,
+                    metadata.required
+                ],
+            )?;
+        }
         append_optional_audit(&transaction, audit)?;
         transaction.commit()?;
 

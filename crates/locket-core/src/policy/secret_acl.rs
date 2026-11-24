@@ -160,50 +160,68 @@ fn validate_relative_path_pattern(secret: &str, pattern: &str) -> Result<(), Pol
 }
 
 fn argv_pattern_matches(pattern: &[String], argv: &[String]) -> bool {
-    argv_pattern_matches_from(pattern, argv)
-}
-
-fn argv_pattern_matches_from(pattern: &[String], argv: &[String]) -> bool {
-    match (pattern.split_first(), argv.split_first()) {
-        (None, None) => true,
-        (Some((head, rest)), _) if head == "**" => {
-            rest.is_empty()
-                || (0..=argv.len()).any(|offset| argv_pattern_matches_from(rest, &argv[offset..]))
+    // matches[n] records whether the processed pattern matches argv[..n].
+    let mut matches = vec![false; argv.len() + 1];
+    matches[0] = true;
+    for token in pattern {
+        if token == "**" {
+            // Keep zero-token matches and extend them one argument at a time.
+            for n in 1..matches.len() {
+                matches[n] |= matches[n - 1];
+            }
+        } else {
+            for (index, arg) in argv.iter().enumerate().rev() {
+                matches[index + 1] = matches[index] && glob_matches(token, arg);
+            }
+            matches[0] = false;
         }
-        (Some((head, rest)), Some((arg, argv_rest))) => {
-            glob_matches(head, arg) && argv_pattern_matches_from(rest, argv_rest)
-        }
-        (None, Some(_)) | (Some(_), None) => false,
     }
+    matches[argv.len()]
 }
 
 fn path_pattern_matches(pattern: &str, relative_cwd: &Path) -> bool {
+    if pattern.is_empty() {
+        return false;
+    }
+    let (Some(pattern), Some(relative)) =
+        (slash_path(Path::new(pattern)), slash_path(relative_cwd))
+    else {
+        return false;
+    };
     if pattern == "." {
         return true;
     }
-    let relative = slash_path(relative_cwd);
     if let Some(base) = pattern.strip_suffix("/**") {
-        return relative == base || relative.starts_with(&format!("{base}/"));
+        return path_is_within(&relative, base);
     }
     if pattern.contains('*') {
-        return glob_matches(pattern, &relative);
+        return glob_matches(&pattern, &relative);
     }
-    relative == pattern || relative.starts_with(&format!("{pattern}/"))
+    path_is_within(&relative, &pattern)
 }
 
-fn slash_path(path: &Path) -> String {
-    let normalized = path
-        .components()
-        .filter_map(|component| match component {
-            Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
-            Component::CurDir
-            | Component::ParentDir
-            | Component::RootDir
-            | Component::Prefix(_) => None,
-        })
-        .collect::<Vec<_>>()
-        .join("/");
-    if normalized.is_empty() { ".".to_owned() } else { normalized }
+fn path_is_within(path: &str, base: &str) -> bool {
+    path == base || path.strip_prefix(base).is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn slash_path(path: &Path) -> Option<String> {
+    let mut normalized = String::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => {
+                if !normalized.is_empty() {
+                    normalized.push('/');
+                }
+                normalized.push_str(part.to_str()?);
+            }
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    if normalized.is_empty() {
+        normalized.push('.');
+    }
+    Some(normalized)
 }
 
 const fn glob_matches(pattern: &str, value: &str) -> bool {
@@ -262,6 +280,33 @@ mod tests {
             &["cargo".to_owned(), "test".to_owned()],
             &["cargo".to_owned(), "test".to_owned(), "-p".to_owned(), "locket-cli".to_owned()],
         ));
+    }
+
+    #[test]
+    fn repeated_argv_wildcards_do_not_backtrack() {
+        let mut pattern = vec!["**".to_owned(); 20];
+        pattern.extend(["required".to_owned(), "**".to_owned()]);
+        let mut argv = vec!["other".to_owned(); 40];
+        assert!(!argv_pattern_matches(&pattern, &argv));
+        argv[24] = "required".to_owned();
+        assert!(argv_pattern_matches(&pattern, &argv));
+        assert!(argv_pattern_matches(&pattern[..20], &[]));
+    }
+
+    #[test]
+    fn path_patterns_reject_non_relative_directories() {
+        for path in ["../apps/api", "/apps/api", "apps/../apps/api"] {
+            assert!(!path_pattern_matches("apps/api/**", Path::new(path)));
+            assert!(!path_pattern_matches(".", Path::new(path)));
+        }
+    }
+
+    #[test]
+    fn path_patterns_normalize_dot_and_empty_segments() {
+        assert!(path_pattern_matches("./apps/api/**", Path::new("apps/api/service")));
+        assert!(path_pattern_matches("apps/api/", Path::new("apps/api")));
+        assert!(path_pattern_matches("apps//./api/", Path::new("apps/api/src")));
+        assert!(!path_pattern_matches("apps/../apps/api", Path::new("apps/api")));
     }
 
     #[test]

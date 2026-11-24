@@ -87,7 +87,7 @@ impl Store {
     ///
     /// Returns [`StoreError::Sqlite`] when `SQLite` cannot query profile rows.
     pub fn list_profiles(&self, project_id: &str) -> Result<Vec<ProfileRecord>, StoreError> {
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare_cached(
             "SELECT id, project_id, name, dangerous, created_at
              FROM profiles
              WHERE project_id = ?1
@@ -111,13 +111,12 @@ impl Store {
         name: &str,
     ) -> Result<Option<ProfileRecord>, StoreError> {
         self.connection
-            .query_row(
+            .prepare_cached(
                 "SELECT id, project_id, name, dangerous, created_at
                  FROM profiles
                  WHERE project_id = ?1 AND name = ?2",
-                (project_id, name),
-                profile_record_from_row,
-            )
+            )?
+            .query_row((project_id, name), profile_record_from_row)
             .optional()
             .map_err(StoreError::from)
     }
@@ -162,13 +161,12 @@ impl Store {
     ) -> Result<Option<ProfileDangerousChange>, StoreError> {
         let transaction = self.connection.transaction()?;
         let Some(profile) = transaction
-            .query_row(
+            .prepare_cached(
                 "SELECT id, project_id, name, dangerous, created_at
                  FROM profiles
                  WHERE project_id = ?1 AND name = ?2",
-                (project_id, name),
-                profile_record_from_row,
-            )
+            )?
+            .query_row((project_id, name), profile_record_from_row)
             .optional()?
         else {
             transaction.commit()?;
@@ -225,10 +223,13 @@ pub fn archive_empty_profile_for_import(
 ) -> Result<Option<String>, StoreError> {
     use sha2::{Digest, Sha256};
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let original: Option<String> = connection.query_row(
-        "SELECT name FROM profiles WHERE project_id=?1 AND id=?2 AND NOT EXISTS (SELECT 1 FROM secrets WHERE profile_id=?2)",
-        (project_id, profile_id), |row| row.get(0),
-    ).optional()?;
+    let original: Option<String> = connection
+        .prepare_cached(
+            "SELECT name FROM profiles WHERE project_id=?1 AND id=?2
+             AND NOT EXISTS (SELECT 1 FROM secrets WHERE profile_id=?2)",
+        )?
+        .query_row((project_id, profile_id), |row| row.get(0))
+        .optional()?;
     let Some(original) = original else {
         return Ok(None);
     };
@@ -248,6 +249,8 @@ pub fn archive_empty_profile_for_import(
             [char::from(HEX[usize::from(byte >> 4)]), char::from(HEX[usize::from(byte & 15)])]
         })
         .collect();
+    let mut name_exists = connection
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM profiles WHERE project_id=?1 AND name=?2)")?;
     for attempt in 0_u64.. {
         let suffix = if attempt == 0 {
             format!("-local-{short_id}")
@@ -256,11 +259,7 @@ pub fn archive_empty_profile_for_import(
         };
         let prefix_len = prefix.len().min(64 - suffix.len());
         let archived = format!("{}{suffix}", &prefix[..prefix_len]);
-        let exists: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM profiles WHERE project_id=?1 AND name=?2)",
-            (project_id, &archived),
-            |row| row.get(0),
-        )?;
+        let exists: bool = name_exists.query_row((project_id, &archived), |row| row.get(0))?;
         if !exists {
             connection.execute(
                 "UPDATE profiles SET name=?3 WHERE project_id=?1 AND id=?2",
