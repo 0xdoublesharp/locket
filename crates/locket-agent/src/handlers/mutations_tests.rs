@@ -55,32 +55,7 @@ impl Fixture {
             scope.project_root.to_str(),
             1,
         )?;
-        for (purpose, profile, material) in [
-            (KeyPurpose::Audit, None, AUDIT),
-            (KeyPurpose::ProfileSecret, Some(PROFILE), [8; 32]),
-            (KeyPurpose::ProfileFingerprint, Some(PROFILE), [9; 32]),
-        ] {
-            let id = format!("lk_key_{}", purpose.as_str());
-            let wrap =
-                derive_wrapping_key_v1(&MASTER, &HkdfWrapInfo::new(project, profile, purpose))?;
-            let aad = key_wrap_aad_v1(&KeyWrapAad::new(
-                project,
-                &id,
-                profile,
-                0,
-                KeyWrapPurpose::from(purpose),
-            ))?;
-            let wrapped = wrap_key_material_v1(&wrap, &material, &aad)?;
-            store.insert_key(&locket_store::KeyRecord {
-                id,
-                project_id: project.into(),
-                profile_id: profile.map(str::to_owned),
-                purpose: purpose.as_str().into(),
-                wrapped_material: wrapped.ciphertext,
-                nonce: wrapped.nonce,
-                created_at: 1,
-            })?;
-        }
+        insert_wrapped_keys(&store, project, PROFILE, &MASTER, &AUDIT)?;
         Ok(Self { directory: dir, scope })
     }
     fn import(&self, text: &str, overwrite: bool) -> ImportDotenvRequest {
@@ -113,25 +88,66 @@ impl Fixture {
     }
     async fn state(&self, action: GrantAction) -> crate::AgentSocketState {
         let state = crate::AgentSocketState::locked("test");
-        state.unlock_cache.lock().await.insert(
-            PROJECT.into(),
-            UnlockEntry::new(MASTER.to_vec(), 0, Duration::from_secs(60), UnlockMethod::Passphrase),
-        );
+        unlock_fixture(&state, &self.scope.project_id, &MASTER).await;
+        self.grant(&state, action).await;
+        state
+    }
+    async fn grant(&self, state: &crate::AgentSocketState, action: GrantAction) {
         state.grants.lock().await.insert(GrantRecord::new(GrantRecordFields {
             grant_id: "lk_grant_mutation".into(),
-            project_id: PROJECT.into(),
-            profile_id: PROFILE.into(),
+            project_id: self.scope.project_id.clone(),
+            profile_id: self.scope.profile_id.clone(),
             action,
             binding: self.scope.binding.clone().unwrap(),
             issued_at_unix_nanos: 0,
             ttl_seconds: 30,
             expires_at_unix_nanos: 30_000_000_000,
         }));
-        state
     }
     fn store(&self) -> Store {
         Store::open(&self.scope.store_path).unwrap()
     }
+}
+fn insert_wrapped_keys(
+    store: &Store,
+    project: &str,
+    profile_id: &str,
+    master: &KeyBytes,
+    audit: &KeyBytes,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (purpose, profile, material) in [
+        (KeyPurpose::Audit, None, audit),
+        (KeyPurpose::ProfileSecret, Some(profile_id), &[8; 32]),
+        (KeyPurpose::ProfileFingerprint, Some(profile_id), &[9; 32]),
+    ] {
+        let id = format!("lk_key_{project}_{}", purpose.as_str());
+        let wrap = derive_wrapping_key_v1(master, &HkdfWrapInfo::new(project, profile, purpose))?;
+        let aad = key_wrap_aad_v1(&KeyWrapAad::new(
+            project,
+            &id,
+            profile,
+            0,
+            KeyWrapPurpose::from(purpose),
+        ))?;
+        let wrapped = wrap_key_material_v1(&wrap, material, &aad)?;
+        store.insert_key(&locket_store::KeyRecord {
+            id,
+            project_id: project.into(),
+            profile_id: profile.map(str::to_owned),
+            purpose: purpose.as_str().into(),
+            wrapped_material: wrapped.ciphertext,
+            nonce: wrapped.nonce,
+            created_at: 1,
+        })?;
+    }
+    Ok(())
+}
+
+async fn unlock_fixture(state: &crate::AgentSocketState, project: &str, master: &KeyBytes) {
+    state.unlock_cache.lock().await.insert(
+        project.into(),
+        UnlockEntry::new(master.to_vec(), 0, Duration::from_secs(60), UnlockMethod::Passphrase),
+    );
 }
 fn code(response: ResponseEnvelope) -> String {
     match response {
@@ -704,5 +720,269 @@ async fn import_grant_scope_binding_and_expiry_fail_before_opening_env()
         "GrantRequired"
     );
     assert_eq!(fixture.store().list_active_secrets_by_profile(PROJECT, PROFILE)?, Vec::new());
+    Ok(())
+}
+
+fn crud_request(
+    method: crate::AgentMethod,
+    scope: &MutationScope,
+    fields: Value,
+) -> RequestEnvelope {
+    let mut payload = serde_json::to_value(scope).unwrap();
+    let Value::Object(fields) = fields else { panic!("expected request fields") };
+    payload.as_object_mut().unwrap().extend(fields);
+    RequestEnvelope::new("desktop-crud", method, payload)
+}
+
+async fn call_crud(state: &crate::AgentSocketState, request: &RequestEnvelope) -> ResponseEnvelope {
+    let response = handle_desktop_crud(request.method().unwrap(), request, state, NOW).await;
+    assert!(!serde_json::to_string(&response).unwrap().contains(CANARY));
+    response
+}
+
+fn success(response: ResponseEnvelope) -> Value {
+    match response {
+        ResponseEnvelope::Success(s) => s.payload,
+        ResponseEnvelope::Error(e) => panic!("unexpected CRUD error: {e:?}"),
+    }
+}
+
+#[tokio::test]
+async fn create_profile_initializes_wrapped_keys_and_audits_once()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = Fixture::new()?;
+    let db = fixture.store();
+    let state = fixture.state(GrantAction::CreateProfile).await;
+    let method = crate::AgentMethod::CreateProfile;
+    let config_path = fixture.scope.project_root.join("locket.toml");
+    let original_config = std::fs::read(&config_path)?;
+    let valid = crud_request(method, &fixture.scope, json!({"profile_name":"staging"}));
+    let invalid = crud_request(method, &fixture.scope, json!({"profile_name":"/invalid"}));
+    assert_eq!(code(call_crud(&state, &invalid).await), "InvalidProfileName");
+    assert!(state.grants.lock().await.is_empty());
+    assert_eq!(code(call_crud(&state, &valid).await), "GrantRequired");
+
+    fixture.grant(&state, GrantAction::CreateProfile).await;
+    let result = success(call_crud(&state, &valid).await);
+    let profile = db.get_profile_by_name(PROJECT, "staging")?.ok_or("profile")?;
+    assert_eq!(
+        result,
+        json!({
+            "profile_id": profile.id, "profile_name": "staging", "dangerous": false, "created": true,
+        })
+    );
+    for purpose in [KeyPurpose::ProfileSecret, KeyPurpose::ProfileFingerprint] {
+        crate::keys::unwrap_profile_key_with_master(&db, PROJECT, &profile.id, &MASTER, purpose)?;
+    }
+    assert_eq!(std::fs::read(config_path)?, original_config);
+    fixture.grant(&state, GrantAction::CreateProfile).await;
+    assert_eq!(code(call_crud(&state, &valid).await), "SecretAlreadyExists");
+    let audit = db.list_audit_rows_since(PROJECT, &profile.id, 0)?;
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].action, "PROFILE_CREATE");
+    assert!(db.verify_audit_chain_read_only(PROJECT, &AUDIT)?.hmac_ok);
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_profile_rejects_locked_rootless_and_rolls_back_on_audit_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = Fixture::new()?;
+    let method = crate::AgentMethod::CreateProfile;
+    let state = fixture.state(GrantAction::CreateProfile).await;
+    let valid = crud_request(method, &fixture.scope, json!({"profile_name":"staging"}));
+    state.unlock_cache.lock().await.evict(PROJECT);
+    assert_eq!(code(call_crud(&state, &valid).await), "UnlockRequired");
+    assert!(state.grants.lock().await.is_empty());
+    unlock_fixture(&state, PROJECT, &MASTER).await;
+    let mut rootless = fixture.scope.clone();
+    rootless.project_root = PathBuf::new();
+    fixture.grant(&state, GrantAction::CreateProfile).await;
+    let request = crud_request(method, &rootless, json!({"profile_name":"staging"}));
+    assert_eq!(code(call_crud(&state, &request).await), "MetadataInvalid");
+
+    let shared = Fixture::for_project(SHARED_PROJECT, "@shared", "default")?;
+    let shared_state = shared.state(GrantAction::CreateProfile).await;
+    let request = crud_request(method, &shared.scope, json!({"profile_name":"staging"}));
+    assert_eq!(code(call_crud(&shared_state, &request).await), "MetadataInvalid");
+
+    let db = fixture.store();
+    db.connection().execute_batch(
+        "CREATE TRIGGER refuse_profile_audit BEFORE INSERT ON audit_log
+         WHEN NEW.action = 'PROFILE_CREATE' BEGIN SELECT RAISE(ABORT, 'fixture'); END;",
+    )?;
+    fixture.grant(&state, GrantAction::CreateProfile).await;
+    assert_eq!(code(call_crud(&state, &valid).await), "CorruptDb");
+    assert!(db.get_profile_by_name(PROJECT, "staging")?.is_none());
+    assert_eq!(
+        db.connection().query_row("SELECT count(*) FROM keys", [], |row| row.get::<_, u32>(0))?,
+        3
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_secret_requires_exact_confirmation_and_one_grant_in_both_vault_types()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (project, project_name, profile) in
+        [(PROJECT, "fixture", "dev"), (SHARED_PROJECT, "@shared", "default")]
+    {
+        let fixture = Fixture::for_project(project, project_name, profile)?;
+        let mut import = fixture.import(&format!("TOKEN={CANARY}\n"), false);
+        let mut scope = fixture.scope.clone();
+        if project == SHARED_PROJECT {
+            scope.project_root = PathBuf::new();
+            import.scope = scope.clone();
+        }
+        import_dotenv_with_master(&import, &MASTER, 1)?;
+        let db = fixture.store();
+        db.set_profile_dangerous(project, profile, true)?;
+        let method = crate::AgentMethod::DeleteSecret;
+        let invalid = crud_request(
+            method,
+            &scope,
+            json!({
+                "secret_name": "TOKEN", "source": "user-local", "confirmation": CANARY,
+            }),
+        );
+        let valid = crud_request(
+            method,
+            &scope,
+            json!({
+                "secret_name": "TOKEN", "source": "user-local", "confirmation": profile,
+            }),
+        );
+        let state = fixture.state(GrantAction::CopySecretToShared).await;
+        assert_eq!(code(call_crud(&state, &valid).await), "GrantRequired");
+        fixture.grant(&state, GrantAction::DeleteSecret).await;
+        assert_eq!(code(call_crud(&state, &invalid).await), "ConfirmationFailed");
+        assert!(db.get_active_secret(project, PROFILE, "TOKEN", "user-local")?.is_some());
+        assert!(state.grants.lock().await.is_empty());
+        assert_eq!(code(call_crud(&state, &valid).await), "GrantRequired");
+
+        fixture.grant(&state, GrantAction::DeleteSecret).await;
+        assert_eq!(
+            success(call_crud(&state, &valid).await),
+            json!({
+                "secret_name": "TOKEN", "source": "user-local", "version": 1, "deleted": true,
+            })
+        );
+        assert!(state.grants.lock().await.is_empty());
+        let secret =
+            db.get_secret_by_source(project, PROFILE, "TOKEN", "user-local")?.ok_or("tombstone")?;
+        assert_eq!(secret.state, "deleted");
+        assert!(db.get_blob(&secret.id, 1)?.is_some());
+        fixture.grant(&state, GrantAction::DeleteSecret).await;
+        assert_eq!(code(call_crud(&state, &valid).await), "SecretNotFound");
+        let audit = db.list_audit_rows_since(project, PROFILE, 0)?;
+        assert_eq!(audit.iter().filter(|row| row.action == "DELETE").count(), 1);
+        assert!(db.connection().query_row(
+            "SELECT NOT EXISTS (SELECT 1 FROM audit_log WHERE instr(metadata_json, ?1) > 0)",
+            [CANARY],
+            |row| row.get::<_, bool>(0),
+        )?);
+        assert!(db.verify_audit_chain_read_only(project, &AUDIT)?.hmac_ok);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn copy_to_shared_requires_both_unlocks_and_rotates_only_with_explicit_overwrite()
+-> Result<(), Box<dyn std::error::Error>> {
+    const DEST_PROFILE: &str = "lk_prof_global_default";
+    const DEST_MASTER: KeyBytes = [22; 32];
+    const DEST_AUDIT: KeyBytes = [23; 32];
+    let fixture = Fixture::new()?;
+    let method = crate::AgentMethod::CopySecretToShared;
+    let db = fixture.store();
+    db.insert_project_if_absent(SHARED_PROJECT, "@shared", 1)?;
+    db.insert_profile_if_absent(DEST_PROFILE, SHARED_PROJECT, "default", false, 1)?;
+    insert_wrapped_keys(&db, SHARED_PROJECT, DEST_PROFILE, &DEST_MASTER, &DEST_AUDIT)?;
+    import_dotenv_with_master(&fixture.import(&format!("TOKEN={CANARY}\n"), false), &MASTER, 2)?;
+    db.set_profile_dangerous(PROJECT, "dev", true)?;
+    let unconfirmed = crud_request(method, &fixture.scope, json!({"secret_name":"TOKEN"}));
+    let create = crud_request(
+        method,
+        &fixture.scope,
+        json!({
+            "secret_name": "TOKEN", "confirmation": "dev",
+        }),
+    );
+    let rotate = crud_request(
+        method,
+        &fixture.scope,
+        json!({
+            "secret_name": "TOKEN", "source": "user-local", "overwrite": true, "confirmation": "dev",
+        }),
+    );
+    let state = fixture.state(GrantAction::CopySecretToShared).await;
+
+    let locked = call_crud(&state, &create).await;
+    assert!(
+        matches!(locked, ResponseEnvelope::Error(e) if e.error == "UnlockRequired" && e.message.contains("unlock the Global Vault"))
+    );
+    assert!(state.grants.lock().await.is_empty());
+    assert!(
+        db.get_secret_by_source(SHARED_PROJECT, DEST_PROFILE, "TOKEN", "user-local")?.is_none()
+    );
+    state.unlock_cache.lock().await.evict(PROJECT);
+    unlock_fixture(&state, SHARED_PROJECT, &DEST_MASTER).await;
+    fixture.grant(&state, GrantAction::CopySecretToShared).await;
+    let locked = call_crud(&state, &create).await;
+    assert!(
+        matches!(locked, ResponseEnvelope::Error(e) if e.error == "UnlockRequired" && e.message.contains("unlock the source vault"))
+    );
+    unlock_fixture(&state, PROJECT, &MASTER).await;
+    fixture.grant(&state, GrantAction::CopySecretToShared).await;
+    assert_eq!(code(call_crud(&state, &unconfirmed).await), "ConfirmationFailed");
+    fixture.grant(&state, GrantAction::CopySecretToShared).await;
+    assert_eq!(
+        success(call_crud(&state, &create).await),
+        json!({
+            "target_project_id": SHARED_PROJECT, "target_profile_id": DEST_PROFILE,
+            "secret_name": "TOKEN", "version": 1, "action": "create",
+        })
+    );
+    assert!(state.grants.lock().await.is_empty());
+    fixture.grant(&state, GrantAction::CopySecretToShared).await;
+    assert_eq!(code(call_crud(&state, &create).await), "SecretAlreadyExists");
+    db.connection().execute_batch(
+        "CREATE TRIGGER refuse_source_copy_audit BEFORE INSERT ON audit_log
+         WHEN NEW.action = 'SECRET_COPY' AND NEW.project_id = 'lk_proj_mutation'
+         BEGIN SELECT RAISE(ABORT, 'fixture'); END;",
+    )?;
+    fixture.grant(&state, GrantAction::CopySecretToShared).await;
+    assert_eq!(code(call_crud(&state, &rotate).await), "CorruptDb");
+    let retained = db
+        .get_active_secret(SHARED_PROJECT, DEST_PROFILE, "TOKEN", "user-local")?
+        .ok_or("target after audit rollback")?;
+    assert_eq!(retained.current_version, 1);
+    assert!(db.get_secret_version(&retained.id, 2)?.is_none());
+    db.connection().execute_batch("DROP TRIGGER refuse_source_copy_audit")?;
+    fixture.grant(&state, GrantAction::CopySecretToShared).await;
+    assert_eq!(success(call_crud(&state, &rotate).await)["action"], "rotate");
+    assert!(state.grants.lock().await.is_empty());
+    let target = db
+        .get_active_secret(SHARED_PROJECT, DEST_PROFILE, "TOKEN", "user-local")?
+        .ok_or("target")?;
+    assert_eq!(target.current_version, 2);
+    assert_eq!(db.get_secret_version(&target.id, 1)?.ok_or("previous")?.state, "deprecated");
+    let value =
+        crate::reveal::decrypt_secret(&db, SHARED_PROJECT, DEST_PROFILE, &target, 2, &DEST_MASTER)?;
+    assert_eq!(value.as_str(), CANARY);
+    let source = db.get_active_secret(PROJECT, PROFILE, "TOKEN", "user-local")?.ok_or("source")?;
+    assert_eq!(source.current_version, 1);
+    for (project, profile, audit_key) in
+        [(PROJECT, PROFILE, AUDIT), (SHARED_PROJECT, DEST_PROFILE, DEST_AUDIT)]
+    {
+        let audit = db.list_audit_rows_since(project, profile, 0)?;
+        assert_eq!(audit.iter().filter(|row| row.action == "SECRET_COPY").count(), 2);
+        assert!(db.connection().query_row(
+            "SELECT NOT EXISTS (SELECT 1 FROM audit_log WHERE instr(metadata_json, ?1) > 0)",
+            [CANARY],
+            |row| row.get::<_, bool>(0),
+        )?);
+        assert!(db.verify_audit_chain_read_only(project, &audit_key)?.hmac_ok);
+    }
     Ok(())
 }

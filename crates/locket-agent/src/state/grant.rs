@@ -78,11 +78,26 @@ pub enum GrantAction {
     Export,
     /// Create or rotate one secret value through a gated path.
     SetSecret,
+    /// Create an environment in a trusted folder project.
+    CreateProfile,
+    /// Tombstone one active secret source.
+    DeleteSecret,
+    /// Promote an active secret to the Global Vault.
+    CopySecretToShared,
     /// Import a batch into the selected profile.
     ImportDotenv,
     /// Persist an execution policy edit.
     ApplyPolicy,
 }
+
+impl GrantAction {
+    pub(crate) const fn is_desktop_crud(self) -> bool {
+        matches!(self, Self::CreateProfile | Self::DeleteSecret | Self::CopySecretToShared)
+    }
+}
+
+/// Maximum lifetime of a single-use desktop CRUD grant.
+pub const DESKTOP_CRUD_GRANT_TTL_SECS: u64 = 30;
 
 /// Metadata-only live grant record.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

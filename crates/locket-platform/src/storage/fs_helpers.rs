@@ -92,3 +92,40 @@ fn refuse_symlink(path: &Path) -> io::Result<()> {
         Err(error) => Err(error),
     }
 }
+
+/// Opens a regular file for reading without following a final symlink or reparse point.
+///
+/// # Errors
+///
+/// Returns an I/O error if the file cannot be opened or is not a regular file.
+pub fn open_regular_file(path: &Path) -> io::Result<fs::File> {
+    #[cfg(unix)]
+    let file = {
+        use rustix::fs::{Mode, OFlags, open};
+        // Nonblocking keeps a swapped-in FIFO from blocking the metadata check.
+        fs::File::from(open(
+            path,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::empty(),
+        )?)
+    };
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+        };
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "expected a regular file"));
+        }
+        file
+    };
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "expected a regular file"));
+    }
+    Ok(file)
+}

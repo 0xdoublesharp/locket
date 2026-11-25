@@ -602,7 +602,7 @@ fn validate_version(
     ))
 }
 
-fn decrypt_secret(
+pub(super) fn decrypt_secret(
     store: &Store,
     project_id: &str,
     profile_id: &str,

@@ -74,6 +74,7 @@ pub use session::{
 };
 #[cfg(target_os = "macos")]
 pub use storage::clipboard::{clear_if_unchanged, write_concealed_secret, write_plain_text};
+pub use storage::fs_helpers::open_regular_file;
 pub use storage::policy_file::{
     PolicyFileDocument, PolicyFileError, SECRET_FILE_IGNORE_PATTERNS, ensure_secret_file_ignores,
 };

@@ -1407,6 +1407,14 @@ pub async fn dispatch_with_peer(
         Ok(AgentMethod::ApplyPolicy) => {
             crate::mutations::handle_apply_policy(envelope, state, current_unix_nanos()).await
         }
+        Ok(
+            method @ (AgentMethod::CreateProfile
+            | AgentMethod::DeleteSecret
+            | AgentMethod::CopySecretToShared),
+        ) => {
+            crate::mutations::handle_desktop_crud(method, envelope, state, current_unix_nanos())
+                .await
+        }
         Ok(AgentMethod::SetSecret) => {
             crate::set_secret::handle_set_secret(envelope, state, current_unix_nanos()).await
         }
@@ -2107,6 +2115,9 @@ async fn handle_request_grant(
         }
         payload.ttl_seconds = policy_ttl_seconds;
     }
+    if payload.action.is_desktop_crud() {
+        payload.ttl_seconds = payload.ttl_seconds.min(crate::grant::DESKTOP_CRUD_GRANT_TTL_SECS);
+    }
     let grant_audit = if let Some(actions) = verification_actions {
         match authorize_secret_grant(
             envelope,
@@ -2237,7 +2248,14 @@ pub struct GrantVerificationAudit {
 }
 
 fn unlock_required_for_grant(envelope: &RequestEnvelope) -> ResponseEnvelope {
-    error_response(envelope, "UnlockRequired", "unlock the project before requesting a grant")
+    let message = if envelope.payload.get("action").and_then(serde_json::Value::as_str)
+        == Some("CopySecretToShared")
+    {
+        "unlock the source vault before copying to the Global Vault"
+    } else {
+        "unlock the project before requesting a grant"
+    };
+    error_response(envelope, "UnlockRequired", message)
 }
 
 const fn secret_grant_verification_actions(
@@ -2247,11 +2265,13 @@ const fn secret_grant_verification_actions(
 
     match action {
         GrantAction::Reveal => Some(&["reveal"]),
-        GrantAction::Copy => Some(&["copy"]),
+        GrantAction::Copy | GrantAction::CopySecretToShared => Some(&["copy"]),
         GrantAction::Export
         | GrantAction::ImportDotenv
         | GrantAction::SetSecret
-        | GrantAction::ApplyPolicy => Some(&["reveal", "copy"]),
+        | GrantAction::ApplyPolicy
+        | GrantAction::CreateProfile
+        | GrantAction::DeleteSecret => Some(&["reveal", "copy"]),
         GrantAction::TeamSync
         | GrantAction::PrepareExec
         | GrantAction::ResolveReference
@@ -2308,7 +2328,7 @@ pub async fn authorize_secret_grant(
                 })?
                 .dangerous
         };
-        if dangerous && !payload.confirm_dangerous {
+        if dangerous && !payload.confirm_dangerous && payload.action != GrantAction::CreateProfile {
             return Err(error_response(
                 envelope,
                 "ConfirmationFailed",

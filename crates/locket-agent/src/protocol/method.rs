@@ -73,6 +73,12 @@ pub enum AgentMethod {
     ListVersions,
     /// Create or rotate one secret value through a gated path.
     SetSecret,
+    /// Create an environment in a trusted folder project.
+    CreateProfile,
+    /// Tombstone one active secret source.
+    DeleteSecret,
+    /// Promote an active secret to the Global Vault inside the agent.
+    CopySecretToShared,
     /// Import a selected dotenv file with an agent-owned key.
     ImportDotenv,
     /// Persist a selected project policy edit.
@@ -135,6 +141,9 @@ impl AgentMethod {
             Self::DiscoverSecrets => "DiscoverSecrets",
             Self::ListVersions => "ListVersions",
             Self::SetSecret => "SetSecret",
+            Self::CreateProfile => "CreateProfile",
+            Self::DeleteSecret => "DeleteSecret",
+            Self::CopySecretToShared => "CopySecretToShared",
             Self::ImportDotenv => "ImportDotenv",
             Self::ApplyPolicy => "ApplyPolicy",
             Self::SetActiveProfile => "SetActiveProfile",
@@ -188,6 +197,9 @@ impl FromStr for AgentMethod {
             "DiscoverSecrets" => Ok(Self::DiscoverSecrets),
             "ListVersions" => Ok(Self::ListVersions),
             "SetSecret" => Ok(Self::SetSecret),
+            "CreateProfile" => Ok(Self::CreateProfile),
+            "DeleteSecret" => Ok(Self::DeleteSecret),
+            "CopySecretToShared" => Ok(Self::CopySecretToShared),
             "ImportDotenv" => Ok(Self::ImportDotenv),
             "ApplyPolicy" => Ok(Self::ApplyPolicy),
             "SetActiveProfile" => Ok(Self::SetActiveProfile),
@@ -210,4 +222,16 @@ impl FromStr for AgentMethod {
 pub struct UnknownMethod {
     /// Method string found in the envelope.
     pub method: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AgentMethod;
+
+    #[test]
+    fn desktop_crud_methods_round_trip() {
+        for name in ["CreateProfile", "DeleteSecret", "CopySecretToShared"] {
+            assert_eq!(name.parse::<AgentMethod>().map(AgentMethod::as_str), Ok(name));
+        }
+    }
 }

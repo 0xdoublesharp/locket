@@ -760,7 +760,7 @@ fn ensure_profile_exists(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn encrypt_secret_version(
+pub(super) fn encrypt_secret_version(
     store: &Store,
     project_id: &str,
     profile_id: &str,
@@ -809,7 +809,7 @@ fn encrypt_secret_version(
     Ok((encrypted, fingerprint.to_vec()))
 }
 
-fn secret_blob(
+pub(super) fn secret_blob(
     secret_id: &str,
     version: u32,
     encrypted: EncryptedSecretValue,
@@ -826,7 +826,7 @@ fn secret_blob(
     }
 }
 
-fn secret_audit_metadata(
+pub(super) fn secret_audit_metadata(
     action: &str,
     secret_name: &str,
     profile_id: &str,

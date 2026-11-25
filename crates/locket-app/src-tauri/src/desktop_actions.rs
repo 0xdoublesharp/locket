@@ -1,8 +1,18 @@
 //! Scoped desktop operations. Child output never crosses the webview boundary.
 
+#[path = "command_detection.rs"]
+mod command_detection;
+use command_detection::DetectedCommand;
+
 #[cfg(not(any(target_os = "windows", test)))]
 use base64 as _;
+use locket_agent::{
+    AgentMethod, CopySecretToSharedResponse, CreateProfileResponse, DeleteSecretResponse,
+    GrantAction,
+};
 use locket_core::ProjectConfig;
+
+use super::AgentClientError;
 use locket_platform::{INSTANCE_ENV, LocketInstance};
 use locket_store::Store;
 use serde::{Deserialize, Serialize};
@@ -1036,6 +1046,185 @@ fn import_env_payload(
         "profile_id": context.profile_id, "env_path": request.path,
         "overwrite": request.overwrite, "literal": request.literal, "confirmation": request.confirmation,
     }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DesktopCreateProfileRequest {
+    project_id: String,
+    profile_name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DesktopDeleteSecretRequest {
+    project_id: String,
+    profile_id: String,
+    secret_name: String,
+    source: String,
+    confirmation: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DesktopCopySecretToSharedRequest {
+    from_project_id: String,
+    from_profile_id: String,
+    secret_name: String,
+    source: Option<String>,
+    #[serde(default)]
+    overwrite: bool,
+    confirmation: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DesktopDetectCommandsRequest {
+    project_id: String,
+}
+
+#[tauri::command]
+pub(crate) async fn desktop_create_profile(
+    request: DesktopCreateProfileRequest,
+) -> Result<CreateProfileResponse, AgentClientError> {
+    let store = super::default_store_path()?;
+    let context = granted_project_context(&store, &request.project_id, None)?;
+    if context.project_root().is_none() {
+        return Err(AgentClientError::Protocol {
+            reason: "Creating an environment requires a trusted project folder.".into(),
+        });
+    }
+    let payload = desktop_crud_payload(
+        &store,
+        &context,
+        serde_json::json!({
+            "profile_name": request.profile_name,
+        }),
+    );
+    invoke_granted_at(
+        &super::resolve_socket_path(),
+        AgentMethod::CreateProfile,
+        GrantAction::CreateProfile,
+        payload,
+        &store,
+        &context,
+    )
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn desktop_delete_secret(
+    request: DesktopDeleteSecretRequest,
+) -> Result<DeleteSecretResponse, AgentClientError> {
+    let store = super::default_store_path()?;
+    let context = granted_project_context(&store, &request.project_id, Some(&request.profile_id))?;
+    let payload = delete_secret_payload(&store, &context, request);
+    invoke_granted_at(
+        &super::resolve_socket_path(),
+        AgentMethod::DeleteSecret,
+        GrantAction::DeleteSecret,
+        payload,
+        &store,
+        &context,
+    )
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn desktop_copy_secret_to_shared(
+    request: DesktopCopySecretToSharedRequest,
+) -> Result<CopySecretToSharedResponse, AgentClientError> {
+    let store = super::default_store_path()?;
+    let context =
+        granted_project_context(&store, &request.from_project_id, Some(&request.from_profile_id))?;
+    let payload = copy_to_shared_payload(&store, &context, request);
+    invoke_granted_at(
+        &super::resolve_socket_path(),
+        AgentMethod::CopySecretToShared,
+        GrantAction::CopySecretToShared,
+        payload,
+        &store,
+        &context,
+    )
+    .await
+    .map_err(|mut error| {
+        if let AgentClientError::Rejected { code, message, display_reason, .. } = &mut error
+            && code == "UnlockRequired"
+        {
+            display_reason.clone_from(message);
+        }
+        error
+    })
+}
+
+fn delete_secret_payload(
+    store: &Path,
+    context: &DesktopProjectContext,
+    request: DesktopDeleteSecretRequest,
+) -> serde_json::Value {
+    desktop_crud_payload(
+        store,
+        context,
+        serde_json::json!({
+            "secret_name": request.secret_name,
+            "source": request.source,
+            "confirmation": request.confirmation,
+        }),
+    )
+}
+
+fn copy_to_shared_payload(
+    store: &Path,
+    context: &DesktopProjectContext,
+    request: DesktopCopySecretToSharedRequest,
+) -> serde_json::Value {
+    desktop_crud_payload(
+        store,
+        context,
+        serde_json::json!({
+            "secret_name": request.secret_name,
+            "source": request.source,
+            "overwrite": request.overwrite,
+            "confirmation": request.confirmation,
+        }),
+    )
+}
+
+fn desktop_crud_payload(
+    store: &Path,
+    context: &DesktopProjectContext,
+    mut fields: serde_json::Value,
+) -> serde_json::Value {
+    fields["store_path"] = serde_json::json!(store);
+    fields["project_root"] = serde_json::json!(context.root);
+    fields["project_id"] = serde_json::json!(context.project_id);
+    fields["profile_id"] = serde_json::json!(context.profile_id);
+    fields
+}
+
+#[tauri::command]
+pub(crate) async fn desktop_detect_commands(
+    request: DesktopDetectCommandsRequest,
+) -> Result<Vec<DetectedCommand>, String> {
+    let store = super::default_store_path().map_err(|error| error.to_string())?;
+    blocking(move || {
+        if is_shared_project_id(&request.project_id) {
+            return Err("The Global Vault has no project folder for command detection.".into());
+        }
+        let context = granted_project_context(&store, &request.project_id, None)
+            .map_err(|error| error.to_string())?;
+        detect_commands_for_context(&context)
+    })
+    .await
+}
+
+fn detect_commands_for_context(
+    context: &DesktopProjectContext,
+) -> Result<Vec<DetectedCommand>, String> {
+    let root = context
+        .project_root()
+        .ok_or_else(|| "Command detection requires a trusted project folder.".to_string())?;
+    command_detection::detect(root, &context.project_id)
 }
 
 #[tauri::command]

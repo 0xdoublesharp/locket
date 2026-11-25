@@ -1,5 +1,10 @@
 //! Agent-owned dotenv imports and durable policy edits. Results contain metadata only.
 
+#[path = "desktop_crud.rs"]
+mod desktop_crud;
+pub use desktop_crud::handle_desktop_crud;
+pub use desktop_crud::{CopySecretToSharedResponse, CreateProfileResponse, DeleteSecretResponse};
+
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;

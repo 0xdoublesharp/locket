@@ -259,9 +259,15 @@ fn desktop_project_actions_are_registered_and_allowed() {
     let registered = handler_command_names(&read_text("src/lib.rs"));
     let allowed =
         toml_string_array(&read_text("permissions/desktop-commands.toml"), "commands.allow");
-    for command in
-        ["desktop_scan_project", "desktop_open_shared_vault", "desktop_inspect_project_folder"]
-    {
+    for command in [
+        "desktop_scan_project",
+        "desktop_open_shared_vault",
+        "desktop_inspect_project_folder",
+        "desktop_create_profile",
+        "desktop_delete_secret",
+        "desktop_copy_secret_to_shared",
+        "desktop_detect_commands",
+    ] {
         assert!(registered.contains(command), "{command} must be registered");
         assert!(allowed.iter().any(|name| name == command), "{command} must be allowed");
     }

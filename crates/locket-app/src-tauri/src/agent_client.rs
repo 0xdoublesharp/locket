@@ -38,6 +38,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Round-trip request timeout once a connection is established.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Allows the local user to finish the OS verification prompt before a grant is issued.
+const GRANT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(125);
+
 /// Windows exposes unary RPCs, so poll for metadata invalidation once a second.
 #[cfg(target_os = "windows")]
 const WINDOWS_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -361,9 +364,18 @@ async fn round_trip(
 ) -> Result<ResponseEnvelope, AgentClientError> {
     let mutation = matches!(
         method,
-        AgentMethod::ImportDotenv | AgentMethod::ApplyPolicy | AgentMethod::SetSecret
+        AgentMethod::ImportDotenv
+            | AgentMethod::ApplyPolicy
+            | AgentMethod::SetSecret
+            | AgentMethod::CreateProfile
+            | AgentMethod::DeleteSecret
+            | AgentMethod::CopySecretToShared
     );
-    let timeout = if mutation { Duration::from_secs(30) } else { REQUEST_TIMEOUT };
+    let timeout = match method {
+        AgentMethod::RequestGrant => GRANT_APPROVAL_TIMEOUT,
+        _ if mutation => Duration::from_secs(30),
+        _ => REQUEST_TIMEOUT,
+    };
     let result = tokio::time::timeout(timeout, exchange_frame(&mut stream, frame)).await;
     match result {
         Ok(Ok(envelope)) => Ok(envelope),

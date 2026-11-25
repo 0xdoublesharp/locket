@@ -1241,3 +1241,258 @@ fn inspect_project_folder_detects_existing_and_missing_locket_toml() -> Result<(
     );
     Ok(())
 }
+
+#[test]
+fn command_detection_reads_manifests_and_identifies_saved_commands_without_running_them()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let config_path = fixture.root.join("locket.toml");
+    let config =
+        fs::read_to_string(&config_path)? + "\n[commands.rust-check]\nargv=['cargo','check']\n";
+    fs::write(&config_path, &config)?;
+    fs::write(
+        fixture.root.join("package.json"),
+        r#"{
+        "packageManager":"pnpm@10.0.0",
+        "scripts":{"dev":"touch canary-executed","test":"private-command-body-canary",
+        "build:web":"vite build","-bad":"bad","empty":"","invalid":false}
+    }"#,
+    )?;
+    fs::write(
+        fixture.root.join("Makefile"),
+        "VALUE := no-target\n.PHONY: check fmt\ncheck fmt: # comment\n\ttouch canary-executed\n%.out: %.in\n",
+    )?;
+    fs::write(fixture.root.join("Cargo.toml"), "[package]\nname='fixture'\nversion='0.1.0'\n")?;
+    fs::create_dir(fixture.root.join("src"))?;
+    fs::write(fixture.root.join("src/main.rs"), "fn main() {}")?;
+    fs::write(
+        fixture.root.join("pyproject.toml"),
+        "[project.scripts]\nserve='fixture:serve'\n[tool.poetry.scripts]\nworker='fixture:worker'\n",
+    )?;
+    let context = open_project_at(&fixture.store, &fixture.root)?;
+    let candidates = serde_json::to_value(detect_commands_for_context(&context)?)?;
+    let rows = candidates.as_array().ok_or("candidate rows")?;
+    let expected = [
+        ("package.json", "build:web", "pnpm run build:web", false),
+        ("package.json", "dev", "pnpm run dev", false),
+        ("package.json", "test", "pnpm run test", true),
+        ("Makefile", "check", "make check", false),
+        ("Makefile", "fmt", "make fmt", false),
+        ("Cargo.toml", "cargo-build", "cargo build", false),
+        ("Cargo.toml", "cargo-check", "cargo check", true),
+        ("Cargo.toml", "cargo-test", "cargo test", false),
+        ("Cargo.toml", "cargo-run", "cargo run", false),
+        ("pyproject.toml", "serve", "uv run serve", false),
+        ("pyproject.toml", "worker", "poetry run worker", false),
+    ];
+    assert_eq!(rows.len(), expected.len());
+    for (source, name, preview, configured) in expected {
+        let row = rows
+            .iter()
+            .find(|row| row["name"] == name && row["source_file"] == source)
+            .ok_or(name)?;
+        assert_eq!(
+            row,
+            &serde_json::json!({
+                "name": name, "source_file": source, "command_preview": preview,
+                "argv": preview.split_ascii_whitespace().collect::<Vec<_>>(), "already_configured": configured,
+            })
+        );
+    }
+    assert!(!candidates.to_string().contains("private-command-body-canary"));
+    assert!(!fixture.root.join("canary-executed").exists());
+    assert_eq!(fs::read_to_string(config_path)?, config);
+    Ok(())
+}
+
+#[test]
+fn detection_refuses_global_vault_and_ignores_malformed_and_large_manifests()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let context = open_project_at(&fixture.store, &fixture.root)?;
+    let mut shared = context.clone();
+    shared.is_shared = true;
+    assert!(detect_commands_for_context(&shared).is_err());
+    fs::write(fixture.root.join("package.json"), "{invalid")?;
+    fs::write(fixture.root.join("Cargo.toml"), "[package")?;
+    fs::write(fixture.root.join("Makefile"), format!("too-large:\n{}", "#".repeat(1024 * 1024)))?;
+    assert!(detect_commands_for_context(&context)?.is_empty());
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn detection_refuses_symlinked_manifests() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let context = open_project_at(&fixture.store, &fixture.root)?;
+    let outside = fixture.directory.path().join("outside.json");
+    fs::write(&outside, r#"{"scripts":{"canary-outside":"anything"}}"#)?;
+    std::os::unix::fs::symlink(outside, fixture.root.join("package.json"))?;
+    assert!(detect_commands_for_context(&context)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn desktop_crud_request_rejects_values_and_caller_auth_fields() {
+    for field in ["value", "store_path", "project_root", "grant_id", "binding"] {
+        let mut deletion = serde_json::json!({
+            "project_id": "folder", "profile_id": "profile", "secret_name": "TOKEN", "source": "user-local",
+        });
+        deletion[field] = serde_json::json!("canary");
+        assert!(serde_json::from_value::<DesktopDeleteSecretRequest>(deletion).is_err());
+        let mut copy = serde_json::json!({
+            "from_project_id": "folder", "from_profile_id": "profile", "secret_name": "TOKEN",
+        });
+        copy[field] = serde_json::json!("canary");
+        assert!(serde_json::from_value::<DesktopCopySecretToSharedRequest>(copy).is_err());
+    }
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn desktop_crud_sends_metadata_and_revokes_native_grants_after_success_and_failure()
+-> Result<(), Box<dyn Error>> {
+    use serde_json::{Value, json};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let fixture = Fixture::new()?;
+    let project_id = "lk_proj_shared_desktop_crud";
+    let profile_id = "lk_prof_shared_desktop_crud";
+    let store = Store::open(&fixture.store)?;
+    store.insert_project_if_absent(project_id, "@shared", 1)?;
+    store.insert_profile_if_absent(profile_id, project_id, "default", true, 1)?;
+    let shared = find_shared_vault_at(&fixture.store, Some(project_id), Some(profile_id))?
+        .ok_or("shared context")?;
+    let folder = open_project_at(&fixture.store, &fixture.root)?;
+    let socket = fixture.directory.path().join("crud.sock");
+    let listener = tokio::net::UnixListener::bind(&socket)?;
+    let expected = native_binding()?;
+    let folder_id = fixture.id.clone();
+    let server = tokio::spawn(async move {
+        for (method, scoped_project, scoped_profile, confirm, payload) in [
+            (
+                "DeleteSecret",
+                project_id,
+                profile_id,
+                true,
+                json!({
+                    "secret_name": "TOKEN", "source": "user-local", "version": 1, "deleted": true,
+                }),
+            ),
+            ("CopySecretToShared", folder_id.as_str(), "lk_prof_fixture", false, Value::Null),
+        ] {
+            for kind in ["RequestGrant", method, "RevokeGrant"] {
+                let (mut stream, _) = listener.accept().await?;
+                let length = stream.read_u32_le().await?;
+                let mut bytes = vec![0; length as usize];
+                stream.read_exact(&mut bytes).await?;
+                let request: locket_agent::RequestEnvelope = serde_json::from_slice(&bytes)?;
+                assert_eq!(request.kind, kind);
+                if kind != "RevokeGrant" {
+                    assert_eq!(request.payload["project_id"], scoped_project);
+                    assert_eq!(request.payload["profile_id"], scoped_profile);
+                    assert_eq!(request.payload["binding"], serde_json::to_value(&expected)?);
+                    assert!(request.payload.get("value").is_none());
+                }
+                if kind == "RequestGrant" {
+                    assert_eq!(request.payload["action"], method);
+                    assert_eq!(request.payload["ttl_seconds"], 30);
+                    assert_eq!(request.payload["confirm_dangerous"], confirm);
+                } else {
+                    assert_eq!(request.payload["grant_id"], "native-crud");
+                }
+                if kind == "DeleteSecret" {
+                    assert_eq!(request.payload["project_root"], "");
+                    assert_eq!(request.payload["confirmation"], "default");
+                    assert_eq!(request.payload["source"], "user-local");
+                }
+                if kind == "CopySecretToShared" {
+                    assert_eq!(request.payload["secret_name"], "TOKEN");
+                    assert_eq!(request.payload["overwrite"], false);
+                    assert!(request.payload["source"].is_null());
+                    assert!(request.payload.get("target_project_id").is_none());
+                }
+                let response = match kind {
+                    "CopySecretToShared" => {
+                        locket_agent::ResponseEnvelope::Error(locket_agent::ErrorEnvelope::new(
+                            request.id,
+                            "UnlockRequired",
+                            "unlock the Global Vault before copying the secret",
+                            false,
+                        ))
+                    }
+                    _ => {
+                        locket_agent::ResponseEnvelope::Success(locket_agent::SuccessEnvelope::new(
+                            request.id,
+                            if kind == "RequestGrant" {
+                                json!({"grant_id": "native-crud"})
+                            } else if kind == method {
+                                payload.clone()
+                            } else {
+                                Value::Null
+                            },
+                        ))
+                    }
+                };
+                stream
+                    .write_all(&locket_agent::encode_frame(
+                        &response,
+                        locket_agent::DEFAULT_MAX_MESSAGE_SIZE,
+                    )?)
+                    .await?;
+            }
+        }
+        Ok::<(), Box<dyn Error + Send + Sync>>(())
+    });
+
+    let delete = delete_secret_payload(
+        &fixture.store,
+        &shared,
+        serde_json::from_value(json!({
+            "project_id": project_id, "profile_id": profile_id, "secret_name":"TOKEN",
+            "source": "user-local", "confirmation": "default",
+        }))?,
+    );
+    let deleted: DeleteSecretResponse = invoke_granted_at(
+        &socket,
+        AgentMethod::DeleteSecret,
+        GrantAction::DeleteSecret,
+        delete,
+        &fixture.store,
+        &shared,
+    )
+    .await?;
+    assert_eq!(
+        serde_json::to_value(deleted)?,
+        json!({
+            "secret_name": "TOKEN", "source": "user-local", "version": 1, "deleted": true,
+        })
+    );
+
+    let copy = copy_to_shared_payload(
+        &fixture.store,
+        &folder,
+        serde_json::from_value(json!({
+            "from_project_id": fixture.id, "from_profile_id": folder.profile_id, "secret_name":"TOKEN",
+        }))?,
+    );
+    let result: Result<CopySecretToSharedResponse, _> = invoke_granted_at(
+        &socket,
+        AgentMethod::CopySecretToShared,
+        GrantAction::CopySecretToShared,
+        copy,
+        &fixture.store,
+        &folder,
+    )
+    .await;
+    let error = result.err().ok_or("expected locked error")?;
+    let error = serde_json::to_value(error)?;
+    assert_eq!(error["code"], "UnlockRequired");
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("unlock the Global Vault"))
+    );
+    assert!(error.get("value").is_none());
+    server.await?.map_err(|error| error.to_string())?;
+    Ok(())
+}

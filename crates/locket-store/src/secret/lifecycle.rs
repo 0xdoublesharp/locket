@@ -632,15 +632,48 @@ impl Store {
         audit: Option<AuditContext<'_>>,
     ) -> Result<(), StoreError> {
         let transaction = self.connection.unchecked_transaction()?;
-        transaction.execute(
-            "UPDATE secrets
-             SET state = 'deleted', deleted_at = ?2, updated_at = ?2
-             WHERE id = ?1",
-            (id, deleted_at),
-        )?;
-        append_optional_audit(&transaction, audit)?;
+        tombstone(&transaction, id, deleted_at, None, audit)?;
         transaction.commit()?;
 
         Ok(())
     }
+
+    /// Tombstones the selected active version and appends its audit row atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::SecretStateConflict`] if the secret is no longer active
+    /// at the selected version, or another [`StoreError`] on write failure.
+    pub fn tombstone_current_secret_with_audit(
+        &mut self,
+        secret: &SecretRecord,
+        deleted_at: i64,
+        audit: AuditContext<'_>,
+    ) -> Result<(), StoreError> {
+        let transaction = self.connection.savepoint()?;
+        tombstone(&transaction, &secret.id, deleted_at, Some(secret.current_version), Some(audit))?;
+        transaction.commit()?;
+        Ok(())
+    }
+}
+
+fn tombstone(
+    transaction: &Connection,
+    id: &str,
+    deleted_at: i64,
+    expected_version: Option<u32>,
+    audit: Option<AuditContext<'_>>,
+) -> Result<(), StoreError> {
+    let updated = transaction.execute(
+        "UPDATE secrets
+         SET state = 'deleted', deleted_at = ?2, updated_at = ?2
+         WHERE id = ?1 AND (?3 IS NULL OR (state = 'active' AND current_version = ?3))",
+        (id, deleted_at, expected_version),
+    )?;
+    if let Some(expected_version) = expected_version
+        && updated != 1
+    {
+        return Err(StoreError::SecretStateConflict { secret_id: id.to_owned(), expected_version });
+    }
+    append_optional_audit(transaction, audit)
 }

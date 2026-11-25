@@ -115,9 +115,9 @@ pub const PROTOCOL_VERSION: u16 = 1;
 mod tests;
 
 pub use mutations::{
-    ApplyPolicyRequest, ApplyPolicyResponse, ImportDiagnostic, ImportDotenvRequest,
-    ImportDotenvResponse, MutationError, MutationScope, apply_policy_with_master,
-    import_dotenv_with_master,
+    ApplyPolicyRequest, ApplyPolicyResponse, CopySecretToSharedResponse, CreateProfileResponse,
+    DeleteSecretResponse, ImportDiagnostic, ImportDotenvRequest, ImportDotenvResponse,
+    MutationError, MutationScope, apply_policy_with_master, import_dotenv_with_master,
 };
 
 pub mod team_sync;
