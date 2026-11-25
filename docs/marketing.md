@@ -1,6 +1,6 @@
 # Describing Locket
 
-Updated 2026-10-18. Keep product copy consistent with the shipped workflow and its acceptance limits. The README and user guides should make the first successful run easy to find.
+Updated 2026-11-24. Keep product copy consistent with the shipped workflow and its acceptance limits. The README and user guides should make the first successful run easy to find.
 
 ## The pitch
 
@@ -12,9 +12,9 @@ For teams, one owner publishes signed, device-encrypted updates through a folder
 
 ## Show the workflow
 
-Lead with importing an existing development file and running one command. Link to the [README quick start](../README.md#quick-start) for the current commands. Explain variable contracts when a developer needs to configure a fresh clone, and introduce [team onboarding](team-updates.md) when they need to share values.
+Lead with either starting a personal Global Vault (`@shared`) for cross-project keys and `locket mcp` or importing an existing project `.env` file and running one command. Link to the [README quick start](../README.md#quick-start) for the current commands. Explain variable contracts when a developer needs to configure a fresh clone, and introduce [team onboarding](team-updates.md) when they need to share values.
 
-The desktop supports import and durable command editing through the unlocked agent, including passphrase-only vaults. Readiness should explain what needs attention before execution. Advanced audit, recovery and policy controls belong after the first successful run.
+The desktop opens with a focused two-choice Welcome view (Global Vault or auto-detecting project folder) and lands directly in Secrets once connected. It supports import and durable command editing through the unlocked agent, including passphrase-only vaults. Readiness explains what needs attention before execution. Advanced audit, recovery, and policy controls stay accessible without crowding the first run.
 
 ## Claims that need care
 

@@ -8,23 +8,20 @@ Build a modern Tauri v2 desktop app as a first-class control surface. The UI sha
 
 Primary views:
 
-- Project dashboard with a guided Start view.
-- Profile switcher.
-- Secret metadata list.
-- Secret editor with gated set/update flow.
+- First-run Welcome view offering one-click Global Vault (`@shared`) creation and auto-detecting project folder connection when no vault or project is selected.
+- Unified sidebar vault and project switcher covering `@shared`, connected projects, environment switching, and project overview.
+- Secret metadata list (default landing view once a vault or project is connected) with Discover, Add or import, and variable history tabs.
+- Secret editor with gated set/update flow and `.env` import (requiring an absolute file path in `@shared`).
 - Secret version history showing current, deprecated, and purged version metadata, including `deprecated_at`, `grace_until`, and pinned-reference eligibility.
-- Command policy editor.
-- Execution/session monitor.
-- Scan results.
-- Audit log and audit verification.
-- Backup/recovery and device export/import.
-- Settings.
+- Command policy editor with variable readiness checks and terminal handoff (project folders with `locket.toml`).
+- Activity views covering execution/session monitor, audit log and verification, and terminal scan handoff.
+- Settings views covering preferences, environment switching, team sharing, people and devices, backup/recovery, and project overview.
 
 Design direction:
 
 - Modern, restrained, dense operational interface.
-- Navigation is grouped around tasks: start, use secrets, run commands, safety, sharing, history, and settings.
-- The dashboard starts with prioritized local next actions derived from verifiable metadata such as lock state, missing secrets, missing policies, scan status, audit health, failed runs, and share readiness.
+- Primary navigation stays focused on four destinations (**Secrets**, **Commands**, **Activity**, and **Settings**) paired with the unified vault switcher and `⌘K` command palette.
+- Connected project overviews surface prioritized local next actions derived from verifiable metadata such as lock state, missing secrets, missing policies, scan status, audit health, failed runs, and share readiness.
 - Keyboard-friendly flows.
 - Clear locked/unlocked state.
 - No marketing-style landing page.

@@ -26,13 +26,37 @@
 
 <br/>
 
-> Import your `.env`, approve which variables a command can use, and run it with Locket. Values are encrypted in your local vault. Project configuration and variable names can go in Git; values stay out of it. Locket collects no telemetry.
+> Store API keys in your local Global Vault (`@shared`) or connect a project folder to import `.env`, approve which variables a command can use, and run it with Locket. Values stay encrypted in your local vault. Project configuration and variable names can go in Git; secret values stay out of it. Locket collects no telemetry.
 
 ---
+
+## Desktop Companion
+
+Start with a personal Global Vault (`@shared`) in one click, or connect any repository with `locket.toml`. Primary navigation focuses on **Secrets**, **Commands**, **Activity**, and **Settings**, with a unified vault switcher in the sidebar and `⌘K` command search.
+
+<table>
+  <tr>
+    <td><img src="docs/screenshots/welcome.png" alt="Locket welcome screen offering Global Vault and project folder setup" /></td>
+    <td><img src="docs/screenshots/secrets.png" alt="Locket Secrets view showing variable metadata, sources, and version status" /></td>
+  </tr>
+  <tr>
+    <td align="center"><sub><strong>First-run Welcome</strong> — Start with Global Vault (<code>@shared</code>) or connect a project folder</sub></td>
+    <td align="center"><sub><strong>Secrets</strong> — Metadata, source badges, grace windows, and gated copy/reveal</sub></td>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/commands.png" alt="Locket Commands view showing approved policies and configuration checks" /></td>
+    <td><img src="docs/screenshots/activity.png" alt="Locket Activity view showing recorded runs and audit links" /></td>
+  </tr>
+  <tr>
+    <td align="center"><sub><strong>Commands</strong> — Approved command policies, detail pane, and readiness checks</sub></td>
+    <td align="center"><sub><strong>Activity</strong> — Recorded runs, audit chain verification, and terminal scan handoff</sub></td>
+  </tr>
+</table>
 
 ## Why Locket
 
 - 🔐 **Encrypted local vault** — your secrets, sealed at rest, unlocked only when you ask.
+- 🌐 **Global Vault (`@shared`) and MCP** — store personal API keys once and use them across projects, terminals, and AI tools via `locket mcp`.
 - 🎯 **Capability-scoped delivery** — `locket run`, `locket exec`, Docker, and Compose helpers inject secrets into one child process and nowhere else.
 - 📋 **Explicit command policies** — declare which secrets a command may receive, and Locket enforces it.
 - 🧭 **Project + profile workflows** — keep `dev`, `staging`, and per-machine secrets cleanly separated.
@@ -56,7 +80,7 @@
 
 ## Current Scope
 
-Locket targets local development. The desktop connects project folders, unlocks the vault, imports env files, edits durable commands, and opens approved commands in a terminal. Imports and policy edits use the unlocked agent cache, including passphrase-only vaults. Native packages bundle a matching CLI; the editor version matches the app and CLI.
+Locket targets local development. The desktop opens a personal Global Vault (`@shared`) without a project folder or connects project folders, unlocks the vault, imports env files, edits durable commands, and opens approved commands in a terminal. Imports and policy edits use the unlocked agent cache, including passphrase-only vaults. Native packages bundle a matching CLI; the editor version matches the app and CLI.
 
 Teams can [join a fresh machine and receive signed encrypted updates](docs/team-updates.md) through an existing shared folder. First join requires the owner's full fingerprint from a separate trusted channel. One owner publishes shared values, while personal overrides remain local. The unlocked agent publishes changed shared values and applies verified updates automatically. Status shows the last verified update; an offline or malicious folder provider can withhold newer files. Owner handover and real sync-provider/clean-OS acceptance remain separate qualification work.
 
@@ -82,7 +106,14 @@ Development builds use a separate development vault. Debug builds and anything s
 
 ## Quick Start
 
-In your application folder, initialize Locket and migrate your variables:
+Start with a personal Global Vault (`@shared`) for keys you use across projects and AI agents, with no project folder required:
+
+```bash
+locket shared init
+locket mcp
+```
+
+Or initialize Locket inside an application folder and migrate your project variables:
 
 ```bash
 locket init --name my-app --profile dev
@@ -110,7 +141,7 @@ locket status
 locket status --scan
 ```
 
-Use the desktop's **Project** page for the same connect → unlock → import → command workflow. The names **Shared**, **My override**, and **This machine** describe where a value comes from. Environments such as `dev` and `staging` retain the compatible `profile` CLI syntax.
+In the desktop app, pick **Start with Global Vault (`@shared`)** or **Connect a project folder** from the Welcome screen. Selecting a folder automatically detects whether `locket.toml` exists and offers one-click initialization when it does not. Once a vault or project is open, the app lands in **Secrets**, and the sidebar switcher moves between `@shared`, connected projects, environments, and project overview. The labels **Shared**, **My override**, and **This machine** describe where a value comes from. Environments such as `dev` and `staging` retain the compatible `profile` CLI syntax.
 
 ## Core Workflows
 
