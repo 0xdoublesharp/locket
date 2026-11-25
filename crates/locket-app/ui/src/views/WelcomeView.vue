@@ -52,12 +52,9 @@ async function cancelInitialize(): Promise<void> {
 <template>
   <section class="welcome" aria-labelledby="welcome-heading">
     <header class="welcome__hero">
-      <div class="welcome__brand">
-        <AppIcon name="brand-lock" :size="40" />
-        <div>
-          <h2 id="welcome-heading">Welcome to Locket</h2>
-          <p class="welcome__subtitle">Store API keys and secrets in an encrypted local vault.</p>
-        </div>
+      <div class="welcome__heading">
+        <h2 id="welcome-heading">Welcome to Locket</h2>
+        <p class="welcome__subtitle">Store API keys and secrets in an encrypted local vault.</p>
       </div>
 
       <div class="welcome__status" role="group" aria-label="Local vault status">
@@ -223,17 +220,7 @@ async function cancelInitialize(): Promise<void> {
   gap: 0.9rem;
 }
 
-.welcome__brand {
-  display: flex;
-  align-items: flex-start;
-  gap: 0.9rem;
-}
-
-.welcome__brand > .app-icon {
-  color: var(--accent);
-}
-
-.welcome__brand h2 {
+.welcome__heading h2 {
   margin: 0;
   font-size: 1.5rem;
   letter-spacing: -0.025em;
