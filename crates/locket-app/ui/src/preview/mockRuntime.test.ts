@@ -170,6 +170,16 @@ it('checks dangerous confirmation in preview and filters discovery by glob and s
   await expect(
     request('agent_set_active_profile', { ...prod, confirmation: 'prod' }),
   ).resolves.toMatchObject({ profile_name: 'prod', dangerous: true });
+  await request('agent_unlock', { project_id: 'acme-api', ttl_seconds: 900 });
+  const access = { project_id: 'acme-api', profile_id: 'acme-api-prod', secret_name: 'TOKEN' };
+  for (const confirm_dangerous_profile of [undefined, '', 'PROD', 'prod ']) {
+    await expect(
+      request('agent_copy_secret', { ...access, confirm_dangerous_profile }),
+    ).rejects.toMatchObject({ code: 'ConfirmationFailed' });
+  }
+  await expect(
+    request('agent_copy_secret', { ...access, confirm_dangerous_profile: 'prod' }),
+  ).resolves.toMatchObject({ kind: 'unsupported' });
   const remove = {
     project_id: 'acme-api',
     profile_id: 'acme-api-prod',

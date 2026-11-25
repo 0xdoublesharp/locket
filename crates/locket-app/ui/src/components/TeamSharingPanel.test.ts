@@ -112,7 +112,7 @@ it('configures delivery after confirmation and copies the verified owner join co
   const confirmDangerous = vi
     .fn()
     .mockResolvedValueOnce(undefined)
-    .mockResolvedValueOnce(true)
+    .mockResolvedValueOnce('dev')
     .mockResolvedValueOnce(false);
   const writeText = vi.fn().mockResolvedValue(undefined);
   vi.stubGlobal('navigator', { clipboard: { writeText } });
@@ -135,7 +135,7 @@ it('configures delivery after confirmation and copies the verified owner join co
       project_id: 'project-a',
       folder: '/fixture/team',
       allow_dangerous: true,
-      confirm_dangerous: true,
+      confirm_dangerous_profile: 'dev',
     },
   });
   await click(button(root, 'Apply verified updates'));
@@ -147,7 +147,7 @@ it('configures delivery after confirmation and copies the verified owner join co
 
 it('reconciles profile and variable collisions with the authenticated IDs', async () => {
   vi.mocked(invoke).mockResolvedValue(blocked);
-  const confirmDangerous = vi.fn().mockResolvedValue(true);
+  const confirmDangerous = vi.fn().mockResolvedValue('dev');
   const { root } = sharing({ confirmDangerous });
   await settle();
   expect(nodeText(root)).toContain('Values are held because this profile is dangerous');
@@ -159,7 +159,7 @@ it('reconciles profile and variable collisions with the authenticated IDs', asyn
   expect(invoke).toHaveBeenLastCalledWith('desktop_team_sync_rename_profile', {
     request: {
       project_id: 'project-a',
-      confirm_dangerous: true,
+      confirm_dangerous_profile: 'dev',
       incoming_profile_id: 'rename',
       local_profile_id: 'local-profile',
       new_name: 'personal-dev',
@@ -173,7 +173,7 @@ it('reconciles profile and variable collisions with the authenticated IDs', asyn
   expect(invoke).toHaveBeenLastCalledWith('desktop_team_sync_preserve_override', {
     request: {
       project_id: 'project-a',
-      confirm_dangerous: true,
+      confirm_dangerous_profile: 'dev',
       incoming_profile_id: 'override',
       local_secret_id: 'local-variable',
     },

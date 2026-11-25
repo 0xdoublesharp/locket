@@ -71,7 +71,7 @@ export function isRejected(
 export interface RevealRequest {
   secret_name: string;
   profile_id: string;
-  confirm_dangerous?: boolean;
+  confirm_dangerous_profile?: string;
 }
 
 export interface RevealResponse {
@@ -131,6 +131,7 @@ export interface PrepareExecRequest {
   profile_id: string;
   project_id?: string;
   binding?: GrantBinding;
+  confirm_dangerous_profile?: string;
 }
 
 export interface GrantBinding {
@@ -270,7 +271,7 @@ export interface ExportBundleRequest {
   include_personal?: boolean;
   include_history?: boolean;
   preview_only?: boolean;
-  confirm_dangerous?: boolean;
+  confirm_dangerous_profile?: string;
 }
 
 export interface ImportBundleRequest {
@@ -278,7 +279,7 @@ export interface ImportBundleRequest {
   bundle_path: string;
   include_audit: boolean;
   conflict_mode: BundleConflictMode;
-  confirm_dangerous?: boolean;
+  confirm_dangerous_profile?: string;
 }
 
 export interface VerifyBundleRequest {
@@ -717,11 +718,11 @@ export interface TeamSyncRenameProfileRequest {
   incoming_profile_id: string;
   local_profile_id: string;
   new_name: string;
-  confirm_dangerous?: boolean;
+  confirm_dangerous_profile?: string;
 }
 export interface TeamSyncPreserveOverrideRequest {
   project_id: string;
   incoming_profile_id: string;
   local_secret_id: string;
-  confirm_dangerous?: boolean;
+  confirm_dangerous_profile?: string;
 }

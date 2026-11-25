@@ -772,7 +772,7 @@ it('uses Secrets in the list, command palette, and history navigation', async ()
 });
 
 describe('reveal request lifetime in the mounted app', () => {
-  it('sends dangerous-profile approval only after the user confirms', async () => {
+  it('sends dangerous-profile approval only after the user types the exact profile name', async () => {
     overrides.set('agent_read_config', () => ({
       privacy_redact_names: false,
       agent_unlock_ttl: '15m',
@@ -804,10 +804,25 @@ describe('reveal request lifetime in the mounted app', () => {
     expect(calls).not.toContain('agent_reveal');
 
     const approved = app.state.handleEditorReveal(secret());
-    control.close('confirm');
+    await settle();
+    const name = byProp(dialog, 'id', 'dangerous-action-profile');
+    const allow = renderedButton(dialog, 'Allow action');
+    expect(nodeText(dialog)).toContain(a.profile_name);
+    expect(allow.props.disabled).toBe(true);
+    await input(name, `${a.profile_name} `);
+    expect(allow.props.disabled).toBe(true);
+    await submit(dialog);
+    expect(calls).not.toContain('agent_reveal');
+    await input(name, a.profile_name);
+    expect(allow.props.disabled).toBe(false);
+    await submit(dialog);
     await approved;
     expect(invoke).toHaveBeenCalledWith('agent_reveal', {
-      request: { secret_name: 'TOKEN', profile_id: a.profile_id, confirm_dangerous: true },
+      request: {
+        secret_name: 'TOKEN',
+        profile_id: a.profile_id,
+        confirm_dangerous_profile: a.profile_name,
+      },
     });
   });
 
@@ -1653,10 +1668,14 @@ describe('connected desktop journeys through the preview fixture agent', () => {
       request: expect.objectContaining({ preview_only: false }),
     });
     await clickRendered(renderedButton(root, 'Browse for a bundle to import'));
+    await input(control(root, 'To import into dangerous'), 'dev');
     await clickRendered(renderedButton(root, 'Review bundle'));
     expect(nodeText(root)).toContain('Sealed bundle imported.');
     expect(invoke).toHaveBeenCalledWith('agent_import_bundle', {
-      request: expect.objectContaining({ conflict_mode: 'review', confirm_dangerous: false }),
+      request: expect.objectContaining({
+        conflict_mode: 'review',
+        confirm_dangerous_profile: 'dev',
+      }),
     });
 
     await clickRendered(renderedButton(root, 'Browse for a bundle to verify'));
@@ -2272,7 +2291,8 @@ it('requires fresh dangerous approval for saving and rotation, and drops approva
   expect(nodeText(create)).toContain('Request failed.');
   expect(nodeText(create)).not.toContain('fixture-only-draft');
   await submit(create);
-  prompt.close('confirm');
+  await input(byProp(dialog, 'id', 'dangerous-action-profile'), a.profile_name);
+  await submit(dialog);
   await settle();
   expect(invoke).toHaveBeenCalledWith('agent_set_secret', {
     request: {
@@ -2282,7 +2302,7 @@ it('requires fresh dangerous approval for saving and rotation, and drops approva
       value: 'fixture-only-draft',
       source: 'user-local',
       grant_id: undefined,
-      confirm_dangerous: true,
+      confirm_dangerous_profile: a.profile_name,
     },
   });
   expect(byProp(create, 'data-testid', 'secret-editor-set-value').value).toBe('');

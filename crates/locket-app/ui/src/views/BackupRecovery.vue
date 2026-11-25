@@ -14,6 +14,9 @@ import type {
 defineOptions({ name: 'BackupRecovery' });
 const props = defineProps<{
   busy?: boolean;
+  contextKey?: string;
+  profileName?: string;
+  dangerousProfile?: boolean;
   previewKey?: string | null;
   previewMessage?: string | null;
 }>();
@@ -28,7 +31,7 @@ const exportDraft = ref<ExportDraft>({
   includeAudit: false,
   includePersonal: false,
   includeHistory: false,
-  confirmDangerous: false,
+  confirmDangerousProfile: '',
   previewOnly: false,
   outputPath: '',
 });
@@ -37,7 +40,7 @@ const importDraft = ref<ImportDraft>({
   bundlePath: '',
   includeAudit: false,
   conflictMode: 'review',
-  confirmDangerous: false,
+  confirmDangerousProfile: '',
 });
 
 const verifyDraft = ref<VerifyDraft>({
@@ -51,8 +54,20 @@ const rotateDraft = ref<RotateDraft>({
   clearAfterDisplay: true,
 });
 
-const canExport = computed<boolean>(() => exportDraft.value.recipientDescriptor.trim().length > 0);
-const canImport = computed<boolean>(() => importDraft.value.bundlePath.trim().length > 0);
+function validProfileConfirmation(typed: string): boolean {
+  return typed === '' ? !props.dangerousProfile : typed === props.profileName;
+}
+
+const canExport = computed(
+  () =>
+    !!exportDraft.value.recipientDescriptor.trim() &&
+    validProfileConfirmation(exportDraft.value.confirmDangerousProfile),
+);
+const canImport = computed(
+  () =>
+    !!importDraft.value.bundlePath.trim() &&
+    validProfileConfirmation(importDraft.value.confirmDangerousProfile),
+);
 const canVerify = computed<boolean>(() => verifyDraft.value.bundlePath.trim().length > 0);
 const canRotate = computed<boolean>(() => rotateDraft.value.acknowledgedOneTimeDisplay);
 
@@ -61,38 +76,43 @@ const previewMatches = computed(
 );
 
 watch(
-  () => [exportSelectionKey(exportDraft.value), props.previewKey],
+  () => [exportSelectionKey(exportDraft.value), props.contextKey, props.profileName],
   () => {
-    exportDraft.value.confirmDangerous = false;
+    exportDraft.value.confirmDangerousProfile = '';
   },
   { flush: 'sync' },
 );
 watch(
-  () => [importDraft.value.bundlePath, importDraft.value.conflictMode],
+  () => [
+    importDraft.value.bundlePath,
+    importDraft.value.conflictMode,
+    props.contextKey,
+    props.profileName,
+  ],
   () => {
-    importDraft.value.confirmDangerous = false;
+    importDraft.value.confirmDangerousProfile = '';
   },
   { flush: 'sync' },
 );
 
 function exportAction(previewOnly = false): void {
-  if (props.busy || (!previewOnly && !previewMatches.value)) return;
+  if (props.busy || !canExport.value || (!previewOnly && !previewMatches.value)) return;
   emit('action', {
     kind: 'export',
     label: 'export sealed bundle',
     request: { ...exportDraft.value, previewOnly },
   });
-  if (!previewOnly) exportDraft.value.confirmDangerous = false;
+  if (!previewOnly) exportDraft.value.confirmDangerousProfile = '';
 }
 
 function importAction(): void {
-  if (props.busy) return;
+  if (props.busy || !canImport.value) return;
   emit('action', {
     kind: 'import',
     label: 'import bundle',
     request: { ...importDraft.value },
   });
-  importDraft.value.confirmDangerous = false;
+  importDraft.value.confirmDangerousProfile = '';
 }
 
 function verifyAction(): void {
@@ -181,6 +201,17 @@ function rotateAction(): void {
           @pick="exportDraft.outputPath = $event"
         />
 
+        <label
+          v-if="profileName && (dangerousProfile || exportDraft.scope === 'all-profiles')"
+          class="view__field"
+        >
+          <span
+            >To include dangerous environments, type the active profile name ({{
+              profileName
+            }}).</span
+          >
+          <input v-model="exportDraft.confirmDangerousProfile" type="text" autocomplete="off" />
+        </label>
         <button
           type="button"
           class="view__action"
@@ -190,10 +221,6 @@ function rotateAction(): void {
           Preview scope
         </button>
         <p v-if="previewMatches" role="status" class="view__preview">{{ props.previewMessage }}</p>
-        <label v-if="previewMatches" class="view__field view__field--inline">
-          <input v-model="exportDraft.confirmDangerous" type="checkbox" />
-          <span>Confirm export from dangerous environments in this scope</span>
-        </label>
         <button
           type="button"
           class="view__action"
@@ -245,9 +272,13 @@ function rotateAction(): void {
           </label>
         </fieldset>
 
-        <label v-if="importDraft.conflictMode !== 'review'" class="view__field view__field--inline">
-          <input v-model="importDraft.confirmDangerous" type="checkbox" />
-          <span>Confirm changes to dangerous environments in this bundle</span>
+        <label v-if="profileName" class="view__field">
+          <span
+            >To import into dangerous environments, type the active profile name ({{
+              profileName
+            }}).</span
+          >
+          <input v-model="importDraft.confirmDangerousProfile" type="text" autocomplete="off" />
         </label>
 
         <button

@@ -4,7 +4,17 @@ import { listen } from '@tauri-apps/api/event';
 import App from './App.vue';
 import type { DesktopProjectContext } from './agent/types';
 import { createMockRuntime } from './preview/mockRuntime';
-import { button, byProp, click, findNode, mountComponent, nodeText, settle } from './test/renderer';
+import {
+  button,
+  byProp,
+  click,
+  findNode,
+  input,
+  mountComponent,
+  nodeText,
+  settle,
+  submit,
+} from './test/renderer';
 import type { SecretRowMeta } from './types/views';
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn(), isTauri: () => true }));
@@ -108,6 +118,49 @@ it('copies through native IPC without exposing plaintext or accessing WebView st
   expect(nodeText(root)).not.toContain(plaintext);
   expect(clipboardWrite).not.toHaveBeenCalled();
   expect(storageAccess).not.toHaveBeenCalled();
+});
+
+it('sends the typed profile name as the only clipboard authorization input', async () => {
+  const native = vi.mocked(invoke).getMockImplementation();
+  vi.mocked(invoke).mockImplementation((async (command, args) => {
+    const result = await native?.(command, args);
+    if (command === 'agent_read_config') {
+      return { ...(result as Record<string, unknown>), dangerous_profile: { dangerous: true } };
+    }
+    return result;
+  }) as typeof invoke);
+
+  const { root, state } = await connectedApp();
+  const dialog = byProp(root, 'aria-labelledby', 'dangerous-action-title');
+  Object.assign(dialog, {
+    returnValue: '',
+    showModal() {},
+    close(result = '') {
+      this.returnValue = result;
+      dialog.dispatchEvent(new Event('close'));
+    },
+  });
+  const copy = state.handleListCopy(secret);
+  await settle();
+  const name = state.activeContext?.profile_name;
+  if (!name) throw new Error('Expected an active profile name');
+  const typed = byProp(dialog, 'id', 'dangerous-action-profile');
+  await input(typed, name + ' ');
+  await submit(dialog);
+  expect(invoke).not.toHaveBeenCalledWith('agent_copy_secret', expect.anything());
+
+  await input(typed, name);
+  await submit(dialog);
+  await copy;
+  expect(invoke).toHaveBeenCalledWith('agent_copy_secret', {
+    request: {
+      secret_name: secret.name,
+      project_id: state.activeContext?.project_id,
+      profile_id: state.activeContext?.profile_id,
+      confirm_dangerous_profile: name,
+    },
+  });
+  expect(clipboardWrite).not.toHaveBeenCalled();
 });
 
 it.each(['dismiss', 'lock', 'timeout'] as const)(

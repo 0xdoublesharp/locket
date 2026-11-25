@@ -64,6 +64,8 @@ pub(crate) struct DesktopProjectContext {
     project_name: String,
     profile_id: String,
     profile_name: String,
+    #[serde(skip)]
+    profile_dangerous: bool,
     is_shared: bool,
 }
 
@@ -200,6 +202,7 @@ fn open_project_at(store_path: &Path, path: &Path) -> Result<DesktopProjectConte
         project_name: project.name,
         profile_id: profile.id,
         profile_name: profile.name,
+        profile_dangerous: profile.dangerous,
         is_shared: false,
     })
 }
@@ -234,6 +237,7 @@ fn shared_vault_context(
         project_name: project.name,
         profile_id: profile.id.clone(),
         profile_name: profile.name.clone(),
+        profile_dangerous: profile.dangerous,
         is_shared: true,
     }))
 }
@@ -1556,10 +1560,12 @@ fn granted_project_context(
 pub(crate) async fn export_bundle(
     store: &Path,
     mut request: locket_agent::ExportBundleRequest,
+    confirmation: Option<&str>,
 ) -> Result<locket_agent::BackupActionResponse, super::AgentClientError> {
     let context =
         granted_project_context(store, &request.project_id, request.profile_id.as_deref())?;
     request.profile_id = Some(context.profile_id.clone());
+    request.confirm_dangerous = matches_profile_confirmation(confirmation, &context.profile_name);
     invoke_granted_at(
         &super::resolve_socket_path(),
         locket_agent::AgentMethod::ExportBundle,
@@ -1573,9 +1579,11 @@ pub(crate) async fn export_bundle(
 
 pub(crate) async fn import_bundle(
     store: &Path,
-    request: locket_agent::ImportBundleRequest,
+    mut request: locket_agent::ImportBundleRequest,
+    confirmation: Option<&str>,
 ) -> Result<locket_agent::BackupActionResponse, super::AgentClientError> {
     let context = granted_project_context(store, &request.project_id, None)?;
+    request.confirm_dangerous = matches_profile_confirmation(confirmation, &context.profile_name);
     invoke_granted_at(
         &super::resolve_socket_path(),
         locket_agent::AgentMethod::ImportBundle,
@@ -1646,10 +1654,42 @@ impl GrantPayload for locket_agent::ImportBundleRequest {
     }
 }
 
+pub(crate) fn matches_profile_confirmation(confirmation: Option<&str>, profile_name: &str) -> bool {
+    !profile_name.is_empty() && confirmation == Some(profile_name)
+}
+
+fn confirmation_required() -> super::AgentClientError {
+    let message = "Type the exact active profile name to confirm this action.";
+    super::AgentClientError::Rejected {
+        code: "ConfirmationFailed".into(),
+        message: message.into(),
+        display_reason: message.into(),
+        next_action: "Confirm the dangerous profile and retry.".into(),
+        retryable: false,
+    }
+}
+
+pub(crate) fn confirm_prepare_exec(
+    store: &Path,
+    project_id: &str,
+    profile_id: &str,
+    confirmation: Option<&str>,
+) -> Result<bool, super::AgentClientError> {
+    let context = granted_project_context(store, project_id, Some(profile_id))?;
+    let confirmed = matches_profile_confirmation(confirmation, &context.profile_name);
+    if context.profile_dangerous && !confirmed {
+        return Err(confirmation_required());
+    }
+    Ok(confirmed)
+}
+
 impl GrantPayload for serde_json::Value {
     fn confirms_dangerous(&self, profile_name: &str) -> bool {
-        self.get("confirmation").and_then(serde_json::Value::as_str) == Some(profile_name)
-            || self.get("confirm_dangerous").and_then(serde_json::Value::as_bool) == Some(true)
+        let confirmation = self
+            .get("confirm_dangerous_profile")
+            .or_else(|| self.get("confirmation"))
+            .and_then(serde_json::Value::as_str);
+        matches_profile_confirmation(confirmation, profile_name)
     }
 
     fn authorize(
@@ -1657,6 +1697,10 @@ impl GrantPayload for serde_json::Value {
         grant: &locket_agent::GrantIdPayload,
         binding: locket_agent::GrantBinding,
     ) {
+        if let Some(fields) = self.as_object_mut() {
+            fields.remove("confirm_dangerous_profile");
+            fields.remove("confirm_dangerous");
+        }
         self["grant_id"] = serde_json::json!(grant.grant_id);
         self["binding"] = serde_json::json!(binding);
     }
@@ -1672,6 +1716,23 @@ async fn invoke_granted_at<R: serde::de::DeserializeOwned>(
 ) -> Result<R, super::AgentClientError> {
     let project_id = context.project_id.as_str();
     let profile_id = payload.grant_profile_id(&context.profile_id);
+    let confirmed = payload.confirms_dangerous(&context.profile_name);
+    if !confirmed && action != locket_agent::GrantAction::CreateProfile {
+        let dangerous = if profile_id == locket_agent::BUNDLE_PROJECT_GRANT_SCOPE {
+            Store::open_read_only(store)
+                .and_then(|store| store.list_profiles(project_id))
+                .map_err(|error| super::AgentClientError::Protocol {
+                    reason: metadata_error(error),
+                })?
+                .iter()
+                .any(|profile| profile.dangerous)
+        } else {
+            context.profile_dangerous
+        };
+        if dangerous {
+            return Err(confirmation_required());
+        }
+    }
     let binding = native_binding()?;
     let grant: locket_agent::GrantIdPayload = super::invoke_method(
         socket,
@@ -1681,7 +1742,7 @@ async fn invoke_granted_at<R: serde::de::DeserializeOwned>(
             profile_id: profile_id.into(),
             policy_name: None,
             action,
-            confirm_dangerous: payload.confirms_dangerous(&context.profile_name),
+            confirm_dangerous: confirmed,
             ttl_seconds: 30,
             binding: binding.clone(),
         },
@@ -1869,8 +1930,7 @@ pub(crate) struct DesktopTeamSyncRequest {
     folder: Option<PathBuf>,
     #[serde(default)]
     allow_dangerous: bool,
-    #[serde(default)]
-    confirm_dangerous: bool,
+    confirm_dangerous_profile: Option<String>,
 }
 async fn team_sync_request(
     request: DesktopTeamSyncRequest,
@@ -1890,7 +1950,7 @@ async fn team_sync_request(
         payload["folder"] = serde_json::json!(folder);
         payload["allow_dangerous"] = serde_json::json!(request.allow_dangerous);
     }
-    payload["confirm_dangerous"] = serde_json::json!(request.confirm_dangerous);
+    payload["confirm_dangerous_profile"] = serde_json::json!(request.confirm_dangerous_profile);
     invoke_granted(
         method,
         locket_agent::GrantAction::TeamSync,
@@ -1927,8 +1987,7 @@ pub(crate) struct DesktopRenameProfileRequest {
     incoming_profile_id: String,
     local_profile_id: String,
     new_name: String,
-    #[serde(default)]
-    confirm_dangerous: bool,
+    confirm_dangerous_profile: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1937,8 +1996,7 @@ pub(crate) struct DesktopPreserveOverrideRequest {
     project_id: String,
     incoming_profile_id: String,
     local_secret_id: String,
-    #[serde(default)]
-    confirm_dangerous: bool,
+    confirm_dangerous_profile: Option<String>,
 }
 
 fn pending_reconcile_payload(
@@ -1967,13 +2025,13 @@ async fn reconcile_pending_profile(
     project_id: &str,
     incoming_profile_id: String,
     action: locket_agent::TeamSyncAction,
-    confirm_dangerous: bool,
+    confirm_dangerous_profile: Option<String>,
 ) -> Result<locket_agent::team_sync::SyncStatus, super::AgentClientError> {
     let store = super::default_store_path()?;
     let context = project_context(&store, project_id)
         .map_err(|reason| super::AgentClientError::Protocol { reason })?;
     let mut payload = pending_reconcile_payload(&context, &store, incoming_profile_id, action)?;
-    payload["confirm_dangerous"] = serde_json::json!(confirm_dangerous);
+    payload["confirm_dangerous_profile"] = serde_json::json!(confirm_dangerous_profile);
     invoke_granted(
         locket_agent::AgentMethod::TeamSyncReconcile,
         locket_agent::GrantAction::TeamSync,
@@ -1996,7 +2054,7 @@ pub(crate) async fn desktop_team_sync_rename_profile(
             local_profile_id: request.local_profile_id,
             new_name: request.new_name,
         },
-        request.confirm_dangerous,
+        request.confirm_dangerous_profile,
     )
     .await
 }
@@ -2009,7 +2067,7 @@ pub(crate) async fn desktop_team_sync_preserve_override(
         &request.project_id,
         request.incoming_profile_id,
         locket_agent::TeamSyncAction::PreserveOverride { local_secret_id: request.local_secret_id },
-        request.confirm_dangerous,
+        request.confirm_dangerous_profile,
     )
     .await
 }

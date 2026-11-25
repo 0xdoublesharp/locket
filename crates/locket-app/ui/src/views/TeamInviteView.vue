@@ -37,7 +37,7 @@ import type { AuditWireRow } from '../agent/types';
 interface Props {
   projectId?: string;
   privacyMode?: boolean;
-  confirmDangerous?: (action: string) => Promise<boolean | undefined>;
+  confirmDangerous?: (action: string) => Promise<string | false | undefined>;
   /** Audit rows for the active project, used for invite reconstruction. */
   auditRows: ReadonlyArray<AuditWireRow>;
   /** Comma-separated list of dangerous-profile names from agent settings. */

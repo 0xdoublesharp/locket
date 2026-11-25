@@ -351,7 +351,7 @@ export interface SetSecretRequest {
   grace_until?: number;
   grant_id?: string;
   store_path?: string;
-  confirm_dangerous?: boolean;
+  confirm_dangerous_profile?: string;
 }
 
 export interface SetSecretResponse {
@@ -415,8 +415,7 @@ export interface CopySecretRequest {
   project_id?: string;
   store_path?: string;
   grant_id?: string;
-  ttl_seconds?: number;
-  confirm_dangerous?: boolean;
+  confirm_dangerous_profile?: string;
 }
 
 export type CopySecretResponse =
@@ -561,13 +560,13 @@ export async function desktopTeamSyncConfigure(request: {
   project_id: string;
   folder: string;
   allow_dangerous?: boolean;
-  confirm_dangerous?: boolean;
+  confirm_dangerous_profile?: string;
 }): Promise<AgentResult<import('./types').TeamSyncStatus>> {
   return callTyped('desktop_team_sync_configure', { request });
 }
 export async function desktopTeamSyncNow(request: {
   project_id: string;
-  confirm_dangerous?: boolean;
+  confirm_dangerous_profile?: string;
 }): Promise<AgentResult<import('./types').TeamSyncStatus>> {
   return callTyped('desktop_team_sync_now', { request });
 }

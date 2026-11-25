@@ -392,6 +392,26 @@ export function createMockRuntime(params: URLSearchParams) {
     return { profile_id: id, profile_name: request.profile_name, dangerous: false, created: true };
   }
 
+  function requireDangerousConfirmation(
+    request: Record<string, unknown>,
+    projectWide = false,
+  ): void {
+    const project = requireSelectedProject();
+    const active = profiles.get(project.profile_id);
+    const dangerous = projectWide
+      ? [...profiles.values()].some(
+          (profile) => profile.project === project.project_id && profile.dangerous,
+        )
+      : active?.dangerous;
+    if (dangerous && (!active?.name || request.confirm_dangerous_profile !== active.name)) {
+      fail(
+        'ConfirmationFailed',
+        'Type the exact active profile name to confirm this action.',
+        'Confirm the dangerous profile and retry.',
+      );
+    }
+  }
+
   function requireProfileConfirmation(profileId: string, confirmation?: string): void {
     const profile = profiles.get(profileId);
     if (profile?.dangerous && confirmation !== profile.name) {
@@ -758,11 +778,15 @@ export function createMockRuntime(params: URLSearchParams) {
       case 'agent_verify_audit':
         return { ...chain, first_break_reason: null };
       case 'agent_set_secret':
+        requireDangerousConfirmation(request);
         return saveSecret(request as unknown as SetSecretRequest, false);
       case 'agent_rotate_secret':
+        requireDangerousConfirmation(request);
         return saveSecret(request as unknown as SetSecretRequest, true);
-      case 'agent_reveal': {
+      case 'agent_reveal':
+      case 'agent_copy': {
         requireUnlocked();
+        requireDangerousConfirmation(request);
         const row = projectSecrets
           .filter((secret) => secret.name === request.secret_name)
           .sort((left, right) => right.source_precedence - left.source_precedence)[0];
@@ -773,6 +797,7 @@ export function createMockRuntime(params: URLSearchParams) {
       }
       case 'agent_copy_secret':
         requireUnlocked();
+        requireDangerousConfirmation(request);
         return {
           kind: 'unsupported',
           unsupported_reason: 'Temporary value copying is available in the macOS app',
@@ -860,12 +885,18 @@ export function createMockRuntime(params: URLSearchParams) {
         };
       }
       case 'desktop_team_sync_configure':
+        requireDangerousConfirmation(request);
         teamFolder = String(request.folder);
         return syncStatus();
-      case 'desktop_team_sync_status':
       case 'desktop_team_sync_now':
+      case 'desktop_team_sync_rename_profile':
+      case 'desktop_team_sync_preserve_override':
+        requireDangerousConfirmation(request);
+        return syncStatus();
+      case 'desktop_team_sync_status':
         return syncStatus();
       case 'agent_export_bundle':
+        requireDangerousConfirmation(request, request.scope === 'all-profiles');
         return {
           action: 'export',
           status: request.preview_only ? 'preview' : 'ok',
@@ -874,6 +905,7 @@ export function createMockRuntime(params: URLSearchParams) {
             : 'Sealed bundle exported.',
         };
       case 'agent_import_bundle':
+        requireDangerousConfirmation(request, true);
         return { action: 'import', status: 'ok', message: 'Sealed bundle imported.' };
       case 'agent_verify_bundle':
         return {

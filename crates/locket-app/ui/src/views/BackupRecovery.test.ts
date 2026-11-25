@@ -20,7 +20,7 @@ vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn(), isTauri: () => true })
 const mounts: ReturnType<typeof mountComponent>[] = [];
 function backup() {
   const onAction = vi.fn<(action: BundleAction) => void>();
-  const view = mountComponent(BackupRecovery, { onAction });
+  const view = mountComponent(BackupRecovery, { onAction, profileName: 'development' });
   mounts.push(view);
   return { ...view, onAction };
 }
@@ -54,7 +54,7 @@ it('requires a matching preview and clears dangerous consent after scope changes
     includeAudit: true,
     includePersonal: true,
     includeHistory: true,
-    confirmDangerous: false,
+    confirmDangerousProfile: '',
     previewOnly: true,
     outputPath: '/fixture/output.lkb',
   } as const;
@@ -64,16 +64,16 @@ it('requires a matching preview and clears dangerous consent after scope changes
   setProps({ previewKey: exportSelectionKey(request), previewMessage: 'Four variables selected.' });
   await settle();
   expect(nodeText(root)).toContain('Four variables selected.');
-  await check(control(root, 'Confirm export from dangerous'));
+  await input(control(root, 'To include dangerous'), 'development');
   await click(button(root, 'Export'));
   expect(onAction).toHaveBeenLastCalledWith({
     kind: 'export',
     label: 'export sealed bundle',
-    request: { ...request, previewOnly: false, confirmDangerous: true },
+    request: { ...request, previewOnly: false, confirmDangerousProfile: 'development' },
   });
-  expect(control(root, 'Confirm export from dangerous').checked).toBe(false);
+  expect(control(root, 'To include dangerous').value).toBe('');
 
-  await check(control(root, 'Confirm export from dangerous'));
+  await input(control(root, 'To include dangerous'), 'development');
   await check(control(root, 'Active environment'));
   expect(button(root, 'Export').props.disabled).toBe(true);
   expect(nodeText(root)).not.toContain('Four variables selected.');
@@ -99,15 +99,15 @@ it('keeps review, import, verification and recovery requests distinct', async ()
         bundlePath: '/fixture/input.lkb',
         includeAudit: false,
         conflictMode: 'review',
-        confirmDangerous: false,
+        confirmDangerousProfile: '',
       },
     }),
   );
   await check(control(importPanel, 'Import and replace'));
-  await check(control(importPanel, 'Confirm changes'));
+  await input(control(importPanel, 'To import into dangerous'), 'development');
   await input(control(importPanel, 'Bundle path'), '/fixture/other.lkb');
-  expect(control(importPanel, 'Confirm changes').checked).toBe(false);
-  await check(control(importPanel, 'Confirm changes'));
+  expect(control(importPanel, 'To import into dangerous').value).toBe('');
+  await input(control(importPanel, 'To import into dangerous'), 'development');
   await check(control(importPanel, 'Import audit evidence'));
   await click(button(root, 'Apply import'));
   expect(onAction).toHaveBeenLastCalledWith(
@@ -117,11 +117,11 @@ it('keeps review, import, verification and recovery requests distinct', async ()
         bundlePath: '/fixture/other.lkb',
         includeAudit: true,
         conflictMode: 'accept-incoming',
-        confirmDangerous: true,
+        confirmDangerousProfile: 'development',
       },
     }),
   );
-  expect(control(importPanel, 'Confirm changes').checked).toBe(false);
+  expect(control(importPanel, 'To import into dangerous').value).toBe('');
 
   vi.mocked(invoke).mockRejectedValueOnce(new Error('picker unavailable'));
   await click(button(root, 'Browse for a bundle to verify'));

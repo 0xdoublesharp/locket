@@ -6,7 +6,7 @@ const draft: ExportDraft = {
   includeAudit: false,
   includePersonal: false,
   includeHistory: false,
-  confirmDangerous: false,
+  confirmDangerousProfile: '',
   outputPath: '',
   previewOnly: true,
 };
@@ -16,7 +16,7 @@ describe('backup scope preview', () => {
   });
   it('lets the user confirm the previewed selection without changing its scope', () => {
     expect(exportSelectionKey(draft)).toBe(
-      exportSelectionKey({ ...draft, confirmDangerous: true }),
+      exportSelectionKey({ ...draft, confirmDangerousProfile: 'dev' }),
     );
   });
   it.each([

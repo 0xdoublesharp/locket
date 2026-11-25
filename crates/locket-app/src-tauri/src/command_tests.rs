@@ -109,7 +109,7 @@ impl Ipc {
                 Box::pin(async move {
                     assert_eq!(value, TOKEN);
                     match ttl.as_secs() {
-                        1 | 7 => Ok(()),
+                        0 | 7 | 300 => Ok(()),
                         _ => Err(ClipboardError::Backend("test refusal".into())),
                     }
                 })
@@ -1144,14 +1144,17 @@ fn wire_command_contracts(ipc: &Ipc, vault: &Vault, socket: &Path) {
     );
 
     wire_granted_actions(ipc, vault, socket, policy);
+    dangerous_actions_require_typed_name(ipc, vault);
+    clipboard_uses_agent_ttl(ipc, vault, socket);
 }
 
 fn wire_granted_actions(ipc: &Ipc, vault: &Vault, socket: &Path, policy: Value) {
     use locket_agent::BUNDLE_PROJECT_GRANT_SCOPE;
-    let access = json!({"secret_name":"TOKEN","profile_id":PROFILE,"confirm_dangerous":true});
+    let access =
+        json!({"secret_name":"TOKEN","profile_id":PROFILE,"confirm_dangerous_profile":"dev"});
     let set = json!({
         "project_id":vault.id,"profile_id":PROFILE,"secret_name":"TOKEN","value":TOKEN,
-        "confirm_dangerous":true,"source":"user-local","grace_until":7,
+        "confirm_dangerous_profile":"dev","source":"user-local","grace_until":7,
     });
     for (command, method, action, request, fields, response, confirm, profile) in [
         (
@@ -1200,7 +1203,7 @@ fn wire_granted_actions(ipc: &Ipc, vault: &Vault, socket: &Path, policy: Value) 
             "Export",
             json!({
                 "project_id":vault.id,"recipient_descriptor":"test","scope":"active-profile",
-                "include_audit":false,"confirm_dangerous":true,
+                "include_audit":false,"confirm_dangerous_profile":"dev",
             }),
             json!({"profile_id":PROFILE,"confirm_dangerous":true}),
             json!({"action":"export","status":"done","message":"sealed"}),
@@ -1255,6 +1258,7 @@ fn wire_granted_actions(ipc: &Ipc, vault: &Vault, socket: &Path, policy: Value) 
             PROFILE,
         ),
     ] {
+        vault.dangerous(confirm);
         let exchanges = native_grant_exchanges(
             vault,
             action,
@@ -1270,6 +1274,7 @@ fn wire_granted_actions(ipc: &Ipc, vault: &Vault, socket: &Path, policy: Value) 
         });
     }
 
+    vault.dangerous(false);
     for warning in [None, Some("Refresh policy metadata.")] {
         let response = json!({
             "imported":1,"overwritten":2,"skipped":3,"original_preserved":true,
@@ -1318,7 +1323,7 @@ fn wire_granted_actions(ipc: &Ipc, vault: &Vault, socket: &Path, policy: Value) 
         let mut request = action_fields.clone();
         request["project_id"] = json!(vault.id);
         request["incoming_profile_id"] = json!("incoming");
-        request["confirm_dangerous"] = json!(true);
+        request["confirm_dangerous_profile"] = json!("dev");
         let mut action = action_fields;
         action["kind"] = json!(if command == "desktop_team_sync_rename_profile" {
             "rename_profile"
@@ -1340,48 +1345,81 @@ fn wire_granted_actions(ipc: &Ipc, vault: &Vault, socket: &Path, policy: Value) 
             },
         );
     }
+}
 
-    // Fault the grant before a dangerous action can reach a clipboard or mutate anything.
+fn dangerous_actions_require_typed_name(ipc: &Ipc, vault: &Vault) {
     vault.dangerous(true);
-    with_exchanges(
-        socket,
-        vec![Exchange::reject(
-            AgentMethod::RequestGrant,
+    let access = json!({"project_id":vault.id,"profile_id":PROFILE,"secret_name":"TOKEN"});
+    let mut set = access.clone();
+    set["value"] = json!(TOKEN);
+    for (command, request) in [
+        ("agent_reveal", access.clone()),
+        ("agent_copy", access.clone()),
+        ("agent_copy_secret", access),
+        ("agent_set_secret", set.clone()),
+        ("agent_rotate_secret", set),
+        (
+            "agent_prepare_exec",
             json!({
-                "project_id":vault.id,"profile_id":PROFILE,"action":"Copy","confirm_dangerous":false,
+                "project_id":vault.id,"profile_id":PROFILE,"policy_name":"test",
             }),
-            "ConfirmationFailed",
-        )],
-        || {
-            ipc.rejected(
-                "agent_copy_secret",
-                json!({
-                    "project_id":vault.id,"profile_id":PROFILE,"secret_name":"TOKEN",
-                }),
-                "ConfirmationFailed",
+        ),
+        ("desktop_team_sync_now", json!({"project_id":vault.id})),
+        (
+            "agent_export_bundle",
+            json!({
+                "project_id":vault.id,"recipient_descriptor":"test","scope":"active-profile",
+                "include_audit":false,
+            }),
+        ),
+        (
+            "agent_import_bundle",
+            json!({
+                "project_id":vault.id,"bundle_path":vault.root.join("test.locket"),
+                "include_audit":false,"conflict_mode":"review",
+            }),
+        ),
+    ] {
+        for confirmation in [None, Some(""), Some("DEV"), Some("dev ")] {
+            let mut request = request.clone();
+            request["confirm_dangerous"] = json!(true);
+            if let Some(typed) = confirmation {
+                request["confirm_dangerous_profile"] = json!(typed);
+            }
+            // The scripted agent is offline. Native denial must happen before any RPC.
+            let error = ipc.rejected(command, request, "ConfirmationFailed");
+            assert_eq!(
+                error["message"],
+                "Type the exact active profile name to confirm this action."
             );
-        },
-    );
+        }
+    }
     vault.dangerous(false);
+}
 
-    for (ttl_override, expected_ttl, expected_error) in [
-        (None, 1, None),
-        (Some(7), 7, None),
-        (Some(8), 8, Some("clipboard write failed: clipboard backend error: test refusal")),
+fn clipboard_uses_agent_ttl(ipc: &Ipc, vault: &Vault, socket: &Path) {
+    vault.dangerous(true);
+    for (requested, agent_ttl, expected_ttl, expected_error) in [
+        (None, 0, 0, None),
+        (Some(8), 7, 7, None),
+        (Some(u32::MAX), 7, 7, None),
+        (None, 600, 300, None),
+        (None, 8, 8, Some("clipboard write failed: clipboard backend error: test refusal")),
     ] {
         let operation = Exchange::success(
             AgentMethod::Copy,
             json!({"secret_name":"TOKEN","store_path":vault.store,"profile_id":PROFILE}),
-            json!({"value":TOKEN,"ttl_seconds":0}),
+            json!({"value":TOKEN,"ttl_seconds":agent_ttl}),
         );
         with_exchanges(
             socket,
-            native_grant_exchanges(vault, "Copy", PROFILE, false, operation),
+            native_grant_exchanges(vault, "Copy", PROFILE, true, operation),
             || {
                 let result = ipc.request(
                     "agent_copy_secret",
                     json!({
-                        "secret_name":"TOKEN","profile_id":PROFILE,"ttl_seconds":ttl_override,
+                        "secret_name":"TOKEN","profile_id":PROFILE,"ttl_seconds":requested,
+                        "confirm_dangerous_profile":"dev",
                     }),
                 );
                 if let Some(reason) = expected_error {
@@ -1392,4 +1430,5 @@ fn wire_granted_actions(ipc: &Ipc, vault: &Vault, socket: &Path, policy: Value) 
             },
         );
     }
+    vault.dangerous(false);
 }

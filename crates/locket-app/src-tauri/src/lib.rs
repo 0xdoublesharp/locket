@@ -514,18 +514,17 @@ async fn agent_set_active_profile(
 struct DesktopValueAccess<T> {
     #[serde(flatten)]
     request: T,
-    #[serde(default)]
-    confirm_dangerous: bool,
+    confirm_dangerous_profile: Option<String>,
 }
 
 fn value_access_payload(
     request: impl Serialize,
-    confirm_dangerous: bool,
+    confirm_dangerous_profile: Option<String>,
 ) -> Result<serde_json::Value, AgentClientError> {
     let mut payload = serde_json::to_value(request).map_err(|_| AgentClientError::Protocol {
         reason: "Invalid secret access request.".into(),
     })?;
-    payload["confirm_dangerous"] = serde_json::json!(confirm_dangerous);
+    payload["confirm_dangerous_profile"] = serde_json::json!(confirm_dangerous_profile);
     Ok(payload)
 }
 
@@ -537,7 +536,7 @@ fn value_access_payload(
 async fn agent_reveal(
     request: DesktopValueAccess<locket_agent::RevealRequest>,
 ) -> Result<locket_agent::RevealResponse, AgentClientError> {
-    let DesktopValueAccess { request, confirm_dangerous } = request;
+    let DesktopValueAccess { request, confirm_dangerous_profile } = request;
     let store = resolve_path(request.store_path.clone(), default_store_path)?;
     let project =
         request.project_id.clone().map(Ok).unwrap_or_else(desktop_actions::selected_project_id)?;
@@ -547,7 +546,7 @@ async fn agent_reveal(
     desktop_actions::invoke_granted(
         locket_agent::AgentMethod::Reveal,
         locket_agent::GrantAction::Reveal,
-        value_access_payload(&request, confirm_dangerous)?,
+        value_access_payload(&request, confirm_dangerous_profile)?,
         &store,
         &project,
         &request.profile_id,
@@ -560,7 +559,7 @@ async fn agent_reveal(
 async fn agent_copy(
     request: DesktopValueAccess<locket_agent::CopyRequest>,
 ) -> Result<locket_agent::CopyResponse, AgentClientError> {
-    let DesktopValueAccess { request, confirm_dangerous } = request;
+    let DesktopValueAccess { request, confirm_dangerous_profile } = request;
     let store = resolve_path(request.store_path.clone(), default_store_path)?;
     let project =
         request.project_id.clone().map(Ok).unwrap_or_else(desktop_actions::selected_project_id)?;
@@ -570,7 +569,7 @@ async fn agent_copy(
     desktop_actions::invoke_granted(
         locket_agent::AgentMethod::Copy,
         locket_agent::GrantAction::Copy,
-        value_access_payload(&request, confirm_dangerous)?,
+        value_access_payload(&request, confirm_dangerous_profile)?,
         &store,
         &project,
         &request.profile_id,
@@ -596,13 +595,35 @@ async fn agent_resolve(
     agent_client::invoke_method(&path, locket_agent::AgentMethod::ResolveReference, &request).await
 }
 
+#[derive(Deserialize)]
+struct DesktopPrepareExecRequest {
+    policy_name: String,
+    profile_id: String,
+    project_id: String,
+    confirm_dangerous_profile: Option<String>,
+    binding: Option<locket_agent::GrantBinding>,
+}
+
 /// Tauri command exposing the agent's `PrepareExec` RPC.
 #[tauri::command]
 async fn agent_prepare_exec(
-    request: locket_agent::PrepareExecRequest,
+    request: DesktopPrepareExecRequest,
 ) -> Result<locket_agent::PrepareExecResponse, AgentClientError> {
     let path = agent_client::resolve_socket_path();
-    agent_client::invoke_method(&path, locket_agent::AgentMethod::PrepareExec, &request).await
+    let confirmed = desktop_actions::confirm_prepare_exec(
+        &default_store_path()?,
+        &request.project_id,
+        &request.profile_id,
+        request.confirm_dangerous_profile.as_deref(),
+    )?;
+    let payload = locket_agent::PrepareExecRequest {
+        policy_name: request.policy_name,
+        profile_id: request.profile_id,
+        project_id: request.project_id,
+        confirm_dangerous: confirmed,
+        binding: request.binding,
+    };
+    agent_client::invoke_method(&path, locket_agent::AgentMethod::PrepareExec, &payload).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -641,20 +662,79 @@ async fn agent_policy_doctor(
         .await
 }
 
+#[derive(Deserialize)]
+struct DesktopExportBundleRequest {
+    project_id: String,
+    profile_id: Option<String>,
+    recipient_descriptor: String,
+    scope: locket_agent::BundleExportScope,
+    include_audit: bool,
+    #[serde(default)]
+    include_personal: bool,
+    #[serde(default)]
+    include_history: bool,
+    #[serde(default)]
+    preview_only: bool,
+    output_path: Option<PathBuf>,
+    confirm_dangerous_profile: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DesktopImportBundleRequest {
+    project_id: String,
+    bundle_path: PathBuf,
+    include_audit: bool,
+    conflict_mode: locket_agent::BundleConflictMode,
+    confirm_dangerous_profile: Option<String>,
+}
+
 /// Tauri command exposing the agent's typed sealed-bundle export path.
 #[tauri::command]
 async fn agent_export_bundle(
-    request: locket_agent::ExportBundleRequest,
+    request: DesktopExportBundleRequest,
 ) -> Result<locket_agent::BackupActionResponse, AgentClientError> {
-    desktop_actions::export_bundle(&default_store_path()?, request).await
+    let payload = locket_agent::ExportBundleRequest {
+        project_id: request.project_id,
+        profile_id: request.profile_id,
+        recipient_descriptor: request.recipient_descriptor,
+        scope: request.scope,
+        include_audit: request.include_audit,
+        include_personal: request.include_personal,
+        include_history: request.include_history,
+        preview_only: request.preview_only,
+        output_path: request.output_path,
+        grant_id: None,
+        binding: None,
+        confirm_dangerous: false,
+    };
+    desktop_actions::export_bundle(
+        &default_store_path()?,
+        payload,
+        request.confirm_dangerous_profile.as_deref(),
+    )
+    .await
 }
 
 /// Tauri command exposing the agent's typed sealed-bundle import path.
 #[tauri::command]
 async fn agent_import_bundle(
-    request: locket_agent::ImportBundleRequest,
+    request: DesktopImportBundleRequest,
 ) -> Result<locket_agent::BackupActionResponse, AgentClientError> {
-    desktop_actions::import_bundle(&default_store_path()?, request).await
+    let payload = locket_agent::ImportBundleRequest {
+        project_id: request.project_id,
+        bundle_path: request.bundle_path,
+        include_audit: request.include_audit,
+        conflict_mode: request.conflict_mode,
+        grant_id: None,
+        binding: None,
+        confirm_dangerous: false,
+    };
+    desktop_actions::import_bundle(
+        &default_store_path()?,
+        payload,
+        request.confirm_dangerous_profile.as_deref(),
+    )
+    .await
 }
 
 /// Tauri command exposing non-destructive sealed-bundle verification.
@@ -789,8 +869,7 @@ struct DesktopSetSecretRequest {
     project_id: String,
     profile_id: String,
     secret_name: String,
-    #[serde(default)]
-    confirm_dangerous: bool,
+    confirm_dangerous_profile: Option<String>,
     #[serde(default)]
     source: Option<String>,
     #[serde(deserialize_with = "deserialize_secret")]
@@ -806,7 +885,7 @@ struct AgentSetSecretPayload<'a> {
     profile_id: &'a str,
     secret_name: &'a str,
     #[serde(skip)]
-    confirm_dangerous: bool,
+    confirm_dangerous_profile: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<&'a str>,
     value: &'a str,
@@ -818,8 +897,8 @@ struct AgentSetSecretPayload<'a> {
 }
 
 impl desktop_actions::GrantPayload for AgentSetSecretPayload<'_> {
-    fn confirms_dangerous(&self, _profile_name: &str) -> bool {
-        self.confirm_dangerous
+    fn confirms_dangerous(&self, profile_name: &str) -> bool {
+        desktop_actions::matches_profile_confirmation(self.confirm_dangerous_profile, profile_name)
     }
 
     fn authorize(
@@ -839,7 +918,7 @@ impl DesktopSetSecretRequest {
             project_id: &self.project_id,
             profile_id: &self.profile_id,
             secret_name: &self.secret_name,
-            confirm_dangerous: self.confirm_dangerous,
+            confirm_dangerous_profile: self.confirm_dangerous_profile.as_deref(),
             source: self.source.as_deref(),
             value: self.value.as_str(),
             rotate,
@@ -960,9 +1039,7 @@ struct DesktopClipboardCopyRequest {
     profile_id: String,
     project_id: Option<String>,
     store_path: Option<PathBuf>,
-    ttl_seconds: Option<u32>,
-    #[serde(default)]
-    confirm_dangerous: bool,
+    confirm_dangerous_profile: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -1001,13 +1078,14 @@ async fn agent_copy_secret(
     let response: locket_agent::CopyResponse = desktop_actions::invoke_granted(
         locket_agent::AgentMethod::Copy,
         locket_agent::GrantAction::Copy,
-        value_access_payload(&agent_request, request.confirm_dangerous)?,
+        value_access_payload(&agent_request, request.confirm_dangerous_profile)?,
         &store,
         &project,
         &agent_request.profile_id,
     )
     .await?;
-    let ttl_seconds = request.ttl_seconds.unwrap_or(response.ttl_seconds.max(1));
+    const MAX_NATIVE_CLIPBOARD_TTL_SECONDS: u32 = 300;
+    let ttl_seconds = response.ttl_seconds.min(MAX_NATIVE_CLIPBOARD_TTL_SECONDS);
     (handoff.copy_secret)(response.value, std::time::Duration::from_secs(u64::from(ttl_seconds)))
         .await
         .map_err(|error| AgentClientError::Protocol {

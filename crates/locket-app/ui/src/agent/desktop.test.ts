@@ -198,6 +198,7 @@ it('sends only typed local collision identifiers for approved pending resolution
     incoming_profile_id: 'incoming-profile',
     local_profile_id: 'local-profile',
     new_name: 'preserved-local',
+    confirm_dangerous_profile: 'production',
   };
   expect(await desktopTeamSyncRenameProfile(rename)).toEqual({ ok: true, value: status });
   expect(invoke).toHaveBeenLastCalledWith('desktop_team_sync_rename_profile', { request: rename });
@@ -205,6 +206,7 @@ it('sends only typed local collision identifiers for approved pending resolution
     project_id: 'project',
     incoming_profile_id: 'incoming-profile',
     local_secret_id: 'local-secret',
+    confirm_dangerous_profile: 'production',
   };
   expect(await desktopTeamSyncPreserveOverride(preserve)).toEqual({ ok: true, value: status });
   expect(invoke).toHaveBeenLastCalledWith('desktop_team_sync_preserve_override', {

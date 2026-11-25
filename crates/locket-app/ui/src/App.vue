@@ -979,14 +979,27 @@ watch(
 
 const dangerousConfirmDialog = ref<HTMLDialogElement | null>(null);
 const dangerousAction = ref('');
+const dangerousProfileName = ref('');
+const dangerousProfileInput = ref('');
+const dangerousProfileMatches = computed(
+  () =>
+    dangerousProfileName.value !== '' && dangerousProfileInput.value === dangerousProfileName.value,
+);
 
-async function confirmDangerousAction(action: string): Promise<boolean | undefined> {
+function submitDangerousConfirmation(): void {
+  if (dangerousProfileMatches.value) dangerousConfirmDialog.value?.close('confirm');
+}
+
+async function confirmDangerousAction(action: string): Promise<string | false | undefined> {
   if (!settings.value.dangerousProfileFlag) return false;
   const dialog = dangerousConfirmDialog.value;
-  if (!dialog || dialog.open) return;
+  if (!dialog || dangerousProfileName.value) return;
   const generation = selectionGeneration.value;
-  const profile = activeContext.value?.profile_id;
+  const profile = activeContext.value;
+  if (!profile?.profile_name) return;
   dangerousAction.value = action;
+  dangerousProfileName.value = profile.profile_name;
+  dangerousProfileInput.value = '';
   dialog.returnValue = '';
   const approved = await new Promise<boolean>((resolve) => {
     dialog.addEventListener('close', () => resolve(dialog.returnValue === 'confirm'), {
@@ -994,17 +1007,27 @@ async function confirmDangerousAction(action: string): Promise<boolean | undefin
     });
     dialog.showModal();
   });
+  const typed = dangerousProfileInput.value;
+  dangerousProfileName.value = '';
+  dangerousProfileInput.value = '';
   if (
     approved &&
     generation === selectionGeneration.value &&
-    profile === activeContext.value?.profile_id
+    profile.profile_id === activeContext.value?.profile_id &&
+    profile.profile_name === activeContext.value?.profile_name &&
+    typed === profile.profile_name
   ) {
-    return true;
+    return typed;
   }
 }
 
 watch(
-  [selectionGeneration, () => activeContext.value?.profile_id, () => status.value?.lock_state],
+  [
+    selectionGeneration,
+    () => activeContext.value?.profile_id,
+    () => activeContext.value?.profile_name,
+    () => status.value?.lock_state,
+  ],
   () => {
     const dialog = dangerousConfirmDialog.value;
     if (dialog?.open) dialog.close();
@@ -1037,7 +1060,7 @@ async function handleRevealSelectedSecret(): Promise<void> {
   const result = await revealAgent({
     secret_name: target.name,
     profile_id: profileId,
-    ...(approved && { confirm_dangerous: true }),
+    ...(approved && { confirm_dangerous_profile: approved }),
   });
   if (!isCurrent()) return;
   if (!result.ok) {
@@ -1058,7 +1081,7 @@ function revealErrorLabel(err: AgentClientError): string {
     case 'protocol':
       return 'Reveal request failed.';
     case 'rejected':
-      return err.code;
+      return err.code === 'ConfirmationFailed' ? err.message : err.code;
     default:
       return 'Reveal request failed.';
   }
@@ -1084,7 +1107,7 @@ async function handleCopySelectedSecret(): Promise<void> {
   if (approved === undefined || !isCurrent()) return;
   const result = await copySecret({
     secret_name: target.name,
-    ...(approved && { confirm_dangerous: true }),
+    ...(approved && { confirm_dangerous_profile: approved }),
     profile_id: profileId,
     project_id: status.value?.project_id ?? undefined,
   });
@@ -1827,7 +1850,7 @@ function backupErrorLabel(error: AgentClientError): string {
     case 'protocol':
       return 'Backup request failed.';
     case 'rejected':
-      return error.code;
+      return error.code === 'ConfirmationFailed' ? error.message : error.code;
     default:
       return 'Backup request failed.';
   }
@@ -1865,7 +1888,7 @@ async function triggerBackupAction(action: BundleAction): Promise<void> {
           include_personal: action.request.includePersonal,
           include_history: action.request.includeHistory,
           preview_only: action.request.previewOnly,
-          confirm_dangerous: action.request.confirmDangerous,
+          confirm_dangerous_profile: action.request.confirmDangerousProfile || undefined,
         });
         if (!isCurrent()) return;
         if (result.ok) {
@@ -1886,7 +1909,7 @@ async function triggerBackupAction(action: BundleAction): Promise<void> {
           bundle_path: action.request.bundlePath,
           include_audit: action.request.includeAudit,
           conflict_mode: action.request.conflictMode,
-          confirm_dangerous: action.request.confirmDangerous,
+          confirm_dangerous_profile: action.request.confirmDangerousProfile || undefined,
         });
         if (!isCurrent()) return;
         if (result.ok) {
@@ -1944,7 +1967,9 @@ async function handleSetSecret(
     : false;
   if (approved === undefined || context !== settingsContextKey.value)
     return { ok: false, error: { kind: 'protocol', reason: 'Action canceled.' } };
-  const result = await setSecret(approved ? { ...payload, confirm_dangerous: true } : payload);
+  const result = await setSecret(
+    approved ? { ...payload, confirm_dangerous_profile: approved } : payload,
+  );
   if (result.ok && context === settingsContextKey.value) {
     await refreshSecrets();
   }
@@ -1960,7 +1985,9 @@ async function handleRotateSecret(
     : false;
   if (approved === undefined || context !== settingsContextKey.value)
     return { ok: false, error: { kind: 'protocol', reason: 'Action canceled.' } };
-  const result = await rotateSecret(approved ? { ...payload, confirm_dangerous: true } : payload);
+  const result = await rotateSecret(
+    approved ? { ...payload, confirm_dangerous_profile: approved } : payload,
+  );
   if (result.ok && context === settingsContextKey.value) {
     await refreshSecrets();
     await refreshVersions();
@@ -2056,7 +2083,7 @@ async function handleCopyToShared(row: SecretRowMeta): Promise<void> {
     from_profile_id: context.profile_id,
     secret_name: row.name,
     source: secretSourceWire(row.source),
-    ...(approved && { confirmation: context.profile_name }),
+    ...(approved && { confirmation: approved }),
   });
   if (!isCurrent()) return;
   secretMutationBusy.value = false;
@@ -3216,6 +3243,9 @@ onUnmounted(() => {
 
       <template v-else-if="currentView === 'recovery'">
         <BackupRecovery
+          :context-key="settingsContextKey"
+          :profile-name="activeContext?.profile_name"
+          :dangerous-profile="settings.dangerousProfileFlag"
           :busy="backupBusy"
           :preview-key="backupPreviewKey"
           :preview-message="backupPreviewMessage"
@@ -3250,11 +3280,23 @@ onUnmounted(() => {
     </main>
 
     <dialog ref="dangerousConfirmDialog" aria-labelledby="dangerous-action-title">
-      <form method="dialog">
+      <form @submit.prevent="submitDangerousConfirmation">
         <h2 id="dangerous-action-title">{{ dangerousAction }}</h2>
-        <p>Allow this action in the dangerous profile {{ profileLabel }}?</p>
-        <button value="cancel" autofocus>Cancel</button>
-        <button value="confirm">Allow action</button>
+        <label for="dangerous-action-profile">
+          Type the exact profile name <strong>{{ dangerousProfileName }}</strong> to allow this
+          action.
+        </label>
+        <input
+          id="dangerous-action-profile"
+          v-model="dangerousProfileInput"
+          type="text"
+          autocomplete="off"
+          autocapitalize="off"
+          spellcheck="false"
+          autofocus
+        />
+        <button type="button" @click="dangerousConfirmDialog?.close()">Cancel</button>
+        <button type="submit" :disabled="!dangerousProfileMatches">Allow action</button>
       </form>
     </dialog>
     <CommandPalette

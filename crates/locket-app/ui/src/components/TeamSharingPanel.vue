@@ -15,7 +15,7 @@ import { joinCommand, syncMessage, type TeamSyncStatus } from '../team/sync';
 const props = defineProps<{
   projectId?: string;
   privacyMode?: boolean;
-  confirmDangerous?: (action: string) => Promise<boolean | undefined>;
+  confirmDangerous?: (action: string) => Promise<string | false | undefined>;
 }>();
 const status = ref<TeamSyncStatus | null>(null);
 const busy = ref(false);
@@ -79,7 +79,10 @@ async function perform(kind: 'status' | 'now' | 'configure') {
             kind === 'now' ? 'Sync team updates' : 'Configure team sync',
           );
     if (approved === undefined || token !== generation || project !== props.projectId) return;
-    const request = { project_id: project, ...(approved && { confirm_dangerous: true }) };
+    const request = {
+      project_id: project,
+      ...(approved && { confirm_dangerous_profile: approved }),
+    };
     const result =
       kind === 'now'
         ? await desktopTeamSyncNow(request)
@@ -108,7 +111,7 @@ async function reconcile(incoming: string, localId: string, kind: 'profile' | 'v
       ? await props.confirmDangerous('Reconcile team changes')
       : false;
     if (approved === undefined || token !== generation || project !== props.projectId) return;
-    const confirmation = approved ? { confirm_dangerous: true } : {};
+    const confirmation = approved ? { confirm_dangerous_profile: approved } : {};
     const result =
       kind === 'profile'
         ? await desktopTeamSyncRenameProfile({
