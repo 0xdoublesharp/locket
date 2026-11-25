@@ -149,6 +149,7 @@ export type AppIconName =
   | 'clock'
   | 'fingerprint'
   | 'refresh'
+  | 'info'
   | 'alert'
   | 'check'
   | 'plus'

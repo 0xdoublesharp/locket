@@ -84,6 +84,10 @@ defineProps<{ name: AppIconName; size?: number }>();
       v-else-if="name === 'refresh'"
       d="M20 10a8 8 0 0 0-13.7-4.3L4 8m0-4v4h4m-4 6a8 8 0 0 0 13.7 4.3L20 16m-4 0h4v4"
     />
+    <template v-else-if="name === 'info'">
+      <circle cx="12" cy="12" r="8.5" />
+      <path d="M12 8h.01m-.01 3.5V16" />
+    </template>
     <template v-else-if="name === 'alert'">
       <circle cx="12" cy="12" r="8.5" />
       <path d="M12 8v4.5m0 3.5h.01" />

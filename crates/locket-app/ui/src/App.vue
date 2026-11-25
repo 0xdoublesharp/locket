@@ -2993,6 +2993,12 @@ html,
   list-style: none;
 }
 
+@container dashboard (min-width: 62rem) {
+  .shell__known-projects ul {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
 .shell__known-project {
   display: flex;
   justify-content: space-between;

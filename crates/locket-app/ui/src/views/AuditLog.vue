@@ -1,8 +1,8 @@
 <script setup lang="ts">
+import AppIcon from '../components/AppIcon.vue';
 import { formatTime } from '../utils/formatTime';
 import { computed, ref } from 'vue';
 
-import { auditHealth } from '../dashboard/health';
 import type { AuditLogRow } from '../types/views';
 
 interface Props {
@@ -56,18 +56,22 @@ const chainBannerText = computed<string>(() => {
   return 'Audit chain broken.';
 });
 
+function profileValue(row: AuditLogRow): string | null {
+  const value = props.privacyMode ? (row.profileAlias ?? row.profile) : row.profile;
+  return value && value.trim().length > 0 ? value : null;
+}
+
+function secretValue(row: AuditLogRow): string | null {
+  const value = props.privacyMode ? (row.secretAlias ?? row.secretName) : row.secretName;
+  return value && value.trim().length > 0 ? value : null;
+}
+
 function profileLabel(row: AuditLogRow): string {
-  if (props.privacyMode) {
-    return row.profileAlias ?? row.profile ?? '—';
-  }
-  return row.profile ?? '—';
+  return profileValue(row) ?? '—';
 }
 
 function secretLabel(row: AuditLogRow): string {
-  if (props.privacyMode) {
-    return row.secretAlias ?? row.secretName ?? '—';
-  }
-  return row.secretName ?? '—';
+  return secretValue(row) ?? '—';
 }
 
 function statusLabel(status: AuditLogRow['status']): string {
@@ -109,89 +113,107 @@ function onVerify(): void {
 
 <template>
   <section class="view" aria-labelledby="audit-log-heading">
-    <header class="view__header">
+    <header class="companion-toolbar view__header">
       <h2 id="audit-log-heading">Audit log</h2>
-      <div class="view__actions">
-        <label class="view__search">
-          <span class="view__search-label">Search audit</span>
+      <div class="companion-toolbar__controls">
+        <label class="companion-toolbar__search">
+          <span class="visually-hidden">Search audit</span>
+          <AppIcon name="search" :size="14" />
           <input
             v-model="searchQuery"
+            class="companion-input"
             type="search"
             autocomplete="off"
             spellcheck="false"
-            placeholder="Search metadata"
+            placeholder="Search audit log…"
           />
         </label>
         <button
           type="button"
-          class="view__action"
+          class="companion-button icon-label"
           aria-label="Verify audit chain"
           @click="onVerify"
         >
+          <AppIcon name="check" />
           Verify chain
         </button>
       </div>
     </header>
 
-    <p
-      :class="['view__chain', chainOk ? 'view__chain--ok' : 'view__chain--broken']"
-      role="status"
-      aria-live="polite"
+    <div
+      :class="[
+        'view__chain',
+        chainOk === true
+          ? 'view__chain--ok'
+          : chainOk === false
+            ? 'view__chain--broken'
+            : 'view__chain--unknown',
+      ]"
     >
-      {{ chainBannerText }}
-    </p>
+      <AppIcon :name="chainOk === true ? 'check' : 'alert'" />
+      <p class="view__chain-text" role="status" aria-live="polite">{{ chainBannerText }}</p>
+      <span v-if="lastCheckedAt" class="view__chain-meta">
+        Project audit last checked
+        <time :datetime="lastCheckedAt" :title="lastCheckedAt">{{
+          formatTime(lastCheckedAt)
+        }}</time>
+      </span>
+    </div>
 
-    <p v-if="loading" role="status">Loading audit…</p>
-    <p v-if="errorMessage" role="alert">{{ errorMessage }} Retry verification.</p>
-    <p v-if="lastCheckedAt">
-      Project audit last checked
-      <time :datetime="lastCheckedAt" :title="lastCheckedAt">{{ formatTime(lastCheckedAt) }}</time>
+    <p v-if="loading" class="view__empty" role="status">Loading audit…</p>
+    <p v-if="errorMessage" class="view__error" role="alert">
+      {{ errorMessage }} Retry verification.
     </p>
-    <p class="view__muted">{{ auditHealth(chainOk).label }}</p>
     <p v-if="isEmpty && !loading" class="view__empty">No audit rows.</p>
 
     <p v-else-if="isFilteredEmpty" class="view__empty">No matching audit rows.</p>
 
     <div
       v-else
-      class="companion-table-scroll"
+      class="companion-table-scroll view__scroll"
       role="region"
       aria-labelledby="audit-log-heading"
       tabindex="0"
     >
-      <table class="view__table" aria-describedby="audit-log-heading">
-        <thead>
-          <tr>
-            <th scope="col">Seq</th>
-            <th scope="col">Timestamp</th>
-            <th scope="col">Action</th>
-            <th scope="col">Status</th>
-            <th scope="col">Profile</th>
-            <th scope="col">Secret</th>
-            <th scope="col">Denial reason</th>
+      <table class="view__table" role="table" aria-describedby="audit-log-heading">
+        <thead role="rowgroup">
+          <tr role="row">
+            <th scope="col" role="columnheader">Seq</th>
+            <th scope="col" role="columnheader">Timestamp</th>
+            <th scope="col" role="columnheader">Action</th>
+            <th scope="col" role="columnheader">Status</th>
+            <th scope="col" role="columnheader">Profile</th>
+            <th scope="col" role="columnheader">Secret</th>
+            <th scope="col" role="columnheader">Denial reason</th>
           </tr>
         </thead>
-        <tbody>
-          <tr v-for="row in filteredRows" :key="row.sequence">
-            <td>
-              <span class="view__muted">{{ row.sequence }}</span>
+        <tbody role="rowgroup">
+          <tr v-for="row in filteredRows" :key="row.sequence" role="row">
+            <td class="view__cell--seq" data-label="Seq" role="cell">
+              <span class="view__seq">#{{ row.sequence }}</span>
             </td>
-            <td>
-              <time :datetime="row.timestamp" :title="row.timestamp">{{
-                formatTime(row.timestamp, 'timestamp')
+            <td class="view__cell--time" data-label="Timestamp" role="cell">
+              <time class="view__timestamp" :datetime="row.timestamp" :title="row.timestamp">{{
+                formatTime(row.timestamp, 'datetime')
               }}</time>
             </td>
-            <td>
+            <td class="view__cell--action" data-label="Action" role="cell">
               <span class="view__name">{{ row.action }}</span>
             </td>
-            <td>
+            <td class="view__cell--status" data-label="Status" role="cell">
               <span :class="['badge', `badge--status-${row.status.toLowerCase()}`]">
                 {{ statusLabel(row.status) }}
               </span>
             </td>
-            <td>{{ profileLabel(row) }}</td>
-            <td>{{ secretLabel(row) }}</td>
-            <td>
+            <td data-label="Profile" role="cell">
+              <span v-if="profileValue(row)">{{ profileValue(row) }}</span>
+              <span v-else class="view__muted">—</span>
+            </td>
+            <td data-label="Secret" role="cell">
+              <span v-if="secretValue(row)" class="view__secret">{{ secretValue(row) }}</span>
+              <span v-else class="view__muted">—</span>
+            </td>
+            <td data-label="Denial reason" role="cell">
               <span v-if="row.status === 'DENIED' && row.denialReason" class="badge badge--warning">
                 {{ row.denialReason }}
               </span>
@@ -206,99 +228,48 @@ function onVerify(): void {
 
 <style scoped>
 .view {
+  container: audit / inline-size;
   background: var(--bg-surface);
   color: var(--text-primary);
   padding: 1rem;
-  border-radius: 0.5rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
 }
 
 .view__header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  flex-wrap: wrap;
   margin-bottom: 0.75rem;
-  gap: 0.75rem;
 }
 
 .view__header h2 {
   margin: 0;
   font-size: 1rem;
-  letter-spacing: 0.04em;
-}
-
-.view__actions {
-  display: inline-flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 0.75rem;
-}
-
-.view__search {
-  display: grid;
-  gap: 0.25rem;
-  min-width: min(18rem, 100%);
-}
-
-.view__search-label {
-  color: var(--text-secondary);
-  font-size: 0.75rem;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-}
-
-.view__search input {
-  box-sizing: border-box;
-  width: 100%;
-  min-height: 2rem;
-  border: 1px solid var(--border-strong);
-  border-radius: 0.375rem;
-  background: var(--bg-subtle);
-  color: var(--text-primary);
-  font: inherit;
-  padding: 0.375rem 0.625rem;
-}
-
-.view__search input:focus {
-  border-color: var(--accent);
-  outline: 2px solid var(--accent);
-  outline-offset: 1px;
-}
-
-.view__search input::placeholder {
-  color: var(--text-muted);
-}
-
-.view__action {
-  background: var(--bg-subtle);
-  color: var(--text-primary);
-  border: 1px solid var(--border-subtle);
-  border-radius: 0.375rem;
-  padding: 0.25rem 0.75rem;
-  font-size: 0.8125rem;
-  cursor: pointer;
-}
-
-.view__action:hover {
-  background: var(--bg-subtle);
-}
-
-.view__action:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
 }
 
 .view__chain {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.25rem 0.5rem;
   margin: 0 0 0.75rem;
   padding: 0.5rem 0.75rem;
-  border-radius: 0.5rem;
-  font-size: 0.8125rem;
   border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  font-size: 0.8125rem;
+}
+
+.view__chain-text {
+  flex: 1 1 auto;
+  margin: 0;
+  font-weight: 600;
+}
+
+.view__chain-meta {
+  color: var(--text-secondary);
+  white-space: nowrap;
 }
 
 .view__chain--ok {
   background: var(--success-soft);
-  border-color: var(--border-strong);
   color: var(--success);
 }
 
@@ -308,35 +279,76 @@ function onVerify(): void {
   color: var(--danger);
 }
 
+.view__chain--unknown {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
 .view__empty {
-  margin: 0;
+  margin: 0 0 0.5rem;
   font-size: 0.875rem;
   color: var(--text-secondary);
+}
+
+.view__error {
+  margin: 0 0 0.5rem;
+  font-size: 0.875rem;
+  color: var(--danger);
 }
 
 .view__table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 0.875rem;
+  font-size: 0.8125rem;
 }
 
 .view__table th,
 .view__table td {
   text-align: left;
-  padding: 0.5rem 0.75rem;
+  padding: 0.5rem 0.65rem;
   border-bottom: 1px solid var(--border-subtle);
-  vertical-align: top;
+  vertical-align: middle;
 }
 
 .view__table th {
   font-weight: 600;
-  color: var(--text-secondary);
+  color: var(--text-muted);
+  font-size: 0.6875rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.view__table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.view__table tbody tr:hover {
+  background: var(--bg-subtle);
+}
+
+.view__seq {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
   font-size: 0.75rem;
-  letter-spacing: 0.04em;
+}
+
+.view__timestamp {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .view__name {
-  font-weight: 600;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.view__secret {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  overflow-wrap: anywhere;
 }
 
 .view__muted {
@@ -346,17 +358,19 @@ function onVerify(): void {
 .badge {
   display: inline-block;
   padding: 0.125rem 0.5rem;
-  border-radius: 0.375rem;
-  font-size: 0.75rem;
-  letter-spacing: 0.02em;
+  border-radius: 999px;
+  font-size: 0.6875rem;
+  font-weight: 650;
+  letter-spacing: 0.03em;
   border: 1px solid var(--border-subtle);
   background: var(--bg-subtle);
   color: var(--text-primary);
+  white-space: nowrap;
 }
 
 .badge--status-ok {
   background: var(--success-soft);
-  border-color: var(--border-strong);
+  border-color: transparent;
   color: var(--success);
 }
 
@@ -376,5 +390,89 @@ function onVerify(): void {
   background: var(--accent-soft);
   border-color: var(--accent);
   color: var(--accent);
+}
+
+@container audit (max-width: 46rem) {
+  .view__scroll {
+    overflow: visible;
+  }
+
+  .view__table,
+  .view__table tbody {
+    display: block;
+  }
+
+  .view__table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+  }
+
+  .view__table tbody tr {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.5rem 0.75rem;
+    margin-bottom: 0.5rem;
+    padding: 0.7rem 0.75rem;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    background: var(--bg-app);
+  }
+
+  .view__table tbody tr:hover {
+    background: var(--bg-app);
+  }
+
+  .view__table td {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.2rem;
+    min-width: 0;
+    padding: 0;
+    border: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .view__table td::before {
+    content: attr(data-label);
+    color: var(--text-muted);
+    font-size: 0.6875rem;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
+
+  /* Card header: action on the left, status on the right. */
+  .view__table td.view__cell--action,
+  .view__table td.view__cell--status {
+    grid-row: 1;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .view__table td.view__cell--action {
+    grid-column: 1 / 3;
+  }
+
+  .view__table td.view__cell--status {
+    grid-column: 3;
+    justify-content: flex-end;
+  }
+
+  .view__table td.view__cell--action::before,
+  .view__table td.view__cell--status::before {
+    content: none;
+  }
+
+  .view__table td.view__cell--time {
+    grid-column: span 2;
+  }
+
+  .badge--warning {
+    white-space: normal;
+  }
 }
 </style>

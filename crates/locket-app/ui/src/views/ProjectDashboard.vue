@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
 import AppIcon from '../components/AppIcon.vue';
-import { formatTime } from '../utils/formatTime';
+import { formatDuration, formatTime } from '../utils/formatTime';
 import VariableReadinessPanel from '../components/VariableReadinessPanel.vue';
 import type {
   AuditLogRow,
@@ -63,6 +63,20 @@ const scan = computed(() =>
 const failedRuns = computed(
   () => props.sessions.filter((row) => row.state === 'failed' || row.state === 'stale').length,
 );
+const requiredVariables = computed(() => props.secrets.filter((row) => row.required).length);
+const vaultTone = computed(() => {
+  switch (props.lockLabel) {
+    case 'Unlocked':
+      return 'ok';
+    case 'Locked':
+      return 'locked';
+    case 'Connecting…':
+      return 'pending';
+    default:
+      return 'error';
+  }
+});
+const unlockDuration = computed(() => formatDuration(props.settings.unlockTtlSeconds || 900));
 const readiness = computed(() => ({
   projectId: props.projectId,
   profileId: props.profileId,
@@ -79,9 +93,17 @@ const readiness = computed(() => ({
 <template>
   <section class="dashboard" aria-labelledby="project-dashboard-heading">
     <header class="dashboard__header">
-      <div>
+      <div class="dashboard__heading">
         <h2 id="project-dashboard-heading">Project</h2>
-        <p class="dashboard__context">{{ projectLabel }} / {{ profileLabel }}</p>
+        <div class="dashboard__context-row">
+          <p class="dashboard__context">{{ projectLabel }} / {{ profileLabel }}</p>
+          <span
+            v-if="!startActions.length && connected"
+            class="companion-pill companion-pill--ok dashboard__setup-complete"
+          >
+            <AppIcon name="check" :size="12" /> Setup complete
+          </span>
+        </div>
       </div>
       <div class="dashboard__header-actions">
         <slot name="search" />
@@ -96,11 +118,6 @@ const readiness = computed(() => ({
         </button>
       </div>
     </header>
-    <p v-if="!startActions.length && connected" class="dashboard__setup-complete">
-      <AppIcon name="check" /> Setup complete
-    </p>
-    <VariableReadinessPanel v-if="activeProjectFolder" v-bind="readiness" />
-    <slot name="connection" />
     <section
       v-if="startActions.length"
       class="dashboard__start"
@@ -117,7 +134,7 @@ const readiness = computed(() => ({
           </div>
           <button
             type="button"
-            class="dashboard__start-action"
+            class="companion-button companion-button--primary dashboard__start-action"
             @click="emit('action', action.target)"
           >
             {{ action.actionLabel }}
@@ -125,82 +142,132 @@ const readiness = computed(() => ({
         </li>
       </ol>
     </section>
-    <VariableReadinessPanel v-if="!activeProjectFolder" v-bind="readiness" />
+    <section class="dashboard__metrics" aria-label="Project summary">
+      <button type="button" class="dashboard__metric" @click="emit('navigate', 'secrets')">
+        <span class="dashboard__metric-label"
+          >Variables <AppIcon name="chevron-down" class="dashboard__metric-arrow" :size="14"
+        /></span>
+        <strong>{{ secretsLoaded ? secrets.length : 'Unknown' }}</strong>
+        <span class="dashboard__metric-meta">{{
+          secretsLoaded ? `${requiredVariables} required` : 'Not loaded'
+        }}</span>
+      </button>
+      <button type="button" class="dashboard__metric" @click="emit('navigate', 'execution')">
+        <span class="dashboard__metric-label"
+          >Recorded runs <AppIcon name="chevron-down" class="dashboard__metric-arrow" :size="14"
+        /></span>
+        <strong>{{ sessionsLastRefreshed ? sessions.length : 'Unknown' }}</strong>
+        <span
+          :class="['dashboard__metric-meta', { 'dashboard__metric-meta--warn': failedRuns > 0 }]"
+          >{{ sessionsLastRefreshed ? `${failedRuns} failed/stale` : 'Not loaded' }}</span
+        >
+      </button>
+      <button type="button" class="dashboard__metric" @click="emit('navigate', 'audit')">
+        <span class="dashboard__metric-label"
+          >Audit chain <AppIcon name="chevron-down" class="dashboard__metric-arrow" :size="14"
+        /></span>
+        <strong :class="`dashboard__health-${audit.tone}`">{{ audit.label }}</strong>
+        <span class="dashboard__metric-meta">
+          <template v-if="auditLastRefreshed"
+            >Checked {{ formatTime(auditLastRefreshed) }}</template
+          >
+          <template v-else>Not checked yet</template>
+        </span>
+      </button>
+      <button type="button" class="dashboard__metric" @click="emit('navigate', 'scan')">
+        <span class="dashboard__metric-label"
+          >Project scan <AppIcon name="chevron-down" class="dashboard__metric-arrow" :size="14"
+        /></span>
+        <strong :class="`dashboard__health-${scan.tone}`">{{ scan.label }}</strong>
+        <span class="dashboard__metric-meta">
+          <template v-if="lastScanAt">Checked {{ formatTime(lastScanAt) }}</template>
+          <template v-else>Runs in your terminal</template>
+        </span>
+      </button>
+    </section>
     <section class="dashboard__status" aria-label="Agent status">
-      <div class="dashboard__lock">
-        <span class="dashboard__lock-label">Vault</span><strong>{{ lockLabel }}</strong>
-      </div>
       <dl class="dashboard__facts">
-        <div>
+        <div class="dashboard__fact">
+          <dt>Vault</dt>
+          <dd :class="`dashboard__status--${vaultTone}`">
+            <span class="dashboard__dot" aria-hidden="true"></span>
+            <strong>{{ lockLabel }}</strong>
+          </dd>
+        </div>
+        <div class="dashboard__fact">
           <dt>Agent</dt>
           <dd>{{ connected ? settings.agentVersion : 'Offline' }}</dd>
         </div>
-        <div>
+        <div class="dashboard__fact">
           <dt>Environment</dt>
           <dd>{{ profileLabel }}</dd>
         </div>
-        <div>
+        <div class="dashboard__fact">
           <dt>Unlock duration</dt>
-          <dd>{{ settings.unlockTtlSeconds || 900 }} seconds</dd>
+          <dd :title="`${settings.unlockTtlSeconds || 900} seconds`">{{ unlockDuration }}</dd>
         </div>
       </dl>
     </section>
-    <section class="dashboard__metrics" aria-label="Project summary">
-      <button type="button" class="dashboard__metric" @click="emit('navigate', 'secrets')">
-        <span>Variables</span><strong>{{ secretsLoaded ? secrets.length : 'Unknown' }}</strong>
-      </button>
-      <button type="button" class="dashboard__metric" @click="emit('navigate', 'execution')">
-        <span>Recorded runs</span
-        ><strong>{{ sessionsLastRefreshed ? sessions.length : 'Unknown' }}</strong>
-      </button>
-      <button type="button" class="dashboard__metric" @click="emit('navigate', 'audit')">
-        <span>Audit chain</span
-        ><strong :class="`dashboard__health-${audit.tone}`">{{ audit.label }}</strong>
-      </button>
-      <button type="button" class="dashboard__metric" @click="emit('navigate', 'scan')">
-        <span>Project scan</span
-        ><strong :class="`dashboard__health-${scan.tone}`">{{ scan.label }}</strong>
-      </button>
-    </section>
+    <div class="dashboard__pair">
+      <VariableReadinessPanel v-if="activeProjectFolder" v-bind="readiness" />
+      <slot name="connection" />
+      <VariableReadinessPanel v-if="!activeProjectFolder" v-bind="readiness" />
+    </div>
     <section class="dashboard__health" aria-labelledby="dashboard-health-heading">
       <h3 id="dashboard-health-heading">Checks for this project</h3>
-      <p>
-        Audit: {{ audit.label
-        }}<span v-if="auditLastRefreshed">
-          · Last checked
-          <time :datetime="auditLastRefreshed" :title="auditLastRefreshed">{{
-            formatTime(auditLastRefreshed)
-          }}</time></span
-        >
+      <ul class="dashboard__checks">
+        <li>
+          <span :class="['dashboard__check-dot', `dashboard__check-dot--${audit.tone}`]"></span>
+          <span class="dashboard__check-body">
+            <strong>Audit: {{ audit.label }}</strong>
+            <span v-if="auditLastRefreshed" class="dashboard__check-meta">
+              Last checked
+              <time :datetime="auditLastRefreshed" :title="auditLastRefreshed">{{
+                formatTime(auditLastRefreshed)
+              }}</time>
+            </span>
+          </span>
+        </li>
+        <li>
+          <span :class="['dashboard__check-dot', `dashboard__check-dot--${scan.tone}`]"></span>
+          <span class="dashboard__check-body">
+            <strong>Scan: {{ scan.label }}</strong>
+            <span class="dashboard__check-meta">
+              <template v-if="lastScanAt">
+                Last checked
+                <time :datetime="lastScanAt" :title="lastScanAt">{{ formatTime(lastScanAt) }}</time>
+                ·
+              </template>
+              Scans check this project's files and available known values.
+            </span>
+          </span>
+        </li>
+        <li v-if="sessionsLastRefreshed">
+          <span
+            :class="[
+              'dashboard__check-dot',
+              failedRuns ? 'dashboard__check-dot--warn' : 'dashboard__check-dot--ok',
+            ]"
+          ></span>
+          <span class="dashboard__check-body">
+            <strong>Failed or stale runs: {{ failedRuns }}</strong>
+          </span>
+        </li>
+      </ul>
+      <p v-if="auditError" class="dashboard__alert" role="alert">
+        {{ auditError }} Retry from Activity.
       </p>
-      <p v-if="auditError" role="alert">{{ auditError }} Retry from Activity.</p>
-      <p>
-        Scan: {{ scan.label
-        }}<span v-if="lastScanAt">
-          · Last checked
-          <time :datetime="lastScanAt" :title="lastScanAt">{{ formatTime(lastScanAt) }}</time></span
-        >. Scans check this project's files and available known values.
-      </p>
-      <p v-if="scanError" role="alert">{{ scanError }} Retry the scan.</p>
-      <p v-if="sessionsLastRefreshed">Failed or stale runs: {{ failedRuns }}</p>
+      <p v-if="scanError" class="dashboard__alert" role="alert">{{ scanError }} Retry the scan.</p>
     </section>
   </section>
 </template>
 <style scoped>
 .dashboard {
+  container: dashboard / inline-size;
   color: var(--text-primary);
   display: flex;
   flex-direction: column;
-  gap: 1rem;
-}
-
-.dashboard__status,
-.dashboard__search,
-.dashboard__start,
-.dashboard__health {
-  background: var(--bg-surface);
-  border-radius: 0.5rem;
-  padding: 1rem;
+  gap: 0.875rem;
 }
 
 .dashboard__header {
@@ -211,57 +278,51 @@ const readiness = computed(() => ({
   min-width: 0;
 }
 
+.dashboard__heading {
+  min-width: 0;
+}
+
 .dashboard__header h2 {
   margin: 0;
   font-size: var(--font-page-title);
   letter-spacing: -0.025em;
 }
-.dashboard__header > div {
-  min-width: 0;
-  overflow-wrap: anywhere;
-}
+
 .dashboard__header .dashboard__header-actions {
   display: flex;
   gap: 0.5rem;
   flex: none;
 }
 
-.dashboard__setup-complete {
+.dashboard__context-row {
   display: flex;
   align-items: center;
-  gap: 0.35rem;
-  margin: 0;
-  color: var(--success);
-  font-size: 0.8125rem;
-}
-
-.dashboard__section-head h3,
-.dashboard__search h3,
-.dashboard__health h3 {
-  margin: 0;
-  font-size: 1rem;
-  letter-spacing: 0.04em;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.6rem;
+  margin-top: 0.25rem;
+  min-width: 0;
 }
 
 .dashboard__context {
-  margin: 0.35rem 0 0;
+  margin: 0;
   color: var(--text-secondary);
-  display: flex;
-  gap: 0.4rem;
+  font-size: 0.9375rem;
   min-width: 0;
   overflow-wrap: anywhere;
 }
 
-.dashboard__context span {
-  overflow-wrap: anywhere;
+.dashboard__start,
+.dashboard__status,
+.dashboard__health {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
 }
 
-.dashboard__metric,
-.dashboard__start-action {
-  border: 1px solid var(--border-subtle);
-  background: var(--bg-subtle);
-  color: var(--text-primary);
-  cursor: pointer;
+.dashboard__section-head h3,
+.dashboard__health h3 {
+  margin: 0;
+  font-size: 0.875rem;
 }
 
 .dashboard__section-head {
@@ -271,19 +332,15 @@ const readiness = computed(() => ({
   justify-content: space-between;
 }
 
-.dashboard__section-head span {
-  color: var(--text-secondary);
-  font-size: 0.78rem;
-}
-
 .dashboard__start {
   display: grid;
-  gap: 0.875rem;
+  gap: 0.75rem;
+  padding: 0.9rem 1rem;
 }
 
 .dashboard__start-list {
   display: grid;
-  gap: 0.625rem;
+  gap: 0.5rem;
   list-style: none;
   margin: 0;
   padding: 0;
@@ -292,72 +349,146 @@ const readiness = computed(() => ({
 .dashboard__start-list li {
   align-items: center;
   border: 1px solid var(--border-subtle);
-  border-radius: 0.5rem;
+  border-radius: var(--radius-sm);
   display: grid;
   gap: 1rem;
   grid-template-columns: 1fr auto;
   min-width: 0;
-  padding: 0.875rem;
+  padding: 0.75rem;
 }
 
 .dashboard__start-list p {
   color: var(--text-secondary);
-  font-size: 0.85rem;
-  margin: 0.25rem 0 0;
-}
-
-.dashboard__start-title {
-  display: block;
-}
-
-.dashboard__start-title--ok {
-  color: var(--success);
-}
-
-.dashboard__start-title--warn {
-  color: var(--accent);
-}
-
-.dashboard__start-title--critical {
-  color: var(--danger);
-}
-
-.dashboard__start-title--neutral {
-  color: var(--text-primary);
+  font-size: 0.8125rem;
+  margin: 0.2rem 0 0;
 }
 
 .dashboard__start-action {
-  border-radius: 0.375rem;
-  min-height: 2.25rem;
-  padding: 0 0.875rem;
   white-space: nowrap;
 }
 
-.dashboard__status {
+/* KPI strip */
+.dashboard__metrics {
   display: grid;
-  grid-template-columns: minmax(12rem, 0.4fr) 1fr;
-  gap: 1rem;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.625rem;
 }
 
-.dashboard__lock {
-  border-radius: 0.5rem;
-  padding: 1rem;
+.dashboard__metric {
   display: flex;
   flex-direction: column;
+  align-items: stretch;
   gap: 0.25rem;
+  min-width: 0;
+  padding: 0.7rem 0.85rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    border-color 120ms ease,
+    background 120ms ease;
+}
+
+.dashboard__metric:hover {
+  border-color: var(--border-strong);
   background: var(--bg-subtle);
 }
 
-.dashboard__lock-label,
-.dashboard__facts dt,
-.dashboard__metric span,
-.dashboard__health li span {
+.dashboard__metric-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.35rem;
   color: var(--text-secondary);
-  font-size: 0.78rem;
+  font-size: 0.75rem;
+  font-weight: 600;
 }
 
-.dashboard__lock strong {
-  font-size: 1.5rem;
+.dashboard__metric-arrow {
+  flex: none;
+  color: var(--text-muted);
+  transform: rotate(-90deg);
+  transition: transform 120ms ease;
+}
+
+.dashboard__metric:hover .dashboard__metric-arrow,
+.dashboard__metric:focus-visible .dashboard__metric-arrow {
+  color: var(--accent);
+  transform: rotate(-90deg) translateY(2px);
+}
+
+.dashboard__metric strong {
+  font-size: 1.375rem;
+  font-weight: 700;
+  line-height: 1.2;
+  letter-spacing: -0.01em;
+  overflow-wrap: anywhere;
+}
+
+.dashboard__metric-meta {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dashboard__metric-meta--warn {
+  color: var(--warn);
+}
+
+/* Status bar */
+.dashboard__status {
+  padding: 0;
+}
+
+.dashboard__facts {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: 0;
+}
+
+.dashboard__fact {
+  min-width: 0;
+  padding: 0.65rem 1rem;
+}
+
+.dashboard__fact + .dashboard__fact {
+  border-left: 1px solid var(--border-subtle);
+}
+
+.dashboard__facts dt {
+  color: var(--text-muted);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.dashboard__facts dd {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0.2rem 0 0;
+  font-size: 0.9375rem;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.dashboard__facts dd strong {
+  font-weight: 650;
+}
+
+.dashboard__dot {
+  flex: none;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: currentColor;
 }
 
 .dashboard__status--ok {
@@ -373,150 +504,83 @@ const readiness = computed(() => ({
   color: var(--danger);
 }
 
-.dashboard__facts {
-  margin: 0;
+/* Configuration checks + project connection */
+.dashboard__pair {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 0.75rem;
-}
-
-.dashboard__facts div {
-  min-width: 0;
-}
-
-.dashboard__facts dd {
-  margin: 0.25rem 0 0;
-  overflow-wrap: anywhere;
-}
-
-.dashboard__metrics {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 0.75rem;
-}
-
-.dashboard__metric {
-  border-radius: 0.5rem;
-  min-height: 6rem;
-  padding: 0.875rem;
-  text-align: left;
-  display: flex;
-  flex-direction: column;
-  justify-content: space-between;
-}
-
-.dashboard__metric:hover,
-.dashboard__metric:focus-visible,
-.dashboard__metric strong {
-  font-size: 2rem;
-}
-
-.dashboard__search {
-  display: flex;
-  flex-direction: column;
+  grid-template-columns: minmax(0, 1fr);
   gap: 0.875rem;
+  align-items: start;
 }
 
-.dashboard__search-header {
+/* Health strip */
+.dashboard__health {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
   align-items: center;
-  display: flex;
-  justify-content: space-between;
-  gap: 1rem;
+  gap: 0.5rem 1.25rem;
+  padding: 0.7rem 1rem;
 }
 
-.dashboard__search-scopes {
+.dashboard__checks {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.375rem;
-}
-
-.dashboard__scope {
-  border: 1px solid var(--border-subtle);
-  border-radius: 0.375rem;
-  background: var(--bg-subtle);
-  color: var(--text-primary);
-  cursor: pointer;
-  min-height: 2rem;
-  padding: 0 0.7rem;
-}
-
-.dashboard__scope--active {
-  border-color: var(--accent);
-  color: var(--accent);
-}
-
-.dashboard__search-box {
-  display: flex;
-  flex-direction: column;
-  gap: 0.375rem;
-}
-
-.dashboard__search-box span,
-.dashboard__search-results li span,
-.dashboard__search-results li em {
-  color: var(--text-secondary);
-  font-size: 0.78rem;
-  font-style: normal;
-}
-
-.dashboard__search-box input {
-  border: 1px solid var(--border-subtle);
-  border-radius: 0.375rem;
-  background: var(--bg-subtle);
-  color: var(--text-primary);
-  min-height: 2.5rem;
-  padding: 0 0.75rem;
-}
-
-.dashboard__search-box input:focus,
-.dashboard__scope:focus-visible {
-  border-color: var(--accent);
-  outline: none;
-}
-
-.dashboard__search-results {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0.75rem;
-  list-style: none;
+  gap: 0.5rem 1.5rem;
   margin: 0;
   padding: 0;
-}
-
-.dashboard__search-results li {
-  border: 1px solid var(--border-subtle);
-  border-radius: 0.5rem;
-  display: grid;
-  gap: 0.25rem;
-  min-height: 4.5rem;
-  padding: 0.75rem;
-}
-
-.dashboard__search-results li strong {
-  overflow-wrap: anywhere;
-}
-
-.dashboard__search-empty {
-  grid-column: 1 / -1;
-}
-
-.dashboard__health ul {
-  margin: 0.75rem 0 0;
-  padding: 0;
   list-style: none;
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 0.75rem;
 }
 
-.dashboard__health li {
+.dashboard__checks li {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.45rem;
+  min-width: 0;
+  font-size: 0.8125rem;
+}
+
+.dashboard__check-body {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.1rem 0.45rem;
   min-width: 0;
 }
 
-.dashboard__health li strong {
-  display: block;
-  margin-top: 0.25rem;
-  overflow-wrap: anywhere;
+.dashboard__check-body strong {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.dashboard__check-meta {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+
+.dashboard__check-dot {
+  flex: none;
+  margin-top: 0.4em;
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+
+.dashboard__check-dot--ok {
+  background: var(--success);
+}
+
+.dashboard__check-dot--warn {
+  background: var(--warn);
+}
+
+.dashboard__alert {
+  grid-column: 1 / -1;
+  margin: 0;
+  padding: 0.45rem 0.65rem;
+  border-radius: var(--radius-sm);
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-size: 0.8125rem;
 }
 
 .dashboard__health-ok {
@@ -524,19 +588,41 @@ const readiness = computed(() => ({
 }
 
 .dashboard__health-warn {
-  color: var(--accent);
+  color: var(--warn);
 }
 
 .dashboard__health-neutral {
   color: var(--text-primary);
 }
 
-@media (max-width: 860px) {
-  .dashboard__status,
-  .dashboard__facts,
+@container dashboard (min-width: 62rem) {
+  .dashboard__pair {
+    grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
+  }
+}
+
+@container dashboard (max-width: 44rem) {
   .dashboard__metrics,
-  .dashboard__search-results,
-  .dashboard__health ul,
+  .dashboard__facts {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .dashboard__fact:nth-child(3) {
+    border-left: 0;
+  }
+
+  .dashboard__fact:nth-child(n + 3) {
+    border-top: 1px solid var(--border-subtle);
+  }
+
+  .dashboard__health {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .dashboard__checks {
+    flex-direction: column;
+  }
+
   .dashboard__start-list li {
     grid-template-columns: 1fr;
   }
@@ -544,11 +630,15 @@ const readiness = computed(() => ({
   .dashboard__start-action {
     width: 100%;
   }
+}
 
-  .dashboard__search-header,
-  .dashboard__section-head {
-    align-items: stretch;
-    flex-direction: column;
+@container dashboard (max-width: 26rem) {
+  .dashboard__metric strong {
+    font-size: 1.125rem;
+  }
+
+  .dashboard__fact {
+    padding: 0.6rem 0.75rem;
   }
 }
 </style>

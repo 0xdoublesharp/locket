@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { formatTime } from '../utils/formatTime';
 import { computed, ref, watch } from 'vue';
+import AppIcon from '../components/AppIcon.vue';
 import VariableReadinessPanel from '../components/VariableReadinessPanel.vue';
 
 import type { CommandPolicyRow } from '../types/views';
@@ -32,8 +33,10 @@ const emit = defineEmits<{
 }>();
 
 const configurationMissing = ref(false);
+const refreshCount = ref(0);
 const selectedId = ref<string | null>(null);
 const searchQuery = ref<string>('');
+const policyDetail = ref<HTMLElement | null>(null);
 
 const sortedRows = computed<CommandPolicyRow[]>(() =>
   [...props.rows].sort((left, right) => left.name.localeCompare(right.name)),
@@ -105,7 +108,7 @@ function searchText(row: CommandPolicyRow): string {
   return [
     policyLabel(row),
     row.commandKind,
-    row.commandPreview,
+    ...(props.privacyMode ? [] : [row.commandPreview]),
     row.envMode,
     row.overrideMode,
     ...gateLabels(row),
@@ -137,7 +140,12 @@ function selectPolicy(row: CommandPolicyRow): void {
   selectedId.value = row.id;
 }
 
+function focusPolicyDetail(): void {
+  policyDetail.value?.focus();
+}
+
 function refreshPolicies(): void {
+  refreshCount.value += 1;
   emit('refresh');
 }
 
@@ -160,39 +168,59 @@ function startDelete(): void {
 
 <template>
   <section class="view" aria-labelledby="policy-editor-heading">
-    <header class="view__header">
+    <header class="companion-toolbar view__header">
       <h2 id="policy-editor-heading">Commands</h2>
-      <div class="view__actions">
-        <label class="view__search">
-          <span class="view__search-label">Search commands</span>
+      <div class="companion-toolbar__controls">
+        <label class="companion-toolbar__search">
+          <span class="visually-hidden">Search commands</span>
+          <AppIcon name="search" :size="14" />
           <input
             v-model="searchQuery"
+            class="companion-input"
             type="search"
             autocomplete="off"
             spellcheck="false"
-            placeholder="Search metadata"
+            placeholder="Search commands…"
           />
         </label>
-        <button type="button" class="view__button" :disabled="!actionsEnabled" @click="startCreate">
-          New command
-        </button>
-        <button
-          type="button"
-          class="view__button"
-          :disabled="!actionsEnabled || !selectedPolicy"
-          @click="startEdit"
-        >
-          Edit
-        </button>
-        <button
-          type="button"
-          class="view__button view__button--danger"
-          :disabled="!actionsEnabled || !selectedPolicy"
-          @click="startDelete"
-        >
-          Delete
-        </button>
-        <button type="button" class="view__button" @click="refreshPolicies">Refresh</button>
+        <div class="view__button-group">
+          <button
+            type="button"
+            class="companion-button icon-label"
+            :class="{ 'companion-button--primary': filteredRows.length === 0 }"
+            :disabled="!actionsEnabled"
+            @click="startCreate"
+          >
+            <AppIcon name="plus" />
+            New command
+          </button>
+          <button
+            type="button"
+            class="companion-button"
+            :disabled="!actionsEnabled || !selectedPolicy"
+            @click="startEdit"
+          >
+            Edit
+          </button>
+          <button
+            type="button"
+            class="companion-button companion-button--danger"
+            :disabled="!actionsEnabled || !selectedPolicy"
+            @click="startDelete"
+          >
+            Delete
+          </button>
+          <button
+            type="button"
+            class="companion-button icon-label"
+            aria-label="Refresh commands"
+            title="Refresh commands"
+            @click="refreshPolicies"
+          >
+            <AppIcon name="refresh" />
+            Refresh
+          </button>
+        </div>
       </div>
     </header>
 
@@ -211,84 +239,110 @@ function startDelete(): void {
 
     <div v-else class="policy-layout">
       <div
-        class="companion-table-scroll"
+        class="companion-table-scroll policy-table"
         role="region"
         aria-labelledby="policy-editor-heading"
         tabindex="0"
       >
-        <table class="view__table" aria-describedby="policy-editor-heading">
-          <thead>
-            <tr>
-              <th scope="col">Name</th>
-              <th scope="col">Mode</th>
-              <th scope="col">Secrets</th>
-              <th scope="col">TTL</th>
-              <th scope="col">Gates</th>
-              <th scope="col">Updated</th>
+        <table class="view__table" role="table" aria-describedby="policy-editor-heading">
+          <thead role="rowgroup">
+            <tr role="row">
+              <th scope="col" role="columnheader">Name</th>
+              <th scope="col" role="columnheader">Mode</th>
+              <th scope="col" role="columnheader">Secrets</th>
+              <th scope="col" role="columnheader">TTL</th>
+              <th scope="col" role="columnheader">Updated</th>
+              <th scope="col" role="columnheader">Gates</th>
             </tr>
           </thead>
-          <tbody>
+          <tbody role="rowgroup">
             <tr
               v-for="row in filteredRows"
               :key="row.id"
+              role="row"
               :class="['view__row', { 'view__row--selected': selectedPolicy?.id === row.id }]"
               tabindex="0"
               :aria-label="`Inspect policy ${policyLabel(row)}`"
+              :aria-current="selectedPolicy?.id === row.id ? 'true' : undefined"
               @click="selectPolicy(row)"
-              @keydown.enter.prevent="selectPolicy(row)"
-              @keydown.space.prevent="selectPolicy(row)"
+              @keydown.enter.self.prevent="selectPolicy(row)"
+              @keydown.space.self.prevent="selectPolicy(row)"
             >
-              <td>
+              <td class="view__cell--name" data-label="Name" role="cell">
                 <span class="view__name">{{ policyLabel(row) }}</span>
               </td>
-              <td>
+              <td class="view__cell--mode" data-label="Mode" role="cell">
                 <span
                   :class="['badge', row.commandKind === 'shell' ? 'badge--warning' : 'badge--ok']"
                 >
                   {{ row.commandKind }}
                 </span>
               </td>
-              <td>{{ secretCount(row) }}</td>
-              <td>{{ ttlLabel(row.ttlSeconds) }}</td>
-              <td>
+              <td data-label="Secrets" role="cell">{{ secretCount(row) }}</td>
+              <td data-label="TTL" role="cell">{{ ttlLabel(row.ttlSeconds) }}</td>
+              <td data-label="Updated" role="cell">
+                <time :datetime="row.updatedAt" :title="row.updatedAt">{{
+                  formatTime(row.updatedAt)
+                }}</time>
+              </td>
+              <td class="view__cell--gates" data-label="Gates" role="cell">
                 <span v-if="gateLabels(row).length > 0" class="view__badges">
                   <span v-for="gate in gateLabels(row)" :key="gate" class="badge badge--gate">
                     {{ gate }}
                   </span>
                 </span>
                 <span v-else class="view__muted">none</span>
-              </td>
-              <td>
-                <time :datetime="row.updatedAt" :title="row.updatedAt">{{
-                  formatTime(row.updatedAt)
-                }}</time>
+                <button
+                  v-if="selectedPolicy?.id === row.id"
+                  type="button"
+                  class="companion-button view__detail-button"
+                  aria-label="Show selected command details"
+                  aria-controls="policy-detail"
+                  @click.stop="focusPolicyDetail"
+                >
+                  Details
+                </button>
               </td>
             </tr>
           </tbody>
         </table>
       </div>
 
-      <aside v-if="selectedPolicy" class="policy-detail" aria-labelledby="policy-detail-heading">
-        <VariableReadinessPanel
-          :project-id="projectId"
-          :profile-id="profileId"
-          :policy-name="selectedPolicy.name"
-          :privacy-mode="privacyMode"
-          :refresh-key="selectedPolicy.updatedAt"
-          @blocked="configurationMissing = $event"
-        />
-        <p v-if="configurationMissing" role="status">
+      <aside
+        v-if="selectedPolicy"
+        id="policy-detail"
+        ref="policyDetail"
+        class="policy-detail"
+        aria-labelledby="policy-detail-heading"
+        tabindex="-1"
+      >
+        <header class="policy-detail__head">
+          <div class="policy-detail__title">
+            <span class="policy-detail__eyebrow">Selected command</span>
+            <h3 id="policy-detail-heading">{{ policyLabel(selectedPolicy) }}</h3>
+          </div>
+          <button
+            type="button"
+            class="companion-button companion-button--primary icon-label"
+            :disabled="!actionsEnabled || running || configurationMissing"
+            @click="emit('run', selectedPolicy)"
+          >
+            <AppIcon name="terminal" />
+            {{ running ? 'Opening terminal…' : 'Run in terminal' }}
+          </button>
+        </header>
+        <p v-if="configurationMissing" class="policy-detail__blocked" role="status">
+          <AppIcon name="alert" :size="14" />
           Resolve this command’s configuration checks before running it.
         </p>
-        <button
-          type="button"
-          class="view__button"
-          :disabled="!actionsEnabled || running || configurationMissing"
-          @click="emit('run', selectedPolicy)"
-        >
-          {{ running ? 'Opening terminal…' : 'Run in terminal' }}
-        </button>
-        <h3 id="policy-detail-heading">{{ policyLabel(selectedPolicy) }}</h3>
+
+        <section class="policy-detail__section" aria-labelledby="policy-command-heading">
+          <h4 id="policy-command-heading">Command</h4>
+          <p v-if="privacyMode" class="policy-detail__command policy-detail__command--muted">
+            Hidden in privacy mode
+          </p>
+          <code v-else class="policy-detail__command">{{ selectedPolicy.commandPreview }}</code>
+        </section>
 
         <dl class="policy-detail__grid">
           <div>
@@ -296,7 +350,7 @@ function startDelete(): void {
             <dd>{{ selectedPolicy.commandKind }}</dd>
           </div>
           <div>
-            <dt>Environment</dt>
+            <dt>Env mode</dt>
             <dd>{{ selectedPolicy.envMode }}</dd>
           </div>
           <div>
@@ -308,11 +362,6 @@ function startDelete(): void {
             <dd>{{ ttlLabel(selectedPolicy.ttlSeconds) }}</dd>
           </div>
         </dl>
-
-        <section class="policy-detail__section" aria-labelledby="policy-command-heading">
-          <h4 id="policy-command-heading">Command</h4>
-          <code class="policy-detail__command">{{ selectedPolicy.commandPreview }}</code>
-        </section>
 
         <section class="policy-detail__section" aria-labelledby="policy-secret-heading">
           <h4 id="policy-secret-heading">Secret access</h4>
@@ -335,27 +384,28 @@ function startDelete(): void {
         <section class="policy-detail__section" aria-labelledby="policy-gates-heading">
           <h4 id="policy-gates-heading">Gates</h4>
           <div class="view__badges">
-            <span v-if="selectedPolicy.requireAgent" class="badge badge--gate">agent required</span>
             <span v-if="selectedPolicy.confirm" class="badge badge--gate">confirm</span>
             <span v-if="selectedPolicy.requireUserVerification" class="badge badge--gate">
               verify user
             </span>
+            <span v-if="selectedPolicy.requireAgent" class="badge badge--gate">agent required</span>
             <span v-if="selectedPolicy.allowRemoteDocker" class="badge badge--warning">
               remote docker
             </span>
-            <span
-              v-if="
-                !selectedPolicy.requireAgent &&
-                !selectedPolicy.confirm &&
-                !selectedPolicy.requireUserVerification &&
-                !selectedPolicy.allowRemoteDocker
-              "
-              class="view__muted"
-            >
-              none
-            </span>
+            <span v-if="gateLabels(selectedPolicy).length === 0" class="view__muted"> none </span>
           </div>
         </section>
+
+        <VariableReadinessPanel
+          class="policy-detail__readiness"
+          :project-id="projectId"
+          :profile-id="profileId"
+          :policy-name="selectedPolicy.name"
+          :privacy-mode="privacyMode"
+          :refresh-key="`${selectedPolicy.updatedAt}:${refreshCount}`"
+          :hide-refresh="true"
+          @blocked="configurationMissing = $event"
+        />
       </aside>
     </div>
   </section>
@@ -363,94 +413,31 @@ function startDelete(): void {
 
 <style scoped>
 .view {
+  container: commands / inline-size;
   background: var(--bg-surface);
   color: var(--text-primary);
   padding: 1rem;
-  border-radius: 0.5rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
 }
 
 .view__header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 0.75rem;
-  margin-bottom: 0.75rem;
+  margin-bottom: 0.875rem;
 }
 
 .view__header h2 {
   margin: 0;
   font-size: 1rem;
-  letter-spacing: 0.04em;
 }
 
-.view__actions {
-  display: inline-flex;
-  align-items: center;
+.view__header .companion-toolbar__search {
+  flex-basis: 10rem;
+}
+
+.view__button-group {
+  display: flex;
   flex-wrap: wrap;
-  gap: 0.75rem;
-}
-
-.view__search {
-  display: grid;
-  gap: 0.25rem;
-  min-width: min(18rem, 100%);
-}
-
-.view__search-label {
-  color: var(--text-secondary);
-  font-size: 0.75rem;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-}
-
-.view__search input {
-  box-sizing: border-box;
-  width: 100%;
-  min-height: 2rem;
-  border: 1px solid var(--border-strong);
-  border-radius: 0.375rem;
-  background: var(--bg-subtle);
-  color: var(--text-primary);
-  font: inherit;
-  padding: 0.375rem 0.625rem;
-}
-
-.view__search input:focus {
-  border-color: var(--accent);
-  outline: 2px solid var(--accent);
-  outline-offset: 1px;
-}
-
-.view__search input::placeholder {
-  color: var(--text-muted);
-}
-
-.view__button {
-  min-height: 2rem;
-  border: 1px solid var(--border-strong);
-  border-radius: 0.375rem;
-  background: var(--bg-subtle);
-  color: var(--text-primary);
-  cursor: pointer;
-  font: inherit;
-  padding: 0.375rem 0.625rem;
-}
-
-.view__button:focus {
-  border-color: var(--accent);
-  outline: 2px solid var(--accent);
-  outline-offset: 1px;
-}
-
-.view__button:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.view__button--danger {
-  border-color: var(--danger);
-  color: var(--danger);
+  gap: 0.375rem;
 }
 
 .view__loading,
@@ -462,8 +449,8 @@ function startDelete(): void {
 
 .view__empty code,
 .policy-detail__command {
-  background: var(--bg-subtle);
-  border-radius: 0.25rem;
+  background: var(--bg-app);
+  border-radius: var(--radius-sm);
   color: var(--text-primary);
   font-size: 0.8125rem;
 }
@@ -474,52 +461,68 @@ function startDelete(): void {
 
 .policy-layout {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(18rem, 24rem);
+  grid-template-columns: minmax(0, 1fr) minmax(19rem, 25rem);
   gap: 1rem;
   align-items: start;
+}
+
+.policy-table {
+  container: policies / inline-size;
 }
 
 .view__table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 0.875rem;
+  font-size: 0.8125rem;
 }
 
 .view__table th,
 .view__table td {
   text-align: left;
-  padding: 0.5rem 0.75rem;
+  padding: 0.55rem 0.65rem;
   border-bottom: 1px solid var(--border-subtle);
-  vertical-align: top;
+  vertical-align: middle;
 }
 
 .view__table th {
-  font-size: 0.75rem;
+  font-size: 0.6875rem;
   font-weight: 600;
-  letter-spacing: 0.04em;
-  color: var(--text-secondary);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  white-space: nowrap;
 }
 
 .view__row {
   cursor: pointer;
 }
 
-.view__row:hover,
-.view__row--selected {
+.view__row:hover {
   background: var(--bg-subtle);
 }
 
-.view__row:focus {
+.view__row--selected,
+.view__row--selected:hover {
+  background: var(--accent-soft);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.view__row:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
 }
 
 .view__name {
-  font-weight: 600;
+  font-weight: 650;
+  white-space: nowrap;
 }
 
 .view__muted {
   color: var(--text-secondary);
+}
+
+.view__detail-button {
+  display: none;
 }
 
 .view__badges {
@@ -530,9 +533,10 @@ function startDelete(): void {
 
 .badge {
   display: inline-block;
-  padding: 0.125rem 0.5rem;
-  border-radius: 0.375rem;
-  font-size: 0.75rem;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  font-size: 0.6875rem;
+  font-weight: 600;
   letter-spacing: 0.02em;
   border: 1px solid var(--border-subtle);
   background: var(--bg-subtle);
@@ -542,7 +546,7 @@ function startDelete(): void {
 
 .badge--ok {
   background: var(--success-soft);
-  border-color: var(--border-strong);
+  border-color: transparent;
   color: var(--success);
 }
 
@@ -561,9 +565,38 @@ function startDelete(): void {
   display: flex;
   flex-direction: column;
   gap: 0.875rem;
-  padding: 0.875rem;
+  padding: 1rem;
   border: 1px solid var(--border-subtle);
-  border-radius: 0.5rem;
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+}
+
+.policy-detail:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.policy-detail__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.75rem;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.policy-detail__title {
+  min-width: 0;
+}
+
+.policy-detail__eyebrow {
+  display: block;
+  color: var(--text-muted);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
 }
 
 .policy-detail h3,
@@ -572,20 +605,36 @@ function startDelete(): void {
 }
 
 .policy-detail h3 {
-  font-size: 0.9375rem;
+  margin-top: 0.15rem;
+  font-size: 1.0625rem;
+  overflow-wrap: anywhere;
 }
 
 .policy-detail h4 {
-  font-size: 0.75rem;
-  letter-spacing: 0.04em;
-  color: var(--text-secondary);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.policy-detail__blocked {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0;
+  padding: 0.45rem 0.65rem;
+  border-radius: var(--radius-sm);
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: 0.8125rem;
 }
 
 .policy-detail__grid,
 .policy-detail__secrets {
   margin: 0;
   display: grid;
-  gap: 0.5rem;
+  gap: 0.625rem 0.75rem;
 }
 
 .policy-detail__grid {
@@ -602,13 +651,14 @@ function startDelete(): void {
 }
 
 .policy-detail dt {
-  color: var(--text-secondary);
+  color: var(--text-muted);
   font-size: 0.75rem;
 }
 
 .policy-detail dd {
   margin: 0.125rem 0 0;
   font-size: 0.875rem;
+  font-weight: 600;
 }
 
 .policy-detail__section {
@@ -619,13 +669,116 @@ function startDelete(): void {
 
 .policy-detail__command {
   display: block;
-  padding: 0.5rem;
+  padding: 0.55rem 0.65rem;
+  border: 1px solid var(--border-subtle);
   overflow-wrap: anywhere;
 }
 
-@media (max-width: 960px) {
+.policy-detail__command--muted {
+  margin: 0;
+  color: var(--text-secondary);
+  font-family: var(--font-sans);
+}
+
+.policy-detail__readiness {
+  padding: 0.875rem 0 0;
+  border: 0;
+  border-top: 1px solid var(--border-subtle);
+  border-radius: 0;
+  background: transparent;
+}
+
+@media (max-width: 1100px) {
   .policy-layout {
     grid-template-columns: 1fr;
+  }
+}
+
+@container commands (max-width: 40rem) {
+  .companion-toolbar__controls {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .view__header .companion-toolbar__search {
+    flex-basis: 100%;
+    max-width: none;
+  }
+}
+
+/* Stack table rows as cards when the list column is narrow. */
+@container policies (max-width: 34rem) {
+  .view__table,
+  .view__table tbody {
+    display: block;
+  }
+
+  .view__table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+  }
+
+  .view__table tbody tr {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.375rem 0.75rem;
+    margin-bottom: 0.5rem;
+    padding: 0.5rem 0.75rem;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+  }
+
+  .view__table td {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.2rem;
+    min-width: 0;
+    padding: 0;
+    border: 0;
+  }
+
+  .view__table td::before {
+    content: attr(data-label);
+    color: var(--text-muted);
+    font-size: 0.6875rem;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
+
+  .view__table td.view__cell--name {
+    grid-column: 1 / 3;
+  }
+
+  .view__table td.view__cell--mode {
+    align-items: flex-end;
+  }
+
+  .view__table td.view__cell--gates {
+    grid-column: 1 / -1;
+    flex-direction: row;
+    align-items: center;
+    gap: 0.4rem;
+  }
+
+  .view__detail-button {
+    display: inline-block;
+    flex: none;
+    margin-inline-start: auto;
+  }
+
+  .view__table td.view__cell--name::before,
+  .view__table td.view__cell--mode::before {
+    content: none;
+  }
+
+  .view__name {
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
 }
 </style>
