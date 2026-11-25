@@ -133,6 +133,11 @@ async fn set_active_profile(
     state: &crate::server::AgentSocketState,
     now_unix_nanos: i128,
 ) -> Result<SetActiveProfileResponse, SetActiveProfileError> {
+    if super::mutations::is_shared_project_id(&request.project_id) {
+        return Err(SetActiveProfileError::MetadataInvalid(
+            "switching environments requires a project folder with locket.toml".into(),
+        ));
+    }
     let profile_name = ProfileName::new(request.profile_name.clone())
         .map_err(|_| SetActiveProfileError::InvalidProfileName)?;
     let master_key = cached_master_key(state, &request.project_id, now_unix_nanos)

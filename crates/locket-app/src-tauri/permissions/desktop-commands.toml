@@ -6,6 +6,8 @@ description = "Allows the Locket webview to invoke the project-scoped desktop co
 commands.allow = [
   "desktop_list_projects",
   "desktop_open_project",
+  "desktop_open_shared_vault",
+  "desktop_inspect_project_folder",
   "desktop_initialize_project",
   "desktop_import_env",
   "desktop_start_agent",

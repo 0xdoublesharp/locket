@@ -28,7 +28,7 @@ static MUTATION_LOCK: Mutex<()> = Mutex::new(());
 pub struct MutationScope {
     /// User-scoped store selected by the native shell.
     pub store_path: PathBuf,
-    /// Selected trusted project folder.
+    /// Selected trusted project folder, empty for a shared vault.
     pub project_root: PathBuf,
     /// Registered project id.
     pub project_id: String,
@@ -46,7 +46,7 @@ pub struct ImportDotenvRequest {
     /// Authorized scope.
     #[serde(flatten)]
     pub scope: MutationScope,
-    /// Explicitly selected env file, relative to the selected project when relative.
+    /// Env file path. Relative paths require a trusted project folder.
     pub env_path: PathBuf,
     /// Rotate existing active values instead of skipping.
     pub overwrite: bool,
@@ -132,11 +132,28 @@ impl From<locket_store::StoreError> for MutationError {
     }
 }
 
+#[derive(PartialEq, Eq)]
 struct Context {
-    root: PathBuf,
+    root: Option<PathBuf>,
     profile: locket_store::ProfileRecord,
 }
+pub(super) fn is_shared_project_id(project_id: &str) -> bool {
+    project_id.starts_with("lk_proj_shared_")
+}
 fn context(store: &Store, scope: &MutationScope) -> Result<Context, MutationError> {
+    if is_shared_project_id(&scope.project_id) {
+        if store.get_project(&scope.project_id)?.is_none() {
+            return Err(metadata());
+        }
+        let profile = store
+            .list_profiles(&scope.project_id)?
+            .into_iter()
+            .find(|profile| profile.id == scope.profile_id)
+            .ok_or_else(|| {
+                failure("ProfileNotFound", "active profile changed; refresh before retrying")
+            })?;
+        return Ok(Context { root: None, profile });
+    }
     let root = scope.project_root.canonicalize().map_err(|_| metadata())?;
     if !root.is_dir() {
         return Err(metadata());
@@ -163,7 +180,18 @@ fn context(store: &Store, scope: &MutationScope) -> Result<Context, MutationErro
     if profile.id != scope.profile_id {
         return Err(failure("ProfileNotFound", "active profile changed; refresh before retrying"));
     }
-    Ok(Context { root, profile })
+    Ok(Context { root: Some(root), profile })
+}
+
+fn confirm_dangerous_profile(
+    profile: &locket_store::ProfileRecord,
+    confirmation: Option<&str>,
+    message: &'static str,
+) -> Result<(), MutationError> {
+    if profile.dangerous && confirmation != Some(profile.name.as_str()) {
+        return Err(failure("ConfirmationFailed", message));
+    }
+    Ok(())
 }
 
 async fn authorize(
@@ -293,19 +321,22 @@ fn import_dotenv_in_store(
 ) -> Result<ImportDotenvResponse, MutationError> {
     let _guard = MUTATION_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let verified = context(&store, &request.scope)?;
-    if request.overwrite
-        && verified.profile.dangerous
-        && request.confirmation.as_deref() != Some(verified.profile.name.as_str())
-    {
-        return Err(failure(
-            "ConfirmationFailed",
+    if request.overwrite {
+        confirm_dangerous_profile(
+            &verified.profile,
+            request.confirmation.as_deref(),
             "type the dangerous profile name to confirm overwrite",
-        ));
+        )?;
     }
     let path = if request.env_path.is_absolute() {
         request.env_path.clone()
+    } else if let Some(root) = verified.root.as_deref() {
+        root.join(&request.env_path)
     } else {
-        verified.root.join(&request.env_path)
+        return Err(failure(
+            "MetadataInvalid",
+            "choose an absolute env file path when importing into a shared vault",
+        ));
     };
     let mut document = read_dotenv(&path, request.literal)?;
     let mut result = ImportDotenvResponse {
@@ -321,7 +352,9 @@ fn import_dotenv_in_store(
         maintenance_warning: None,
     };
     let write_result = store.with_atomic_write(|store| {
-        context(store, &request.scope)?;
+        if context(store, &request.scope)? != verified {
+            return Err(metadata());
+        }
         for entry in &document.entries {
             let value = Zeroizing::new(entry.value.clone());
             let existing = store.get_secret_by_source(
@@ -366,7 +399,9 @@ fn import_dotenv_in_store(
         zeroize::Zeroize::zeroize(&mut entry.value);
     }
     write_result?;
-    if locket_platform::ensure_secret_file_ignores(&verified.root).is_err() {
+    if let Some(root) = verified.root.as_deref()
+        && locket_platform::ensure_secret_file_ignores(root).is_err()
+    {
         result.maintenance_warning = Some("Import committed, but .gitignore could not be updated. Review plaintext env-file exclusions.".into());
     }
     Ok(result)
@@ -553,17 +588,17 @@ fn apply_policy_in_store(
         return Err(failure("MetadataInvalid", "policy request exceeds 64 KiB"));
     }
     let verified = context(&store, &request.scope)?;
-    if verified.profile.dangerous
-        && request.confirmation.as_deref() != Some(verified.profile.name.as_str())
-    {
-        return Err(failure(
-            "ConfirmationFailed",
-            "type the dangerous profile name to confirm policy changes",
-        ));
-    }
+    let root = verified.root.as_deref().ok_or_else(|| {
+        failure("MetadataInvalid", "saving commands requires a project folder with locket.toml")
+    })?;
+    confirm_dangerous_profile(
+        &verified.profile,
+        request.confirmation.as_deref(),
+        "type the dangerous profile name to confirm policy changes",
+    )?;
     let audit_key = unwrap_audit_key_with_master(&store, &request.scope.project_id, master)
         .map_err(|_| storage())?;
-    let path = verified.root.join("locket.toml");
+    let path = root.join("locket.toml");
     let mut document = PolicyFileDocument::read(&path).map_err(|_| metadata())?;
     edit_document(&mut document, request)?;
     let candidate = document.rendered_source().map_err(|_| metadata())?;
@@ -586,7 +621,9 @@ fn apply_policy_in_store(
     };
     let mut file_saved = false;
     let committed = store.with_atomic_write(|store| {
-        context(store, &request.scope)?;
+        if context(store, &request.scope)? != verified {
+            return Err(metadata());
+        }
         if request.mode == "delete" || (request.mode == "edit" && original != &request.policy.name)
         {
             let audit_context = (request.mode == "delete")

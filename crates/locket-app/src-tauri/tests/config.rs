@@ -255,12 +255,16 @@ fn capability_file_denies_default_and_lists_no_broad_permissions() {
 }
 
 #[test]
-fn desktop_scan_action_is_registered_and_allowed() {
+fn desktop_project_actions_are_registered_and_allowed() {
     let registered = handler_command_names(&read_text("src/lib.rs"));
-    assert!(registered.contains("desktop_scan_project"));
     let allowed =
         toml_string_array(&read_text("permissions/desktop-commands.toml"), "commands.allow");
-    assert!(allowed.iter().any(|name| name == "desktop_scan_project"));
+    for command in
+        ["desktop_scan_project", "desktop_open_shared_vault", "desktop_inspect_project_folder"]
+    {
+        assert!(registered.contains(command), "{command} must be registered");
+        assert!(allowed.iter().any(|name| name == command), "{command} must be allowed");
+    }
 }
 
 #[test]

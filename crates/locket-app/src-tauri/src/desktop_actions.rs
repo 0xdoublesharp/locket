@@ -18,6 +18,7 @@ use std::{
 
 const CHILD_TIMEOUT: Duration = Duration::from_secs(30);
 const PLAIN_CLIPBOARD_MAX_BYTES: usize = 16 * 1024;
+const SHARED_PROJECT_ID_PREFIX: &str = "lk_proj_shared_";
 static RESOURCE_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 static SELECTED_PROJECT: std::sync::Mutex<Option<DesktopProjectContext>> =
     std::sync::Mutex::new(None);
@@ -29,6 +30,30 @@ pub(crate) struct DesktopProjectContext {
     project_name: String,
     profile_id: String,
     profile_name: String,
+    is_shared: bool,
+}
+
+impl DesktopProjectContext {
+    fn project_root(&self) -> Option<&Path> {
+        (!self.is_shared && !self.root.is_empty()).then(|| Path::new(&self.root))
+    }
+}
+
+pub(crate) fn is_shared_project_id(id: &str) -> bool {
+    id.starts_with(SHARED_PROJECT_ID_PREFIX)
+}
+
+#[derive(Deserialize, Default)]
+pub(crate) struct DesktopOpenSharedVaultRequest {
+    #[serde(default)]
+    project_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct DesktopFolderInspection {
+    path: String,
+    has_config: bool,
+    folder_name: String,
 }
 
 #[derive(Deserialize)]
@@ -112,6 +137,9 @@ fn open_project_at(store_path: &Path, path: &Path) -> Result<DesktopProjectConte
     }
     let store = Store::open(store_path).map_err(metadata_error)?;
     let project_id = config.project_id.as_str();
+    if is_shared_project_id(project_id) {
+        return Err("Open the Global Vault from the vault list.".into());
+    }
     if !store.project_root_is_trusted(project_id, &root_hash(&root)).map_err(metadata_error)? {
         return Err(
             "This folder is not trusted for the project. Run `locket trust` in this folder first."
@@ -138,7 +166,124 @@ fn open_project_at(store_path: &Path, path: &Path) -> Result<DesktopProjectConte
         project_name: project.name,
         profile_id: profile.id,
         profile_name: profile.name,
+        is_shared: false,
     })
+}
+
+fn shared_metadata_error(_: impl std::fmt::Display) -> String {
+    "Cannot read Global Vault metadata. Check the local vault with `locket doctor`.".into()
+}
+
+fn shared_projects(store: &Store) -> Result<Vec<locket_store::ProjectRecord>, String> {
+    let mut projects = store.list_projects().map_err(shared_metadata_error)?;
+    projects.retain(|project| is_shared_project_id(&project.id));
+    // The store orders by name and ID. Keep that order after the Global Vault.
+    projects.sort_by_key(|project| project.name != "@shared");
+    Ok(projects)
+}
+
+fn shared_vault_context(
+    store: &Store,
+    project: locket_store::ProjectRecord,
+    profile_id: Option<&str>,
+) -> Result<Option<DesktopProjectContext>, String> {
+    let profiles = store.list_profiles(&project.id).map_err(shared_metadata_error)?;
+    let profile = match profile_id {
+        Some(id) => Some(profiles.iter().find(|profile| profile.id == id).ok_or_else(|| {
+            "The selected Global Vault profile changed. Open the vault again.".to_string()
+        })?),
+        None => profiles.iter().find(|profile| profile.name == "default").or(profiles.first()),
+    };
+    Ok(profile.map(|profile| DesktopProjectContext {
+        root: String::new(),
+        project_id: project.id,
+        project_name: project.name,
+        profile_id: profile.id.clone(),
+        profile_name: profile.name.clone(),
+        is_shared: true,
+    }))
+}
+
+fn find_shared_vault_at(
+    store_path: &Path,
+    project_id: Option<&str>,
+    profile_id: Option<&str>,
+) -> Result<Option<DesktopProjectContext>, String> {
+    if project_id.is_some_and(|id| !is_shared_project_id(id)) {
+        return Err("Requested vault ID must identify a Global Vault.".into());
+    }
+    match fs::symlink_metadata(store_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(shared_metadata_error(error)),
+    }
+    let store = Store::open_read_only(store_path).map_err(shared_metadata_error)?;
+    let project = if let Some(id) = project_id {
+        store.get_project(id).map_err(shared_metadata_error)?
+    } else {
+        shared_projects(&store)?.into_iter().next()
+    };
+    let Some(project) = project else {
+        return Ok(None);
+    };
+    shared_vault_context(&store, project, profile_id)?.map(Some).ok_or_else(|| {
+        "Global Vault has no profile. Check the local vault with `locket doctor`.".into()
+    })
+}
+
+fn open_shared_vault_at(
+    store_path: &Path,
+    project_id: Option<&str>,
+    initialize: impl FnOnce() -> Result<(), String>,
+) -> Result<DesktopProjectContext, String> {
+    if let Some(context) = find_shared_vault_at(store_path, project_id, None)? {
+        return Ok(context);
+    }
+    if project_id.is_some() {
+        return Err("Global Vault is not registered in this store.".into());
+    }
+    initialize()?;
+    find_shared_vault_at(store_path, None, None)?
+        .ok_or_else(|| "Global Vault is missing after initialization.".into())
+}
+
+fn refresh_context_at(
+    store_path: &Path,
+    selected: &DesktopProjectContext,
+) -> Result<DesktopProjectContext, String> {
+    if selected.is_shared || is_shared_project_id(&selected.project_id) {
+        return find_shared_vault_at(
+            store_path,
+            Some(&selected.project_id),
+            Some(&selected.profile_id),
+        )?
+        .ok_or_else(|| "Global Vault is not registered in this store.".into());
+    }
+    let root = selected.project_root().ok_or_else(|| "Open a project folder again.".to_string())?;
+    open_project_at(store_path, root)
+}
+
+fn inspect_project_folder_at(path: &Path) -> Result<DesktopFolderInspection, String> {
+    if !path.is_absolute() {
+        return Err("Select an existing project folder by its absolute path.".into());
+    }
+    let root = selected_root(path)?;
+    let config = root.join("locket.toml");
+    let has_config = match fs::symlink_metadata(&config) {
+        Ok(_) if config.is_file() => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        _ => return Err("Cannot inspect locket.toml in the selected folder.".into()),
+    };
+    let folder_name = root
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| root.to_string_lossy().into_owned());
+    let path = root
+        .to_str()
+        .ok_or_else(|| "Project folder must have a valid Unicode path.".to_string())?
+        .into();
+    Ok(DesktopFolderInspection { path, has_config, folder_name })
 }
 
 fn list_projects_at(store_path: &Path) -> Result<Vec<DesktopProjectContext>, String> {
@@ -146,6 +291,12 @@ fn list_projects_at(store_path: &Path) -> Result<Vec<DesktopProjectContext>, Str
         return Ok(Vec::new());
     }
     let store = Store::open(store_path).map_err(metadata_error)?;
+    let mut projects = Vec::new();
+    for project in shared_projects(&store)? {
+        if let Some(context) = shared_vault_context(&store, project, None)? {
+            projects.push(context);
+        }
+    }
     let mut query = store.connection().prepare("SELECT DISTINCT display_path FROM project_roots WHERE display_path IS NOT NULL ORDER BY display_path").map_err(metadata_error)?;
     let roots = query
         .query_map([], |row| row.get::<_, String>(0))
@@ -153,7 +304,22 @@ fn list_projects_at(store_path: &Path) -> Result<Vec<DesktopProjectContext>, Str
         .collect::<Result<Vec<_>, _>>()
         .map_err(metadata_error)?;
     // Stale, moved, or untrusted copies are omitted instead of guessed.
-    Ok(roots.iter().filter_map(|root| open_project_at(store_path, Path::new(root)).ok()).collect())
+    projects
+        .extend(roots.iter().filter_map(|root| open_project_at(store_path, Path::new(root)).ok()));
+    Ok(projects)
+}
+
+fn application_directory() -> Result<PathBuf, String> {
+    Ok(std::env::current_exe()
+        .map_err(metadata_error)?
+        .parent()
+        .ok_or_else(|| "Cannot find application directory.".to_string())?
+        .into())
+}
+
+fn shared_init_plan() -> Result<CliPlan, String> {
+    let cwd = application_directory()?;
+    Ok(CliPlan { cwd, args: vec!["shared".into(), "init".into(), "--json".into()], input: None })
 }
 
 fn project_context(store_path: &Path, project_id: &str) -> Result<DesktopProjectContext, String> {
@@ -175,14 +341,11 @@ fn initialize_plan(path: &Path) -> Result<CliPlan, String> {
 }
 
 fn start_plan(store_path: &Path, project_id: Option<&str>) -> Result<CliPlan, String> {
-    let cwd = match project_id {
-        Some(id) => project_context(store_path, id)?.root.into(),
-        None => std::env::current_exe()
-            .map_err(metadata_error)?
-            .parent()
-            .ok_or_else(|| "Cannot find application directory.".to_string())?
-            .into(),
-    };
+    let context = project_id.map(|id| project_context(store_path, id)).transpose()?;
+    let cwd = context
+        .as_ref()
+        .and_then(DesktopProjectContext::project_root)
+        .map_or_else(application_directory, |root| Ok(root.to_path_buf()))?;
     Ok(CliPlan { cwd, args: vec!["agent".into(), "start".into()], input: None })
 }
 
@@ -192,11 +355,13 @@ fn policy_context(
     name: &str,
 ) -> Result<DesktopProjectContext, String> {
     let context = project_context(store_path, project_id)?;
+    let root = context.project_root().ok_or_else(|| {
+        "Commands require a connected project folder with locket.toml.".to_string()
+    })?;
     if name.is_empty() || name.starts_with('-') || name.contains('\0') {
         return Err("Choose a policy whose name does not begin with a dash.".into());
     }
-    let source =
-        fs::read_to_string(Path::new(&context.root).join("locket.toml")).map_err(metadata_error)?;
+    let source = fs::read_to_string(root.join("locket.toml")).map_err(metadata_error)?;
     let policies = locket_core::PolicyDocument::from_toml_str(&source).map_err(metadata_error)?;
     if !policies.commands.contains_key(name) {
         return Err("The policy no longer exists in locket.toml. Refresh the command list.".into());
@@ -747,17 +912,18 @@ async fn blocking<T: Send + 'static>(
 }
 
 async fn set_agent_context(context: &DesktopProjectContext) -> Result<(), String> {
+    let Some(root) = context.project_root() else {
+        return Ok(());
+    };
     let request = locket_agent::SetActiveProfileRequest {
         // The existing agent RPC expects locket.toml, despite its generic name.
-        config_path: Path::new(&context.root).join("locket.toml"),
+        config_path: root.join("locket.toml"),
         store_path: super::default_store_path().map_err(|error| error.to_string())?,
         project_id: context.project_id.clone(),
         profile_name: context.profile_name.clone(),
         confirmation: None,
         privacy_redact_names: false,
-        root_hash: Some(
-            root_hash(Path::new(&context.root)).iter().map(|byte| format!("{byte:02x}")).collect(),
-        ),
+        root_hash: Some(root_hash(root).iter().map(|byte| format!("{byte:02x}")).collect()),
     };
     let result: Result<locket_agent::SetActiveProfileResponse, _> = super::invoke_method(
         &super::resolve_socket_path(),
@@ -790,6 +956,31 @@ pub(crate) async fn desktop_open_project(
     Ok(context)
 }
 #[tauri::command]
+pub(crate) async fn desktop_open_shared_vault(
+    request: Option<DesktopOpenSharedVaultRequest>,
+) -> Result<DesktopProjectContext, String> {
+    let store = super::default_store_path().map_err(|error| error.to_string())?;
+    let project_id = request.and_then(|req| req.project_id);
+    let context = blocking(move || {
+        open_shared_vault_at(&store, project_id.as_deref(), || {
+            let plan = shared_init_plan()?;
+            execute_cli(&resolve_cli()?, &plan, CHILD_TIMEOUT).map_err(|error| {
+                format!("{error} Initializing the Global Vault needs OS keychain access.")
+            })
+        })
+    })
+    .await?;
+    *SELECTED_PROJECT.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some(context.clone());
+    Ok(context)
+}
+#[tauri::command]
+pub(crate) async fn desktop_inspect_project_folder(
+    request: DesktopPathRequest,
+) -> Result<DesktopFolderInspection, String> {
+    blocking(move || inspect_project_folder_at(&request.path)).await
+}
+#[tauri::command]
 pub(crate) async fn desktop_initialize_project(
     request: DesktopPathRequest,
 ) -> Result<DesktopProjectContext, String> {
@@ -810,11 +1001,7 @@ pub(crate) async fn desktop_import_env(
 ) -> Result<DesktopImportSummary, String> {
     let store = super::default_store_path().map_err(|error| error.to_string())?;
     let context = project_context(&store, &request.project_id)?;
-    let payload = serde_json::json!({
-        "store_path": store, "project_root": context.root, "project_id": context.project_id,
-        "profile_id": context.profile_id, "env_path": request.path,
-        "overwrite": request.overwrite, "literal": request.literal, "confirmation": request.confirmation,
-    });
+    let payload = import_env_payload(&store, &context, request)?;
     let result: locket_agent::ImportDotenvResponse = invoke_granted(
         locket_agent::AgentMethod::ImportDotenv,
         locket_agent::GrantAction::ImportDotenv,
@@ -835,6 +1022,22 @@ pub(crate) async fn desktop_import_env(
     }
     Ok(DesktopImportSummary { summary })
 }
+
+fn import_env_payload(
+    store: &Path,
+    context: &DesktopProjectContext,
+    request: DesktopImportEnvRequest,
+) -> Result<serde_json::Value, String> {
+    if context.is_shared && !request.path.is_absolute() {
+        return Err("Choose an absolute env file path when importing into the Global Vault.".into());
+    }
+    Ok(serde_json::json!({
+        "store_path": store, "project_root": context.root, "project_id": context.project_id,
+        "profile_id": context.profile_id, "env_path": request.path,
+        "overwrite": request.overwrite, "literal": request.literal, "confirmation": request.confirmation,
+    }))
+}
+
 #[tauri::command]
 pub(crate) async fn desktop_start_agent(request: DesktopStartAgentRequest) -> Result<(), String> {
     let store = super::default_store_path().map_err(|error| error.to_string())?;
@@ -873,8 +1076,11 @@ fn scan_project_with(
     launch: impl FnOnce(&Path, &Path, &[&str]) -> Result<(), String>,
 ) -> Result<DesktopRunResponse, String> {
     let context = project_context(store, project_id)?;
+    let root = context.project_root().ok_or_else(|| {
+        "Scanning requires a connected project folder with locket.toml.".to_string()
+    })?;
     let cli = resolve()?;
-    launch(&cli, Path::new(&context.root), &["scan", "--require-known"])?;
+    launch(&cli, root, &["scan", "--require-known"])?;
     Ok(DesktopRunResponse { launched: true, command: "locket scan --require-known".into() })
 }
 
@@ -896,11 +1102,7 @@ pub(crate) async fn desktop_save_policy(request: serde_json::Value) -> Result<()
         .ok_or_else(|| "A project id is required.".to_owned())?
         .to_owned();
     let context = project_context(&store, &project_id)?;
-    let mut payload = request;
-    let object = payload.as_object_mut().ok_or_else(|| "Invalid policy request.".to_owned())?;
-    object.insert("store_path".into(), serde_json::json!(store));
-    object.insert("project_root".into(), serde_json::json!(context.root));
-    object.insert("profile_id".into(), serde_json::json!(context.profile_id));
+    let payload = save_policy_payload(&store, &context, request)?;
     let _: locket_agent::ApplyPolicyResponse = invoke_granted(
         locket_agent::AgentMethod::ApplyPolicy,
         locket_agent::GrantAction::ApplyPolicy,
@@ -912,6 +1114,21 @@ pub(crate) async fn desktop_save_policy(request: serde_json::Value) -> Result<()
     .await
     .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn save_policy_payload(
+    store: &Path,
+    context: &DesktopProjectContext,
+    mut payload: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let root = context.project_root().ok_or_else(|| {
+        "Saving commands requires a connected project folder with locket.toml.".to_string()
+    })?;
+    let object = payload.as_object_mut().ok_or_else(|| "Invalid policy request.".to_owned())?;
+    object.insert("store_path".into(), serde_json::json!(store));
+    object.insert("project_root".into(), serde_json::json!(root));
+    object.insert("profile_id".into(), serde_json::json!(context.profile_id));
+    Ok(payload)
 }
 
 #[cfg(test)]
@@ -991,11 +1208,7 @@ pub(crate) async fn selected_agent_status(
     };
     let store = super::default_store_path()?;
     let context = blocking(move || {
-        let refreshed = open_project_at(&store, Path::new(&selected.root))?;
-        if refreshed.project_id != selected.project_id {
-            return Err("The selected folder's project changed. Open the project again.".into());
-        }
-        Ok(refreshed)
+        project_context_with_selection(&store, &selected.project_id, Some(&selected))
     })
     .await
     .map_err(|reason| super::AgentClientError::Protocol { reason })?;
@@ -1007,11 +1220,15 @@ fn project_context_with_selection(
     selected: Option<&DesktopProjectContext>,
 ) -> Result<DesktopProjectContext, String> {
     if let Some(selected) = selected.filter(|selected| selected.project_id == id) {
-        let refreshed = open_project_at(store, Path::new(&selected.root))?;
+        let refreshed = refresh_context_at(store, selected)?;
         if refreshed.project_id != id {
             return Err("The selected folder now belongs to another project. Open it again.".into());
         }
         return Ok(refreshed);
+    }
+    if is_shared_project_id(id) {
+        return find_shared_vault_at(store, Some(id), None)?
+            .ok_or_else(|| "Global Vault is not registered in this store.".into());
     }
     let mut matches =
         list_projects_at(store)?.into_iter().filter(|context| context.project_id == id);
@@ -1029,7 +1246,11 @@ fn project_context_with_selection(
 }
 
 pub(crate) fn project_config_path(store: &Path, id: &str) -> Result<PathBuf, String> {
-    Ok(Path::new(&project_context(store, id)?.root).join("locket.toml"))
+    let context = project_context(store, id)?;
+    context
+        .project_root()
+        .map(|root| root.join("locket.toml"))
+        .ok_or_else(|| "Environments require a connected project folder with locket.toml.".into())
 }
 async fn fetch_context_status(
     socket: &Path,
@@ -1223,7 +1444,7 @@ async fn invoke_granted_at<R: serde::de::DeserializeOwned>(
         },
     )
     .await?;
-    let fresh = open_project_at(store, Path::new(&context.root));
+    let fresh = refresh_context_at(store, context);
     if fresh.as_ref() != Ok(context) {
         let _: Result<serde_json::Value, _> =
             super::invoke_method(socket, locket_agent::AgentMethod::RevokeGrant, &grant).await;
@@ -1277,9 +1498,17 @@ fn variable_readiness_at(
     request: &DesktopReadinessRequest,
 ) -> Result<DesktopReadinessResponse, String> {
     let context = project_context(store_path, &request.project_id)?;
+    let Some(root) = context.project_root() else {
+        return Ok(DesktopReadinessResponse {
+            project_id: context.project_id,
+            profile_id: context.profile_id,
+            profile_name: context.profile_name,
+            policies: Vec::new(),
+        });
+    };
     // Desktop Run starts at the selected trusted root. Cwd is native-owned,
     // never accepted from the webview or inherited from the app process.
-    variable_readiness_for_context(store_path, request, &context, Path::new(&context.root))
+    variable_readiness_for_context(store_path, request, &context, root)
 }
 
 fn variable_readiness_for_context(

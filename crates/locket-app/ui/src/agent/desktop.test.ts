@@ -11,6 +11,8 @@ import {
   discoverSecrets,
   listProjects,
   desktopOpenProject,
+  desktopOpenSharedVault,
+  desktopInspectProjectFolder,
   desktopInitializeProject,
   desktopImportEnv,
   desktopStartAgent,
@@ -33,6 +35,12 @@ describe('typed desktop operations', () => {
     expect(invoke).toHaveBeenLastCalledWith('desktop_list_projects', {});
     await desktopOpenProject({ path: '/fixture' });
     expect(invoke).toHaveBeenLastCalledWith('desktop_open_project', {
+      request: { path: '/fixture' },
+    });
+    await desktopOpenSharedVault();
+    expect(invoke).toHaveBeenLastCalledWith('desktop_open_shared_vault', {});
+    await desktopInspectProjectFolder({ path: '/fixture' });
+    expect(invoke).toHaveBeenLastCalledWith('desktop_inspect_project_folder', {
       request: { path: '/fixture' },
     });
     await desktopInitializeProject({ path: '/fixture' });

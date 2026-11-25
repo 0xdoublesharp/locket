@@ -45,35 +45,41 @@ export function createMockRuntime(params: URLSearchParams) {
   const config = { privacy_redact_names: false, agent_unlock_ttl: '1h' };
   let unlockedFor = 3600;
 
-  const projects: DesktopProjectContext[] = [
-    {
-      root: `${workspace}/acme-api`,
-      project_id: 'acme-api',
-      project_name: 'acme-api',
-      profile_id: 'acme-api-dev',
-      profile_name: 'dev',
-    },
-    {
-      root: 'Shared vault',
-      project_id: 'shared',
-      project_name: '@shared',
-      profile_id: 'shared-default',
-      profile_name: 'default',
-    },
-    {
-      root: `${workspace}/web-app`,
-      project_id: 'web-app',
-      project_name: 'web-app',
-      profile_id: 'web-app-dev',
-      profile_name: 'dev',
-    },
-  ];
-  let selected = projects[0]!;
+  const isWelcome = scenario === 'welcome';
+  const projects: DesktopProjectContext[] = isWelcome
+    ? []
+    : [
+        {
+          root: '',
+          project_id: 'lk_proj_shared_preview',
+          project_name: '@shared',
+          profile_id: 'shared-default',
+          profile_name: 'default',
+          is_shared: true,
+        },
+        {
+          root: `${workspace}/acme-api`,
+          project_id: 'acme-api',
+          project_name: 'acme-api',
+          profile_id: 'acme-api-dev',
+          profile_name: 'dev',
+          is_shared: false,
+        },
+        {
+          root: `${workspace}/web-app`,
+          project_id: 'web-app',
+          project_name: 'web-app',
+          profile_id: 'web-app-dev',
+          profile_name: 'dev',
+          is_shared: false,
+        },
+      ];
+  let selected = projects.find((project) => !project.is_shared) ?? null;
   const profiles = new Map([
     ['acme-api-dev', { project: 'acme-api', name: 'dev', dangerous: false }],
     ['acme-api-staging', { project: 'acme-api', name: 'staging', dangerous: false }],
     ['acme-api-prod', { project: 'acme-api', name: 'prod', dangerous: true }],
-    ['shared-default', { project: 'shared', name: 'default', dangerous: false }],
+    ['shared-default', { project: 'lk_proj_shared_preview', name: 'default', dangerous: false }],
     ['web-app-dev', { project: 'web-app', name: 'dev', dangerous: false }],
   ]);
   const names = [
@@ -193,16 +199,18 @@ export function createMockRuntime(params: URLSearchParams) {
 
   function status(): AgentStatus {
     return {
-      lock_state: unlocked ? 'unlocked' : 'locked',
-      project_id: selected.project_id,
-      profile_name: selected.profile_name,
-      live_grant_count: unlocked ? 1 : 0,
+      lock_state: selected ? (unlocked ? 'unlocked' : 'locked') : 'locked',
+      project_id: selected?.project_id ?? null,
+      profile_name: selected?.profile_name ?? null,
+      live_grant_count: selected && unlocked ? 1 : 0,
       agent_version: '0.1.1',
-      unlock_ttl_seconds: unlocked ? unlockedFor : null,
-      running_session_count: sessions.filter((session) => session.state === 'running').length,
+      unlock_ttl_seconds: selected && unlocked ? unlockedFor : null,
+      running_session_count: selected
+        ? sessions.filter((session) => session.state === 'running').length
+        : 0,
       scan_warning_count: 0,
-      recent_audit_status: unlocked ? 'ok' : 'unknown',
-      pinned_reference_warning_count: policies.length ? 1 : 0,
+      recent_audit_status: selected && unlocked ? 'ok' : 'unknown',
+      pinned_reference_warning_count: selected && policies.length ? 1 : 0,
       session_monitoring: 'active: macOS native notifications',
     };
   }
@@ -365,6 +373,10 @@ export function createMockRuntime(params: URLSearchParams) {
   function requireUnlocked(): void {
     if (!unlocked) fail('UnlockRequired', 'The vault is locked.', 'Unlock the vault and retry.');
   }
+  function requireSelectedProject(): DesktopProjectContext {
+    if (!selected) fail('ProjectNotFound', 'No vault is open.', 'Open a vault or project first.');
+    return selected;
+  }
 
   return async (command: string, args: Record<string, unknown>): Promise<unknown> => {
     if (command === routeCommands[startView]) {
@@ -391,6 +403,31 @@ export function createMockRuntime(params: URLSearchParams) {
         return status();
       case 'desktop_list_projects':
         return projects.map((project) => ({ ...project }));
+      case 'desktop_open_shared_vault': {
+        let shared = projects.find((entry) => entry.is_shared);
+        if (!shared) {
+          shared = {
+            root: '',
+            project_id: 'lk_proj_shared_preview',
+            project_name: '@shared',
+            profile_id: 'shared-default',
+            profile_name: 'default',
+            is_shared: true,
+          };
+          projects.unshift(shared);
+        }
+        selected = shared;
+        return { ...selected };
+      }
+      case 'desktop_inspect_project_folder': {
+        const path = typeof request.path === 'string' ? request.path : '';
+        const hasConfig = projects.some((entry) => !entry.is_shared && entry.root === path);
+        return {
+          path,
+          has_config: hasConfig,
+          folder_name: path.split('/').filter(Boolean).pop() || path || 'project',
+        };
+      }
       case 'desktop_open_project':
       case 'desktop_initialize_project': {
         let project = projects.find((entry) => entry.root === request.path);
@@ -406,6 +443,7 @@ export function createMockRuntime(params: URLSearchParams) {
             project_name: request.path.split('/').pop() || 'new-project',
             profile_id: `${id}-dev`,
             profile_name: 'dev',
+            is_shared: false,
           };
           projects.push(project);
           profiles.set(project.profile_id, { project: id, name: 'dev', dangerous: false });
@@ -436,7 +474,7 @@ export function createMockRuntime(params: URLSearchParams) {
         if (changes.agent_unlock_ttl) config.agent_unlock_ttl = changes.agent_unlock_ttl;
         if (changes.user_verification_required_for)
           Object.assign(verification, changes.user_verification_required_for);
-        const profile = profiles.get(selected.profile_id);
+        const profile = selected ? profiles.get(selected.profile_id) : undefined;
         if (profile && typeof changes.dangerous_profile === 'boolean')
           profile.dangerous = changes.dangerous_profile;
         return {
@@ -453,9 +491,10 @@ export function createMockRuntime(params: URLSearchParams) {
         return;
       case 'agent_set_active_profile': {
         requireUnlocked();
+        const project = requireSelectedProject();
         const entry = [...profiles].find(
           ([, profile]) =>
-            profile.project === selected.project_id && profile.name === request.profile_name,
+            profile.project === project.project_id && profile.name === request.profile_name,
         );
         if (!entry)
           fail(
@@ -471,9 +510,9 @@ export function createMockRuntime(params: URLSearchParams) {
             'Choose the environment and type its name.',
           );
         }
-        const previous = { ...selected };
-        selected.profile_id = id;
-        selected.profile_name = profile.name;
+        const previous = { ...project };
+        project.profile_id = id;
+        project.profile_name = profile.name;
         return {
           changed: previous.profile_id !== id,
           profile_id: id,
@@ -597,26 +636,28 @@ export function createMockRuntime(params: URLSearchParams) {
         launchAtLogin = args.enabled === true;
         return launchAtLogin;
       case 'desktop_pick_directory':
-        return selected.root;
+        return selected?.root || `${workspace}/acme-api`;
       case 'desktop_pick_file':
         return args.save
           ? `/Users/justin/Downloads/${args.defaultName ?? 'locket-backup.lkb'}`
           : args.title === 'Browse for an env file'
-            ? `${selected.root}/.env`
+            ? `${selected?.root || '/Users/justin/Downloads'}/.env`
             : '/Users/justin/Downloads/locket-backup.lkb';
       case 'desktop_mcp_config_snippet':
         return { ...mcp, json: JSON.stringify({ mcpServers: { locket: mcp } }, null, 2) };
-      case 'desktop_import_env':
+      case 'desktop_import_env': {
+        const project = requireSelectedProject();
         saveSecret(
           {
-            project_id: selected.project_id,
-            profile_id: selected.profile_id,
+            project_id: project.project_id,
+            profile_id: project.profile_id,
             secret_name: 'REDIS_URL',
             value: 'preview-imported-value',
           },
           false,
         );
         return { summary: 'Imported 1 variable.' };
+      }
       case 'desktop_run_policy':
         return { launched: true, command: `locket run ${request.policy_name}` };
       case 'desktop_scan_project':
@@ -629,16 +670,17 @@ export function createMockRuntime(params: URLSearchParams) {
           policies.push({ ...policy, id: `policy-new-${++sequence}`, updated_at_unix_nanos: now });
         return;
       }
-      case 'desktop_variable_readiness':
+      case 'desktop_variable_readiness': {
+        const project = requireSelectedProject();
         return {
-          project_id: selected.project_id,
-          profile_id: selected.profile_id,
-          profile_name: selected.profile_name,
+          project_id: project.project_id,
+          profile_id: project.profile_id,
+          profile_name: project.profile_name,
           policies: policies.map((policy) => ({
             policy_name: policy.name,
-            profile_id: selected.profile_id,
+            profile_id: project.profile_id,
             rows: secrets
-              .filter((row) => row.profile_id === selected.profile_id)
+              .filter((row) => row.profile_id === project.profile_id)
               .map((row) => ({
                 name: row.name,
                 required: row.required,
@@ -648,6 +690,7 @@ export function createMockRuntime(params: URLSearchParams) {
               })),
           })),
         };
+      }
       case 'desktop_team_sync_configure':
         teamFolder = String(request.folder);
         return syncStatus();
@@ -668,7 +711,7 @@ export function createMockRuntime(params: URLSearchParams) {
         return {
           structural_valid: true,
           schema_version: 1,
-          project_id: selected.project_id,
+          project_id: requireSelectedProject().project_id,
           profile_count: 1,
           recipient_count: 1,
           payload_digest: 'a'.repeat(64),

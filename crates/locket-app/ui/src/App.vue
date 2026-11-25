@@ -30,7 +30,7 @@ import {
   initialProjectSelection,
 } from './profile/selection';
 import type { StartHereTarget } from './dashboard/startHere';
-import type { DesktopProjectContext, UnlockRequest } from './agent/types';
+import type { DesktopFolderInspection, DesktopProjectContext, UnlockRequest } from './agent/types';
 import {
   copySecret,
   exportBundle,
@@ -47,9 +47,12 @@ import {
   recoveryRotate,
   desktopActionsAvailable,
   desktopCopyTextPlain,
+  desktopPickDirectory,
   previewParams,
   desktopListProjects,
   desktopOpenProject,
+  desktopOpenSharedVault,
+  desktopInspectProjectFolder,
   desktopInitializeProject,
   desktopImportEnv,
   desktopStartAgent,
@@ -85,6 +88,7 @@ import DeviceMemberDirectory from './views/DeviceMemberDirectory.vue';
 import ExecutionMonitor from './views/ExecutionMonitor.vue';
 import PolicyEditor from './views/PolicyEditor.vue';
 import ProjectDashboard from './views/ProjectDashboard.vue';
+import WelcomeView from './views/WelcomeView.vue';
 import ScanResults from './views/ScanResults.vue';
 import SecretEditorView from './views/SecretEditorView.vue';
 import SecretMetadataList from './views/SecretMetadataList.vue';
@@ -149,11 +153,25 @@ const activeContext = computed(() =>
 const projectConnected = computed(
   () => selectedProject.value !== null || status.value?.project_id != null,
 );
+const selectedIsShared = computed(() => Boolean(selectedProject.value?.is_shared));
 const projectPath = ref('');
+const pendingInitFolder = ref<DesktopFolderInspection | null>(null);
+const pendingInitHeading = ref<HTMLElement | null>(null);
+const manualConnectOpen = ref(false);
+const manualConnectPath = ref<HTMLInputElement | null>(null);
+const connectProjectTrigger = ref<HTMLButtonElement | null>(null);
 const activeProjectFolder = computed(() =>
-  Boolean(selectedProject.value && projectPath.value.trim() === selectedProject.value.root),
+  Boolean(
+    selectedProject.value &&
+    !selectedProject.value.is_shared &&
+    projectPath.value.trim() === selectedProject.value.root,
+  ),
 );
 const knownProjects = ref<DesktopProjectContext[]>([]);
+const knownFolderProjects = computed(() =>
+  knownProjects.value.filter((project) => !project.is_shared),
+);
+const hasSharedVault = computed(() => knownProjects.value.some((project) => project.is_shared));
 const desktopAvailable = desktopActionsAvailable();
 const desktopBusy = ref(false);
 const desktopError = ref<string | null>(null);
@@ -173,6 +191,14 @@ const envPath = ref('.env');
 const importOverwrite = ref(false);
 const importConfirmation = ref('');
 const importLiteral = ref(false);
+const envPathReady = computed(() => {
+  const path = envPath.value.trim();
+  return path !== '' && (!selectedIsShared.value || /^(?:\/|[a-z]:[\\/]|\\\\)/i.test(path));
+});
+watch(selectedIsShared, (shared) => {
+  envPath.value = shared ? '' : '.env';
+  importConfirmation.value = '';
+});
 const commandRunning = ref(false);
 const commandRunError = ref<string | null>(null);
 const commandRunNotice = ref<string | null>(null);
@@ -230,22 +256,20 @@ type TrayMenuAction =
   | 'copy-secret';
 
 const primaryItems: ReadonlyArray<{ key: ViewKey; label: string; icon: AppIconName }> = [
-  { key: 'dashboard', label: 'Project', icon: 'folder' },
-  { key: 'secrets', label: 'Variables', icon: 'key' },
+  { key: 'secrets', label: 'Secrets', icon: 'key' },
   { key: 'policies', label: 'Commands', icon: 'terminal' },
   { key: 'execution', label: 'Activity', icon: 'activity' },
-  { key: 'team', label: 'Team', icon: 'users' },
   { key: 'settings', label: 'Settings', icon: 'settings' },
 ];
-const overflowItems = primaryItems.slice(3);
-const moreOpen = ref(false);
-const moreTrigger = ref<HTMLButtonElement | null>(null);
+const vaultSwitcherOpen = ref(false);
+const vaultSwitcherRef = ref<HTMLElement | null>(null);
+const vaultSwitcherTrigger = ref<HTMLButtonElement | null>(null);
 const secondaryItems = computed<Array<{ key: ViewKey; label: string }>>(() => {
   if (['secrets', 'discover', 'secret-editor', 'versions'].includes(currentView.value))
     return [
-      { key: 'secrets', label: 'Variables' },
+      { key: 'secrets', label: 'Secrets' },
+      { key: 'secret-editor', label: 'Add or import' },
       { key: 'discover', label: 'Discover' },
-      { key: 'secret-editor', label: 'Import or add' },
       ...(selectedSecret.value ? [{ key: 'versions' as const, label: 'Variable history' }] : []),
     ];
   if (['execution', 'audit', 'scan'].includes(currentView.value))
@@ -254,43 +278,42 @@ const secondaryItems = computed<Array<{ key: ViewKey; label: string }>>(() => {
       { key: 'audit', label: 'Audit' },
       { key: 'scan', label: 'Scan in terminal' },
     ];
-  if (['team', 'devices'].includes(currentView.value))
-    return [
-      { key: 'team', label: 'Sharing' },
-      { key: 'devices', label: 'People and devices' },
-    ];
-  if (['settings', 'profiles', 'recovery'].includes(currentView.value))
+  if (
+    ['settings', 'profiles', 'team', 'devices', 'recovery'].includes(currentView.value) ||
+    (currentView.value === 'dashboard' && projectConnected.value)
+  )
     return [
       { key: 'settings', label: 'Preferences' },
-      { key: 'profiles', label: 'Environments' },
-      { key: 'recovery', label: 'Backup and recovery' },
+      ...(selectedIsShared.value ? [] : [{ key: 'profiles' as const, label: 'Environments' }]),
+      { key: 'team', label: 'Team' },
+      { key: 'devices', label: 'Devices' },
+      { key: 'recovery', label: 'Backup' },
+      ...(projectConnected.value && !selectedIsShared.value
+        ? [{ key: 'dashboard' as const, label: 'Project' }]
+        : []),
     ];
   return [];
 });
-const overflowActive = computed(() =>
-  overflowItems.find(
-    ({ key }) => currentView.value === key || secondaryItems.value.some((item) => item.key === key),
-  ),
-);
 
-function closeMore(restoreFocus = false): void {
-  if (!moreOpen.value) return;
-  moreOpen.value = false;
-  if (restoreFocus) moreTrigger.value?.focus();
+function closeVaultSwitcher(): void {
+  vaultSwitcherOpen.value = false;
 }
 
-function onMoreFocusout(event: FocusEvent): void {
-  if (
-    event.relatedTarget &&
-    !(event.currentTarget as HTMLElement).contains(event.relatedTarget as Node)
-  ) {
-    closeMore();
+function dismissVaultSwitcher(): void {
+  if (!vaultSwitcherOpen.value) return;
+  closeVaultSwitcher();
+  vaultSwitcherTrigger.value?.focus?.();
+}
+
+function onSwitcherFocusout(event: FocusEvent): void {
+  if (event.relatedTarget && !vaultSwitcherRef.value?.contains(event.relatedTarget as Node)) {
+    closeVaultSwitcher();
   }
 }
 
-function onMorePointerdown(event: PointerEvent): void {
-  if (moreOpen.value && !moreTrigger.value?.parentElement?.contains(event.target as Node)) {
-    closeMore();
+function onSwitcherPointerdown(event: PointerEvent): void {
+  if (vaultSwitcherOpen.value && !vaultSwitcherRef.value?.contains(event.target as Node)) {
+    closeVaultSwitcher();
   }
 }
 
@@ -336,6 +359,13 @@ const profileLabel = computed<string>(() =>
     profileAlias.value,
   ),
 );
+const switcherLabel = computed<string>(() => {
+  if (!projectConnected.value) return 'Choose a vault…';
+  if (selectedIsShared.value) {
+    return settings.value.privacyRedactNames ? projectLabel.value : 'Global Vault';
+  }
+  return `${projectLabel.value} · ${profileLabel.value}`;
+});
 
 const secrets = ref<SecretRowMeta[]>([]);
 const versions = ref<VersionHistoryRow[]>([]);
@@ -586,11 +616,7 @@ watch(
 
 function selectView(key: ViewKey): void {
   currentView.value = key;
-}
-
-function selectOverflowView(key: ViewKey): void {
-  selectView(key);
-  closeMore(true);
+  dismissVaultSwitcher();
 }
 
 async function addVariable(): Promise<void> {
@@ -602,7 +628,7 @@ async function addVariable(): Promise<void> {
 async function handleTrayMenuAction(action: TrayMenuAction): Promise<void> {
   switch (action) {
     case 'open-app':
-      currentView.value = 'dashboard';
+      currentView.value = projectConnected.value ? 'secrets' : 'dashboard';
       break;
     case 'lock-vault':
       {
@@ -616,6 +642,7 @@ async function handleTrayMenuAction(action: TrayMenuAction): Promise<void> {
       openUnlock();
       break;
     case 'switch-profile':
+      if (selectedIsShared.value) break;
       currentView.value = 'profiles';
       await refresh();
       break;
@@ -659,6 +686,10 @@ const paletteActions = computed<RunnablePaletteAction[]>(() => {
   const views = [
     ...primaryItems,
     { key: 'discover' as const, label: 'Discover', icon: 'compass' as const },
+    { key: 'team' as const, label: 'Team', icon: 'users' as const },
+    ...(projectConnected.value && !selectedIsShared.value
+      ? [{ key: 'dashboard' as const, label: 'Project overview', icon: 'folder' as const }]
+      : []),
   ];
   const actions: RunnablePaletteAction[] = views.map(({ key, label, icon }) => ({
     id: `view:${key}`,
@@ -687,7 +718,19 @@ const paletteActions = computed<RunnablePaletteAction[]>(() => {
     label: 'Add variable',
     run: addVariable,
   });
-  knownProjects.value.forEach((project, index) => {
+  actions.push({
+    id: 'project:shared',
+    group: 'Projects',
+    icon: 'key',
+    badge: 'Vault',
+    label: redact ? 'Global Vault' : 'Global Vault (@shared)',
+    detail: 'Personal secrets across projects and MCP',
+    keywords: 'shared global vault personal',
+    run: async () => {
+      if (await openSharedVault()) selectView('secrets');
+    },
+  });
+  knownFolderProjects.value.forEach((project, index) => {
     actions.push({
       id: `project:${index}`,
       group: 'Projects',
@@ -697,7 +740,7 @@ const paletteActions = computed<RunnablePaletteAction[]>(() => {
       detail: redact ? 'Open project' : project.root,
       keywords: 'open project',
       run: async () => {
-        if (await connectProject(false, project.root)) selectView('dashboard');
+        if (await connectProject(false, project.root)) selectView('secrets');
       },
     });
   });
@@ -750,10 +793,14 @@ watch(
 );
 
 async function openDiscoveredProject(row: DiscoveredSecretWire): Promise<void> {
+  const known = knownProjects.value.find((project) => project.project_id === row.project_id);
+  if (known?.is_shared) {
+    if (await openSharedVault(known.project_id)) selectView('secrets');
+    return;
+  }
   const root =
-    knownProjects.value.find((project) => project.project_id === row.project_id)?.root ??
-    (settings.value.privacyRedactNames ? undefined : row.trusted_roots[0]);
-  if (root && (await connectProject(false, root))) selectView('dashboard');
+    known?.root ?? (settings.value.privacyRedactNames ? undefined : row.trusted_roots[0]);
+  if (root && (await connectProject(false, root))) selectView('secrets');
 }
 
 function switchDiscoveredEnvironment(row: DiscoveredSecretWire): void {
@@ -1043,7 +1090,7 @@ const runtimeSessionRequest = computed<ListRuntimeSessionsRequest | null>(() => 
 
 const policiesRequest = computed<ListPoliciesRequest | null>(() => {
   const projectId = status.value?.project_id;
-  if (projectId === null || projectId === undefined) {
+  if (!projectId || selectedIsShared.value) {
     return null;
   }
   return {
@@ -1524,37 +1571,6 @@ async function refreshAuditLog(): Promise<void> {
   auditLoading.value = false;
 }
 
-const recentActivityRows = computed(() => {
-  const okCount = auditRows.value.filter((row) => row.status === 'OK').length;
-  const deniedCount = auditRows.value.filter((row) => row.status === 'DENIED').length;
-  const failedCount = auditRows.value.filter(
-    (row) => row.status === 'FAILED' || row.hmacOk === false,
-  ).length;
-  const unloadedValue = projectConnected.value ? 'Unknown' : '—';
-  return [
-    {
-      label: 'OK',
-      value: auditLastRefreshed.value ? okCount.toString() : unloadedValue,
-      tone: 'neutral',
-    },
-    {
-      label: 'Denied',
-      value: auditLastRefreshed.value ? deniedCount.toString() : unloadedValue,
-      tone: deniedCount === 0 ? 'neutral' : 'warn',
-    },
-    {
-      label: 'Failed',
-      value: auditLastRefreshed.value ? failedCount.toString() : unloadedValue,
-      tone: failedCount === 0 ? 'neutral' : 'warn',
-    },
-    {
-      label: 'Audit',
-      value: auditHealth(auditChainOk.value).label,
-      tone: auditHealth(auditChainOk.value).tone,
-    },
-  ];
-});
-
 async function verifyAuditChain(): Promise<void> {
   const request = auditRequest.value;
   auditChainOk.value = null;
@@ -1586,7 +1602,13 @@ watch(
 );
 
 async function launchProjectScan(): Promise<void> {
-  if (scanLaunching.value || desktopBusy.value || profileSwitchInProgress.value) return;
+  if (
+    selectedIsShared.value ||
+    scanLaunching.value ||
+    desktopBusy.value ||
+    profileSwitchInProgress.value
+  )
+    return;
   scanError.value = null;
   scanNotice.value = null;
   const projectId = selectedProject.value?.project_id;
@@ -1767,20 +1789,126 @@ async function refreshProjectConnections(): Promise<void> {
     knownProjects.value = result.value;
     if (generation !== selectionGeneration.value) return;
     const initial = previewParams
-      ? result.value[0]
+      ? (result.value.find((project) => !project.is_shared) ?? result.value[0])
       : initialProjectSelection(result.value, selectedProject.value);
     if (!selectedProject.value && initial) {
-      await connectProject(false, initial.root);
+      if (initial.is_shared) {
+        await openSharedVault(initial.project_id);
+      } else {
+        await connectProject(false, initial.root);
+      }
     }
   } else if (generation === selectionGeneration.value && desktopAvailable)
     desktopError.value = actionError(result.error);
 }
 
-async function connectProject(initialize = false, path = projectPath.value): Promise<boolean> {
-  if (desktopBusy.value || !path.trim()) return false;
+async function openSharedVault(projectId?: string): Promise<boolean> {
+  if (desktopBusy.value) return false;
   selectionGeneration.value++;
   profileSwitchInProgress.value = false;
   profileSwitchError.value = null;
+  pendingInitFolder.value = null;
+  manualConnectOpen.value = false;
+  dismissVaultSwitcher();
+  desktopBusy.value = true;
+  desktopError.value = null;
+  desktopNotice.value = null;
+  const result = await desktopOpenSharedVault(projectId ? { project_id: projectId } : undefined);
+  if (result.ok) {
+    const showPreviewUnlock = !selectedProject.value && previewParams?.get('modal') === 'unlock';
+    selectedProject.value = result.value;
+    selectedSecret.value = null;
+    unlockOpen.value = showPreviewUnlock;
+    projectPath.value = '';
+    if (currentView.value === 'dashboard' || currentView.value === 'profiles') {
+      currentView.value = 'secrets';
+    }
+    await refreshProjectConnections();
+    await refresh();
+  } else desktopError.value = actionError(result.error);
+  desktopBusy.value = false;
+  return result.ok;
+}
+
+async function inspectAndConnectPath(rawPath = projectPath.value): Promise<void> {
+  const trimmed = rawPath.trim();
+  if (desktopBusy.value || !trimmed) return;
+  desktopError.value = null;
+  desktopNotice.value = null;
+  desktopBusy.value = true;
+  const inspected = await desktopInspectProjectFolder({ path: trimmed });
+  desktopBusy.value = false;
+  if (!inspected.ok) {
+    pendingInitFolder.value = null;
+    desktopError.value = actionError(inspected.error);
+    return;
+  }
+  projectPath.value = inspected.value.path;
+  if (inspected.value.has_config) {
+    pendingInitFolder.value = null;
+    await connectProject(false, inspected.value.path);
+  } else {
+    pendingInitFolder.value = inspected.value;
+    await nextTick();
+    pendingInitHeading.value?.focus?.();
+  }
+}
+
+async function handleWelcomePickFolder(path: string): Promise<void> {
+  projectPath.value = path;
+  await inspectAndConnectPath(path);
+}
+
+async function confirmInitializeFolder(): Promise<void> {
+  const folder = pendingInitFolder.value;
+  if (!folder) return;
+  pendingInitFolder.value = null;
+  await connectProject(true, folder.path);
+}
+
+async function cancelFolderConnection(): Promise<void> {
+  const returnToPath = manualConnectOpen.value && pendingInitFolder.value;
+  pendingInitFolder.value = null;
+  if (!returnToPath) {
+    manualConnectOpen.value = false;
+    projectPath.value = selectedProject.value?.root ?? '';
+  }
+  await nextTick();
+  const target = returnToPath
+    ? manualConnectPath.value
+    : (connectProjectTrigger.value ?? vaultSwitcherTrigger.value);
+  target?.focus?.();
+}
+
+async function pickProjectFolder(): Promise<void> {
+  dismissVaultSwitcher();
+  if (!desktopAvailable || desktopBusy.value) return;
+  desktopBusy.value = true;
+  const picked = await desktopPickDirectory('Choose a project folder');
+  desktopBusy.value = false;
+  if (!picked.ok) {
+    if (projectConnected.value) {
+      pendingInitFolder.value = null;
+      projectPath.value = '';
+      manualConnectOpen.value = true;
+      await nextTick();
+      manualConnectPath.value?.focus?.();
+    } else {
+      selectView('dashboard');
+    }
+    return;
+  }
+  if (picked.value) await inspectAndConnectPath(picked.value);
+}
+
+async function connectProject(initialize = false, path = projectPath.value): Promise<boolean> {
+  if (desktopBusy.value || !path.trim()) return false;
+  const wasUnconnected = selectedProject.value === null;
+  selectionGeneration.value++;
+  profileSwitchInProgress.value = false;
+  profileSwitchError.value = null;
+  pendingInitFolder.value = null;
+  dismissVaultSwitcher();
   desktopBusy.value = true;
   desktopError.value = null;
   desktopNotice.value = null;
@@ -1793,6 +1921,14 @@ async function connectProject(initialize = false, path = projectPath.value): Pro
     selectedSecret.value = null;
     unlockOpen.value = showPreviewUnlock;
     projectPath.value = result.value.root;
+    manualConnectOpen.value = false;
+    if (
+      wasUnconnected &&
+      currentView.value === 'dashboard' &&
+      (!previewParams || previewParams.get('state') === 'welcome')
+    ) {
+      currentView.value = 'secrets';
+    }
     await refreshProjectConnections();
     await refresh();
   } else desktopError.value = actionError(result.error);
@@ -1850,8 +1986,7 @@ async function handleUnlock(source: UnlockRequest['source']): Promise<void> {
 }
 async function importEnv(): Promise<void> {
   const projectId = selectedProject.value?.project_id ?? status.value?.project_id;
-  if (!secretAccess.value.enabled || !projectId || desktopBusy.value || !envPath.value.trim())
-    return;
+  if (!secretAccess.value.enabled || !projectId || desktopBusy.value || !envPathReady.value) return;
   if (
     settings.value.dangerousProfileFlag &&
     importConfirmation.value !== activeContext.value?.profile_name
@@ -1926,9 +2061,12 @@ watch(
 );
 
 onMounted(() => {
-  window.addEventListener('pointerdown', onMorePointerdown);
+  window.addEventListener('pointerdown', onSwitcherPointerdown);
   void refreshProjectConnections();
-  if (previewParams) return;
+  if (previewParams) {
+    if (previewParams.get('state') === 'welcome') void refresh();
+    return;
+  }
   void listen<TrayMenuAction>('tray-menu-action', (event) => {
     void handleTrayMenuAction(event.payload);
   })
@@ -1939,7 +2077,7 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
-  window.removeEventListener('pointerdown', onMorePointerdown);
+  window.removeEventListener('pointerdown', onSwitcherPointerdown);
   clearTimeout(desktopNoticeTimer);
   metadataClipboardRequests.dispose();
   copyRequests.dispose();
@@ -1964,21 +2102,123 @@ onUnmounted(() => {
     <aside class="shell__nav" aria-label="Workspace">
       <div class="shell__masthead">
         <h1><AppIcon name="brand-lock" :size="26" /> <span>Locket</span></h1>
-        <button
-          class="companion-button shell__context"
-          type="button"
-          :title="`${projectLabel} · ${profileLabel} — ${connectionLabel} · Vault ${lockLabel}`"
-          :aria-label="
-            projectConnected
-              ? `Switch environment for ${projectLabel} / ${profileLabel}. Agent ${connectionLabel}. Vault ${lockLabel}.`
-              : 'Open project'
-          "
-          @click="selectView(projectConnected ? 'profiles' : 'dashboard')"
+        <div
+          ref="vaultSwitcherRef"
+          class="shell__switcher"
+          @keydown.esc="dismissVaultSwitcher"
+          @focusout="onSwitcherFocusout"
         >
-          <span class="shell__context-dot" :data-online="agentOnline" aria-hidden="true" />
-          <span>{{ projectLabel }} · {{ profileLabel }}</span>
-          <AppIcon name="chevron-down" :size="13" />
-        </button>
+          <button
+            ref="vaultSwitcherTrigger"
+            class="companion-button shell__context"
+            type="button"
+            :title="
+              projectConnected
+                ? `${switcherLabel} — ${connectionLabel} · Vault ${lockLabel}`
+                : 'Choose a vault or connect a project folder'
+            "
+            :aria-label="
+              projectConnected
+                ? `Switch vault or project (${switcherLabel}). Agent ${connectionLabel}. Vault ${lockLabel}.`
+                : 'Choose a vault or project'
+            "
+            :aria-expanded="vaultSwitcherOpen"
+            :aria-controls="vaultSwitcherOpen ? 'vault-switcher-menu' : undefined"
+            @click="vaultSwitcherOpen = !vaultSwitcherOpen"
+          >
+            <span class="shell__context-dot" :data-online="agentOnline" aria-hidden="true" />
+            <span>{{ switcherLabel }}</span>
+            <AppIcon name="chevron-down" :size="13" />
+          </button>
+          <div
+            v-if="vaultSwitcherOpen"
+            id="vault-switcher-menu"
+            class="shell__switcher-menu"
+            role="group"
+            aria-label="Vaults and projects"
+          >
+            <div class="shell__switcher-group">
+              <span class="shell__switcher-heading">Global Vault</span>
+              <button
+                type="button"
+                class="shell__switcher-item"
+                :aria-current="selectedIsShared ? 'true' : undefined"
+                :disabled="desktopBusy || !desktopAvailable"
+                @click="openSharedVault()"
+              >
+                <AppIcon name="key" :size="14" />
+                <span class="shell__switcher-text">
+                  <strong>{{
+                    settings.privacyRedactNames ? 'Global Vault' : 'Global Vault (@shared)'
+                  }}</strong>
+                  <small>{{ hasSharedVault ? 'Personal secrets & MCP' : 'Create now' }}</small>
+                </span>
+                <AppIcon v-if="selectedIsShared" name="check" :size="14" />
+              </button>
+            </div>
+            <div v-if="knownFolderProjects.length" class="shell__switcher-group">
+              <span class="shell__switcher-heading">Projects</span>
+              <button
+                v-for="project in knownFolderProjects"
+                :key="project.project_id"
+                type="button"
+                class="shell__switcher-item"
+                :aria-current="
+                  selectedProject?.project_id === project.project_id ? 'true' : undefined
+                "
+                :disabled="desktopBusy"
+                @click="connectProject(false, project.root)"
+              >
+                <AppIcon name="folder" :size="14" />
+                <span class="shell__switcher-text">
+                  <strong>{{
+                    settings.privacyRedactNames ? 'Project' : project.project_name
+                  }}</strong>
+                  <small v-if="!settings.privacyRedactNames">{{
+                    shortenProjectPath(project.root)
+                  }}</small>
+                </span>
+                <AppIcon
+                  v-if="selectedProject?.project_id === project.project_id"
+                  name="check"
+                  :size="14"
+                />
+              </button>
+            </div>
+            <div class="shell__switcher-group shell__switcher-actions">
+              <button
+                type="button"
+                class="shell__switcher-item"
+                :disabled="desktopBusy || !desktopAvailable"
+                @click="pickProjectFolder"
+              >
+                <AppIcon name="plus" :size="14" />
+                <span class="shell__switcher-text"><strong>Connect project folder…</strong></span>
+              </button>
+              <button
+                v-if="projectConnected && !selectedIsShared"
+                type="button"
+                class="shell__switcher-item"
+                @click="selectView('profiles')"
+              >
+                <AppIcon name="compass" :size="14" />
+                <span class="shell__switcher-text">
+                  <strong>Switch environment</strong>
+                  <small>{{ profileLabel }}</small>
+                </span>
+              </button>
+              <button
+                v-if="projectConnected && !selectedIsShared"
+                type="button"
+                class="shell__switcher-item"
+                @click="selectView('dashboard')"
+              >
+                <AppIcon name="folder" :size="14" />
+                <span class="shell__switcher-text"><strong>Project overview</strong></span>
+              </button>
+            </div>
+          </div>
+        </div>
         <div class="shell__agent">
           <span class="shell__vault" :data-unlocked="lockLabel === 'Unlocked'">
             <AppIcon :name="lockLabel === 'Unlocked' ? 'unlock' : 'lock'" />
@@ -2028,11 +2268,7 @@ onUnmounted(() => {
 
       <nav class="shell__primary" aria-label="Primary navigation">
         <ul class="shell__primary-list">
-          <li
-            v-for="(item, index) in primaryItems"
-            :key="item.key"
-            :class="{ 'shell__wide-destination': index >= 3 }"
-          >
+          <li v-for="item in primaryItems" :key="item.key">
             <button
               type="button"
               class="shell__nav-item"
@@ -2047,66 +2283,13 @@ onUnmounted(() => {
               {{ item.label }}
             </button>
           </li>
-          <li class="shell__more" @focusout="onMoreFocusout" @keydown.esc.stop="closeMore(true)">
-            <button
-              ref="moreTrigger"
-              type="button"
-              class="shell__nav-item"
-              :class="{ 'shell__nav-item--active': overflowActive }"
-              :aria-expanded="moreOpen"
-              :aria-current="overflowActive ? 'location' : undefined"
-              :aria-controls="moreOpen ? 'more-destinations' : undefined"
-              @click="moreOpen = !moreOpen"
-            >
-              <AppIcon v-if="overflowActive" :name="overflowActive.icon" />
-              {{ overflowActive?.label ?? 'More' }}
-              <AppIcon name="chevron-down" :size="12" />
-            </button>
-            <ul v-if="moreOpen" id="more-destinations" class="shell__more-list">
-              <li v-for="item in overflowItems" :key="item.key">
-                <button
-                  type="button"
-                  class="shell__nav-item"
-                  :class="{ 'shell__nav-item--active': overflowActive?.key === item.key }"
-                  :aria-current="overflowActive?.key === item.key ? 'page' : undefined"
-                  @click="selectOverflowView(item.key)"
-                >
-                  <AppIcon :name="item.icon" />
-                  {{ item.label }}
-                </button>
-              </li>
-            </ul>
-          </li>
         </ul>
       </nav>
-
-      <section class="shell__activity" aria-label="Recent activity">
-        <div class="shell__activity-head">
-          <span>Recent</span>
-          <span v-if="auditLoading">Loading</span>
-          <span v-else-if="auditError" class="shell__activity-error" :title="auditError"
-            >Unavailable</span
-          >
-          <time
-            v-else-if="auditLastRefreshed"
-            :datetime="auditLastRefreshed"
-            :title="auditLastRefreshed"
-          >
-            {{ formatTime(auditLastRefreshed) }}
-          </time>
-        </div>
-        <dl>
-          <div v-for="row in recentActivityRows" :key="row.label">
-            <dt>{{ row.label }}</dt>
-            <dd :class="`shell__activity-value--${row.tone}`">{{ row.value }}</dd>
-          </div>
-        </dl>
-      </section>
     </aside>
 
     <main class="shell__main">
       <div
-        v-if="currentView !== 'dashboard'"
+        v-if="!(currentView === 'dashboard' && !projectConnected)"
         class="shell__topbar"
         :class="{ 'shell__topbar--has-sections': secondaryItems.length }"
       >
@@ -2160,12 +2343,19 @@ onUnmounted(() => {
       </p>
       <div
         v-if="agentOnline && lockLabel !== 'Unlocked' && projectConnected"
-        class="shell__toolbar"
+        class="shell__unlock-bar"
         aria-label="Vault actions"
       >
+        <div class="shell__unlock-copy">
+          <AppIcon name="lock" :size="16" />
+          <span>
+            <strong>{{ switcherLabel }} is locked.</strong>
+            Unlock with your keychain or passphrase to view and edit secrets.
+          </span>
+        </div>
         <button
           type="button"
-          class="companion-button icon-label"
+          class="companion-button companion-button--primary icon-label"
           :disabled="!desktopAvailable || unlockBusy"
           @click="openUnlock"
         >
@@ -2181,16 +2371,26 @@ onUnmounted(() => {
         <h2 id="import-heading">Import an env file</h2>
         <p v-if="secretAccess.guidance" role="status">{{ secretAccess.guidance }}</p>
         <form @submit.prevent="importEnv">
-          <label
-            >File path
-            <input v-model="envPath" type="text" autocomplete="off" :disabled="desktopBusy"
-          /></label>
+          <label>
+            File path
+            <input
+              v-model="envPath"
+              type="text"
+              autocomplete="off"
+              aria-describedby="env-path-hint"
+              :placeholder="selectedIsShared ? '/path/to/.env' : undefined"
+              :disabled="desktopBusy"
+            />
+          </label>
           <PathBrowse
             title="Browse for an env file"
             :disabled="desktopBusy"
             @pick="envPath = $event"
           />
-          <p>Relative paths start in the connected project.</p>
+          <p v-if="selectedIsShared" id="env-path-hint">
+            Choose an absolute path to a <code>.env</code> file.
+          </p>
+          <p v-else id="env-path-hint">Relative paths start in the connected project.</p>
           <details>
             <summary>Import options</summary>
             <label
@@ -2215,7 +2415,7 @@ onUnmounted(() => {
               !desktopAvailable ||
               desktopBusy ||
               !secretAccess.enabled ||
-              !envPath.trim() ||
+              !envPathReady ||
               (settings.dangerousProfileFlag && importConfirmation !== activeContext?.profile_name)
             "
           >
@@ -2230,8 +2430,99 @@ onUnmounted(() => {
         <AppIcon name="check" />{{ desktopNotice }}
       </p>
 
+      <section
+        v-if="projectConnected && pendingInitFolder"
+        class="shell__panel"
+        aria-labelledby="initialize-folder-heading"
+      >
+        <h2 id="initialize-folder-heading" ref="pendingInitHeading" tabindex="-1">
+          Initialize Locket in this folder?
+        </h2>
+        <p>
+          {{ settings.privacyRedactNames ? 'This folder' : pendingInitFolder.folder_name }} has no
+          <code>locket.toml</code> yet.
+        </p>
+        <div class="shell__toolbar">
+          <button
+            type="button"
+            class="companion-button companion-button--primary"
+            :disabled="desktopBusy"
+            @click="confirmInitializeFolder"
+          >
+            Initialize &amp; open
+          </button>
+          <button type="button" class="companion-button" @click="cancelFolderConnection">
+            Cancel
+          </button>
+        </div>
+      </section>
+      <section
+        v-else-if="manualConnectOpen"
+        class="shell__panel"
+        aria-labelledby="manual-connect-heading"
+      >
+        <h2 id="manual-connect-heading">Connect a project folder</h2>
+        <form class="shell__project-form" @submit.prevent="inspectAndConnectPath()">
+          <div class="shell__project-field">
+            <label for="manual-project-path">Project folder</label>
+            <input
+              id="manual-project-path"
+              ref="manualConnectPath"
+              v-model="projectPath"
+              type="text"
+              placeholder="/path/to/project"
+              autocomplete="off"
+              spellcheck="false"
+              :disabled="desktopBusy"
+            />
+          </div>
+          <div class="shell__toolbar">
+            <button
+              type="submit"
+              class="companion-button companion-button--primary"
+              :disabled="desktopBusy || !projectPath.trim()"
+            >
+              Connect folder
+            </button>
+            <button type="button" class="companion-button" @click="cancelFolderConnection">
+              Cancel
+            </button>
+          </div>
+        </form>
+      </section>
+
+      <WelcomeView
+        v-if="currentView === 'dashboard' && !projectConnected"
+        :agent-online="agentOnline"
+        :agent-version="settings.agentVersion"
+        :desktop-available="desktopAvailable"
+        :busy="desktopBusy"
+        :privacy-mode="settings.privacyRedactNames"
+        :project-path="projectPath"
+        :known-projects="knownProjects"
+        :pending-init-folder="pendingInitFolder"
+        @update:project-path="
+          (value) => {
+            projectPath = value;
+            pendingInitFolder = null;
+          }
+        "
+        @open-shared="openSharedVault()"
+        @pick-folder="handleWelcomePickFolder"
+        @connect-path="inspectAndConnectPath()"
+        @confirm-init="confirmInitializeFolder"
+        @cancel-init="pendingInitFolder = null"
+        @open-known="
+          (project) =>
+            project.is_shared
+              ? openSharedVault(project.project_id)
+              : connectProject(false, project.root)
+        "
+        @start-agent="startAgent"
+      />
+
       <ProjectDashboard
-        v-if="currentView === 'dashboard'"
+        v-else-if="currentView === 'dashboard'"
         :privacy-mode="settings.privacyRedactNames"
         :project-id="activeContext?.project_id"
         :profile-id="activeContext?.profile_id"
@@ -2322,14 +2613,16 @@ onUnmounted(() => {
                 </button>
               </div>
             </form>
-            <div v-if="knownProjects.length" class="shell__known-projects">
+            <div v-if="knownFolderProjects.length" class="shell__known-projects">
               <h3>Known projects</h3>
               <ul>
-                <li v-for="project in knownProjects" :key="project.root">
+                <li v-for="project in knownFolderProjects" :key="project.project_id">
                   <button
                     class="companion-button shell__known-project"
                     type="button"
-                    :aria-current="selectedProject?.root === project.root ? 'true' : undefined"
+                    :aria-current="
+                      selectedProject?.project_id === project.project_id ? 'true' : undefined
+                    "
                     :disabled="desktopBusy"
                     @click="connectProject(false, project.root)"
                   >
@@ -2343,7 +2636,7 @@ onUnmounted(() => {
                       }}</code>
                     </span>
                     <AppIcon
-                      v-if="selectedProject?.root === project.root"
+                      v-if="selectedProject?.project_id === project.project_id"
                       class="shell__known-project-check"
                       name="check"
                     />
@@ -2460,6 +2753,29 @@ onUnmounted(() => {
         :last-checked-at="auditLastRefreshed"
         @verify="triggerVerify"
       />
+
+      <section
+        v-else-if="selectedIsShared && (currentView === 'policies' || currentView === 'scan')"
+        class="shell__panel"
+        aria-labelledby="project-required-heading"
+      >
+        <h2 id="project-required-heading">
+          {{ currentView === 'policies' ? 'Commands' : 'Scan in terminal' }}
+        </h2>
+        <p>
+          {{ currentView === 'policies' ? 'Approved commands belong to' : 'Terminal scans run in' }}
+          connected project folders with a <code>locket.toml</code> file.
+        </p>
+        <button
+          ref="connectProjectTrigger"
+          type="button"
+          class="companion-button"
+          :disabled="!desktopAvailable || desktopBusy"
+          @click="pickProjectFolder"
+        >
+          Connect a project folder
+        </button>
+      </section>
 
       <ScanResults
         v-else-if="currentView === 'scan'"
@@ -2637,14 +2953,149 @@ html,
   color: var(--accent);
 }
 
+.shell__switcher {
+  position: relative;
+  min-width: 0;
+}
+
 .shell__context {
   display: flex;
   align-items: center;
   gap: 0.3rem;
   justify-content: space-between;
+  width: 100%;
   min-width: 0;
   text-align: start;
   padding-inline: 0.45rem;
+}
+
+.shell__switcher-menu {
+  position: absolute;
+  z-index: 20;
+  inset-block-start: calc(100% + 0.35rem);
+  inset-inline-start: 0;
+  width: max-content;
+  min-width: 15.5rem;
+  max-width: min(20rem, calc(100vw - 1.5rem));
+  max-height: min(26rem, 60dvh);
+  box-sizing: border-box;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0.35rem;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow-lg);
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.shell__switcher-group {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.shell__switcher-actions {
+  padding-top: 0.35rem;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.shell__switcher-heading {
+  padding: 0.2rem 0.5rem 0.1rem;
+  font-size: 0.6875rem;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.shell__switcher-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  padding: 0.42rem 0.5rem;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 0.8125rem;
+  text-align: start;
+  cursor: pointer;
+}
+
+.shell__switcher-item:hover:not(:disabled) {
+  background: var(--bg-subtle);
+}
+
+.shell__switcher-item:focus-visible {
+  outline-offset: -2px;
+}
+
+.shell__switcher-item[aria-current='true'] {
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent), transparent 55%);
+  color: var(--accent);
+}
+
+.shell__switcher-item:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.shell__switcher-text {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+}
+
+.shell__switcher-text strong {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shell__switcher-text small {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shell__unlock-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  padding: 0.7rem 0.9rem;
+  border: 1px solid color-mix(in srgb, var(--accent), var(--border-subtle) 55%);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--accent), var(--bg-surface) 93%);
+}
+
+.shell__unlock-copy {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+
+.shell__unlock-copy strong {
+  color: var(--text-primary);
+  margin-right: 0.3rem;
+}
+
+.shell__unlock-copy .app-icon {
+  color: var(--accent);
 }
 
 .shell__context span:not(.shell__context-dot) {
@@ -2708,65 +3159,13 @@ html,
   font-weight: 400;
 }
 
-.shell__activity {
-  padding: 0.7rem 0.25rem 0;
-  border-top: 1px solid var(--border-subtle);
-}
-
-.shell__activity-head {
-  display: flex;
-  justify-content: space-between;
-  gap: 0.25rem;
-  font-size: 0.75rem;
-  color: var(--text-secondary);
-}
-
-.shell__activity-head span:first-child {
-  font-weight: 650;
-}
-
-.shell__activity-error {
-  color: var(--danger);
-}
-
-.shell__activity dl {
-  margin: 0.45rem 0 0;
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0.5rem;
-}
-
-.shell__activity dt {
-  font-size: 0.7rem;
-  color: var(--text-secondary);
-}
-
-.shell__activity dd {
-  margin: 0.125rem 0 0;
-  font-size: 0.875rem;
-  font-weight: 650;
-}
-
-.shell__activity-value--ok {
-  color: var(--success);
-}
-
-.shell__activity-value--warn {
-  color: var(--warn);
-}
-
-.shell__primary-list,
-.shell__more-list {
+.shell__primary-list {
   list-style: none;
   margin: 0;
   padding: 0;
   display: flex;
   flex-direction: column;
   gap: 0.15rem;
-}
-
-.shell__more {
-  display: none;
 }
 
 .shell__nav-item {
@@ -3103,12 +3502,14 @@ html,
   }
 
   .shell__context {
-    margin-inline-end: auto;
     max-width: 100%;
   }
 
+  .shell__switcher {
+    margin-inline-end: auto;
+  }
+
   .shell__connection,
-  .shell__activity,
   .shell__topbar .shell__palette-button,
   .shell__main .shell__dashboard-search,
   .shell__topbar:not(.shell__topbar--has-sections) {
@@ -3182,6 +3583,21 @@ html,
 }
 
 @media (max-width: 639px) {
+  .shell__masthead {
+    position: relative;
+  }
+
+  .shell__switcher {
+    position: static;
+  }
+
+  .shell__switcher-menu {
+    inset-inline: 0;
+    width: auto;
+    min-width: 0;
+    max-width: none;
+  }
+
   .shell__masthead h1 span,
   .shell__audit-label {
     position: absolute;
@@ -3230,42 +3646,21 @@ html,
 
   .shell__primary-list {
     display: grid;
-    grid-template-columns: repeat(4, minmax(max-content, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 
   .shell__primary-list > li > .shell__nav-item {
+    flex-direction: column;
     justify-content: center;
-    gap: 0.2rem;
-    min-width: max-content;
-    min-height: 1.9rem;
-    padding-inline: 0.1rem;
+    gap: 0.15rem;
+    min-height: 2.75rem;
+    padding: 0.25rem 0.1rem;
     font-size: 0.75rem;
+    line-height: 1.15;
   }
 
   .shell__primary-list > li > .shell__nav-item .app-icon {
     width: 0.8125rem;
-  }
-
-  .shell__primary-list .shell__wide-destination {
-    display: none;
-  }
-
-  .shell__more {
-    position: relative;
-    display: block;
-  }
-
-  .shell__more-list {
-    position: absolute;
-    z-index: 2;
-    inset-block-start: calc(100% + 0.25rem);
-    inset-inline-end: 0;
-    min-width: 8.75rem;
-    padding: 0.25rem;
-    border: 1px solid var(--border-strong);
-    border-radius: var(--radius-md);
-    background: var(--bg-elevated);
-    box-shadow: var(--shadow-lg);
   }
 
   .shell__segments button {

@@ -613,6 +613,12 @@ export interface DesktopProjectContext {
   project_name: string;
   profile_id: string;
   profile_name: string;
+  is_shared?: boolean;
+}
+export interface DesktopFolderInspection {
+  path: string;
+  has_config: boolean;
+  folder_name: string;
 }
 export interface DesktopImportEnvRequest {
   confirmation?: string;

@@ -975,3 +975,269 @@ async fn pending_profile_actions_use_team_sync_grants_and_return_status_metadata
     server.await?.map_err(|error| error.to_string())?;
     Ok(())
 }
+
+#[test]
+fn shared_vault_lists_first_refreshes_without_folder_and_guards_folder_actions()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let shared_id = "lk_proj_shared_test0000000000000000";
+    {
+        let db = locket_store::Store::open(&fixture.store)?;
+        db.insert_project_if_absent(shared_id, "@shared", 2)?;
+        db.insert_profile_if_absent("lk_prof_shared_default", shared_id, "default", false, 2)?;
+    }
+
+    let opened = open_shared_vault_at(&fixture.store, None, || Err("Unexpected init".into()))?;
+    assert_eq!(opened.project_id, shared_id);
+    assert_eq!(opened.project_name, "@shared");
+    assert_eq!(opened.profile_id, "lk_prof_shared_default");
+    assert_eq!(opened.profile_name, "default");
+    assert!(opened.is_shared);
+    assert!(opened.root.is_empty());
+
+    let listed = list_projects_at(&fixture.store)?;
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0], opened);
+    assert_eq!(listed[1].project_id, fixture.id);
+    assert!(!listed[1].is_shared);
+
+    assert_eq!(refresh_context_at(&fixture.store, &opened)?, opened);
+    assert_eq!(project_context_with_selection(&fixture.store, shared_id, Some(&opened))?, opened);
+
+    let readiness = variable_readiness_at(
+        &fixture.store,
+        &DesktopReadinessRequest { project_id: shared_id.into(), policy_name: None },
+    )?;
+    assert!(readiness.policies.is_empty());
+    assert_eq!(readiness.project_id, shared_id);
+    assert_eq!(readiness.profile_id, opened.profile_id);
+
+    let start = start_plan(&fixture.store, Some(shared_id))?;
+    assert_eq!(start.cwd, application_directory()?);
+    assert_eq!(start.args, ["agent", "start"]);
+    assert!(start.input.is_none());
+    assert_eq!(
+        project_config_path(&fixture.store, shared_id).err().as_deref(),
+        Some("Environments require a connected project folder with locket.toml.")
+    );
+    assert_eq!(
+        policy_context(&fixture.store, shared_id, "test").err().as_deref(),
+        Some("Commands require a connected project folder with locket.toml.")
+    );
+    assert_eq!(
+        save_policy_payload(&fixture.store, &opened, serde_json::json!({"project_id": shared_id}))
+            .err()
+            .as_deref(),
+        Some("Saving commands requires a connected project folder with locket.toml.")
+    );
+    assert_eq!(
+        scan_project_with(
+            &fixture.store,
+            shared_id,
+            || Err("Unexpected CLI resolution".into()),
+            |_, _, _| Err("Unexpected launch".into()),
+        )
+        .err()
+        .as_deref(),
+        Some("Scanning requires a connected project folder with locket.toml.")
+    );
+
+    let db = Store::open(&fixture.store)?;
+    db.trust_project_root(shared_id, &root_hash(&fixture.root), fixture.root.to_str(), 2)?;
+    fs::write(
+        fixture.root.join("locket.toml"),
+        format!(
+            "schema_version = 1\nproject_id = '{shared_id}'\nname = '@shared'\ndefault_profile = 'default'\n"
+        ),
+    )?;
+    assert_eq!(
+        open_project_at(&fixture.store, &fixture.root).err().as_deref(),
+        Some("Open the Global Vault from the vault list.")
+    );
+    assert_eq!(list_projects_at(&fixture.store)?, [opened]);
+    Ok(())
+}
+
+#[test]
+fn opening_shared_vault_initializes_only_on_implicit_absence() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let shared_id = "lk_proj_shared_open_test";
+    let unexpected_init = || Err("Unexpected init".to_string());
+    assert_eq!(
+        open_shared_vault_at(&fixture.store, Some(&fixture.id), unexpected_init).err().as_deref(),
+        Some("Requested vault ID must identify a Global Vault.")
+    );
+    assert_eq!(
+        open_shared_vault_at(&fixture.store, Some(shared_id), unexpected_init).err().as_deref(),
+        Some("Global Vault is not registered in this store.")
+    );
+    let corrupt = fixture.directory.path().join("corrupt.db");
+    fs::write(&corrupt, "invalid vault contents")?;
+    assert_eq!(
+        open_shared_vault_at(&corrupt, None, unexpected_init).err().as_deref(),
+        Some("Cannot read Global Vault metadata. Check the local vault with `locket doctor`.")
+    );
+
+    let db = Store::open(&fixture.store)?;
+    let opened = open_shared_vault_at(&fixture.store, None, || {
+        db.insert_project_if_absent(shared_id, "@shared", 2).map_err(|error| error.to_string())?;
+        db.insert_profile_if_absent("shared-default", shared_id, "default", false, 2)
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    })?;
+    assert_eq!(opened.project_id, shared_id);
+    assert_eq!(open_shared_vault_at(&fixture.store, Some(shared_id), unexpected_init)?, opened);
+    db.connection().execute("DELETE FROM profiles WHERE id = 'shared-default'", [])?;
+    assert_eq!(
+        open_shared_vault_at(&fixture.store, None, unexpected_init).err().as_deref(),
+        Some("Global Vault has no profile. Check the local vault with `locket doctor`.")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn shared_vault_status_and_import_grants_use_the_selected_profile_and_revoke_on_change()
+-> Result<(), Box<dyn Error>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let fixture = Fixture::new()?;
+    let shared_id = "lk_proj_shared_grant_test";
+    let db = Store::open(&fixture.store)?;
+    db.insert_project_if_absent(shared_id, "@shared", 2)?;
+    db.insert_profile_if_absent("shared-default", shared_id, "default", false, 2)?;
+    db.insert_profile_if_absent("shared-other", shared_id, "other", false, 2)?;
+    let context = project_context_with_selection(&fixture.store, shared_id, None)?;
+    let import_request = |path| DesktopImportEnvRequest {
+        project_id: shared_id.into(),
+        path,
+        overwrite: false,
+        literal: false,
+        confirmation: None,
+    };
+    assert_eq!(
+        import_env_payload(&fixture.store, &context, import_request(".env".into()))
+            .err()
+            .as_deref(),
+        Some("Choose an absolute env file path when importing into the Global Vault.")
+    );
+    let env_path = fixture.root.join(".env");
+    let payload = import_env_payload(&fixture.store, &context, import_request(env_path.clone()))?;
+    let socket = fixture.directory.path().join("shared.sock");
+    let listener = tokio::net::UnixListener::bind(&socket)?;
+    let store_path = fixture.store.clone();
+    let expected_binding = serde_json::to_value(native_binding()?)?;
+    let server = tokio::spawn(async move {
+        for (index, kind) in
+            ["Status", "RequestGrant", "ImportDotenv", "RevokeGrant", "RequestGrant", "RevokeGrant"]
+                .into_iter()
+                .enumerate()
+        {
+            let (mut stream, _) = listener.accept().await?;
+            let length = stream.read_u32_le().await?;
+            let mut bytes = vec![0; length as usize];
+            stream.read_exact(&mut bytes).await?;
+            let request: locket_agent::RequestEnvelope = serde_json::from_slice(&bytes)?;
+            assert_eq!(request.kind, kind);
+            let value = match kind {
+                "Status" => {
+                    assert_eq!(request.payload["project_id"], shared_id);
+                    let mut status = locket_agent::StatusPayload::locked("fake");
+                    status.project_id = Some(shared_id.into());
+                    serde_json::to_value(status)?
+                }
+                "RequestGrant" => {
+                    assert_eq!(request.payload["project_id"], shared_id);
+                    assert_eq!(request.payload["profile_id"], "shared-default");
+                    assert_eq!(request.payload["action"], "ImportDotenv");
+                    assert_eq!(request.payload["binding"], expected_binding);
+                    if index == 4 {
+                        Store::open(&store_path)?
+                            .connection()
+                            .execute("DELETE FROM profiles WHERE id = 'shared-default'", [])?;
+                    }
+                    serde_json::json!({"grant_id": "shared-grant"})
+                }
+                "ImportDotenv" => {
+                    let import: locket_agent::ImportDotenvRequest =
+                        serde_json::from_value(request.payload)?;
+                    assert_eq!(import.scope.project_id, shared_id);
+                    assert_eq!(import.scope.profile_id, "shared-default");
+                    assert_eq!(import.scope.store_path, store_path);
+                    assert!(import.scope.project_root.as_os_str().is_empty());
+                    assert_eq!(import.scope.grant_id.as_deref(), Some("shared-grant"));
+                    assert_eq!(serde_json::to_value(import.scope.binding)?, expected_binding);
+                    assert_eq!(import.env_path, env_path);
+                    serde_json::json!({"imported": 1})
+                }
+                _ => {
+                    assert_eq!(request.payload["grant_id"], "shared-grant");
+                    serde_json::json!({})
+                }
+            };
+            let response = locket_agent::ResponseEnvelope::Success(
+                locket_agent::SuccessEnvelope::new(request.id, value),
+            );
+            stream
+                .write_all(&locket_agent::encode_frame(
+                    &response,
+                    locket_agent::DEFAULT_MAX_MESSAGE_SIZE,
+                )?)
+                .await?;
+        }
+        Ok::<(), Box<dyn Error + Send + Sync>>(())
+    });
+    let status = fetch_context_status(&socket, &context).await?;
+    assert_eq!(status.project_id.as_deref(), Some(shared_id));
+    assert_eq!(status.profile_name.as_deref(), Some("default"));
+    assert_eq!(status.lock_state, locket_agent::LockState::Locked);
+    let imported: serde_json::Value = invoke_granted_at(
+        &socket,
+        locket_agent::AgentMethod::ImportDotenv,
+        locket_agent::GrantAction::ImportDotenv,
+        payload.clone(),
+        &fixture.store,
+        &context,
+    )
+    .await?;
+    assert_eq!(imported["imported"], 1);
+    let stale: Result<serde_json::Value, _> = invoke_granted_at(
+        &socket,
+        locket_agent::AgentMethod::ImportDotenv,
+        locket_agent::GrantAction::ImportDotenv,
+        payload,
+        &fixture.store,
+        &context,
+    )
+    .await;
+    assert!(
+        matches!(stale, Err(super::super::AgentClientError::Protocol { reason }) if reason.contains("selected Global Vault profile changed"))
+    );
+    server.await?.map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[test]
+fn inspect_project_folder_detects_existing_and_missing_locket_toml() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let configured = inspect_project_folder_at(&fixture.root)?;
+    assert!(configured.has_config);
+    assert_eq!(configured.path, fixture.root.to_string_lossy());
+    assert_eq!(inspect_project_folder_at(&fixture.root.join("locket.toml"))?, configured);
+
+    let empty_dir = fixture.directory.path().join("fresh-repo");
+    fs::create_dir(&empty_dir)?;
+    let empty_canonical = empty_dir.canonicalize()?;
+    let unconfigured = inspect_project_folder_at(&empty_dir)?;
+    assert!(!unconfigured.has_config);
+    assert_eq!(unconfigured.folder_name, "fresh-repo");
+    assert_eq!(unconfigured.path, empty_canonical.to_string_lossy());
+    assert!(inspect_project_folder_at(Path::new(".")).is_err());
+    assert!(inspect_project_folder_at(&empty_dir.join("missing")).is_err());
+    fs::create_dir(empty_dir.join("locket.toml"))?;
+    assert_eq!(
+        inspect_project_folder_at(&empty_dir).err().as_deref(),
+        Some("Cannot inspect locket.toml in the selected folder.")
+    );
+    Ok(())
+}

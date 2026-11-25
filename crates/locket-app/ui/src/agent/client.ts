@@ -466,6 +466,16 @@ export async function desktopOpenProject(request: {
 }): Promise<AgentResult<DesktopProjectContext>> {
   return callTyped('desktop_open_project', { request });
 }
+export async function desktopOpenSharedVault(request?: {
+  project_id?: string;
+}): Promise<AgentResult<DesktopProjectContext>> {
+  return callTyped('desktop_open_shared_vault', request ? { request } : {});
+}
+export async function desktopInspectProjectFolder(request: {
+  path: string;
+}): Promise<AgentResult<import('./types').DesktopFolderInspection>> {
+  return callTyped('desktop_inspect_project_folder', { request });
+}
 export async function desktopInitializeProject(request: {
   path: string;
 }): Promise<AgentResult<DesktopProjectContext>> {

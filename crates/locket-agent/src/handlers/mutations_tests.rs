@@ -8,6 +8,7 @@ use locket_crypto::{
 use std::time::Duration;
 
 const PROJECT: &str = "lk_proj_mutation";
+const SHARED_PROJECT: &str = "lk_proj_shared_mutation";
 const PROFILE: &str = "lk_prof_actual";
 const NOW: i128 = 1_000;
 const MASTER: KeyBytes = [7; 32];
@@ -19,6 +20,13 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        Self::for_project(PROJECT, "fixture", "dev")
+    }
+    fn for_project(
+        project: &str,
+        project_name: &str,
+        profile_name: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let root = dir.path().join("project");
         std::fs::create_dir(&root)?;
@@ -26,23 +34,23 @@ impl Fixture {
         std::fs::write(
             root.join("locket.toml"),
             format!(
-                "# keep notes\nschema_version=1\nproject_id='{PROJECT}'\nname='fixture'\ndefault_profile='dev'\n[commands.dev]\nargv=['node','a b.js'] # keep argv\nrequire_agent=true\ninherit_env=['PATH']\nexternal_env_sources=['ide']\n"
+                "# keep notes\nschema_version=1\nproject_id='{project}'\nname='{project_name}'\ndefault_profile='{profile_name}'\n[commands.dev]\nargv=['node','a b.js'] # keep argv\nrequire_agent=true\ninherit_env=['PATH']\nexternal_env_sources=['ide']\n"
             ),
         )?;
         let scope = MutationScope {
             store_path: dir.path().join("store.db"),
             project_root: root,
-            project_id: PROJECT.into(),
+            project_id: project.into(),
             profile_id: PROFILE.into(),
             grant_id: Some("lk_grant_mutation".into()),
             binding: Some(GrantBinding::new(std::process::id(), "test-start")),
         };
         let mut store = Store::open(&scope.store_path)?;
         store.initialize_schema()?;
-        store.insert_project_if_absent(PROJECT, "fixture", 1)?;
-        store.insert_profile_if_absent(PROFILE, PROJECT, "dev", false, 1)?;
+        store.insert_project_if_absent(project, project_name, 1)?;
+        store.insert_profile_if_absent(PROFILE, project, profile_name, false, 1)?;
         store.trust_project_root(
-            PROJECT,
+            project,
             &Sha256::digest(scope.project_root.to_string_lossy().as_bytes()).into(),
             scope.project_root.to_str(),
             1,
@@ -54,9 +62,9 @@ impl Fixture {
         ] {
             let id = format!("lk_key_{}", purpose.as_str());
             let wrap =
-                derive_wrapping_key_v1(&MASTER, &HkdfWrapInfo::new(PROJECT, profile, purpose))?;
+                derive_wrapping_key_v1(&MASTER, &HkdfWrapInfo::new(project, profile, purpose))?;
             let aad = key_wrap_aad_v1(&KeyWrapAad::new(
-                PROJECT,
+                project,
                 &id,
                 profile,
                 0,
@@ -65,7 +73,7 @@ impl Fixture {
             let wrapped = wrap_key_material_v1(&wrap, &material, &aad)?;
             store.insert_key(&locket_store::KeyRecord {
                 id,
-                project_id: PROJECT.into(),
+                project_id: project.into(),
                 profile_id: profile.map(str::to_owned),
                 purpose: purpose.as_str().into(),
                 wrapped_material: wrapped.ciphertext,
@@ -91,7 +99,8 @@ impl Fixture {
             &std::fs::read_to_string(self.scope.project_root.join("locket.toml")).unwrap(),
         )
         .unwrap();
-        let mut policy = CommandPolicySnapshot::from_policy(PROJECT, &parsed.commands["dev"], 1);
+        let mut policy =
+            CommandPolicySnapshot::from_policy(&self.scope.project_id, &parsed.commands["dev"], 1);
         policy.required_secrets = vec!["TOKEN".into()];
         policy.allowed_secrets = policy.required_secrets.clone();
         ApplyPolicyRequest {
@@ -542,6 +551,92 @@ fn relative_import_and_policy_request_limit_are_enforced_by_real_services()
     policy.policy.command_preview = "x".repeat(MAX_POLICY_BYTES);
     assert_eq!(apply_policy_with_master(&policy, &MASTER, 2).unwrap_err().code, "MetadataInvalid");
     assert_eq!(std::fs::read_to_string(fixture.scope.project_root.join("locket.toml"))?, source);
+    Ok(())
+}
+
+#[test]
+fn shared_vault_import_accepts_absolute_paths_without_editing_ignores()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = Fixture::for_project(SHARED_PROJECT, "@shared", "default")?;
+    let ignore = fixture.scope.project_root.join(".gitignore");
+    let original = "# keep notes\n";
+    std::fs::write(&ignore, original)?;
+    let mut request = fixture.import("TOKEN=shared\n", false);
+    request.scope.project_root = PathBuf::new();
+
+    let result = import_dotenv_with_master(&request, &MASTER, i64::try_from(NOW)?)?;
+    assert_eq!(result.imported, 1);
+    assert!(result.original_preserved);
+    assert!(result.maintenance_warning.is_none());
+    assert_eq!(std::fs::read_to_string(&request.env_path)?, "TOKEN=shared\n");
+    assert_eq!(std::fs::read_to_string(ignore)?, original);
+    assert!(
+        fixture
+            .store()
+            .get_secret_by_source(SHARED_PROJECT, PROFILE, "TOKEN", "user-local")?
+            .is_some()
+    );
+    Ok(())
+}
+
+#[test]
+fn shared_vault_import_rejects_relative_paths_even_with_a_trusted_folder()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = Fixture::for_project(SHARED_PROJECT, "@shared", "default")?;
+    let mut request = fixture.import("TOKEN=shared\n", false);
+    request.env_path = PathBuf::from(".env");
+
+    let failure = import_dotenv_with_master(&request, &MASTER, i64::try_from(NOW)?).unwrap_err();
+    assert_eq!(failure.code, "MetadataInvalid");
+    assert!(failure.message.contains("absolute env file path"));
+    assert!(
+        fixture
+            .store()
+            .get_secret_by_source(SHARED_PROJECT, PROFILE, "TOKEN", "user-local")?
+            .is_none()
+    );
+    Ok(())
+}
+
+#[test]
+fn shared_vault_policy_edit_requires_a_folder_backed_project_before_reading_keys()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = Fixture::for_project(SHARED_PROJECT, "@shared", "default")?;
+    let config = fixture.scope.project_root.join("locket.toml");
+    let source = std::fs::read(&config)?;
+    let mut request = fixture.policy();
+    for root in [PathBuf::new(), fixture.scope.project_root] {
+        request.scope.project_root = root;
+        let failure =
+            apply_policy_with_master(&request, &[42; 32], i64::try_from(NOW)?).unwrap_err();
+        assert_eq!(failure.code, "MetadataInvalid");
+        assert!(failure.message.contains("project folder"));
+        assert_eq!(std::fs::read(&config)?, source);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn shared_vault_profile_switch_rejects_folder_config()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = Fixture::for_project(SHARED_PROJECT, "@shared", "default")?;
+    let state = crate::AgentSocketState::locked("test");
+    let request = crate::SetActiveProfileRequest {
+        config_path: fixture.scope.project_root.join("locket.toml"),
+        store_path: fixture.scope.store_path,
+        project_id: SHARED_PROJECT.into(),
+        profile_name: "other".into(),
+        confirmation: None,
+        privacy_redact_names: false,
+        root_hash: None,
+    };
+    let response = super::super::profile::handle_set_active_profile(
+        &envelope(crate::AgentMethod::SetActiveProfile, &request),
+        &state,
+        NOW,
+    )
+    .await;
+    assert_eq!(code(response), "MetadataInvalid");
     Ok(())
 }
 

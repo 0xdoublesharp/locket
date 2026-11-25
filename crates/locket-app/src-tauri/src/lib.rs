@@ -478,6 +478,11 @@ struct DesktopSetActiveProfileRequest {
 
 impl DesktopSetActiveProfileRequest {
     fn into_agent_request(self) -> Result<locket_agent::SetActiveProfileRequest, AgentClientError> {
+        if desktop_actions::is_shared_project_id(&self.project_id) {
+            return Err(AgentClientError::Protocol {
+                reason: "Environments require a connected project folder with locket.toml.".into(),
+            });
+        }
         let store_path = resolve_path(self.store_path, default_store_path)?;
         let config_path = match self.config_path {
             Some(path) => path,
@@ -1090,6 +1095,8 @@ pub fn run() -> tauri::Result<()> {
         .invoke_handler(tauri::generate_handler![
             desktop_actions::desktop_list_projects,
             desktop_actions::desktop_open_project,
+            desktop_actions::desktop_open_shared_vault,
+            desktop_actions::desktop_inspect_project_folder,
             desktop_actions::desktop_initialize_project,
             desktop_actions::desktop_import_env,
             desktop_actions::desktop_start_agent,
@@ -1218,6 +1225,22 @@ mod tests {
         })?;
         assert_eq!(resolved, path);
         Ok(())
+    }
+
+    #[test]
+    fn shared_vault_cannot_switch_environments_even_with_an_explicit_config_path() {
+        let request = DesktopSetActiveProfileRequest {
+            config_path: Some(PathBuf::from("locket.toml")),
+            store_path: Some(PathBuf::from("store.db")),
+            project_id: "lk_proj_shared_test".into(),
+            profile_name: "other".into(),
+            confirmation: None,
+            privacy_redact_names: false,
+            root_hash: None,
+        };
+        assert!(
+            matches!(request.into_agent_request(), Err(AgentClientError::Protocol { reason }) if reason.contains("connected project folder"))
+        );
     }
 
     #[test]

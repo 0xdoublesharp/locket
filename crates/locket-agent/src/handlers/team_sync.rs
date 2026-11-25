@@ -595,6 +595,40 @@ mod tests {
         Ok(store)
     }
 
+    #[test]
+    fn shared_vault_team_sync_has_status_and_requires_owner_pin()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let local = directory.path().join("local");
+        let folder = directory.path().join("delivery");
+        std::fs::create_dir(&local)?;
+        std::fs::create_dir(&folder)?;
+        let path = local.join("store.db");
+        let store = open_sync_store(&path)?;
+        let project_id = "lk_proj_shared_team";
+        store.insert_project_if_absent(project_id, "@shared", 1)?;
+        let request = TeamSyncConfigureRequest {
+            scope: TeamSyncRequest {
+                project_id: project_id.into(),
+                store_path: Some(path.clone()),
+                profile_id: None,
+                grant_id: None,
+                binding: None,
+            },
+            folder,
+            allow_dangerous: false,
+        };
+        let authorize: team_sync::CommitAuthorization = std::sync::Arc::new(|| Ok(Box::new(())));
+        let result = configure_store(&store, &request, &path, &authorize);
+        assert!(
+            matches!(result, Err(team_sync::SyncError::Rejected(reason)) if reason.contains("independent owner pin"))
+        );
+        let status = team_sync::status(&store, project_id)?;
+        assert_eq!(status.state, "unanchored");
+        assert!(status.folder.is_none());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn observed_team_security_state_evicts_only_affected_project()
     -> Result<(), Box<dyn std::error::Error>> {

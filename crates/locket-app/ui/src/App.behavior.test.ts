@@ -15,6 +15,7 @@ interface AppState {
   activeContext: DesktopProjectContext | null;
   selectedSecret: SecretRowMeta | null;
   projectPath: string;
+  envPath: string;
   desktopBusy: boolean;
   desktopError: string | null;
   revealError: string | null;
@@ -32,7 +33,9 @@ interface AppState {
     confirmation: undefined;
     dangerous: boolean;
   }) => Promise<void>;
-  selectView: (view: 'dashboard' | 'secrets' | 'settings' | 'scan') => void;
+  selectView: (
+    view: 'dashboard' | 'secrets' | 'settings' | 'scan' | 'policies' | 'secret-editor',
+  ) => void;
 }
 
 const project = (name: string): DesktopProjectContext => ({
@@ -44,6 +47,14 @@ const project = (name: string): DesktopProjectContext => ({
 });
 const a = project('A');
 const b = project('B');
+const shared: DesktopProjectContext = {
+  root: '',
+  project_id: 'lk_proj_shared_test',
+  project_name: '@shared',
+  profile_id: 'lk_prof_shared_default',
+  profile_name: 'default',
+  is_shared: true,
+};
 const secret = (name = 'TOKEN'): SecretRowMeta => ({
   id: name,
   name,
@@ -71,6 +82,9 @@ async function nativeInvoke(command: string, args?: InvokeArgs): Promise<unknown
   switch (command) {
     case 'desktop_list_projects':
       return [];
+    case 'desktop_open_shared_vault':
+      nativeSelection = shared;
+      return nativeSelection;
     case 'desktop_open_project': {
       const path = (args as { request: { path: string } }).request.path;
       nativeSelection = path === b.root ? b : a;
@@ -735,9 +749,213 @@ describe('desktop scan terminal handoff in the mounted app', () => {
     await settle();
     await app.state.refresh();
     await settle();
-    expect(findNode(app.root, (node) => node.text === 'No project')).toBeDefined();
-    expect(findNode(app.root, (node) => node.text === '0.1.1')).toBeDefined();
+    expect(findNode(app.root, (node) => node.text.trim() === 'No project')).toBeDefined();
+    expect(findNode(app.root, (node) => node.text === 'Agent live · 0.1.1')).toBeDefined();
     expect(findNode(app.root, (node) => node.text === 'Unavailable')).toBeUndefined();
+    expect(findNode(app.root, (node) => node.text === 'Welcome to Locket')).toBeDefined();
+    expect(findNode(app.root, (node) => node.text === 'Start with Global Vault')).toBeDefined();
+    expect(findNode(app.root, (node) => node.text === 'Configuration checks')).toBeUndefined();
+    expect(findNode(app.root, (node) => node.text === 'Recent')).toBeUndefined();
     app.unmount();
+  });
+
+  it('opens Global Vault from Welcome and lands directly in Secrets', async () => {
+    overrides.set('desktop_list_projects', () => (nativeSelection ? [shared] : []));
+    const app = mountApp();
+    await settle();
+    const button = findNode(
+      app.root,
+      (node) =>
+        node.tag === 'button' &&
+        !!findNode(node, (content) => content.text.includes('Create Global Vault')),
+    );
+    expect(button).toBeDefined();
+    (button!.props.onClick as () => void)();
+    await settle();
+    expect(invoke).toHaveBeenCalledWith('desktop_open_shared_vault', {});
+    expect(app.state.selectedProject).toEqual(shared);
+    expect(findNode(app.root, (node) => node.text.includes('default'))).toBeDefined();
+    expect(findNode(app.root, (node) => node.text === 'Welcome to Locket')).toBeUndefined();
+    app.unmount();
+  });
+
+  it('auto-detects missing locket.toml and prompts to initialize instead of guessing', async () => {
+    overrides.set('desktop_list_projects', () => []);
+    overrides.set('desktop_inspect_project_folder', () => ({
+      path: '/fixture/fresh-app',
+      has_config: false,
+      folder_name: 'fresh-app',
+    }));
+    const app = mountApp();
+    await settle();
+    app.state.projectPath = '/fixture/fresh-app';
+    await settle();
+    const form = findNode(app.root, (node) => node.tag === 'form' && !!node.props.onSubmit);
+    expect(form).toBeDefined();
+    (form!.props.onSubmit as (event: Event) => void)(new Event('submit'));
+    await settle();
+    expect(invoke).toHaveBeenCalledWith('desktop_inspect_project_folder', {
+      request: { path: '/fixture/fresh-app' },
+    });
+    expect(calls).not.toContain('desktop_open_project');
+    expect(findNode(app.root, (node) => node.text.includes('Initialize & open'))).toBeDefined();
+    app.unmount();
+  });
+});
+
+describe('Global Vault workspace actions', () => {
+  type MountedApp = ReturnType<typeof mountApp>;
+
+  function click(app: MountedApp, label: string) {
+    const button = findNode(app.root, (node) => node.tag === 'button' && node.text.includes(label));
+    expect(button).toBeDefined();
+    expect(button?.props.disabled).toBeFalsy();
+    (button?.props.onClick as () => void)();
+  }
+
+  async function switchToShared(app: MountedApp) {
+    const switcher = findNode(
+      app.root,
+      (node) =>
+        node.props['aria-expanded'] === false &&
+        node.props.class === 'companion-button shell__context',
+    );
+    expect(switcher).toBeDefined();
+    (switcher?.props.onClick as () => void)();
+    await settle();
+    const item = findNode(
+      app.root,
+      (node) => node.tag === 'strong' && node.text === 'Global Vault (@shared)',
+    );
+    expect(item).toBeDefined();
+    (item?.parent?.parent?.props.onClick as () => void)();
+    await settle();
+    expect(app.state.activeContext).toEqual(shared);
+  }
+
+  it('clears a project import path and requires an absolute env path in Global Vault', async () => {
+    const app = await connectedApp();
+    overrides.set('desktop_import_env', () => ({ summary: 'Imported 1 variable.' }));
+    app.state.selectView('secret-editor');
+    app.state.envPath = 'config/.env';
+    await settle();
+    expect(findNode(app.root, (node) => node.text.includes('Relative paths start'))).toBeDefined();
+
+    await switchToShared(app);
+    expect(app.state.envPath).toBe('');
+    expect(
+      findNode(app.root, (node) => node.text.includes('Choose an absolute path')),
+    ).toBeDefined();
+    expect(
+      findNode(app.root, (node) => node.text.includes('Relative paths start')),
+    ).toBeUndefined();
+
+    const importForm = findNode(
+      app.root,
+      (node) => node.props['aria-labelledby'] === 'import-heading',
+    );
+    const submit = findNode(
+      importForm!,
+      (node) => node.tag === 'button' && node.props.type === 'submit',
+    );
+    const submitImport = () =>
+      (submit?.parent?.props.onSubmit as (event: Event) => void)(new Event('submit'));
+    app.state.envPath = '.env';
+    await settle();
+    expect(submit?.props.disabled).toBe(true);
+    submitImport();
+    await settle();
+    expect(calls).not.toContain('desktop_import_env');
+
+    app.state.envPath = '/fixture/Downloads/.env';
+    await settle();
+    expect(submit?.props.disabled).toBe(false);
+    submitImport();
+    await settle();
+    expect(invoke).toHaveBeenCalledWith('desktop_import_env', {
+      request: expect.objectContaining({ project_id: shared.project_id, path: app.state.envPath }),
+    });
+
+    await app.state.connectProject(false, b.root);
+    expect(app.state.envPath).toBe('.env');
+  });
+
+  it.each(['policies', 'scan'] as const)('connects a folder from the %s callout', async (view) => {
+    const app = await connectedApp();
+    await switchToShared(app);
+    app.state.selectView(view);
+    await settle();
+    expect(
+      findNode(app.root, (node) => node.props['aria-labelledby'] === 'project-required-heading'),
+    ).toBeDefined();
+
+    if (view === 'scan') await app.state.handleTrayMenuAction('start-scan');
+    expect(calls).not.toContain('desktop_scan_project');
+    expect(invoke).not.toHaveBeenCalledWith('agent_list_policies', {
+      request: { project_id: shared.project_id, privacy_redact_names: false },
+    });
+
+    overrides.set('desktop_pick_directory', () => b.root);
+    overrides.set('desktop_inspect_project_folder', () => ({
+      path: b.root,
+      has_config: true,
+      folder_name: 'B',
+    }));
+    click(app, 'Connect a project folder');
+    await settle();
+    expect(invoke).toHaveBeenCalledWith('desktop_open_project', { request: { path: b.root } });
+    expect(app.state.activeContext).toEqual(b);
+    expect(
+      findNode(app.root, (node) => node.props['aria-labelledby'] === 'project-required-heading'),
+    ).toBeUndefined();
+  });
+
+  it('asks before initializing a folder picked from Global Vault', async () => {
+    const app = await connectedApp();
+    await switchToShared(app);
+    app.state.selectView('policies');
+    await settle();
+    overrides.set('desktop_pick_directory', () => b.root);
+    overrides.set('desktop_inspect_project_folder', () => ({
+      path: b.root,
+      has_config: false,
+      folder_name: 'B',
+    }));
+    overrides.set('desktop_initialize_project', () => (nativeSelection = b));
+    click(app, 'Connect a project folder');
+    await settle();
+    expect(calls).not.toContain('desktop_initialize_project');
+    expect(app.state.activeContext).toEqual(shared);
+
+    click(app, 'Initialize & open');
+    await settle();
+    expect(invoke).toHaveBeenCalledWith('desktop_initialize_project', {
+      request: { path: b.root },
+    });
+    expect(app.state.activeContext).toEqual(b);
+  });
+
+  it('accepts a typed project path when the native picker is unavailable', async () => {
+    const app = await connectedApp();
+    await switchToShared(app);
+    app.state.selectView('policies');
+    await settle();
+    overrides.set('desktop_pick_directory', () => Promise.reject('Picker unavailable'));
+    overrides.set('desktop_inspect_project_folder', () => ({
+      path: b.root,
+      has_config: true,
+      folder_name: 'B',
+    }));
+    click(app, 'Connect a project folder');
+    await settle();
+    expect(findNode(app.root, (node) => node.props.id === 'manual-project-path')).toBeDefined();
+
+    app.state.projectPath = b.root;
+    await settle();
+    const form = findNode(app.root, (node) => node.tag === 'form' && !!node.props.onSubmit);
+    (form?.props.onSubmit as (event: Event) => void)(new Event('submit'));
+    await settle();
+    expect(app.state.activeContext).toEqual(b);
+    expect(findNode(app.root, (node) => node.props.id === 'manual-project-path')).toBeUndefined();
   });
 });
