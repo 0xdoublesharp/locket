@@ -627,6 +627,54 @@ export interface DesktopImportEnvRequest {
   overwrite: boolean;
   literal: boolean;
 }
+export interface DesktopCreateProfileRequest {
+  project_id: string;
+  profile_name: string;
+}
+export interface DesktopCreateProfileResponse {
+  profile_id: string;
+  profile_name: string;
+  dangerous: boolean;
+  created: boolean;
+}
+export interface DesktopDeleteSecretRequest {
+  project_id: string;
+  profile_id: string;
+  secret_name: string;
+  source: SecretSourceWire;
+  confirmation?: string;
+}
+export interface DesktopDeleteSecretResponse {
+  secret_name: string;
+  source: SecretSourceWire;
+  version: number;
+  deleted: boolean;
+}
+export interface DesktopCopySecretToSharedRequest {
+  from_project_id: string;
+  from_profile_id: string;
+  secret_name: string;
+  source?: SecretSourceWire;
+  overwrite?: boolean;
+  confirmation?: string;
+}
+export interface DesktopCopySecretToSharedResponse {
+  target_project_id: string;
+  target_profile_id: string;
+  secret_name: string;
+  version: number;
+  action: 'create' | 'rotate';
+}
+export interface DesktopDetectCommandsRequest {
+  project_id: string;
+}
+export interface DetectedCommandRow {
+  name: string;
+  argv: string[];
+  command_preview: string;
+  source_file: string;
+  already_configured: boolean;
+}
 export interface DesktopSavePolicyRequest {
   project_id: string;
   mode: 'create' | 'edit' | 'delete';

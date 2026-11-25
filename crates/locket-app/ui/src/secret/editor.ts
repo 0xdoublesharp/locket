@@ -3,10 +3,6 @@
 // The Vue view (`SecretEditorView.vue`) mirrors form state through
 // these helpers so dangerous-typed-confirmation, payload-construction,
 // and validation stay testable without spinning up jsdom.
-//
-// The desktop uses a shared write path for create and rotate. Delete
-// remains CLI-directed so the desktop can keep a metadata-only handoff
-// without duplicating lifecycle policy in the webview.
 
 export type SecretSource = 'team-managed' | 'user-local' | 'machine-local';
 

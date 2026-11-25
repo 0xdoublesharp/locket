@@ -5,6 +5,7 @@ import AppIcon from '../components/AppIcon.vue';
 import VariableReadinessPanel from '../components/VariableReadinessPanel.vue';
 
 import type { CommandPolicyRow } from '../types/views';
+import type { DetectedCommandRow } from '../agent/types';
 
 defineOptions({ name: 'PolicyEditor' });
 
@@ -21,12 +22,16 @@ interface Props {
   running?: boolean;
   runError?: string | null;
   runNotice?: string | null;
+  detectedCommands?: DetectedCommandRow[];
+  detectingCommands?: boolean;
+  detectionError?: string | null;
 }
 
 const props = defineProps<Props>();
 const emit = defineEmits<{
   refresh: [];
   create: [];
+  addDetected: [row: DetectedCommandRow];
   edit: [row: CommandPolicyRow];
   delete: [row: CommandPolicyRow];
   run: [row: CommandPolicyRow];
@@ -69,6 +74,9 @@ const isEmpty = computed<boolean>(
 );
 const isFilteredEmpty = computed<boolean>(
   () => !props.loading && sortedRows.value.length > 0 && filteredRows.value.length === 0,
+);
+const unconfiguredCommands = computed(() =>
+  (props.detectedCommands ?? []).filter((row) => !row.already_configured),
 );
 
 function policyLabel(row: CommandPolicyRow): string {
@@ -232,7 +240,9 @@ function startDelete(): void {
     <p v-else-if="errorMessage" class="view__empty">{{ errorMessage }}</p>
 
     <p v-else-if="isEmpty" class="view__empty">
-      No commands yet. Choose New command to approve a command and its variable access.
+      No commands yet.<template v-if="!detectingCommands && unconfiguredCommands.length === 0">
+        Choose New command to approve a command and its variable access.</template
+      >
     </p>
 
     <p v-else-if="isFilteredEmpty" class="view__empty">No matching policies.</p>
@@ -408,6 +418,45 @@ function startDelete(): void {
         />
       </aside>
     </div>
+
+    <p v-if="!privacyMode && detectingCommands" class="view__loading" role="status">
+      Looking for commands in this folder…
+    </p>
+    <p v-else-if="!privacyMode && detectionError" class="view__empty" role="status">
+      {{ detectionError }}
+    </p>
+    <details
+      v-else-if="!privacyMode && unconfiguredCommands.length"
+      :key="String(isEmpty)"
+      class="detected-commands"
+      :open="isEmpty"
+    >
+      <summary>
+        Detected commands <span class="badge">{{ unconfiguredCommands.length }}</span>
+      </summary>
+      <ul class="detected-commands__list">
+        <li
+          v-for="row in unconfiguredCommands"
+          :key="`${row.source_file}:${row.name}:${row.command_preview}`"
+          class="detected-commands__row"
+        >
+          <div class="detected-commands__body">
+            <strong>{{ row.name }}</strong>
+            <span class="badge">{{ row.source_file }}</span>
+            <code>{{ row.command_preview }}</code>
+          </div>
+          <button
+            type="button"
+            class="companion-button"
+            :disabled="!actionsEnabled"
+            :aria-label="`Add command ${row.name}`"
+            @click="emit('addDetected', row)"
+          >
+            Add command
+          </button>
+        </li>
+      </ul>
+    </details>
   </section>
 </template>
 
@@ -419,6 +468,47 @@ function startDelete(): void {
   padding: 1rem;
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
+}
+.detected-commands {
+  margin-top: 1rem;
+  padding: 0.75rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-app);
+  font-size: 0.875rem;
+}
+.detected-commands summary {
+  width: fit-content;
+  font-weight: 600;
+  cursor: pointer;
+}
+.detected-commands__list {
+  display: grid;
+  gap: 0.5rem;
+  margin: 0.75rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+.detected-commands__row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--border-subtle);
+}
+.detected-commands__body {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 0.5rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.detected-commands__body code {
+  flex-basis: 100%;
+  color: var(--text-secondary);
 }
 
 .view__header {

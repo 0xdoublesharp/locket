@@ -4,8 +4,15 @@ import type {
   AgentStatus,
   AuditWireRow,
   CommandPolicyWireRow,
+  DesktopCopySecretToSharedRequest,
+  DesktopCopySecretToSharedResponse,
+  DesktopCreateProfileRequest,
+  DesktopCreateProfileResponse,
+  DesktopDeleteSecretRequest,
+  DesktopDeleteSecretResponse,
   DesktopProjectContext,
   DesktopSavePolicyRequest,
+  DetectedCommandRow,
   DeviceMemberWireRow,
   DiscoverSecretsRequest,
   DiscoveredSecretWire,
@@ -30,7 +37,6 @@ export function createMockRuntime(params: URLSearchParams) {
   const now = Date.now() * 1_000_000;
   const minute = 60_000_000_000;
   const day = 1440 * minute;
-  let unlocked = scenario !== 'locked';
   let launchAtLogin = false;
   let sequence = 0;
   const verification: EffectiveUserVerificationSettings = {
@@ -43,7 +49,6 @@ export function createMockRuntime(params: URLSearchParams) {
     device_register: true,
   };
   const config = { privacy_redact_names: false, agent_unlock_ttl: '1h' };
-  let unlockedFor = 3600;
 
   const isWelcome = scenario === 'welcome';
   const projects: DesktopProjectContext[] = isWelcome
@@ -75,6 +80,9 @@ export function createMockRuntime(params: URLSearchParams) {
         },
       ];
   let selected = projects.find((project) => !project.is_shared) ?? null;
+  const unlockedProjects = new Map(
+    scenario === 'locked' ? [] : projects.map(({ project_id }) => [project_id, 3600]),
+  );
   const profiles = new Map([
     ['acme-api-dev', { project: 'acme-api', name: 'dev', dangerous: false }],
     ['acme-api-staging', { project: 'acme-api', name: 'staging', dangerous: false }],
@@ -112,7 +120,13 @@ export function createMockRuntime(params: URLSearchParams) {
         }));
   if (secrets.length) {
     secrets.push(
-      { ...secrets[4]!, id: 'variable-shared-email', profile_id: 'shared-default' },
+      {
+        ...secrets[4]!,
+        id: 'variable-shared-email',
+        profile_id: 'shared-default',
+        source: 'user-local',
+        source_precedence: 2,
+      },
       { ...secrets[5]!, id: 'variable-web-monitoring', profile_id: 'web-app-dev' },
       { ...secrets[0]!, id: 'variable-staging-database', profile_id: 'acme-api-staging' },
       { ...secrets[2]!, id: 'variable-prod-billing', profile_id: 'acme-api-prod' },
@@ -120,7 +134,7 @@ export function createMockRuntime(params: URLSearchParams) {
   }
 
   const definitions = [
-    ['dev-server', 'pnpm dev', ['DATABASE_URL', 'OPENAI_API_KEY'], ['SENTRY_DSN']],
+    ['dev-server', 'pnpm run dev', ['DATABASE_URL', 'OPENAI_API_KEY'], ['SENTRY_DSN']],
     ['db-migrate', 'pnpm db:migrate', ['DATABASE_URL'], []],
     ['deploy-prod', 'pnpm deploy', ['STRIPE_SECRET_KEY@v2'], ['POSTMARK_TOKEN']],
   ] as const;
@@ -197,19 +211,24 @@ export function createMockRuntime(params: URLSearchParams) {
   const values = new Map<string, string>();
   let teamFolder = `${workspace}/acme-api/.locket/team`;
 
+  function unlockTtl(): number | null {
+    return selected ? (unlockedProjects.get(selected.project_id) ?? null) : null;
+  }
+
   function status(): AgentStatus {
+    const ttl = unlockTtl();
     return {
-      lock_state: selected ? (unlocked ? 'unlocked' : 'locked') : 'locked',
+      lock_state: ttl === null ? 'locked' : 'unlocked',
       project_id: selected?.project_id ?? null,
       profile_name: selected?.profile_name ?? null,
-      live_grant_count: selected && unlocked ? 1 : 0,
+      live_grant_count: ttl === null ? 0 : 1,
       agent_version: '0.2.0',
-      unlock_ttl_seconds: selected && unlocked ? unlockedFor : null,
+      unlock_ttl_seconds: ttl,
       running_session_count: selected
         ? sessions.filter((session) => session.state === 'running').length
         : 0,
       scan_warning_count: 0,
-      recent_audit_status: selected && unlocked ? 'ok' : 'unknown',
+      recent_audit_status: ttl === null ? 'unknown' : 'ok',
       pinned_reference_warning_count: selected && policies.length ? 1 : 0,
       session_monitoring: 'active: macOS native notifications',
     };
@@ -314,19 +333,22 @@ export function createMockRuntime(params: URLSearchParams) {
 
   function saveSecret(request: SetSecretRequest, rotate: boolean): SetSecretResponse {
     requireUnlocked();
-    const existing = secrets.find(
-      (row) => row.name === request.secret_name && row.profile_id === request.profile_id,
-    );
     const source: SecretWireRow['source'] =
       request.source === 'team-managed' || request.source === 'machine-local'
         ? request.source
         : 'user-local';
+    const existing = secrets.find(
+      (row) =>
+        row.name === request.secret_name &&
+        row.profile_id === request.profile_id &&
+        row.source === source,
+    );
     const row: SecretWireRow = existing ?? {
       id: `variable-new-${++sequence}`,
       profile_id: request.profile_id,
       name: request.secret_name,
       source,
-      source_precedence: 2,
+      source_precedence: source === 'team-managed' ? 1 : source === 'user-local' ? 2 : 3,
       origin: 'local',
       current_version: 0,
       state: 'active',
@@ -338,12 +360,122 @@ export function createMockRuntime(params: URLSearchParams) {
     if (!existing) secrets.push(row);
     row.current_version++;
     if (rotate) row.last_rotated_at = now;
-    values.set(`${row.profile_id}:${row.name}`, request.value);
+    values.set(row.id, request.value);
     return {
       action: rotate ? 'rotated' : 'set',
       secret_id: row.id,
       version: row.current_version,
       source: row.source,
+    };
+  }
+
+  function createProfile(request: DesktopCreateProfileRequest): DesktopCreateProfileResponse {
+    requireUnlocked();
+    if (
+      [...profiles.values()].some(
+        (profile) =>
+          profile.project === request.project_id && profile.name === request.profile_name,
+      )
+    )
+      fail(
+        'SecretAlreadyExists',
+        'An environment with this name already exists.',
+        'Choose another name.',
+      );
+    const id = `${request.project_id}-profile-${++sequence}`;
+    profiles.set(id, { project: request.project_id, name: request.profile_name, dangerous: false });
+    return { profile_id: id, profile_name: request.profile_name, dangerous: false, created: true };
+  }
+
+  function requireProfileConfirmation(profileId: string, confirmation?: string): void {
+    const profile = profiles.get(profileId);
+    if (profile?.dangerous && confirmation !== profile.name) {
+      fail(
+        'DangerousProfileConfirmationRequired',
+        'Confirm the dangerous environment.',
+        'Confirm the action with the environment name.',
+      );
+    }
+  }
+
+  function deleteSecret(request: DesktopDeleteSecretRequest): DesktopDeleteSecretResponse {
+    requireUnlocked();
+    requireProfileConfirmation(request.profile_id, request.confirmation);
+    const index = secrets.findIndex(
+      (row) =>
+        row.profile_id === request.profile_id &&
+        row.name === request.secret_name &&
+        row.source === request.source,
+    );
+    if (index < 0) fail('SecretNotFound', 'The secret was not found.', 'Refresh the secret list.');
+    const [row] = secrets.splice(index, 1);
+    values.delete(row!.id);
+    return {
+      secret_name: row!.name,
+      source: row!.source,
+      version: row!.current_version,
+      deleted: true,
+    };
+  }
+
+  function copyToShared(
+    request: DesktopCopySecretToSharedRequest,
+  ): DesktopCopySecretToSharedResponse {
+    requireUnlocked();
+    const target = projects.find((project) => project.is_shared);
+    if (!target)
+      fail(
+        'ProjectNotFound',
+        'Set up the Global Vault before copying the secret.',
+        'Open Global Vault.',
+      );
+    if (!unlockedProjects.has(target.project_id)) {
+      fail(
+        'UnlockRequired',
+        'Unlock the Global Vault before copying the secret.',
+        'Open Global Vault and unlock it.',
+      );
+    }
+    requireProfileConfirmation(request.from_profile_id, request.confirmation);
+    requireProfileConfirmation(target.profile_id, request.confirmation);
+    const source = secrets
+      .filter(
+        (row) =>
+          row.profile_id === request.from_profile_id &&
+          row.name === request.secret_name &&
+          (request.source === undefined || row.source === request.source),
+      )
+      .sort((left, right) => right.source_precedence - left.source_precedence)[0];
+    if (!source) fail('SecretNotFound', 'The secret was not found.', 'Refresh the secret list.');
+    const targetSecret = secrets.find(
+      (row) =>
+        row.profile_id === target.profile_id &&
+        row.name === source.name &&
+        row.source === 'user-local',
+    );
+    if (targetSecret && !request.overwrite) {
+      fail(
+        'SecretAlreadyExists',
+        'The secret already exists in Global Vault.',
+        'Review the existing secret in Global Vault.',
+      );
+    }
+    const saved = saveSecret(
+      {
+        project_id: target.project_id,
+        profile_id: target.profile_id,
+        secret_name: source.name,
+        source: 'user-local',
+        value: values.get(source.id) ?? 'preview-only-value',
+      },
+      Boolean(targetSecret),
+    );
+    return {
+      target_project_id: target.project_id,
+      target_profile_id: target.profile_id,
+      secret_name: source.name,
+      version: saved.version,
+      action: targetSecret ? 'rotate' : 'create',
     };
   }
 
@@ -371,7 +503,8 @@ export function createMockRuntime(params: URLSearchParams) {
     } satisfies AgentClientError;
   }
   function requireUnlocked(): void {
-    if (!unlocked) fail('UnlockRequired', 'The vault is locked.', 'Unlock the vault and retry.');
+    if (unlockTtl() === null)
+      fail('UnlockRequired', 'The vault is locked.', 'Unlock the vault and retry.');
   }
   function requireSelectedProject(): DesktopProjectContext {
     if (!selected) fail('ProjectNotFound', 'No vault is open.', 'Open a vault or project first.');
@@ -389,6 +522,7 @@ export function createMockRuntime(params: URLSearchParams) {
       fail('AgentUnavailable', 'The Locket agent is offline.', 'Start the agent, then retry.');
     }
     const request = (args.request ?? {}) as Record<string, unknown>;
+    const unlocked = unlockTtl() !== null;
     const redact = request.redact_names === true || request.privacy_redact_names === true;
     const projectSecrets = secrets.filter((row) => row.profile_id === request.profile_id);
     const auditRows = request.project_id === 'acme-api' ? audit : [];
@@ -483,12 +617,19 @@ export function createMockRuntime(params: URLSearchParams) {
         };
       }
       case 'agent_lock':
-        unlocked = false;
+        unlockedProjects.clear();
         return;
-      case 'agent_unlock':
-        unlocked = true;
-        unlockedFor = (request as unknown as UnlockRequest).ttl_seconds;
+      case 'agent_unlock': {
+        const { project_id, ttl_seconds } = request as unknown as UnlockRequest;
+        unlockedProjects.set(project_id, ttl_seconds);
         return;
+      }
+      case 'desktop_create_profile':
+        return createProfile(request as unknown as DesktopCreateProfileRequest);
+      case 'desktop_delete_secret':
+        return deleteSecret(request as unknown as DesktopDeleteSecretRequest);
+      case 'desktop_copy_secret_to_shared':
+        return copyToShared(request as unknown as DesktopCopySecretToSharedRequest);
       case 'agent_set_active_profile': {
         requireUnlocked();
         const project = requireSelectedProject();
@@ -615,12 +756,16 @@ export function createMockRuntime(params: URLSearchParams) {
         return saveSecret(request as unknown as SetSecretRequest, false);
       case 'agent_rotate_secret':
         return saveSecret(request as unknown as SetSecretRequest, true);
-      case 'agent_reveal':
+      case 'agent_reveal': {
         requireUnlocked();
+        const row = projectSecrets
+          .filter((secret) => secret.name === request.secret_name)
+          .sort((left, right) => right.source_precedence - left.source_precedence)[0];
         return {
-          value: values.get(`${request.profile_id}:${request.secret_name}`) ?? 'preview-only-value',
+          value: (row && values.get(row.id)) ?? 'preview-only-value',
           ttl_seconds: 20,
         };
+      }
       case 'agent_copy_secret':
         requireUnlocked();
         return {
@@ -662,6 +807,24 @@ export function createMockRuntime(params: URLSearchParams) {
         return { launched: true, command: `locket run ${request.policy_name}` };
       case 'desktop_scan_project':
         return { launched: true, command: 'locket scan --require-known' };
+      case 'desktop_detect_commands':
+        return request.project_id === 'acme-api'
+          ? ['dev', 'test', 'lint', 'build'].map((name): DetectedCommandRow => {
+              const argv = ['pnpm', 'run', name];
+              const command_preview = argv.join(' ');
+              return {
+                name,
+                argv,
+                command_preview,
+                source_file: 'package.json',
+                already_configured: policies.some(
+                  (policy) =>
+                    policy.name === name ||
+                    (policy.command_kind === 'argv' && policy.command_preview === command_preview),
+                ),
+              };
+            })
+          : [];
       case 'desktop_save_policy': {
         const { policy, mode, original_name } = request as unknown as DesktopSavePolicyRequest;
         const index = policies.findIndex((row) => row.name === original_name);
@@ -728,7 +891,7 @@ export function createMockRuntime(params: URLSearchParams) {
   function syncStatus() {
     return {
       epoch: 3,
-      state: unlocked ? 'verified' : 'locked',
+      state: unlockTtl() === null ? 'locked' : 'verified',
       conflicts: 0,
       waiting: 0,
       waiting_known: true,

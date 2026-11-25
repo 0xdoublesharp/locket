@@ -17,6 +17,10 @@ import {
   desktopImportEnv,
   desktopStartAgent,
   desktopRunPolicy,
+  desktopCreateProfile,
+  desktopDeleteSecret,
+  desktopCopySecretToShared,
+  desktopDetectCommands,
   desktopSavePolicy,
   desktopTeamSyncRenameProfile,
   desktopTeamSyncPreserveOverride,
@@ -94,6 +98,60 @@ describe('typed desktop operations', () => {
     };
     await desktopSavePolicy(request);
     expect(invoke).toHaveBeenLastCalledWith('desktop_save_policy', { request });
+  });
+  it('sends typed requests and returns the responses for desktop CRUD and detection', async () => {
+    const create = { project_id: 'fixture', profile_name: 'qa' };
+    const created = { profile_id: 'qa-id', profile_name: 'qa', dangerous: false, created: true };
+    vi.mocked(invoke).mockResolvedValueOnce(created);
+    expect(await desktopCreateProfile(create)).toEqual({ ok: true, value: created });
+
+    const remove = {
+      project_id: 'fixture',
+      profile_id: 'prod-id',
+      secret_name: 'TOKEN',
+      source: 'team-managed' as const,
+      confirmation: 'prod',
+    };
+    const deleted = { secret_name: 'TOKEN', source: 'team-managed', version: 2, deleted: true };
+    vi.mocked(invoke).mockResolvedValueOnce(deleted);
+    expect(await desktopDeleteSecret(remove)).toEqual({ ok: true, value: deleted });
+
+    const copy = {
+      from_project_id: 'fixture',
+      from_profile_id: 'prod-id',
+      secret_name: 'TOKEN',
+      source: 'machine-local' as const,
+      overwrite: true,
+      confirmation: 'prod',
+    };
+    const copied = {
+      target_project_id: 'shared-id',
+      target_profile_id: 'shared-default-id',
+      secret_name: 'TOKEN',
+      version: 3,
+      action: 'rotate',
+    };
+    vi.mocked(invoke).mockResolvedValueOnce(copied);
+    expect(await desktopCopySecretToShared(copy)).toEqual({ ok: true, value: copied });
+
+    const detect = { project_id: 'fixture' };
+    const detected = [
+      {
+        name: 'test',
+        argv: ['pnpm', 'run', 'test'],
+        command_preview: 'pnpm run test',
+        source_file: 'package.json',
+        already_configured: false,
+      },
+    ];
+    vi.mocked(invoke).mockResolvedValueOnce(detected);
+    expect(await desktopDetectCommands(detect)).toEqual({ ok: true, value: detected });
+    expect(vi.mocked(invoke).mock.calls).toEqual([
+      ['desktop_create_profile', { request: create }],
+      ['desktop_delete_secret', { request: remove }],
+      ['desktop_copy_secret_to_shared', { request: copy }],
+      ['desktop_detect_commands', { request: detect }],
+    ]);
   });
   it('uses typed keychain unlock or explicit passphrase', async () => {
     const request = {

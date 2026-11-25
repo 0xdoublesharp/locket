@@ -59,6 +59,10 @@ import {
   desktopStartAgent,
   desktopRunPolicy,
   desktopScanProject,
+  desktopCreateProfile,
+  desktopDeleteSecret,
+  desktopCopySecretToShared,
+  desktopDetectCommands,
   desktopSavePolicy,
   unlockVault,
   actionError,
@@ -72,13 +76,13 @@ import {
 } from './agent/client';
 import { dotenvMigrationPrompt, mcpClientSnippets } from './agent/agentPrompts';
 import type { SetSecretRequest, SetSecretResponse } from './agent/client';
-import type { PolicyFormMode } from './policy/form';
-import { rememberTarget, type ProfileSwitchState } from './profile/switcher';
+import type { PolicyFormMode, PolicyFormState } from './policy/form';
+import { isValidProfileName, rememberTarget, type ProfileSwitchState } from './profile/switcher';
 import type { CommandPolicySnapshotWire } from './agent/types';
 import { deviceMemberRow } from './agent/deviceMembers';
 import { commandPolicyRow } from './agent/policies';
 import { runtimeSessionRow } from './agent/runtimeSessions';
-import { secretRow } from './agent/secrets';
+import { secretRow, secretSourceWire } from './agent/secrets';
 import { versionHistoryRow } from './agent/versions';
 import { useAgent } from './composables/useAgent';
 import { useTray } from './composables/useTray';
@@ -111,6 +115,7 @@ import type {
 import type {
   AgentClientError,
   AgentConfigSettings,
+  DetectedCommandRow,
   DiscoveredSecretWire,
   AuditChainStatus,
   AuditWireRow,
@@ -242,6 +247,7 @@ const previewViews: ViewKey[] = [
   'discover',
   'secret-editor',
   'policies',
+  'profiles',
   'execution',
   'audit',
   'team',
@@ -1316,6 +1322,48 @@ watch(policiesRequest, () => {
   void refreshPolicies();
 });
 
+const detectedCommands = ref<DetectedCommandRow[]>([]);
+const detectingCommands = ref(false);
+const detectionError = ref<string | null>(null);
+const detectionRequests = createRequestLifetime();
+const detectionProject = computed(() =>
+  currentView.value === 'policies' &&
+  !!activeContext.value?.root &&
+  !selectedIsShared.value &&
+  !desktopBusy.value &&
+  agentOnline.value &&
+  settingsReady.value &&
+  !settings.value.privacyRedactNames
+    ? activeContext.value?.project_id
+    : undefined,
+);
+
+async function refreshDetectedCommands(): Promise<void> {
+  const isCurrent = detectionRequests.begin();
+  const projectId = detectionProject.value;
+  detectingCommands.value = Boolean(projectId);
+  detectionError.value = null;
+  if (!projectId) return;
+  const result = await desktopDetectCommands({ project_id: projectId });
+  if (!isCurrent()) return;
+  detectingCommands.value = false;
+  detectedCommands.value = result.ok ? result.value : [];
+  if (!result.ok) detectionError.value = actionError(result.error);
+}
+
+watch(
+  [selectionGeneration, detectionProject],
+  () => {
+    detectedCommands.value = [];
+    void refreshDetectedCommands();
+  },
+  { immediate: true, flush: 'sync' },
+);
+
+async function refreshCommandView(): Promise<void> {
+  await Promise.all([refreshPolicies(), refreshDetectedCommands()]);
+}
+
 const profileSwitchState = ref<ProfileSwitchState>({
   activeProfile: null,
   activeDangerous: false,
@@ -1325,15 +1373,72 @@ const profileSwitchInProgress = ref<boolean>(false);
 const profileSwitchError = ref<string | null>(null);
 const profileSwitchLastAt = ref<string | undefined>(undefined);
 const discoverProfileTarget = ref<{ name: string; dangerous: boolean } | null>(null);
+const profileCreateBusy = ref(false);
+const profileCreateNotice = ref<string | null>(null);
+const profileCreateError = ref<string | null>(null);
+const profileCreateRequests = createRequestLifetime();
+const profileListRevision = ref(0);
+const canCreateProfile = computed(
+  () =>
+    desktopAvailable &&
+    !!activeContext.value?.root &&
+    !selectedIsShared.value &&
+    agentOnline.value &&
+    settingsReady.value &&
+    status.value?.lock_state === 'unlocked' &&
+    !desktopBusy.value &&
+    !profileSwitchInProgress.value,
+);
+
+watch(
+  [settingsContextKey, () => settings.value.privacyRedactNames],
+  () => {
+    profileCreateRequests.invalidate();
+    profileCreateBusy.value = false;
+    profileCreateNotice.value = null;
+    profileCreateError.value = null;
+  },
+  { flush: 'sync' },
+);
+
+async function handleProfileCreate(name: string): Promise<void> {
+  const context = activeContext.value;
+  if (!context || !canCreateProfile.value || profileCreateBusy.value || !isValidProfileName(name))
+    return;
+  const isCurrent = profileCreateRequests.begin();
+  profileCreateBusy.value = true;
+  profileCreateNotice.value = null;
+  profileCreateError.value = null;
+  const result = await desktopCreateProfile({
+    project_id: context.project_id,
+    profile_name: name.trim(),
+  });
+  if (!isCurrent()) return;
+  profileCreateBusy.value = false;
+  if (!result.ok) {
+    profileCreateError.value =
+      result.error.kind === 'rejected' && result.error.code === 'SecretAlreadyExists'
+        ? 'An environment with this name already exists.'
+        : actionError(result.error);
+    return;
+  }
+  profileListRevision.value++;
+  const label = settings.value.privacyRedactNames ? '' : ` ${result.value.profile_name}`;
+  profileCreateNotice.value = result.value.created
+    ? `Created environment${label}.`
+    : `Environment${label} already exists.`;
+}
+
 watch(currentView, (view) => {
   if (view !== 'profiles') discoverProfileTarget.value = null;
   profileSwitchError.value = null;
 });
 
 watch(
-  [currentView, settingsContextKey, () => settings.value.privacyRedactNames],
-  async ([view, context, redact], _previous, onCleanup) => {
-    profileSwitchState.value = { ...profileSwitchState.value, knownProfiles: [] };
+  [currentView, settingsContextKey, () => settings.value.privacyRedactNames, profileListRevision],
+  async ([view, context, redact], [previousView, previousContext, previousRedact], onCleanup) => {
+    if (view !== previousView || context !== previousContext || redact !== previousRedact)
+      profileSwitchState.value = { ...profileSwitchState.value, knownProfiles: [] };
     const projectId = status.value?.project_id;
     if (view !== 'profiles' || !projectId || redact) return;
     let cancelled = false;
@@ -1378,7 +1483,12 @@ async function handleProfileSwitch(payload: {
   dangerous: boolean;
 }): Promise<void> {
   const captured = captureSelection(selectedProject.value, selectionGeneration.value);
-  if (!captured || !activeContext.value || profileSwitchInProgress.value) {
+  if (
+    !captured ||
+    !activeContext.value ||
+    profileSwitchInProgress.value ||
+    profileCreateBusy.value
+  ) {
     profileSwitchError.value =
       'Connect and unlock the selected project before switching environments.';
     return;
@@ -1429,13 +1539,22 @@ function profileSwitchErrorLabel(err: AgentClientError): string {
 
 const policyFormMode = ref<PolicyFormMode | null>(null);
 const policyFormRow = ref<CommandPolicyRow | null>(null);
+const policyFormDraft = ref<Pick<
+  PolicyFormState,
+  'name' | 'commandKind' | 'commandPreview'
+> | null>(null);
 const policyFormSubmitting = ref<boolean>(false);
 const policyFormError = ref<string | null>(null);
+const policyFormRequests = createRequestLifetime();
 
-function openPolicyCreate(): void {
+function openPolicyCreate(detected?: DetectedCommandRow): void {
   if (!policyAccess.value.enabled) return;
+  if (detected && !detectionProject.value) return;
   policyFormMode.value = 'create';
   policyFormRow.value = null;
+  policyFormDraft.value = detected
+    ? { name: detected.name, commandKind: 'argv', commandPreview: detected.command_preview }
+    : null;
   policyFormError.value = null;
 }
 
@@ -1454,10 +1573,15 @@ function openPolicyDelete(row: CommandPolicyRow): void {
 }
 
 function dismissPolicyForm(): void {
+  policyFormRequests.invalidate();
   policyFormMode.value = null;
   policyFormRow.value = null;
+  policyFormDraft.value = null;
+  policyFormSubmitting.value = false;
   policyFormError.value = null;
 }
+
+watch(settingsContextKey, dismissPolicyForm, { flush: 'sync' });
 
 async function submitPolicyForm(payload: {
   mode: PolicyFormMode;
@@ -1470,6 +1594,8 @@ async function submitPolicyForm(payload: {
     policyFormError.value = 'Active project unavailable.';
     return;
   }
+  if (policyFormSubmitting.value) return;
+  const isCurrent = policyFormRequests.begin();
   policyFormSubmitting.value = true;
   policyFormError.value = null;
   const result = await desktopSavePolicy({
@@ -1479,13 +1605,14 @@ async function submitPolicyForm(payload: {
     policy: payload.snapshot,
     confirmation: payload.confirmation,
   });
+  if (!isCurrent()) return;
   policyFormSubmitting.value = false;
   if (!result.ok) {
     policyFormError.value = actionError(result.error);
     return;
   }
   dismissPolicyForm();
-  await refreshPolicies();
+  await refreshCommandView();
 }
 
 function deviceMemberErrorLabel(error: AgentClientError): string {
@@ -1829,6 +1956,105 @@ async function handleRotateSecret(
     await refreshVersions();
   }
   return result;
+}
+
+const secretMutationBusy = ref(false);
+const secretMutationError = ref<{ id: string; message: string } | null>(null);
+const secretMutationRequests = createRequestLifetime();
+const secretMutationAvailable = computed(
+  () =>
+    desktopAvailable &&
+    secretAccess.value.enabled &&
+    settingsReady.value &&
+    !settings.value.privacyRedactNames &&
+    !desktopBusy.value &&
+    !secretMutationBusy.value,
+);
+
+watch(
+  [settingsContextKey, () => settings.value.privacyRedactNames],
+  () => {
+    secretMutationRequests.invalidate();
+    secretMutationBusy.value = false;
+    secretMutationError.value = null;
+    if (settings.value.privacyRedactNames) desktopNotice.value = null;
+  },
+  { flush: 'sync' },
+);
+
+async function handleDeleteSecret(row: SecretRowMeta, confirmation?: string): Promise<void> {
+  const context = activeContext.value;
+  if (!context || !secretMutationAvailable.value) return;
+  const dangerous = settings.value.dangerousProfileFlag;
+  if (dangerous && confirmation !== context.profile_name) return;
+
+  const isCurrent = secretMutationRequests.begin();
+  secretMutationBusy.value = true;
+  secretMutationError.value = null;
+  desktopNotice.value = null;
+  const result = await desktopDeleteSecret({
+    project_id: context.project_id,
+    profile_id: context.profile_id,
+    secret_name: row.name,
+    source: secretSourceWire(row.source),
+    ...(dangerous && { confirmation: context.profile_name }),
+  });
+  if (!isCurrent()) return;
+  secretMutationBusy.value = false;
+  if (!result.ok || !result.value.deleted) {
+    secretMutationError.value = {
+      id: row.id,
+      message: result.ok ? 'The secret could not be deleted.' : actionError(result.error),
+    };
+    return;
+  }
+  if (selectedSecret.value?.id === row.id) selectedSecret.value = null;
+  desktopNotice.value = `Deleted ${row.name}.`;
+  await Promise.all([refreshSecrets(), refreshVersions()]);
+}
+
+function copyToSharedError(error: AgentClientError, name: string): string {
+  if (error.kind === 'rejected') {
+    if (error.code === 'SecretAlreadyExists') {
+      return `${name} already exists in Global Vault. Open Global Vault to review the existing secret.`;
+    }
+    if (error.code === 'UnlockRequired' && error.message.includes('Global Vault')) {
+      return 'Open and unlock Global Vault (@shared), then return here and try again.';
+    }
+    if (error.code === 'ProjectNotFound' && error.message.includes('Global Vault')) {
+      return 'Set up Global Vault (@shared), then return here and try again.';
+    }
+  }
+  return actionError(error);
+}
+
+async function handleCopyToShared(row: SecretRowMeta): Promise<void> {
+  const context = activeContext.value;
+  if (!context || selectedIsShared.value || !secretMutationAvailable.value) return;
+  const isCurrent = secretMutationRequests.begin();
+  secretMutationBusy.value = true;
+  secretMutationError.value = null;
+  desktopNotice.value = null;
+  const approved = await confirmDangerousAction('Copy secret to Global Vault');
+  if (!isCurrent()) return;
+  if (approved === undefined) {
+    secretMutationBusy.value = false;
+    return;
+  }
+  const result = await desktopCopySecretToShared({
+    from_project_id: context.project_id,
+    from_profile_id: context.profile_id,
+    secret_name: row.name,
+    source: secretSourceWire(row.source),
+    ...(approved && { confirmation: context.profile_name }),
+  });
+  if (!isCurrent()) return;
+  secretMutationBusy.value = false;
+  if (!result.ok) {
+    secretMutationError.value = { id: row.id, message: copyToSharedError(result.error, row.name) };
+    return;
+  }
+  desktopNotice.value = `Copied ${row.name} to Global Vault.`;
 }
 
 async function handleEditorReveal(row: SecretRowMeta): Promise<void> {
@@ -2178,6 +2404,10 @@ onBeforeUnmount(() => {
   metadataClipboardRequests.dispose();
   copyRequests.dispose();
   settingsRequests.dispose();
+  profileCreateRequests.dispose();
+  secretMutationRequests.dispose();
+  policyFormRequests.dispose();
+  detectionRequests.dispose();
   scanRequests.dispose();
   unlockRequests.dispose();
   scanLaunching.value = false;
@@ -2772,10 +3002,15 @@ onUnmounted(() => {
         :last-refreshed-at="secretsLastRefreshed"
         :metadata-loaded="secretAccess.enabled"
         :is-shared="selectedIsShared"
+        :dangerous-profile="settings.dangerousProfileFlag"
+        :mutation-disabled="!secretMutationAvailable"
+        :mutation-error="secretMutationError"
         :action-guidance="secretAccess.guidance"
         @select="selectSecret"
         @copy-value="handleListCopy"
         @reveal-value="handleEditorReveal"
+        @copy-to-shared="handleCopyToShared"
+        @delete-secret="handleDeleteSecret"
         @refresh="retryVariables"
         @retry="retryVariables"
         @start="startAgent"
@@ -2810,6 +3045,7 @@ onUnmounted(() => {
         :on-rotate-secret="handleRotateSecret"
         @refresh="refreshSecrets"
         @reveal="handleEditorReveal"
+        @manage="selectView('secrets')"
       />
 
       <template v-else-if="currentView === 'versions'">
@@ -2911,9 +3147,13 @@ onUnmounted(() => {
         :running="commandRunning"
         :run-error="commandRunError"
         :run-notice="commandRunNotice"
+        :detected-commands="detectedCommands"
+        :detecting-commands="detectingCommands"
+        :detection-error="detectionError"
         @run="runCommand"
-        @refresh="refreshPolicies"
+        @refresh="refreshCommandView"
         @create="openPolicyCreate"
+        @add-detected="openPolicyCreate"
         @edit="openPolicyEdit"
         @delete="openPolicyDelete"
       />
@@ -2926,7 +3166,12 @@ onUnmounted(() => {
         :switching="profileSwitchInProgress"
         :error-message="profileSwitchError"
         :last-switched-at="profileSwitchLastAt"
+        :can-create="canCreateProfile"
+        :creating="profileCreateBusy"
+        :create-notice="profileCreateNotice"
+        :create-error="profileCreateError"
         @switch="handleProfileSwitch"
+        @create="handleProfileCreate"
       />
 
       <TeamInviteView
@@ -3008,6 +3253,7 @@ onUnmounted(() => {
       v-if="policyFormMode !== null && policyAccess.enabled"
       :mode="policyFormMode"
       :row="policyFormRow"
+      :initial-draft="policyFormDraft"
       :project-id="status?.project_id ?? ''"
       :dangerous-profile="settings.dangerousProfileFlag"
       :profile-label="status?.profile_name ?? profileLabel"

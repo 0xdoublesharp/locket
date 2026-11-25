@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { formatTime } from '../utils/formatTime';
-import { computed, ref } from 'vue';
+import { computed, ref, watch } from 'vue';
 
 import {
   isValidProfileName,
@@ -19,6 +19,10 @@ interface Props {
   errorMessage?: string | null;
   lastSwitchedAt?: string;
   initialTarget?: Pick<ProfileEntry, 'name' | 'dangerous'> | null;
+  canCreate?: boolean;
+  creating?: boolean;
+  createNotice?: string | null;
+  createError?: string | null;
 }
 
 const props = defineProps<Props>();
@@ -28,11 +32,22 @@ const emit = defineEmits<{
     payload: { profileName: string; confirmation: string | undefined; dangerous: boolean },
   ): void;
   (event: 'select', entry: ProfileEntry): void;
+  (event: 'create', name: string): void;
 }>();
 
 const targetName = ref(props.initialTarget?.name ?? '');
 const targetDangerous = ref(props.initialTarget?.dangerous ?? false);
 const confirmation = ref<string>('');
+const createName = ref('');
+const validCreateName = computed(() => isValidProfileName(createName.value));
+const canSubmitCreate = computed(() => props.canCreate && !props.creating && validCreateName.value);
+
+watch(
+  () => props.createNotice,
+  (notice) => {
+    if (notice) createName.value = '';
+  },
+);
 
 const entries = computed<ProfileEntry[]>(() => profileEntries(props.state));
 
@@ -57,7 +72,7 @@ const requiresConfirmation = computed<boolean>(() =>
 const validName = computed<boolean>(() => isValidProfileName(targetName.value));
 
 const canSubmit = computed<boolean>(() => {
-  if (props.switching || !validName.value) {
+  if (props.switching || props.creating || !validName.value) {
     return false;
   }
   if (requiresConfirmation.value && confirmation.value.trim() !== targetName.value.trim()) {
@@ -91,6 +106,10 @@ function onSubmit(): void {
     dangerous: effectiveDangerous.value,
   });
 }
+
+function onCreate(): void {
+  if (canSubmitCreate.value) emit('create', createName.value.trim());
+}
 </script>
 
 <template>
@@ -105,10 +124,7 @@ function onSubmit(): void {
       </span>
     </header>
 
-    <p v-if="entries.length === 0" class="view__empty">
-      No environments tracked yet. Type a target name below or run
-      <code>locket profile create &lt;name&gt;</code>.
-    </p>
+    <p v-if="entries.length === 0" class="view__empty">No environments tracked yet.</p>
 
     <ul v-else class="profile-list" data-testid="profile-list">
       <li
@@ -134,6 +150,38 @@ function onSubmit(): void {
         </button>
       </li>
     </ul>
+
+    <details class="create-environment">
+      <summary>+ New environment</summary>
+      <form class="switcher-form" data-testid="profile-create-form" @submit.prevent="onCreate">
+        <h3>Create environment</h3>
+        <label class="switcher-form__field">
+          <span>Environment name</span>
+          <input
+            v-model="createName"
+            type="text"
+            autocomplete="off"
+            spellcheck="false"
+            :disabled="!canCreate || creating"
+            data-testid="profile-create-name"
+          />
+          <span v-if="createName.length > 0 && !validCreateName" class="switcher-form__error">
+            Use 1–128 letters, digits, dots, underscores, or dashes.
+          </span>
+        </label>
+        <p v-if="createError" role="alert" class="switcher-form__error">{{ createError }}</p>
+        <p v-if="createNotice" role="status" class="switcher-form__notice">{{ createNotice }}</p>
+        <div class="switcher-form__actions">
+          <button
+            type="submit"
+            class="view__button view__button--primary"
+            :disabled="!canSubmitCreate"
+          >
+            {{ creating ? 'Creating…' : 'Create environment' }}
+          </button>
+        </div>
+      </form>
+    </details>
 
     <form class="switcher-form" data-testid="profile-switcher-form" @submit.prevent="onSubmit">
       <h3>Switch environment</h3>
@@ -215,12 +263,6 @@ function onSubmit(): void {
   color: var(--text-secondary);
   font-size: 0.85rem;
 }
-.view__empty code {
-  background: var(--bg-subtle);
-  border-radius: 0.25rem;
-  color: var(--text-primary);
-  padding: 0.125rem 0.25rem;
-}
 .profile-list {
   list-style: none;
   margin: 0 0 1rem;
@@ -251,6 +293,12 @@ function onSubmit(): void {
 }
 .profile-list__name {
   flex: 1;
+}
+.create-environment > summary {
+  width: fit-content;
+  color: var(--accent);
+  font-size: 0.875rem;
+  cursor: pointer;
 }
 .switcher-form {
   display: flex;
@@ -290,6 +338,11 @@ function onSubmit(): void {
 .switcher-form__error {
   color: var(--danger);
   font-size: 0.75rem;
+}
+.switcher-form__notice {
+  margin: 0;
+  color: var(--success);
+  font-size: 0.85rem;
 }
 .switcher-form__actions {
   display: flex;

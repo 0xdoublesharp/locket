@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, ref } from 'vue';
+import { computed, nextTick, ref, watch } from 'vue';
 
 import AppIcon from '../components/AppIcon.vue';
 import AgentUnavailableBanner from '../components/AgentUnavailableBanner.vue';
@@ -28,6 +28,9 @@ interface Props {
   loading: boolean;
   metadataLoaded: boolean;
   isShared?: boolean;
+  dangerousProfile?: boolean;
+  mutationDisabled?: boolean;
+  mutationError?: { id: string; message: string } | null;
   actionGuidance?: string | null;
   lastRefreshedAt?: string;
 }
@@ -37,12 +40,36 @@ const props = defineProps<Props>();
 const emit = defineEmits<{
   (e: 'select', row: SecretRowMeta): void;
   (e: 'refresh' | 'add' | 'retry' | 'start' | 'openAgentSetup'): void;
-  (e: 'copyValue' | 'revealValue', row: SecretRowMeta): void;
+  (e: 'copyValue' | 'revealValue' | 'copyToShared', row: SecretRowMeta): void;
+  (e: 'deleteSecret', row: SecretRowMeta, confirmation?: string): void;
 }>();
 
 const searchQuery = ref<string>('');
 const filterState = ref<SecretFilterState>(defaultSecretFilter());
 const inspectedId = ref<string | null>(null);
+const confirmingDelete = ref(false);
+const deleteConfirmation = ref('');
+const canMutate = computed(() => props.canAccessValues && !props.mutationDisabled);
+const canDelete = computed(
+  () =>
+    canMutate.value &&
+    (!props.dangerousProfile ||
+      Boolean(props.profileName && deleteConfirmation.value === props.profileName)),
+);
+
+function cancelDelete(): void {
+  confirmingDelete.value = false;
+  deleteConfirmation.value = '';
+}
+
+watch([inspectedId, () => props.canAccessValues, () => props.profileName], cancelDelete);
+
+function confirmDelete(row: SecretRowMeta): void {
+  if (!confirmingDelete.value || !canDelete.value) return;
+  emit('deleteSecret', row, props.dangerousProfile ? deleteConfirmation.value : undefined);
+  cancelDelete();
+}
+
 const inspectedRow = computed(() => props.rows.find(({ id }) => id === inspectedId.value));
 const inspectedReference = computed(() =>
   secretReference(props.profileName, inspectedRow.value?.name ?? '', props.privacyMode),
@@ -509,6 +536,63 @@ function graceDetails(row: SecretRowMeta): string {
                 </li>
               </ul>
             </div>
+            <div v-if="canAccessValues" class="variable-inspector__management">
+              <div v-if="!confirmingDelete" class="variable-inspector__actions">
+                <button
+                  v-if="!isShared"
+                  type="button"
+                  class="companion-button"
+                  :disabled="!canMutate"
+                  @click="emit('copyToShared', row)"
+                >
+                  Copy to Global Vault
+                </button>
+                <button
+                  type="button"
+                  class="companion-button companion-button--danger"
+                  :disabled="!canMutate"
+                  @click="confirmingDelete = true"
+                >
+                  Delete
+                </button>
+              </div>
+              <template v-else>
+                <p>
+                  Delete <code>{{ displayName(row) }}</code
+                  >?
+                </p>
+                <label v-if="dangerousProfile" class="variable-inspector__confirmation">
+                  <span>Type {{ profileLabel }} to confirm deletion.</span>
+                  <input
+                    v-model="deleteConfirmation"
+                    class="companion-input"
+                    type="text"
+                    autocomplete="off"
+                    spellcheck="false"
+                    data-testid="secret-delete-confirmation"
+                  />
+                </label>
+                <div class="variable-inspector__actions">
+                  <button
+                    type="button"
+                    class="companion-button companion-button--danger"
+                    :disabled="!canDelete"
+                    @click="confirmDelete(row)"
+                  >
+                    Confirm delete
+                  </button>
+                  <button type="button" class="companion-button" @click="cancelDelete">
+                    Cancel
+                  </button>
+                </div>
+              </template>
+              <p v-if="privacyMode" class="variable-inspector__hint">
+                Turn off privacy mode to copy or delete a secret by name.
+              </p>
+              <p v-if="mutationError?.id === row.id" class="variable-inspector__error" role="alert">
+                {{ mutationError.message }}
+              </p>
+            </div>
           </section>
         </li>
       </ul>
@@ -835,6 +919,32 @@ function graceDetails(row: SecretRowMeta): string {
 .variable-inspector__grace .app-icon {
   align-self: start;
   color: var(--warn);
+}
+.variable-inspector__management {
+  display: grid;
+  gap: 0.5rem;
+  padding-top: 0.65rem;
+  border-top: 1px solid var(--border-subtle);
+  font-size: 0.8rem;
+}
+.variable-inspector__management p {
+  margin: 0;
+}
+.variable-inspector__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+.variable-inspector__confirmation {
+  display: grid;
+  gap: 0.35rem;
+  justify-items: start;
+}
+.variable-inspector__hint {
+  color: var(--text-secondary);
+}
+.variable-inspector__error {
+  color: var(--danger);
 }
 @media (max-width: 959px) {
   .variable-inspector__metadata {

@@ -16,6 +16,7 @@ import type { CommandPolicyRow } from '../types/views';
 interface Props {
   mode: PolicyFormMode;
   row?: CommandPolicyRow | null;
+  initialDraft?: Pick<PolicyFormState, 'name' | 'commandKind' | 'commandPreview'> | null;
   projectId: string;
   /** Active environment is flagged dangerous in agent settings. */
   dangerousProfile: boolean;
@@ -44,7 +45,7 @@ const form = ref<PolicyFormState>(initialState());
 const confirmation = ref<string>('');
 
 watch(
-  () => [props.mode, props.row],
+  () => [props.mode, props.row, props.initialDraft],
   () => {
     form.value = initialState();
     confirmation.value = '';
@@ -55,7 +56,7 @@ function initialState(): PolicyFormState {
   if ((props.mode === 'edit' || props.mode === 'delete') && props.row) {
     return policyFormFromRow(props.row);
   }
-  return defaultPolicyForm();
+  return { ...defaultPolicyForm(), ...props.initialDraft };
 }
 
 const validation = computed(() => validatePolicyForm(form.value));
@@ -289,7 +290,12 @@ function onDismiss(): void {
       <p v-if="props.errorMessage" class="modal__error" role="alert">{{ props.errorMessage }}</p>
 
       <div class="modal__actions">
-        <button type="button" class="modal__btn modal__btn--ghost" @click="onDismiss">
+        <button
+          type="button"
+          class="modal__btn modal__btn--ghost"
+          :disabled="submitting"
+          @click="onDismiss"
+        >
           Cancel
         </button>
         <button

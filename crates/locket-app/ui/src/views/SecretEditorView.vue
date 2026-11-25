@@ -1,27 +1,22 @@
 <script setup lang="ts">
+import { secretSourceWire } from '../agent/secrets';
 import { formatTime } from '../utils/formatTime';
-// Desktop view for gated secret set/rotate, CLI-directed delete, and
-// TTL-bound reveal. Plaintext enters the webview only for an active form
+// Desktop view for gated secret set/rotate and TTL-bound reveal.
+// Plaintext enters the webview only for an active form
 // submission or reveal modal and is cleared when the flow completes.
 
 import { computed, ref } from 'vue';
 
-import CommandHandoff from '../components/CommandHandoff.vue';
 import RevealModal from '../components/RevealModal.vue';
 import {
-  defaultDeleteForm,
   defaultRotateForm,
   defaultSetForm,
-  deleteSecretCliCommand,
-  deleteUnavailableNotice,
   rotateSecretSuccessNotice,
   rotateFormToPayload,
   setSecretSuccessNotice,
   setFormToPayload,
-  validateDeleteForm,
   validateRotateForm,
   validateSetForm,
-  type SecretDeleteFormState,
   type SecretRotateFormState,
   type SecretSetFormState,
   type SecretSource,
@@ -57,13 +52,12 @@ interface Props {
 const props = defineProps<Props>();
 
 const emit = defineEmits<{
-  (event: 'refresh'): void;
+  (event: 'refresh' | 'manage'): void;
   (event: 'reveal', row: SecretRowMeta): void;
 }>();
 
 const setForm = ref<SecretSetFormState>(defaultSetForm());
 const rotateForm = ref<SecretRotateFormState>(defaultRotateForm());
-const deleteForm = ref<SecretDeleteFormState>(defaultDeleteForm());
 
 const setSubmitting = ref<boolean>(false);
 const rotateSubmitting = ref<boolean>(false);
@@ -95,7 +89,6 @@ const filteredRows = computed<SecretRowMeta[]>(() => {
 
 const setValidation = computed(() => validateSetForm(setForm.value));
 const rotateValidation = computed(() => validateRotateForm(rotateForm.value));
-const deleteValidation = computed(() => validateDeleteForm(deleteForm.value));
 
 const canSubmitSet = computed<boolean>(
   () => setValidation.value.valid && !setSubmitting.value && hasContext.value,
@@ -103,18 +96,6 @@ const canSubmitSet = computed<boolean>(
 const canSubmitRotate = computed<boolean>(
   () => rotateValidation.value.valid && !rotateSubmitting.value && hasContext.value,
 );
-const deleteCliCommand = computed<string | null>(() => {
-  if (!deleteValidation.value.valid) {
-    return null;
-  }
-  return deleteSecretCliCommand(deleteForm.value.name);
-});
-const deleteNotice = computed<string | null>(() => {
-  if (deleteCliCommand.value === null) {
-    return null;
-  }
-  return deleteUnavailableNotice(deleteForm.value.name);
-});
 
 const hasContext = computed<boolean>(
   () => props.metadataLoaded && Boolean(props.projectId) && Boolean(props.profileId),
@@ -123,17 +104,7 @@ const hasContext = computed<boolean>(
 function rotateSourceFor(name: string): SecretSource {
   const trimmed = name.trim();
   const row = props.rows.find((entry) => entry.name === trimmed);
-  if (row === undefined) {
-    return 'user-local';
-  }
-  switch (row.source) {
-    case 'team':
-      return 'team-managed';
-    case 'machine-local':
-      return 'machine-local';
-    default:
-      return 'user-local';
-  }
+  return row ? secretSourceWire(row.source) : 'user-local';
 }
 
 function refresh(): void {
@@ -432,49 +403,10 @@ function errorLabel(error: AgentClientError): string {
 
     <section aria-labelledby="secret-editor-delete-heading" class="view__panel">
       <h3 id="secret-editor-delete-heading" class="view__panel-heading">Delete secret</h3>
-      <p class="view__muted">
-        Secret deletion is available from the Locket CLI. This form validates the typed confirmation
-        and shows the command to run in a terminal.
-      </p>
-      <form @submit.prevent>
-        <label class="view__field">
-          <span>Secret name</span>
-          <input
-            v-model="deleteForm.name"
-            type="text"
-            list="secret-editor-known"
-            autocomplete="off"
-            spellcheck="false"
-            data-testid="secret-editor-delete-name"
-          />
-          <span v-if="deleteValidation.errors.name" class="view__error">
-            {{ deleteValidation.errors.name }}
-          </span>
-        </label>
-        <label class="view__field">
-          <span>Type the secret name to confirm</span>
-          <input
-            v-model="deleteForm.confirmation"
-            type="text"
-            autocomplete="off"
-            spellcheck="false"
-            data-testid="secret-editor-delete-confirm"
-          />
-          <span v-if="deleteValidation.errors.confirmation" class="view__error">
-            {{ deleteValidation.errors.confirmation }}
-          </span>
-        </label>
-        <p v-if="deleteNotice" class="view__notice" role="note">{{ deleteNotice }}</p>
-        <div class="view__form-actions">
-          <CommandHandoff
-            v-if="deleteCliCommand"
-            :command="deleteCliCommand"
-            label="Delete secret command"
-            data-testid="secret-editor-delete-cli-command"
-          />
-          <span v-else class="view__muted">Complete the confirmation to show the CLI command.</span>
-        </div>
-      </form>
+      <p class="view__muted">Open Details for a secret in the list to delete it.</p>
+      <button type="button" class="companion-button" @click="emit('manage')">
+        Open secret list
+      </button>
     </section>
 
     <RevealModal />

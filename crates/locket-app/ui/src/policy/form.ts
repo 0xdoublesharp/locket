@@ -79,7 +79,7 @@ export function policyFormFromRow(row: CommandPolicyRow): PolicyFormState {
   };
 }
 
-const NAME_PATTERN = /^[A-Za-z0-9._-]+$/;
+const NAME_PATTERN = /^[A-Za-z0-9._:-]+$/;
 const SECRET_NAME_PATTERN = /^[A-Z_][A-Z0-9_]*$/;
 const COMMAND_PREVIEW_MAX = 4096;
 
@@ -96,7 +96,7 @@ export function validatePolicyForm(state: PolicyFormState): PolicyFormValidation
   if (name.length === 0) {
     errors.name = 'Name is required.';
   } else if (!NAME_PATTERN.test(name)) {
-    errors.name = 'Name may contain letters, digits, dot, underscore, and dash.';
+    errors.name = 'Use letters, digits, dots, underscores, dashes, or colons.';
   } else if (name.length > 128) {
     errors.name = 'Name is too long (max 128).';
   }

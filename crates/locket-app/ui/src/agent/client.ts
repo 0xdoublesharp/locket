@@ -13,6 +13,14 @@ import type {
   ProjectListRequest,
   ProjectSummaryWire,
   DesktopImportEnvRequest,
+  DesktopCreateProfileRequest,
+  DesktopCreateProfileResponse,
+  DesktopDeleteSecretRequest,
+  DesktopDeleteSecretResponse,
+  DesktopCopySecretToSharedRequest,
+  DesktopCopySecretToSharedResponse,
+  DesktopDetectCommandsRequest,
+  DetectedCommandRow,
   DesktopSavePolicyRequest,
   UnlockRequest,
 } from './types';
@@ -501,6 +509,26 @@ export async function desktopScanProject(request: {
   project_id: string;
 }): Promise<AgentResult<{ launched: boolean; command: string }>> {
   return callTyped('desktop_scan_project', { request });
+}
+export function desktopCreateProfile(
+  request: DesktopCreateProfileRequest,
+): Promise<AgentResult<DesktopCreateProfileResponse>> {
+  return callTyped('desktop_create_profile', { request });
+}
+export function desktopDeleteSecret(
+  request: DesktopDeleteSecretRequest,
+): Promise<AgentResult<DesktopDeleteSecretResponse>> {
+  return callTyped('desktop_delete_secret', { request });
+}
+export function desktopCopySecretToShared(
+  request: DesktopCopySecretToSharedRequest,
+): Promise<AgentResult<DesktopCopySecretToSharedResponse>> {
+  return callTyped('desktop_copy_secret_to_shared', { request });
+}
+export function desktopDetectCommands(
+  request: DesktopDetectCommandsRequest,
+): Promise<AgentResult<DetectedCommandRow[]>> {
+  return callTyped('desktop_detect_commands', { request });
 }
 export async function desktopSavePolicy(
   request: DesktopSavePolicyRequest,

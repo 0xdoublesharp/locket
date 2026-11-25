@@ -1,4 +1,4 @@
-import type { SecretWireRow } from './types';
+import type { SecretSourceWire, SecretWireRow } from './types';
 import type { SecretRowMeta } from '../types/views';
 
 const NANOS_PER_MILLI = 1_000_000;
@@ -14,6 +14,10 @@ function nanosToIso(nanos: number): string {
 
 function sourceLabel(source: SecretWireRow['source']): SecretRowMeta['source'] {
   return source === 'team-managed' ? 'team' : source;
+}
+
+export function secretSourceWire(source: SecretRowMeta['source']): SecretSourceWire {
+  return source === 'team' ? 'team-managed' : source;
 }
 
 export function secretRow(row: SecretWireRow): SecretRowMeta {

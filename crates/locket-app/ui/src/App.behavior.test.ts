@@ -39,7 +39,7 @@ interface AppState {
     dangerous: boolean;
   }) => Promise<void>;
   selectView: (
-    view: 'dashboard' | 'secrets' | 'settings' | 'scan' | 'policies' | 'secret-editor',
+    view: 'dashboard' | 'secrets' | 'settings' | 'scan' | 'policies' | 'profiles' | 'secret-editor',
   ) => void;
 }
 
@@ -142,6 +142,8 @@ async function nativeInvoke(command: string, args?: InvokeArgs): Promise<unknown
       return { launched: true, command: 'locket scan --require-known' };
     case 'agent_scan':
       return { findings: [], locked: true };
+    case 'desktop_detect_commands':
+      return [];
     case 'agent_lock':
       lockState = 'locked';
       return;
@@ -194,6 +196,257 @@ async function connectedApp() {
 function plaintext(app: ReturnType<typeof mountApp>): string | undefined {
   return findNode(app.root, (node) => node.props['data-testid'] === 'reveal-value')?.text;
 }
+
+describe('desktop environment, secret, and command actions', () => {
+  type MountedApp = Awaited<ReturnType<typeof connectedApp>>;
+  const byId = (app: MountedApp, id: string) =>
+    findNode(app.root, (node) => node.props['data-testid'] === id);
+  const button = (app: MountedApp, label: string) =>
+    findNode(
+      app.root,
+      (node) =>
+        node.tag === 'button' && !!findNode(node, (content) => content.text.trim() === label),
+    );
+  const click = (app: MountedApp, label: string) => {
+    const action = button(app, label);
+    expect(action).toBeDefined();
+    expect(action?.props.disabled).toBeFalsy();
+    (action?.props.onClick as () => void)();
+  };
+  const row: SecretWireRow = {
+    id: 'token',
+    profile_id: a.profile_id,
+    name: 'TOKEN',
+    source: 'team-managed',
+    source_precedence: 1,
+    origin: 'local',
+    current_version: 1,
+    state: 'active',
+    required: true,
+    created_at: 0,
+    updated_at: 0,
+    last_rotated_at: null,
+  };
+  const detected = {
+    name: 'test:unit',
+    argv: ['pnpm', 'run', 'test:unit'],
+    command_preview: 'pnpm run test:unit',
+    source_file: 'package.json',
+    already_configured: false,
+  };
+
+  async function inspectSecret(app: MountedApp) {
+    Object.assign(windowEvents, { matchMedia: () => ({ matches: false }) });
+    app.state.selectView('secrets');
+    await settle();
+    expect(button(app, 'Copy to Global Vault')).toBeUndefined();
+    const details = findNode(app.root, (node) => node.props['aria-label'] === 'Details for TOKEN');
+    await (details?.props.onClick as (event: MouseEvent) => Promise<void>)(
+      new Event('click') as MouseEvent,
+    );
+    await settle();
+  }
+
+  it('creates an environment and refreshes the switcher without switching into it', async () => {
+    let created = false;
+    overrides.set('agent_list_projects', () => [
+      {
+        project_id: a.project_id,
+        profiles: created ? [{ id: 'A-qa', name: 'qa', dangerous: false }] : [],
+      },
+    ]);
+    overrides.set('desktop_create_profile', () => {
+      created = true;
+      return { profile_id: 'A-qa', profile_name: 'qa', dangerous: false, created };
+    });
+    const app = await connectedApp();
+    app.state.selectView('profiles');
+    await settle();
+    const name = byId(app, 'profile-create-name');
+    expect(name).toBeDefined();
+    name!.value = 'invalid name';
+    name!.dispatchEvent(new Event('input'));
+    await settle();
+    expect(button(app, 'Create environment')?.props.disabled).toBe(true);
+    name!.value = ' qa ';
+    name!.dispatchEvent(new Event('input'));
+    await settle();
+    await (byId(app, 'profile-create-form')?.props.onSubmit as (event: Event) => Promise<void>)(
+      new Event('submit'),
+    );
+    await settle();
+    expect(invoke).toHaveBeenCalledWith('desktop_create_profile', {
+      request: { project_id: a.project_id, profile_name: 'qa' },
+    });
+    expect(byId(app, 'profile-entry-qa')).toBeDefined();
+    expect(
+      findNode(app.root, (node) => node.text.trim() === 'Created environment qa.'),
+    ).toBeDefined();
+    expect(app.state.activeContext).toEqual(a);
+  });
+
+  it('requires inline confirmation and the exact dangerous environment name before deleting', async () => {
+    let deleted = false;
+    overrides.set('agent_list_secrets', () => ({ rows: deleted ? [] : [row] }));
+    overrides.set('agent_read_config', () => ({
+      privacy_redact_names: false,
+      agent_unlock_ttl: '15m',
+      user_verification_required_for: {},
+      dangerous_profile: { dangerous: true },
+    }));
+    overrides.set('desktop_delete_secret', () => {
+      deleted = true;
+      return { secret_name: row.name, source: row.source, version: 1, deleted };
+    });
+    const app = await connectedApp();
+    await inspectSecret(app);
+    click(app, 'Delete');
+    await settle();
+    expect(button(app, 'Confirm delete')?.props.disabled).toBe(true);
+    click(app, 'Cancel');
+    await settle();
+    expect(calls).not.toContain('desktop_delete_secret');
+    click(app, 'Delete');
+    await settle();
+    const name = byId(app, 'secret-delete-confirmation')!;
+    name.value = a.profile_name;
+    name.dispatchEvent(new Event('input'));
+    await settle();
+    click(app, 'Confirm delete');
+    await settle();
+    expect(invoke).toHaveBeenCalledWith('desktop_delete_secret', {
+      request: {
+        project_id: a.project_id,
+        profile_id: a.profile_id,
+        secret_name: row.name,
+        source: 'team-managed',
+        confirmation: a.profile_name,
+      },
+    });
+    expect(
+      findNode(app.root, (node) => node.props['aria-label'] === 'Details for TOKEN'),
+    ).toBeUndefined();
+    expect(findNode(app.root, (node) => node.text.trim() === 'Deleted TOKEN.')).toBeDefined();
+  });
+
+  it('copies the selected source to the Global Vault with no overwrite', async () => {
+    overrides.set('agent_list_secrets', () => ({ rows: [row] }));
+    overrides.set('desktop_copy_secret_to_shared', () => ({
+      target_project_id: shared.project_id,
+      target_profile_id: shared.profile_id,
+      secret_name: row.name,
+      version: 1,
+      action: 'create',
+    }));
+    const app = await connectedApp();
+    await inspectSecret(app);
+    click(app, 'Copy to Global Vault');
+    await settle();
+    expect(invoke).toHaveBeenCalledWith('desktop_copy_secret_to_shared', {
+      request: {
+        from_project_id: a.project_id,
+        from_profile_id: a.profile_id,
+        secret_name: row.name,
+        source: 'team-managed',
+      },
+    });
+    expect(
+      findNode(app.root, (node) => node.text.trim() === 'Copied TOKEN to Global Vault.'),
+    ).toBeDefined();
+  });
+
+  it.each([
+    [
+      'UnlockRequired',
+      'unlock the Global Vault before copying the secret',
+      'Open and unlock Global Vault (@shared), then return here and try again.',
+    ],
+    [
+      'SecretAlreadyExists',
+      'a user-local secret with this name already exists in the Global Vault',
+      'TOKEN already exists in Global Vault. Open Global Vault to review the existing secret.',
+    ],
+  ])('shows actionable copy feedback for %s', async (code, message, notice) => {
+    overrides.set('agent_list_secrets', () => ({ rows: [row] }));
+    overrides.set('desktop_copy_secret_to_shared', () =>
+      Promise.reject({ kind: 'rejected', code, message }),
+    );
+    const app = await connectedApp();
+    await inspectSecret(app);
+    click(app, 'Copy to Global Vault');
+    await settle();
+    expect(
+      findNode(app.root, (node) => node.props.role === 'alert' && node.text === notice),
+    ).toBeDefined();
+    expect(calls.filter((call) => call === 'desktop_copy_secret_to_shared')).toHaveLength(1);
+  });
+
+  it('opens a prefilled argv draft for an unconfigured detected command', async () => {
+    let saved = false;
+    overrides.set('desktop_detect_commands', () => [
+      { ...detected, already_configured: saved },
+      { ...detected, name: 'dev', already_configured: true },
+    ]);
+    overrides.set('desktop_save_policy', () => {
+      saved = true;
+    });
+    const app = await connectedApp();
+    app.state.selectView('policies');
+    await settle();
+    expect(invoke).toHaveBeenCalledWith('desktop_detect_commands', {
+      request: { project_id: a.project_id },
+    });
+    expect(findNode(app.root, (node) => node.text === 'package.json')).toBeDefined();
+    expect(findNode(app.root, (node) => node.text === 'dev')).toBeUndefined();
+    click(app, 'Add command');
+    await settle();
+    expect(byId(app, 'policy-form-name')?.value).toBe('test:unit');
+    const kind = byId(app, 'policy-form-kind')!;
+    expect(kind.options[kind.selectedIndex]?.value).toBe('argv');
+    expect(byId(app, 'policy-form-command')?.value).toBe('pnpm run test:unit');
+    expect(calls).not.toContain('desktop_save_policy');
+    expect(button(app, 'Create')?.props.disabled).toBe(false);
+    await (byId(app, 'policy-form')?.props.onSubmit as (event: Event) => Promise<void>)(
+      new Event('submit'),
+    );
+    await settle();
+    expect(invoke).toHaveBeenCalledWith('desktop_save_policy', {
+      request: expect.objectContaining({
+        project_id: a.project_id,
+        mode: 'create',
+        original_name: 'test:unit',
+        policy: expect.objectContaining({
+          command_kind: 'argv',
+          command_preview: 'pnpm run test:unit',
+        }),
+      }),
+    });
+    expect(button(app, 'Add command')).toBeUndefined();
+  });
+
+  it('drops command suggestions that arrive after changing projects', async () => {
+    const first = deferred<(typeof detected)[]>();
+    overrides.set('desktop_detect_commands', (args) =>
+      (args as { request: { project_id: string } }).request.project_id === a.project_id
+        ? first.promise
+        : [{ ...detected, name: 'build', command_preview: 'pnpm run build' }],
+    );
+    const app = await connectedApp();
+    app.state.selectView('policies');
+    await settle();
+    expect(calls).toContain('desktop_detect_commands');
+    await app.state.connectProject(false, b.root);
+    await settle();
+    first.resolve([detected]);
+    await settle();
+    expect(
+      findNode(app.root, (node) => node.props['aria-label'] === 'Add command build'),
+    ).toBeDefined();
+    expect(
+      findNode(app.root, (node) => node.props['aria-label'] === 'Add command test:unit'),
+    ).toBeUndefined();
+  });
+});
 
 describe('vault unlock in the mounted app', () => {
   type MountedApp = ReturnType<typeof mountApp>;
