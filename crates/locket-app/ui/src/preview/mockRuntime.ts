@@ -136,7 +136,12 @@ export function createMockRuntime(params: URLSearchParams) {
   const definitions = [
     ['dev-server', 'pnpm run dev', ['DATABASE_URL', 'OPENAI_API_KEY'], ['SENTRY_DSN']],
     ['db-migrate', 'pnpm db:migrate', ['DATABASE_URL'], []],
-    ['deploy-prod', 'pnpm deploy', ['STRIPE_SECRET_KEY@v2'], ['POSTMARK_TOKEN']],
+    [
+      'deploy-prod',
+      'pnpm deploy lk://dev/STRIPE_SECRET_KEY@v2',
+      ['STRIPE_SECRET_KEY'],
+      ['POSTMARK_TOKEN'],
+    ],
   ] as const;
   const policies: CommandPolicyWireRow[] =
     scenario === 'empty'

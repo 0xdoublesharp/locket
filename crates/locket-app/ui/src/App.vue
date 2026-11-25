@@ -449,6 +449,7 @@ const scanError = ref<string | null>(null);
 const scanNotice = ref<string | null>(null);
 const scanRequests = createRequestLifetime();
 const backupBusy = ref<boolean>(false);
+const backupRequests = createRequestLifetime();
 const backupNotice = ref<string | null>(null);
 const backupError = ref<string | null>(null);
 const backupPreviewKey = ref<string | null>(null);
@@ -1833,110 +1834,118 @@ function backupErrorLabel(error: AgentClientError): string {
 }
 
 async function triggerBackupAction(action: BundleAction): Promise<void> {
-  backupBusy.value = true;
+  if (backupBusy.value) return;
   backupNotice.value = null;
   backupError.value = null;
   const projectId = status.value?.project_id;
   if (projectId === null || projectId === undefined) {
     backupError.value = 'Active project unavailable.';
-    backupBusy.value = false;
     return;
   }
 
-  switch (action.kind) {
-    case 'export': {
-      if (
-        !action.request.previewOnly &&
-        backupPreviewKey.value !== exportSelectionKey(action.request)
-      ) {
-        backupError.value = 'Preview the current export scope before exporting.';
-        backupBusy.value = false;
-        return;
-      }
-      const result = await exportBundle({
-        project_id: projectId,
-        profile_id: activeContext.value?.profile_id ?? null,
-        recipient_descriptor: action.request.recipientDescriptor,
-        scope: action.request.scope,
-        include_audit: action.request.includeAudit,
-        output_path: action.request.outputPath || null,
-        include_personal: action.request.includePersonal,
-        include_history: action.request.includeHistory,
-        preview_only: action.request.previewOnly,
-        confirm_dangerous: action.request.confirmDangerous,
-      });
-      if (result.ok) {
-        if (action.request.previewOnly && result.value.status === 'preview') {
-          backupPreviewKey.value = exportSelectionKey(action.request);
-          backupPreviewMessage.value = result.value.message;
+  const isCurrent = backupRequests.begin();
+  backupBusy.value = true;
+  try {
+    switch (action.kind) {
+      case 'export': {
+        if (
+          !action.request.previewOnly &&
+          backupPreviewKey.value !== exportSelectionKey(action.request)
+        ) {
+          backupError.value = 'Preview the current export scope before exporting.';
+          return;
         }
-        backupNotice.value = `${result.value.status}: ${result.value.message}`;
-        await refresh();
-      } else {
-        backupError.value = backupErrorLabel(result.error);
+        const result = await exportBundle({
+          project_id: projectId,
+          profile_id: activeContext.value?.profile_id ?? null,
+          recipient_descriptor: action.request.recipientDescriptor,
+          scope: action.request.scope,
+          include_audit: action.request.includeAudit,
+          output_path: action.request.outputPath || null,
+          include_personal: action.request.includePersonal,
+          include_history: action.request.includeHistory,
+          preview_only: action.request.previewOnly,
+          confirm_dangerous: action.request.confirmDangerous,
+        });
+        if (!isCurrent()) return;
+        if (result.ok) {
+          if (action.request.previewOnly && result.value.status === 'preview') {
+            backupPreviewKey.value = exportSelectionKey(action.request);
+            backupPreviewMessage.value = result.value.message;
+          }
+          backupNotice.value = `${result.value.status}: ${result.value.message}`;
+          await refresh();
+        } else {
+          backupError.value = backupErrorLabel(result.error);
+        }
+        break;
       }
-      break;
-    }
-    case 'import': {
-      const result = await importBundle({
-        project_id: projectId,
-        bundle_path: action.request.bundlePath,
-        include_audit: action.request.includeAudit,
-        conflict_mode: action.request.conflictMode,
-        confirm_dangerous: action.request.confirmDangerous,
-      });
-      if (result.ok) {
-        backupNotice.value = `${result.value.status}: ${result.value.message}`;
-        await refresh();
-      } else {
-        backupError.value = backupErrorLabel(result.error);
+      case 'import': {
+        const result = await importBundle({
+          project_id: projectId,
+          bundle_path: action.request.bundlePath,
+          include_audit: action.request.includeAudit,
+          conflict_mode: action.request.conflictMode,
+          confirm_dangerous: action.request.confirmDangerous,
+        });
+        if (!isCurrent()) return;
+        if (result.ok) {
+          backupNotice.value = `${result.value.status}: ${result.value.message}`;
+          await refresh();
+        } else {
+          backupError.value = backupErrorLabel(result.error);
+        }
+        break;
       }
-      break;
-    }
-    case 'verify': {
-      const result = await verifyBundle({
-        bundle_path: action.request.bundlePath,
-        require_decryptable: action.request.requireDecryptable,
-      });
-      if (result.ok) {
-        backupNotice.value = result.value.message;
-        await refresh();
-      } else {
-        backupError.value = backupErrorLabel(result.error);
+      case 'verify': {
+        const result = await verifyBundle({
+          bundle_path: action.request.bundlePath,
+          require_decryptable: action.request.requireDecryptable,
+        });
+        if (!isCurrent()) return;
+        if (result.ok) {
+          backupNotice.value = result.value.message;
+          await refresh();
+        } else {
+          backupError.value = backupErrorLabel(result.error);
+        }
+        break;
       }
-      break;
-    }
-    case 'rotate': {
-      const result = await recoveryRotate({
-        project_id: projectId,
-        verification: action.request.verification,
-        acknowledged_one_time_display: action.request.acknowledgedOneTimeDisplay,
-        clear_after_display: action.request.clearAfterDisplay,
-      });
-      if (result.ok) {
-        backupNotice.value = `${result.value.status}: ${result.value.message}`;
-        await refresh();
-      } else {
-        backupError.value = backupErrorLabel(result.error);
+      case 'rotate': {
+        const result = await recoveryRotate({
+          project_id: projectId,
+          verification: action.request.verification,
+          acknowledged_one_time_display: action.request.acknowledgedOneTimeDisplay,
+          clear_after_display: action.request.clearAfterDisplay,
+        });
+        if (!isCurrent()) return;
+        if (result.ok) {
+          backupNotice.value = `${result.value.status}: ${result.value.message}`;
+          await refresh();
+        } else {
+          backupError.value = backupErrorLabel(result.error);
+        }
+        break;
       }
-      break;
+      default:
+        break;
     }
-    default:
-      break;
+  } finally {
+    if (isCurrent()) backupBusy.value = false;
   }
-  backupBusy.value = false;
 }
 
 async function handleSetSecret(
   payload: SetSecretRequest,
 ): Promise<{ ok: true; value: SetSecretResponse } | { ok: false; error: AgentClientError }> {
+  const context = settingsContextKey.value;
   const approved = settings.value.dangerousProfileFlag
     ? await confirmDangerousAction('Save secret')
     : false;
-  if (approved === undefined)
+  if (approved === undefined || context !== settingsContextKey.value)
     return { ok: false, error: { kind: 'protocol', reason: 'Action canceled.' } };
   const result = await setSecret(approved ? { ...payload, confirm_dangerous: true } : payload);
-  if (result.ok) {
+  if (result.ok && context === settingsContextKey.value) {
     await refreshSecrets();
   }
   return result;
@@ -1945,13 +1954,14 @@ async function handleSetSecret(
 async function handleRotateSecret(
   payload: SetSecretRequest,
 ): Promise<{ ok: true; value: SetSecretResponse } | { ok: false; error: AgentClientError }> {
+  const context = settingsContextKey.value;
   const approved = settings.value.dangerousProfileFlag
     ? await confirmDangerousAction('Rotate secret')
     : false;
-  if (approved === undefined)
+  if (approved === undefined || context !== settingsContextKey.value)
     return { ok: false, error: { kind: 'protocol', reason: 'Action canceled.' } };
   const result = await rotateSecret(approved ? { ...payload, confirm_dangerous: true } : payload);
-  if (result.ok) {
+  if (result.ok && context === settingsContextKey.value) {
     await refreshSecrets();
     await refreshVersions();
   }
@@ -2377,9 +2387,20 @@ watch(
     auditChainOk.value = null;
     auditLastRefreshed.value = undefined;
     auditError.value = null;
+  },
+);
+
+watch(
+  settingsContextKey,
+  () => {
+    backupRequests.invalidate();
+    backupBusy.value = false;
+    backupNotice.value = null;
+    backupError.value = null;
     backupPreviewKey.value = null;
     backupPreviewMessage.value = null;
   },
+  { flush: 'sync' },
 );
 
 onMounted(() => {
@@ -2402,6 +2423,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('pointerdown', onSwitcherPointerdown);
   clearTimeout(desktopNoticeTimer);
   metadataClipboardRequests.dispose();
+  backupRequests.dispose();
   copyRequests.dispose();
   settingsRequests.dispose();
   profileCreateRequests.dispose();
@@ -3032,6 +3054,7 @@ onUnmounted(() => {
 
       <SecretEditorView
         v-else-if="currentView === 'secret-editor'"
+        :key="settingsContextKey"
         :rows="secretRows"
         :privacy-mode="settings.privacyRedactNames"
         :loading="secretsLoading"

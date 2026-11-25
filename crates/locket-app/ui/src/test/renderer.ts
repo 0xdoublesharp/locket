@@ -1,47 +1,4 @@
-import {
-  createRenderer,
-  createVNode,
-  nextTick,
-  ssrContextKey,
-  type Component,
-  type ComponentOptions,
-} from 'vue';
-import * as vue from 'vue';
-import { compileScript, compileTemplate, parse } from 'vue/compiler-sfc';
-import { ScriptTarget, transpileModule } from 'typescript';
-
-// The existing Node Vitest runner imports SFC scripts in SSR mode. Compile their
-// real templates for this client renderer too, using the installed Vue compiler.
-// This keeps the standard test command working without a DOM package or config edit.
-const components = import.meta.glob<ComponentOptions>('../**/*.vue', {
-  eager: true,
-  import: 'default',
-});
-const sources = import.meta.glob<string>('../**/*.vue', {
-  eager: true,
-  query: '?raw',
-  import: 'default',
-});
-for (const [filename, component] of Object.entries(components)) {
-  const { descriptor } = parse(sources[filename]!, { filename });
-  const script = compileScript(descriptor, { id: filename });
-  const template = compileTemplate({
-    source: descriptor.template!.content,
-    filename,
-    id: filename,
-    compilerOptions: {
-      mode: 'function',
-      bindingMetadata: script.bindings,
-      prefixIdentifiers: true,
-      expressionPlugins: ['typescript'],
-    },
-  });
-  if (template.errors.length) throw new Error(`${filename}: ${template.errors.join(', ')}`);
-  const { outputText } = transpileModule(template.code, {
-    compilerOptions: { target: ScriptTarget.ES2022 },
-  });
-  component.render = new Function('Vue', outputText)(vue);
-}
+import { createRenderer, createVNode, nextTick, shallowRef, type Component } from 'vue';
 
 // A small host for mounting real Vue components without a browser dependency.
 // EventTarget and the input fields also support Vue's v-model directives.
@@ -107,9 +64,19 @@ const renderer = createRenderer<TestNode, TestNode>({
     const siblings = node.parent?.children ?? [];
     return siblings[siblings.indexOf(node) + 1] ?? null;
   },
-  patchProp: (node, key, _previous, value) => {
+  patchProp: (node, key, previous, value) => {
     node.props[key] = value;
     if (key === 'value') node.value = value;
+    if (/^on[A-Z]/.test(key) && !key.startsWith('onUpdate:')) {
+      const event = key.slice(2).toLowerCase();
+      for (const listener of [previous].flat()) {
+        if (typeof listener === 'function')
+          node.removeEventListener(event, listener as EventListener);
+      }
+      for (const listener of [value].flat()) {
+        if (typeof listener === 'function') node.addEventListener(event, listener as EventListener);
+      }
+    }
   },
   insert,
   remove,
@@ -123,10 +90,12 @@ const renderer = createRenderer<TestNode, TestNode>({
 
 export function mountComponent<State>(component: Component, props?: Record<string, unknown>) {
   const root = new TestNode('root');
-  const vnode = createVNode(component, props);
-  const app = renderer.createApp({ render: () => vnode });
-  app.provide(ssrContextKey, {});
-  app.mount(root);
+  const currentProps = shallowRef(props);
+  const app = renderer.createApp({
+    render: () => createVNode(component, currentProps.value),
+  });
+  const host = app.mount(root);
+  const vnode = host.$.subTree;
   // Script-setup bindings are inspected only in tests. The component's real
   // template, watchers, event handlers and mount/unmount hooks still execute.
   const instance = vnode.component as typeof vnode.component & { setupState: State };
@@ -134,6 +103,9 @@ export function mountComponent<State>(component: Component, props?: Record<strin
   return {
     root,
     state: instance!.setupState,
+    setProps: (patch: Record<string, unknown>) => {
+      currentProps.value = { ...currentProps.value, ...patch };
+    },
     unmount: () => {
       if (mounted) app.unmount();
       mounted = false;
@@ -162,4 +134,66 @@ export function deferred<T>() {
 export async function settle(): Promise<void> {
   // Drain the finite chain of IPC promises, watcher updates and nested renders.
   for (let i = 0; i < 20; i++) await nextTick();
+}
+
+export function nodeText(node: TestNode): string {
+  if (node.tag === '#comment') return '';
+  return [node.text, ...node.children.map(nodeText)].join(' ').replace(/\s+/g, ' ').trim();
+}
+
+export function nodeBy(root: TestNode, match: (node: TestNode) => boolean): TestNode {
+  const node = findNode(root, match);
+  if (!node) throw new Error(`Expected element in: ${nodeText(root)}`);
+  return node;
+}
+
+export function byProp(root: TestNode, key: string, value: unknown): TestNode {
+  return nodeBy(root, (node) => node.props[key] === value);
+}
+
+export function control(root: TestNode, label: string, tag = 'input'): TestNode {
+  const field = nodeBy(root, (node) => node.tag === 'label' && nodeText(node).startsWith(label));
+  return nodeBy(field, (node) => node.tag === tag);
+}
+
+export function button(root: TestNode, label: string): TestNode {
+  return nodeBy(
+    root,
+    (node) =>
+      node.tag === 'button' && (node.props['aria-label'] === label || nodeText(node) === label),
+  );
+}
+
+export async function click(node: TestNode): Promise<void> {
+  if (node.props.disabled || node.props.disabled === '') throw new Error('Button is disabled');
+  if (!node.props.onClick) throw new Error('Element has no click handler');
+  node.dispatchEvent(new Event('click', { cancelable: true }));
+  await settle();
+}
+
+export async function input(node: TestNode, value: string): Promise<void> {
+  node.value = value;
+  node.dispatchEvent(new Event('input'));
+  await settle();
+}
+
+export async function check(node: TestNode, value = true): Promise<void> {
+  node.checked = value;
+  node.dispatchEvent(new Event('change'));
+  await settle();
+}
+
+export async function select(node: TestNode, value: string): Promise<void> {
+  const option = node.options.find((child) => child.value === value);
+  if (!option) throw new Error(`Missing option: ${value}`);
+  for (const child of node.options) child.selected = child === option;
+  node.dispatchEvent(new Event('change'));
+  await settle();
+}
+
+export async function submit(root: TestNode): Promise<void> {
+  const form = nodeBy(root, (node) => node.tag === 'form');
+  if (typeof form.props.onSubmit !== 'function') throw new Error('Form has no submit handler');
+  form.dispatchEvent(new Event('submit', { cancelable: true }));
+  await settle();
 }

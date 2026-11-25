@@ -349,12 +349,12 @@ function errorLabel(error: AgentClientError): string {
           <input
             v-model="rotateForm.name"
             type="text"
-            list="secret-editor-known"
+            :list="privacyMode ? undefined : 'secret-editor-known'"
             autocomplete="off"
             spellcheck="false"
             data-testid="secret-editor-rotate-name"
           />
-          <datalist id="secret-editor-known">
+          <datalist v-if="!privacyMode" id="secret-editor-known">
             <option v-for="row in props.rows" :key="row.id" :value="row.name" />
           </datalist>
           <span v-if="rotateValidation.errors.name" class="view__error">

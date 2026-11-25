@@ -10,6 +10,7 @@
     "preview": "vite preview",
     "lint": "eslint . --max-warnings=0",
     "test": "vitest run",
+    "coverage": "vitest run --coverage --coverage.provider=v8 --coverage.reporter=text --coverage.reporter=json-summary",
     "test:smoke": "vitest run src/secret/editor.smoke.test.ts",
     "typecheck": "vue-tsc --noEmit",
     "format:check": "prettier --check ."

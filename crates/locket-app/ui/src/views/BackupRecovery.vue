@@ -86,6 +86,7 @@ function exportAction(previewOnly = false): void {
 }
 
 function importAction(): void {
+  if (props.busy) return;
   emit('action', {
     kind: 'import',
     label: 'import bundle',
@@ -95,6 +96,7 @@ function importAction(): void {
 }
 
 function verifyAction(): void {
+  if (props.busy) return;
   emit('action', {
     kind: 'verify',
     label: 'verify bundle',
@@ -103,6 +105,7 @@ function verifyAction(): void {
 }
 
 function rotateAction(): void {
+  if (props.busy) return;
   emit('action', {
     kind: 'rotate',
     label: 'rotate recovery code',
@@ -289,7 +292,12 @@ function rotateAction(): void {
           </div>
         </dl>
 
-        <button type="button" class="view__action" :disabled="!canVerify" @click="verifyAction">
+        <button
+          type="button"
+          class="view__action"
+          :disabled="!canVerify || props.busy"
+          @click="verifyAction"
+        >
           Verify
         </button>
       </section>
@@ -325,7 +333,7 @@ function rotateAction(): void {
         <button
           type="button"
           class="view__action view__action--danger"
-          :disabled="!canRotate"
+          :disabled="!canRotate || props.busy"
           @click="rotateAction"
         >
           Rotate

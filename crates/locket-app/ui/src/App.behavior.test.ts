@@ -10,7 +10,21 @@ import type {
 } from './agent/types';
 import type { SecretRowMeta } from './types/views';
 import type RevealModal from './components/RevealModal.vue';
-import { deferred, findNode, mountComponent, settle } from './test/renderer';
+import { createMockRuntime } from './preview/mockRuntime';
+import {
+  button as renderedButton,
+  byProp,
+  check,
+  click as clickRendered,
+  control,
+  deferred,
+  findNode,
+  input,
+  mountComponent,
+  nodeText,
+  settle,
+  submit,
+} from './test/renderer';
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn(), isTauri: () => true }));
 vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn() }));
@@ -32,14 +46,38 @@ interface AppState {
   refresh: () => Promise<void>;
   connectProject: (initialize: boolean, path: string) => Promise<void>;
   handleEditorReveal: (row: SecretRowMeta) => Promise<void>;
-  handleTrayMenuAction: (action: 'lock-vault' | 'reveal-secret' | 'start-scan') => Promise<void>;
+  handleTrayMenuAction: (
+    action:
+      | 'open-app'
+      | 'lock-vault'
+      | 'unlock-vault'
+      | 'switch-profile'
+      | 'run-policy'
+      | 'reveal-secret'
+      | 'copy-secret'
+      | 'start-scan',
+  ) => Promise<void>;
   handleProfileSwitch: (payload: {
     profileName: string;
     confirmation: undefined;
     dangerous: boolean;
   }) => Promise<void>;
   selectView: (
-    view: 'dashboard' | 'secrets' | 'settings' | 'scan' | 'policies' | 'profiles' | 'secret-editor',
+    view:
+      | 'dashboard'
+      | 'secrets'
+      | 'settings'
+      | 'scan'
+      | 'policies'
+      | 'profiles'
+      | 'secret-editor'
+      | 'versions'
+      | 'execution'
+      | 'devices'
+      | 'audit'
+      | 'team'
+      | 'recovery'
+      | 'discover',
   ) => void;
 }
 
@@ -1503,4 +1541,761 @@ describe('Global Vault workspace actions', () => {
     expect(app.state.activeContext).toEqual(b);
     expect(findNode(app.root, (node) => node.props.id === 'manual-project-path')).toBeUndefined();
   });
+});
+
+function usePreviewFixtures(params = new URLSearchParams()) {
+  const fixtureInvoke = createMockRuntime(params);
+  vi.mocked(invoke).mockImplementation((async (command: string, args?: InvokeArgs) => {
+    calls.push(command);
+    const override = overrides.get(command);
+    if (override) return override(args);
+    if (command === 'agent_subscribe_status' || command.startsWith('tray_set_')) return;
+    return fixtureInvoke(command, (args ?? {}) as Record<string, unknown>);
+  }) as typeof invoke);
+  return fixtureInvoke;
+}
+
+describe('connected desktop journeys through the preview fixture agent', () => {
+  async function openFixtureProject() {
+    const fixtureInvoke = usePreviewFixtures();
+    Object.assign(windowEvents, { matchMedia: () => ({ matches: false }) });
+    const app = mountApp();
+    await settle();
+    const projects = (await fixtureInvoke('desktop_list_projects', {})) as DesktopProjectContext[];
+    await app.state.connectProject(
+      false,
+      projects.find((project) => project.project_id === 'acme-api')!.root,
+    );
+    await settle();
+    expect(app.state.activeContext?.project_id).toBe('acme-api');
+    return app;
+  }
+
+  it('connects monitoring, device, audit and version views to project-scoped metadata', async () => {
+    const app = await openFixtureProject();
+    const { root } = app;
+    app.state.selectView('execution');
+    await settle();
+    expect(nodeText(root)).toContain('running dev-server run-1');
+    expect(nodeText(root)).toContain('failed deploy-prod run-3');
+    overrides.set('agent_list_runtime_sessions', () => Promise.reject('Runtime transport lost'));
+    await clickRendered(renderedButton(root, 'Refresh'));
+    expect(nodeText(root)).toContain('Runtime transport lost.');
+    overrides.delete('agent_list_runtime_sessions');
+
+    app.state.selectView('devices');
+    await settle();
+    expect(nodeText(root)).toContain('Work MacBook device — 62a8b220c5f4 local');
+    overrides.set('agent_list_device_members', () =>
+      Promise.reject('Privacy-sensitive fixture detail'),
+    );
+    await clickRendered(renderedButton(root, 'Refresh'));
+    expect(nodeText(root)).toContain('Device request failed.');
+    expect(nodeText(root)).not.toContain('Privacy-sensitive fixture detail');
+    overrides.delete('agent_list_device_members');
+
+    app.state.selectView('audit');
+    await settle();
+    expect(nodeText(root)).toContain('RUN_POLICY');
+    expect(nodeText(root)).toContain('Audit chain verified.');
+    overrides.set('agent_verify_audit', () => Promise.reject('Verification interrupted'));
+    await clickRendered(renderedButton(root, 'Verify audit chain'));
+    expect(nodeText(root)).toContain('Verification interrupted.');
+    overrides.delete('agent_verify_audit');
+    await clickRendered(renderedButton(root, 'Verify audit chain'));
+    expect(invoke).toHaveBeenCalledWith('agent_verify_audit', {
+      request: { project_id: 'acme-api' },
+    });
+    expect(nodeText(root)).toContain('Audit chain verified.');
+
+    app.state.selectView('secrets');
+    await settle();
+    await clickRendered(renderedButton(root, 'Open metadata for STRIPE_SECRET_KEY'));
+    expect(nodeText(root)).toContain('v3 current');
+    expect(nodeText(root)).toContain('v2 deprecated');
+    await clickRendered(renderedButton(root, 'Copy value'));
+    expect(nodeText(root)).toContain('Clipboard unavailable:');
+    overrides.set('agent_copy_secret', () => ({ kind: 'copied' }));
+    await clickRendered(renderedButton(root, 'Copy value'));
+    expect(nodeText(root)).toContain('Copied value temporarily.');
+    expect(nodeText(root)).not.toContain('preview-only-value');
+    await clickRendered(renderedButton(root, 'Reveal'));
+    expect(plaintext(app)).toBe('preview-only-value');
+    windowEvents.dispatchEvent(new Event('blur'));
+    await settle();
+    expect(plaintext(app)).toBeUndefined();
+    overrides.set('agent_list_versions', () => Promise.reject('Fixture transport detail'));
+    await clickRendered(renderedButton(root, 'Refresh'));
+    expect(nodeText(root)).toContain('Version request failed.');
+    expect(nodeText(root)).not.toContain('Fixture transport detail');
+  });
+
+  it('previews and exports a scoped backup, then reviews and verifies its file before recovery rotation', async () => {
+    const app = await openFixtureProject();
+    const { root } = app;
+    app.state.selectView('recovery');
+    await settle();
+    expect(renderedButton(root, 'Export').props.disabled).toBe(true);
+    await input(control(root, 'Recipient descriptor', 'textarea'), 'lkdev2_preview_fixture');
+    await clickRendered(renderedButton(root, 'Preview scope'));
+    expect(invoke).toHaveBeenCalledWith('agent_export_bundle', {
+      request: expect.objectContaining({
+        project_id: 'acme-api',
+        profile_id: 'acme-api-dev',
+        preview_only: true,
+        scope: 'active-profile',
+      }),
+    });
+    expect(nodeText(root)).toContain('6 variables and 1 environment selected.');
+    await clickRendered(renderedButton(root, 'Export'));
+    expect(nodeText(root)).toContain('Sealed bundle exported.');
+    expect(invoke).toHaveBeenCalledWith('agent_export_bundle', {
+      request: expect.objectContaining({ preview_only: false }),
+    });
+    await clickRendered(renderedButton(root, 'Browse for a bundle to import'));
+    await clickRendered(renderedButton(root, 'Review bundle'));
+    expect(nodeText(root)).toContain('Sealed bundle imported.');
+    expect(invoke).toHaveBeenCalledWith('agent_import_bundle', {
+      request: expect.objectContaining({ conflict_mode: 'review', confirm_dangerous: false }),
+    });
+
+    await clickRendered(renderedButton(root, 'Browse for a bundle to verify'));
+    overrides.set('agent_verify_bundle', () => Promise.reject('fixture-untrusted-detail'));
+    await clickRendered(renderedButton(root, 'Verify'));
+    expect(nodeText(root)).toContain('Backup request failed.');
+    expect(nodeText(root)).not.toContain('fixture-untrusted-detail');
+    overrides.delete('agent_verify_bundle');
+    await clickRendered(renderedButton(root, 'Verify'));
+    expect(nodeText(root)).toContain('Bundle verified.');
+    await check(control(root, 'One-time display acknowledged'));
+    await clickRendered(renderedButton(root, 'Rotate'));
+    expect(invoke).toHaveBeenCalledWith('agent_recovery_rotate', {
+      request: {
+        project_id: 'acme-api',
+        verification: 'platform',
+        acknowledged_one_time_display: true,
+        clear_after_display: true,
+      },
+    });
+    expect(nodeText(root)).toContain('Recovery code rotated.');
+  });
+
+  it('discards a delayed backup preview when switching projects, even with the same draft', async () => {
+    const { root, state } = await openFixtureProject();
+    const pending = deferred<{ status: string; message: string }>();
+    const projects = await invoke<DesktopProjectContext[]>('desktop_list_projects', {});
+    const next = projects.find((project) => project.project_id === 'web-app')!;
+    overrides.set('agent_export_bundle', () => pending.promise);
+    state.selectView('recovery');
+    await settle();
+    await input(control(root, 'Recipient descriptor', 'textarea'), 'lkdev2_fixture');
+    await clickRendered(renderedButton(root, 'Preview scope'));
+    expect(nodeText(root)).toContain('Backup action running…');
+    await state.connectProject(false, next.root);
+    await settle();
+    expect(state.activeContext?.project_id).toBe(next.project_id);
+    pending.resolve({ status: 'preview', message: 'Old project preview' });
+    await settle();
+    expect(nodeText(root)).not.toContain('Old project preview');
+    expect(renderedButton(root, 'Export').props.disabled).toBe(true);
+    expect(renderedButton(root, 'Preview scope').props.disabled).toBe(false);
+  });
+
+  it('writes settings patches, applies privacy to connected metadata, and opens command runs in the terminal', async () => {
+    const app = await openFixtureProject();
+    const { root } = app;
+    app.state.selectView('settings');
+    await settle();
+    await clickRendered(renderedButton(root, '4h'));
+    expect(nodeText(root)).toContain('Vault session duration saved.');
+    expect(invoke).toHaveBeenCalledWith('agent_write_config', {
+      request: {
+        project_id: 'acme-api',
+        profile_name: 'dev',
+        changes: { agent_unlock_ttl: '4h' },
+      },
+    });
+    const privacy = byProp(root, 'aria-labelledby', 'settings-privacy');
+    await check(control(privacy, 'Redact'));
+    expect(nodeText(root)).toContain('Settings saved.');
+    app.state.selectView('execution');
+    await settle();
+    expect(nodeText(root)).toContain('Command 1 run-1 Environment');
+    expect(nodeText(root)).not.toContain('dev-server');
+    app.state.selectView('devices');
+    await settle();
+    expect(nodeText(root)).toContain('Member 1');
+    expect(nodeText(root)).not.toMatch(/Work MacBook|62a8b220c5f4/);
+    app.state.selectView('audit');
+    await settle();
+    expect(nodeText(root)).not.toMatch(/DATABASE_URL|STRIPE_SECRET_KEY|acme-api-dev/);
+    app.state.selectView('settings');
+    await settle();
+    await check(control(byProp(root, 'aria-labelledby', 'settings-privacy'), 'Redact'), false);
+    app.state.selectView('policies');
+    await settle();
+    expect(nodeText(root)).toContain('db-migrate');
+    overrides.set('desktop_run_policy', () => ({ launched: false }));
+    await clickRendered(renderedButton(root, 'Run in terminal'));
+    expect(nodeText(root)).toContain('The terminal did not launch.');
+    overrides.delete('desktop_run_policy');
+    await clickRendered(renderedButton(root, 'Run in terminal'));
+    expect(invoke).toHaveBeenCalledWith('desktop_run_policy', {
+      request: { project_id: 'acme-api', policy_name: 'db-migrate' },
+    });
+    expect(nodeText(root)).toContain('Opened in your terminal. Complete any approval there.');
+  });
+
+  it('sets, rotates, and refreshes variable metadata through the editor without rendering its values', async () => {
+    const app = await openFixtureProject();
+    const { root } = app;
+    app.state.selectView('secret-editor');
+    await settle();
+    const create = byProp(root, 'aria-labelledby', 'secret-editor-set-heading');
+    await input(byProp(create, 'data-testid', 'secret-editor-set-name'), 'FIXTURE_VALUE');
+    await input(byProp(create, 'data-testid', 'secret-editor-set-value'), 'fixture-create-value');
+    await submit(create);
+    expect(nodeText(root)).toContain('FIXTURE_VALUE My override v1');
+    expect(nodeText(root)).not.toContain('fixture-create-value');
+
+    const rotate = byProp(root, 'aria-labelledby', 'secret-editor-rotate-heading');
+    await input(byProp(rotate, 'data-testid', 'secret-editor-rotate-name'), 'FIXTURE_VALUE');
+    await input(
+      byProp(rotate, 'data-testid', 'secret-editor-rotate-value'),
+      'fixture-rotate-value',
+    );
+    await submit(rotate);
+    await settle();
+    expect(nodeText(root)).toContain('FIXTURE_VALUE My override v2');
+    expect(nodeText(root)).not.toMatch(/fixture-create-value|fixture-rotate-value/);
+    expect(invoke).toHaveBeenCalledWith('agent_rotate_secret', {
+      request: expect.objectContaining({ profile_id: 'acme-api-dev', source: 'user-local' }),
+    });
+    await clickRendered(renderedButton(root, 'Open secret list'));
+    await clickRendered(renderedButton(root, 'Open metadata for FIXTURE_VALUE'));
+    expect(nodeText(root)).toContain('v2 current');
+  });
+
+  it('clears secret drafts and ignores pending editor feedback after switching projects', async () => {
+    const { root, state } = await openFixtureProject();
+    const nextWrite = deferred<{
+      action: string;
+      secret_id: string;
+      version: number;
+      source: string;
+    }>();
+    overrides.set('agent_set_secret', () => nextWrite.promise);
+    state.selectView('secret-editor');
+    await settle();
+    const field = (name: string) => byProp(root, 'data-testid', `secret-editor-${name}`);
+    await input(field('set-name'), 'FIRST_VAULT_TOKEN');
+    await input(field('set-value'), 'fixture-first-vault-value');
+    await input(field('rotate-name'), 'DATABASE_URL');
+    await input(field('rotate-value'), 'fixture-rotation-draft');
+    await submit(byProp(root, 'aria-labelledby', 'secret-editor-set-heading'));
+    expect(nodeText(root)).toContain('Submitting…');
+    expect(invoke).toHaveBeenCalledWith('agent_set_secret', {
+      request: expect.objectContaining({ project_id: 'acme-api', profile_id: 'acme-api-dev' }),
+    });
+    const projects = await invoke<DesktopProjectContext[]>('desktop_list_projects', {});
+    await state.connectProject(
+      false,
+      projects.find((project) => project.project_id === 'web-app')!.root,
+    );
+    await settle();
+    expect(state.activeContext?.project_id).toBe('web-app');
+    expect(field('set-name').value).toBe('');
+    expect(field('set-value').value).toBe('');
+    expect(field('rotate-name').value).toBe('');
+    expect(field('rotate-value').value).toBe('');
+    nextWrite.resolve({ action: 'set', secret_id: 'test', version: 1, source: 'user-local' });
+    await settle();
+    expect(nodeText(root)).not.toContain('Created FIRST_VAULT_TOKEN');
+    expect(nodeText(root)).not.toMatch(/fixture-first-vault-value|fixture-rotation-draft/);
+  });
+
+  it('discovers variables across vaults and routes dangerous environments through typed confirmation', async () => {
+    const app = await openFixtureProject();
+    const { root } = app;
+    app.state.selectView('discover');
+    await settle();
+    const discover = byProp(root, 'aria-labelledby', 'discovery-title');
+    await input(control(discover, 'Search'), 'DATABASE_URL');
+    await input(control(discover, 'Tag'), 'database');
+    await input(control(discover, 'Owner'), 'Platform');
+    await submit(discover);
+    expect(nodeText(discover)).toContain('2 results');
+    expect(nodeText(discover)).not.toContain('STRIPE_SECRET_KEY');
+    await clickRendered(renderedButton(discover, 'Switch to staging'));
+    await settle();
+    expect(app.state.activeContext?.profile_name).toBe('staging');
+
+    await input(control(discover, 'Search'), 'STRIPE_SECRET_KEY');
+    await input(control(discover, 'Tag'), '');
+    await input(control(discover, 'Owner'), '');
+    await submit(discover);
+    await clickRendered(renderedButton(discover, 'Switch to prod'));
+    expect(nodeText(root)).toContain(
+      'Type the target environment name to confirm dangerous switch',
+    );
+    expect(renderedButton(root, 'Switch environment').props.disabled).toBe(true);
+    const form = byProp(root, 'data-testid', 'profile-switcher-form');
+    await input(control(form, 'Type the target environment'), 'prod');
+    await submit(form);
+    await settle();
+    expect(app.state.activeContext?.profile_name).toBe('prod');
+
+    app.state.selectView('discover');
+    await settle();
+    const searchView = byProp(root, 'aria-labelledby', 'discovery-title');
+    await input(control(searchView, 'Search'), 'web-app');
+    await submit(searchView);
+    await clickRendered(renderedButton(searchView, 'Open project'));
+    await settle();
+    expect(app.state.activeContext?.project_id).toBe('web-app');
+  });
+
+  it('updates and deletes the selected command, preserving the draft when a save fails', async () => {
+    const { root, state } = await openFixtureProject();
+    state.selectView('policies');
+    await settle();
+    await clickRendered(byProp(root, 'aria-label', 'Inspect policy deploy-prod'));
+    await clickRendered(renderedButton(root, 'Edit'));
+    const form = byProp(root, 'data-testid', 'policy-form');
+    const name = byProp(form, 'data-testid', 'policy-form-name');
+    expect(name.value).toBe('deploy-prod');
+    expect(byProp(form, 'data-testid', 'policy-form-required').value).toBe('STRIPE_SECRET_KEY');
+    expect(byProp(form, 'data-testid', 'policy-form-command').value).toContain(
+      'lk://dev/STRIPE_SECRET_KEY@v2',
+    );
+    await input(name, 'deploy-preview');
+    overrides.set('desktop_save_policy', () => Promise.reject('Write refused'));
+    await submit(form);
+    expect(nodeText(form)).toContain('Write refused.');
+    expect(name.value).toBe('deploy-preview');
+    overrides.delete('desktop_save_policy');
+    await submit(form);
+    await settle();
+    expect(invoke).toHaveBeenCalledWith('desktop_save_policy', {
+      request: expect.objectContaining({
+        mode: 'edit',
+        original_name: 'deploy-prod',
+        policy: expect.objectContaining({ name: 'deploy-preview' }),
+      }),
+    });
+    expect(findNode(root, (node) => node.props['data-testid'] === 'policy-form')).toBeUndefined();
+    await clickRendered(byProp(root, 'aria-label', 'Inspect policy deploy-preview'));
+    await clickRendered(renderedButton(root, 'Delete'));
+    const remove = byProp(root, 'data-testid', 'policy-form');
+    expect(nodeText(remove)).toContain('Delete deploy-preview');
+    await submit(remove);
+    await settle();
+    expect(invoke).toHaveBeenCalledWith('desktop_save_policy', {
+      request: expect.objectContaining({ mode: 'delete', original_name: 'deploy-preview' }),
+    });
+    expect(
+      findNode(root, (node) => node.props['aria-label'] === 'Inspect policy deploy-preview'),
+    ).toBeUndefined();
+  });
+
+  it('ignores errors from a prior project’s metadata refresh after changing selection', async () => {
+    const { root, state } = await openFixtureProject();
+    const pending = deferred<never>();
+    const delayed = [
+      'agent_list_runtime_sessions',
+      'agent_list_device_members',
+      'agent_list_versions',
+      'agent_list_audit',
+      'agent_list_policies',
+    ];
+    for (const command of delayed) overrides.set(command, () => pending.promise);
+    state.selectView('audit');
+    await settle();
+    await clickRendered(renderedButton(root, 'Verify audit chain'));
+    await settle();
+    expect(nodeText(root)).toContain('Loading audit');
+    for (const command of delayed) overrides.delete(command);
+    const projects = await invoke<DesktopProjectContext[]>('desktop_list_projects', {});
+    await state.connectProject(
+      false,
+      projects.find((project) => project.project_id === 'web-app')!.root,
+    );
+    await settle();
+    pending.reject('fixture-old-project-transport-failure');
+    await settle();
+    expect(nodeText(root)).toContain('No audit rows.');
+    expect(nodeText(root)).not.toContain('fixture-old-project-transport-failure');
+    state.selectView('execution');
+    await settle();
+    expect(nodeText(root)).toContain('No runtime sessions yet.');
+    state.selectView('policies');
+    await settle();
+    expect(nodeText(root)).toContain('No commands yet.');
+    expect(nodeText(root)).not.toContain('fixture-old-project-transport-failure');
+  });
+
+  it('uses the project dashboard to navigate checks and configures signed team updates', async () => {
+    const { root, state } = await openFixtureProject();
+    state.selectView('dashboard');
+    await settle();
+    const dashboard = byProp(root, 'aria-labelledby', 'project-dashboard-heading');
+    expect(nodeText(dashboard)).toContain('Setup complete');
+    expect(nodeText(dashboard)).toContain('Failed or stale runs: 1');
+    expect(nodeText(dashboard)).toContain('Secrets 6 4 required');
+    expect(nodeText(dashboard)).toContain('Recorded runs 3 1 failed/stale');
+    const metric = (label: string) =>
+      findNode(dashboard, (node) => node.tag === 'button' && nodeText(node).startsWith(label))!;
+    await clickRendered(metric('Recorded runs'));
+    expect(nodeText(root)).toContain('Runtime sessions');
+    state.selectView('dashboard');
+    await settle();
+    const refresh = renderedButton(
+      byProp(root, 'aria-labelledby', 'project-dashboard-heading'),
+      'Refresh',
+    );
+    const before = calls.filter((command) => command === 'agent_verify_audit').length;
+    await clickRendered(refresh);
+    await settle();
+    expect(calls.filter((command) => command === 'agent_verify_audit')).toHaveLength(before + 1);
+
+    state.selectView('team');
+    await settle();
+    expect(nodeText(root)).toContain('Showing the last verified update.');
+    await input(control(root, 'Shared folder'), '/fixture/team-delivery');
+    await clickRendered(renderedButton(root, 'Save folder and consent'));
+    expect(invoke).toHaveBeenCalledWith('desktop_team_sync_configure', {
+      request: { project_id: 'acme-api', folder: '/fixture/team-delivery', allow_dangerous: false },
+    });
+    expect(nodeText(root)).toContain('team-delivery');
+    await clickRendered(renderedButton(root, 'Apply verified updates'));
+    expect(invoke).toHaveBeenCalledWith('desktop_team_sync_now', {
+      request: { project_id: 'acme-api' },
+    });
+  });
+});
+
+describe('desktop activity while opening and using a project', () => {
+  it('starts the agent, offers a retry after inspection failure, and initializes the folder chosen in Welcome', async () => {
+    usePreviewFixtures(new URLSearchParams({ state: 'welcome' }));
+    const app = mountApp();
+    const { root } = app;
+    await settle();
+    overrides.set('desktop_start_agent', () => Promise.reject('Could not start fixture agent'));
+    await clickRendered(renderedButton(root, 'Start agent'));
+    expect(nodeText(root)).toContain('Could not start fixture agent.');
+    overrides.delete('desktop_start_agent');
+    await clickRendered(renderedButton(root, 'Start agent'));
+    expect(nodeText(root)).toContain('Agent started.');
+    expect(nodeText(root)).toContain('No project');
+
+    const folder = '/fixture/new-project';
+    overrides.set('desktop_pick_directory', () => folder);
+    overrides.set('desktop_inspect_project_folder', () =>
+      Promise.reject('Folder metadata unavailable'),
+    );
+    await clickRendered(renderedButton(root, 'Choose a project folder'));
+    expect(nodeText(root)).toContain('Folder metadata unavailable.');
+    overrides.delete('desktop_inspect_project_folder');
+    await clickRendered(renderedButton(root, 'Choose a project folder'));
+    expect(nodeText(root)).toContain('new-project has no locket.toml yet.');
+    await clickRendered(renderedButton(root, 'Cancel'));
+    expect(nodeText(root)).not.toContain('Initialize Locket in this folder?');
+    await clickRendered(renderedButton(root, 'Choose a project folder'));
+    await clickRendered(renderedButton(root, 'Initialize & open'));
+    await settle();
+    expect(invoke).toHaveBeenCalledWith('desktop_initialize_project', {
+      request: { path: folder },
+    });
+    expect(invoke).toHaveBeenCalledWith('agent_unlock', {
+      request: expect.objectContaining({ source: { kind: 'os-keychain' } }),
+    });
+    expect(app.state.activeContext?.root).toBe(folder);
+  });
+
+  it('applies tray view actions and guides copy, reveal, and unlock when no target is selected', async () => {
+    const app = mountApp();
+    await settle();
+    await app.state.handleTrayMenuAction('unlock-vault');
+    expect(nodeText(app.root)).toContain('Connect a project before unlocking.');
+    await app.state.handleTrayMenuAction('copy-secret');
+    expect(nodeText(app.root)).toContain('Select a secret in the list before copying.');
+    await app.state.handleTrayMenuAction('reveal-secret');
+    expect(nodeText(app.root)).toContain('Select a secret in the list before revealing.');
+    await app.state.handleTrayMenuAction('open-app');
+    await settle();
+    expect(nodeText(app.root)).toContain('Connect a project folder');
+    await app.state.connectProject(false, a.root);
+    await app.state.handleTrayMenuAction('switch-profile');
+    await settle();
+    expect(nodeText(app.root)).toContain('Switch environment');
+    await app.state.handleTrayMenuAction('run-policy');
+    await settle();
+    expect(nodeText(app.root)).toContain('No commands yet.');
+    await app.state.handleTrayMenuAction('unlock-vault');
+    await settle();
+    expect(nodeText(app.root)).toContain('Use system keychain');
+  });
+
+  it('keeps the previous settings after a rejected write and re-enables editing', async () => {
+    const app = await connectedApp();
+    app.state.selectView('settings');
+    await settle();
+    overrides.set('agent_write_config', () =>
+      Promise.reject({
+        kind: 'rejected',
+        code: 'SettingsDenied',
+        message: 'fixture-sensitive-diagnostic',
+      }),
+    );
+    await clickRendered(renderedButton(app.root, '8h'));
+    expect(nodeText(app.root)).toContain('SettingsDenied');
+    expect(nodeText(app.root)).not.toContain('fixture-sensitive-diagnostic');
+    expect(renderedButton(app.root, '15m').props['aria-pressed']).toBe(true);
+    expect(renderedButton(app.root, '8h').props.disabled).toBe(false);
+  });
+});
+
+describe('desktop recovery feedback', () => {
+  it('keeps backup failures scoped and maps each agent failure to safe user feedback', async () => {
+    const { root, state } = await connectedApp();
+    state.selectView('recovery');
+    await settle();
+    const unavailable = {
+      kind: 'unavailable',
+      reason: 'fixture-local-socket',
+      socket_path: '/fixture/private',
+    };
+    const denied = { kind: 'rejected', code: 'RecoveryDenied', message: 'fixture-recovery-detail' };
+    const exportPanel = byProp(root, 'aria-labelledby', 'backup-export-heading');
+    await input(control(exportPanel, 'Recipient descriptor', 'textarea'), 'lkdev2_fixture');
+    overrides.set('agent_export_bundle', () => Promise.reject(unavailable));
+    await clickRendered(renderedButton(exportPanel, 'Preview scope'));
+    expect(nodeText(root)).toContain('Agent unavailable.');
+    expect(nodeText(root)).not.toMatch(/fixture-local-socket|fixture\/private/);
+    expect(renderedButton(exportPanel, 'Export').props.disabled).toBe(true);
+    const importPanel = byProp(root, 'aria-labelledby', 'backup-import-heading');
+    await input(control(importPanel, 'Bundle path'), '/fixture/import.lkb');
+    overrides.set('agent_import_bundle', () => Promise.reject(denied));
+    await clickRendered(renderedButton(importPanel, 'Review bundle'));
+    expect(nodeText(root)).toContain('RecoveryDenied');
+    expect(nodeText(root)).not.toContain('fixture-recovery-detail');
+    overrides.set('agent_recovery_rotate', () => Promise.reject(denied));
+    await check(control(root, 'One-time display acknowledged'));
+    await clickRendered(renderedButton(root, 'Rotate'));
+    expect(nodeText(root)).toContain('RecoveryDenied');
+    expect(nodeText(root)).not.toContain('Backup action running');
+    expect(renderedButton(root, 'Rotate').props.disabled).toBe(false);
+  });
+
+  it('dismisses the project switcher on Escape or outside focus and returns keyboard focus', async () => {
+    const { root } = await connectedApp();
+    const trigger = findNode(
+      root,
+      (node) =>
+        typeof node.props['aria-label'] === 'string' &&
+        node.props['aria-label'].startsWith('Switch vault or project'),
+    )!;
+    const wrapper = trigger.parent!;
+    const focus = vi.fn();
+    Object.assign(trigger, { focus });
+    Object.assign(wrapper, { contains: (target: EventTarget) => target === trigger });
+    await clickRendered(trigger);
+    expect(trigger.props['aria-expanded']).toBe(true);
+    wrapper.dispatchEvent(Object.assign(new Event('focusout'), { relatedTarget: trigger }));
+    await settle();
+    expect(trigger.props['aria-expanded']).toBe(true);
+    wrapper.dispatchEvent(Object.assign(new Event('keydown'), { key: 'Escape' }));
+    await settle();
+    expect(trigger.props['aria-expanded']).toBe(false);
+    expect(focus).toHaveBeenCalledOnce();
+    await clickRendered(trigger);
+    wrapper.dispatchEvent(Object.assign(new Event('focusout'), { relatedTarget: root }));
+    await settle();
+    expect(trigger.props['aria-expanded']).toBe(false);
+    await clickRendered(trigger);
+    windowEvents.dispatchEvent(new Event('pointerdown'));
+    await settle();
+    expect(trigger.props['aria-expanded']).toBe(false);
+  });
+});
+
+describe('desktop metadata failure and recovery', () => {
+  it('marks a broken audit chain with metadata-only status and retries after a transport failure', async () => {
+    const timestamp = 1_750_000_000_000_000_000;
+    const base = {
+      timestamp,
+      profile_id: a.profile_id,
+      secret_name: 'TOKEN',
+      command: 'fixture-command-metadata',
+    };
+    overrides.set('agent_list_audit', () => ({
+      rows: [
+        { ...base, sequence: 1, action: 'UNLOCK', status: 'SUCCESS' },
+        { ...base, sequence: 2, action: 'REVEAL', status: 'DENIED' },
+        { ...base, sequence: 3, action: 'COPY', status: 'FAILED' },
+      ],
+      chain_status: { locked: false, hmac_ok: false, first_break_sequence: 2 },
+    }));
+    overrides.set('agent_verify_audit', () => ({
+      locked: false,
+      hmac_ok: false,
+      first_break_sequence: 2,
+    }));
+    const { root, state } = await connectedApp();
+    state.selectView('audit');
+    await settle();
+    expect(nodeText(root)).toContain('Audit chain broken at row 2.');
+    expect(nodeText(root)).toContain('REVEAL DENIED');
+    expect(nodeText(root)).toContain('COPY FAILED');
+    expect(nodeText(root)).not.toContain('fixture-command-metadata');
+    const listAudit = overrides.get('agent_list_audit')!;
+    overrides.set('agent_list_audit', () => Promise.reject('Audit transport failed'));
+    await clickRendered(renderedButton(root, 'Verify audit chain'));
+    await settle();
+    expect(nodeText(root)).toContain('Audit transport failed.');
+    expect(nodeText(root)).not.toContain('REVEAL DENIED');
+    overrides.set('agent_list_audit', listAudit);
+    await clickRendered(renderedButton(root, 'Verify audit chain'));
+    await settle();
+    expect(nodeText(root)).toContain('Audit chain broken at row 2.');
+  });
+
+  it('retries command loading and keeps detection failures separate from command approval', async () => {
+    overrides.set('agent_list_policies', () => Promise.reject('Policy transport unavailable'));
+    overrides.set('desktop_detect_commands', () => Promise.reject('Detection failed'));
+    const { root, state } = await connectedApp();
+    state.selectView('policies');
+    await settle();
+    expect(nodeText(root)).toContain('Policy transport unavailable.');
+    expect(nodeText(root)).toContain('Detection failed.');
+    expect(renderedButton(root, 'New command').props.disabled).toBe(true);
+    overrides.delete('agent_list_policies');
+    overrides.delete('desktop_detect_commands');
+    await clickRendered(renderedButton(root, 'Refresh commands'));
+    await settle();
+    expect(nodeText(root)).not.toContain('Detection failed.');
+    expect(nodeText(root)).toContain('No commands yet.');
+    await clickRendered(renderedButton(root, 'New command'));
+    expect(nodeText(byProp(root, 'data-testid', 'policy-form'))).toContain('Create command');
+  });
+
+  it('focuses the add form from onboarding and sends an env import only after project confirmation', async () => {
+    overrides.set('agent_read_config', () => ({
+      privacy_redact_names: false,
+      agent_unlock_ttl: '15m',
+      user_verification_required_for: {},
+      dangerous_profile: {
+        profile_name: a.profile_name,
+        profile_label: a.profile_name,
+        dangerous: true,
+      },
+    }));
+    const { root, state } = await connectedApp();
+    const focus = vi.fn();
+    vi.stubGlobal('document', {
+      getElementById: (id: string) => (id === 'secret-editor-set-heading' ? { focus } : null),
+    });
+    state.selectView('secrets');
+    await settle();
+    await clickRendered(renderedButton(root, 'Add a secret'));
+    expect(focus).toHaveBeenCalledOnce();
+    expect(nodeText(root)).toContain('Variable editor');
+    const panel = byProp(root, 'aria-labelledby', 'import-heading');
+    const confirmation = control(panel, 'Type development to confirm');
+    expect(renderedButton(panel, 'Import secrets').props.disabled).toBe(true);
+    await input(confirmation, 'wrong-environment');
+    await submit(panel);
+    expect(calls).not.toContain('desktop_import_env');
+    await input(confirmation, 'development');
+    await check(control(panel, 'Replace existing values'));
+    await check(control(panel, 'Keep expansion syntax'));
+    overrides.set('desktop_import_env', () => Promise.reject('Import refused'));
+    await submit(panel);
+    expect(nodeText(root)).toContain('Import refused.');
+    expect(confirmation.value).toBe('development');
+    overrides.set('desktop_import_env', () => ({ summary: 'Imported 1 variable.' }));
+    await submit(panel);
+    expect(invoke).toHaveBeenCalledWith('desktop_import_env', {
+      request: {
+        project_id: a.project_id,
+        path: '.env',
+        overwrite: true,
+        literal: true,
+        confirmation: 'development',
+      },
+    });
+    expect(nodeText(root)).toContain('Imported 1 variable.');
+    expect(confirmation.value).toBe('');
+    expect(renderedButton(panel, 'Import secrets').props.disabled).toBe(true);
+  });
+});
+
+it('requires fresh dangerous approval for saving and rotation, and drops approval on project switch', async () => {
+  overrides.set('agent_read_config', () => ({
+    privacy_redact_names: false,
+    agent_unlock_ttl: '15m',
+    user_verification_required_for: {},
+    dangerous_profile: { dangerous: true },
+  }));
+  overrides.set('agent_set_secret', () => ({
+    action: 'set',
+    secret_id: 'fixture-id',
+    version: 1,
+    source: 'user-local',
+  }));
+  const { root, state } = await connectedApp();
+  const dialog = byProp(root, 'aria-labelledby', 'dangerous-action-title');
+  const prompt = Object.assign(dialog, {
+    open: false,
+    returnValue: '',
+    showModal() {
+      this.open = true;
+    },
+    close(result = '') {
+      this.open = false;
+      this.returnValue = result;
+      dialog.dispatchEvent(new Event('close'));
+    },
+  });
+  state.selectView('secret-editor');
+  await settle();
+  const create = byProp(root, 'aria-labelledby', 'secret-editor-set-heading');
+  await input(byProp(create, 'data-testid', 'secret-editor-set-name'), 'FIXTURE_APPROVAL');
+  await input(byProp(create, 'data-testid', 'secret-editor-set-value'), 'fixture-only-draft');
+  await submit(create);
+  expect(prompt.open).toBe(true);
+  expect(nodeText(dialog)).toContain('Save secret');
+  expect(calls).not.toContain('agent_set_secret');
+  prompt.close('cancel');
+  await settle();
+  expect(calls).not.toContain('agent_set_secret');
+  expect(nodeText(create)).toContain('Request failed.');
+  expect(nodeText(create)).not.toContain('fixture-only-draft');
+  await submit(create);
+  prompt.close('confirm');
+  await settle();
+  expect(invoke).toHaveBeenCalledWith('agent_set_secret', {
+    request: {
+      project_id: a.project_id,
+      profile_id: a.profile_id,
+      secret_name: 'FIXTURE_APPROVAL',
+      value: 'fixture-only-draft',
+      source: 'user-local',
+      grant_id: undefined,
+      confirm_dangerous: true,
+    },
+  });
+  expect(byProp(create, 'data-testid', 'secret-editor-set-value').value).toBe('');
+
+  const rotate = byProp(root, 'aria-labelledby', 'secret-editor-rotate-heading');
+  await input(byProp(rotate, 'data-testid', 'secret-editor-rotate-name'), 'FIXTURE_APPROVAL');
+  await input(byProp(rotate, 'data-testid', 'secret-editor-rotate-value'), 'fixture-only-rotation');
+  await submit(rotate);
+  expect(prompt.open).toBe(true);
+  expect(nodeText(dialog)).toContain('Rotate secret');
+  await state.connectProject(false, b.root);
+  await settle();
+  expect(prompt.open).toBe(false);
+  expect(calls).not.toContain('agent_rotate_secret');
+  expect(byProp(root, 'data-testid', 'secret-editor-rotate-value').value).toBe('');
 });
