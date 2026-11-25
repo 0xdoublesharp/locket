@@ -636,6 +636,38 @@ mod tests {
     }
 
     #[test]
+    fn age_bundle_binds_the_payload_to_the_rfc7748_recipient() {
+        use data_encoding::HEXLOWER;
+
+        // RFC 7748, section 6.1, Alice's private and public X25519 keys.
+        let alice: [u8; 32] = HEXLOWER
+            .decode(b"77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let recipient = HEXLOWER
+            .decode(b"8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let plaintext = b"synthetic bundle payload";
+        let mut encrypted =
+            encrypt_bundle_payload_for_age_recipients(plaintext, &[recipient]).unwrap();
+        assert_eq!(
+            decrypt_bundle_payload_with_x25519_secret(&encrypted, &alice).unwrap(),
+            plaintext
+        );
+        assert!(decrypt_bundle_payload_with_x25519_secret(&encrypted, &[11; 32]).is_err());
+        assert!(
+            decrypt_bundle_payload_with_x25519_secret(&encrypted[..encrypted.len() - 1], &alice)
+                .is_err()
+        );
+        let last = encrypted.last_mut().unwrap();
+        *last ^= 1;
+        assert!(decrypt_bundle_payload_with_x25519_secret(&encrypted, &alice).is_err());
+    }
+
+    #[test]
     fn age_payload_requires_at_least_one_recipient() {
         let error = encrypt_bundle_payload_for_age_recipients(b"{}", &[]).unwrap_err();
         assert_eq!(error, BundleEncryptionError::MissingRecipients);

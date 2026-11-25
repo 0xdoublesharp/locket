@@ -1208,3 +1208,679 @@ async fn authenticated_team_publication_after_revocation() {
     publisher.assert_audit_integrity(A);
     trace.emit("TeamSyncAndAuditWitness");
 }
+
+async fn authorization_snapshot(fixture: &Fixture, outcome: &str, grant: Option<&str>) -> String {
+    let unlocked =
+        fixture.state.unlock_cache.lock().await.lookup(A.id, i128::from(now())).is_some();
+    let blocked = fixture.session_blocked().await;
+    let table = fixture.state.grants.lock().await;
+    assert_eq!(table.len(), usize::from(grant.is_some()));
+    let held = grant.is_some_and(|id| {
+        let entry = table.get(id).unwrap();
+        assert_eq!(entry.project_id, A.id);
+        assert_eq!(entry.profile_id, A.profile);
+        assert_eq!(entry.action, GrantAction::Reveal);
+        true
+    });
+    format!(
+        "[unlocked |-> {}, blocked |-> {}, grant |-> {}, outcome |-> {outcome:?}]",
+        tla_bool(unlocked),
+        tla_bool(blocked),
+        tla_bool(held)
+    )
+}
+
+#[tokio::test]
+async fn agent_authorization_protocol() {
+    use locket_agent::{PeerIdentity, dispatch_with_peer};
+    use locket_platform::MemoryLocalUserVerifier;
+
+    let mut fixture = Fixture::new(&[(A, true)]);
+    fixture.state = fixture
+        .state
+        .with_daemon_user_verification(true)
+        .with_user_verifier(Arc::new(MemoryLocalUserVerifier::allowing()));
+    let denied =
+        fixture.state.clone().with_user_verifier(Arc::new(MemoryLocalUserVerifier::denying()));
+    fixture.state.master_key_store.store_master_key(A.id, &MASTER).unwrap();
+    let live = locket_platform::current_process_binding().unwrap();
+    let peer = PeerIdentity { uid: current_process_uid(), pid: Some(live.pid), connection_id: 77 };
+    let binding = GrantBinding::new(live.pid, live.process_start_time);
+
+    let mut trace = Trace::default();
+    trace.record("init", "<<>>", &authorization_snapshot(&fixture, "none", None).await);
+    let unlock = RequestEnvelope::new(
+        "unlock",
+        AgentMethod::Unlock,
+        json!({
+            "project_id": A.id, "ttl_seconds": 120,
+            "audit": {"store_path": fixture.path, "profile_id": A.profile},
+        }),
+    );
+    assert_eq!(
+        denial(dispatch_with_peer(&unlock, &denied, Some(peer)).await),
+        "UserVerificationFailed"
+    );
+    trace.record("unlock", "<<FALSE>>", &authorization_snapshot(&fixture, "Denied", None).await);
+    success(dispatch_with_peer(&unlock, &fixture.state, Some(peer)).await);
+    trace.record("unlock", "<<TRUE>>", &authorization_snapshot(&fixture, "Unlocked", None).await);
+
+    let grant = |confirmed| {
+        RequestEnvelope::new(
+            "grant",
+            AgentMethod::RequestGrant,
+            json!({
+                "project_id": A.id, "profile_id": A.profile, "store_path": fixture.path,
+                "action": "Reveal", "confirm_dangerous": confirmed, "ttl_seconds": 30, "binding": binding,
+            }),
+        )
+    };
+    assert_eq!(
+        denial(dispatch_with_peer(&grant(false), &fixture.state, Some(peer)).await),
+        "ConfirmationFailed"
+    );
+    trace.record(
+        "grant",
+        "<<FALSE, TRUE>>",
+        &authorization_snapshot(&fixture, "Denied", None).await,
+    );
+
+    let store = fixture.store();
+    store
+        .connection()
+        .execute_batch(
+            "CREATE TRIGGER deny_grant_audit BEFORE INSERT ON audit_log
+         WHEN NEW.action = 'AGENT_GRANT' BEGIN SELECT RAISE(ABORT, 'trace fixture'); END",
+        )
+        .unwrap();
+    assert_eq!(
+        denial(dispatch_with_peer(&grant(true), &fixture.state, Some(peer)).await),
+        "AuditIntegrityFailed"
+    );
+    trace.record(
+        "grant",
+        "<<TRUE, FALSE>>",
+        &authorization_snapshot(&fixture, "AuditIntegrityFailed", None).await,
+    );
+    store.connection().execute_batch("DROP TRIGGER deny_grant_audit").unwrap();
+
+    let id = grant_id(dispatch_with_peer(&grant(true), &fixture.state, Some(peer)).await);
+    trace.record(
+        "grant",
+        "<<TRUE, TRUE>>",
+        &authorization_snapshot(&fixture, "Granted", Some(&id)).await,
+    );
+    success(fixture.rpc(AgentMethod::Lock, json!({"project_id": A.id})).await);
+    trace.record("lock", "<<>>", &authorization_snapshot(&fixture, "none", None).await);
+    fixture.assert_audit_integrity(A);
+    trace.emit("AgentAuthzProtocol");
+}
+
+fn signed_prepare(
+    fixture: &Fixture,
+    challenge: &locket_agent::ClientHelloResponse,
+    signing: &ed25519_dalek::SigningKey,
+) -> RequestEnvelope {
+    use data_encoding::BASE64URL_NOPAD;
+    use ed25519_dalek::Signer;
+
+    let mut request = RequestEnvelope::new(
+        "prepare",
+        AgentMethod::PrepareExec,
+        json!({
+            "project_id": A.id, "profile_id": A.profile, "store_path": fixture.path,
+            "policy_name": POLICY, "requested_action": "run-policy",
+        }),
+    );
+    let timestamp = now();
+    let mut canonical = serde_json::to_value(&request).unwrap();
+    canonical.sort_all_objects();
+    let digest = Sha256::digest(serde_json::to_vec(&canonical).unwrap());
+    let nonce = BASE64URL_NOPAD.decode(challenge.nonce.as_bytes()).unwrap();
+    let message = [
+        b"locket-client-auth-v1",
+        challenge.client_id.as_bytes(),
+        challenge.challenge_id.as_bytes(),
+        &nonce,
+        timestamp.to_string().as_bytes(),
+        request.id.as_bytes(),
+        digest.as_slice(),
+    ]
+    .concat();
+    request.payload["auth"] = json!({
+        "client_id": challenge.client_id, "challenge_id": challenge.challenge_id,
+        "nonce": challenge.nonce, "request_timestamp": timestamp,
+        "signature": BASE64URL_NOPAD.encode(&signing.sign(&message).to_bytes()),
+    });
+    request
+}
+
+async fn automation_snapshot(
+    fixture: &Fixture,
+    nonce: Option<&str>,
+    status: &str,
+    granted: bool,
+) -> String {
+    use data_encoding::BASE64URL_NOPAD;
+
+    let challenges = fixture.state.automation_challenges.lock().await.len();
+    let store = fixture.store();
+    let client = store.get_automation_client(A.id, "trace-client").unwrap();
+    let registry = match &client {
+        None => "absent",
+        Some(row) if row.revoked_at.is_some() => "revoked",
+        Some(_) => "active",
+    };
+    let last_used = tla_bool(client.and_then(|row| row.last_used_at).is_some());
+    let mut query =
+        store.connection().prepare("SELECT nonce FROM automation_client_nonces").unwrap();
+    let stored = query
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    if !stored.is_empty() {
+        assert_eq!(stored, [BASE64URL_NOPAD.decode(nonce.unwrap().as_bytes()).unwrap()]);
+    }
+    let used = if stored.is_empty() { "{}" } else { "{\"nonceA\"}" };
+    let audit_count: u32 = store
+        .connection()
+        .query_row(
+            "SELECT count(*) FROM audit_log WHERE action = 'CLIENT_AUTH' AND status = 'SUCCESS'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    format!(
+        "[registry |-> {registry:?}, challenges |-> {challenges}, used |-> {used}, \
+         auditCount |-> {audit_count}, lastUsed |-> {last_used}, status |-> {status:?}, granted |-> {}]",
+        tla_bool(granted),
+    )
+}
+
+#[tokio::test]
+async fn automation_client_authentication() {
+    use data_encoding::BASE64URL_NOPAD;
+    use ed25519_dalek::SigningKey;
+    use locket_agent::CommandPolicySnapshot;
+    use locket_platform::MemoryLocalUserVerifier;
+
+    let mut fixture = Fixture::new(&[(A, false)]);
+    fixture.state = fixture
+        .state
+        .with_daemon_user_verification(true)
+        .with_user_verifier(Arc::new(MemoryLocalUserVerifier::allowing()));
+    success(fixture.unlock(A, 120).await);
+    let policy = locket_core::PolicyDocument::from_toml_str(
+        "schema_version = 1\n[commands.inspect]\nargv = ['echo']\nrequired_secrets = ['TOKEN']",
+    )
+    .unwrap();
+    fixture.state.command_policies.lock().await.push(CommandPolicySnapshot::from_policy(
+        A.id,
+        &policy.commands[POLICY],
+        1,
+    ));
+    let mut trace = Trace::default();
+    trace.record("init", "<<>>", &automation_snapshot(&fixture, None, "none", false).await);
+    let signing = SigningKey::from_bytes(&[23; 32]);
+    let registration = success(fixture.rpc(AgentMethod::RegisterClient, json!({
+        "project_id": A.id, "store_path": fixture.path, "name": "trace-client",
+        "public_key": signing.verifying_key().to_bytes(), "storage": "external",
+        "allowed_actions": ["run-policy", "resolve-reference"], "allowed_policies": [POLICY],
+    })).await);
+    let client = &registration["client_id"];
+    trace.record("register", "<<>>", &automation_snapshot(&fixture, None, "none", false).await);
+
+    let mut accepted_nonce: Option<String> = None;
+    for (id, nonce_alias, expected) in [
+        ("helloA", "nonceA", "Authenticated"),
+        ("helloB", "nonceB", "Denied"),
+        ("helloB", "nonceA", "Replay"),
+    ] {
+        let hello = fixture.rpc(AgentMethod::ClientHello, json!({"client_id": client})).await;
+        let mut challenge: locket_agent::ClientHelloResponse =
+            serde_json::from_value(success(hello)).unwrap();
+        assert_eq!(client, &challenge.client_id);
+        {
+            let mut pool = fixture.state.automation_challenges.lock().await;
+            let entry = pool.get_mut(&challenge.challenge_id).unwrap();
+            assert_eq!(BASE64URL_NOPAD.encode(&entry.nonce), challenge.nonce);
+            if expected == "Replay" {
+                // Reissue a saved nonce under a new challenge id to exercise
+                // the durable nonce table independently of challenge burning.
+                challenge.nonce.clone_from(accepted_nonce.as_ref().unwrap());
+                entry.nonce =
+                    BASE64URL_NOPAD.decode(challenge.nonce.as_bytes()).unwrap().try_into().unwrap();
+            }
+            drop(pool);
+        }
+        trace.record(
+            "hello",
+            format!("<<{id:?}, {nonce_alias:?}>>"),
+            &automation_snapshot(&fixture, accepted_nonce.as_deref(), "none", false).await,
+        );
+        let other = SigningKey::from_bytes(&[24; 32]);
+        let signer = if expected == "Denied" { &other } else { &signing };
+        let request = signed_prepare(&fixture, &challenge, signer);
+        let response = dispatch(&request, &fixture.state).await;
+        let granted = expected == "Authenticated";
+        if granted {
+            let id = grant_id(response);
+            assert!(fixture.state.grants.lock().await.get(&id).is_some());
+            accepted_nonce = Some(challenge.nonce);
+            success(fixture.rpc(AgentMethod::RevokeGrant, json!({"grant_id": id})).await);
+        } else {
+            let error = if expected == "Replay" {
+                "AutomationClientReplayDetected"
+            } else {
+                "AutomationClientNotTrusted"
+            };
+            assert_eq!(denial(response), error);
+            assert!(fixture.state.grants.lock().await.is_empty());
+        }
+        let action = if expected == "Denied" { "badSignature" } else { "signed" };
+        trace.record(
+            action,
+            format!("<<{id:?}, {nonce_alias:?}>>"),
+            &automation_snapshot(&fixture, accepted_nonce.as_deref(), expected, granted).await,
+        );
+    }
+    success(
+        fixture
+            .rpc(
+                AgentMethod::RevokeClient,
+                json!({
+                    "project_id": A.id, "store_path": fixture.path, "client": client,
+                }),
+            )
+            .await,
+    );
+    trace.record(
+        "revoke",
+        "<<>>",
+        &automation_snapshot(&fixture, accepted_nonce.as_deref(), "none", false).await,
+    );
+    fixture.assert_audit_integrity(A);
+    trace.emit("AutomationClientAuth");
+}
+
+#[cfg(unix)]
+mod cli_traces {
+    use super::{AgentMethod, RequestEnvelope, Store, Trace, fs, json, success, tla_bool};
+    use locket_core::{ProfileId, ProjectId};
+    use locket_platform::LocketInstance;
+    use serde_json::Value;
+    use sha2::{Digest, Sha256};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::net::UnixStream;
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, Command, ExitStatus, Output, Stdio};
+    use std::time::{Duration, Instant};
+
+    const WAIT: Duration = Duration::from_secs(10);
+
+    fn tempdir() -> tempfile::TempDir {
+        // Cargo wrappers may choose long temporary paths. Keep Unix socket
+        // addresses within sockaddr_un and give the daemon a private parent.
+        let dir = tempfile::tempdir_in("/Volumes/Scratch/locket/t").unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
+    fn cli(root: &Path) -> Option<Command> {
+        let binary = std::env::var_os("LOCKET_TLA_CLI").or_else(|| {
+            assert!(
+                std::env::var_os("LOCKET_TLA_TRACE_DIR").is_none(),
+                "trace runner must supply the CLI"
+            );
+            None
+        })?;
+        let mut command = Command::new(binary);
+        command
+            .current_dir(root)
+            .env("HOME", ".")
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_RUNTIME_DIR", ".")
+            .env("LOCKET_INSTANCE", "dev")
+            .stdin(Stdio::null());
+        Some(command)
+    }
+
+    fn ok(output: Output) -> String {
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    fn serve(mut cli: Command, socket: &Path, pid: &Path) -> Command {
+        cli.arg("internal-agent-serve").arg("--socket").arg(socket).arg("--pid-file").arg(pid);
+        cli
+    }
+
+    struct Worker(Child);
+
+    impl Drop for Worker {
+        fn drop(&mut self) {
+            if matches!(self.0.try_wait(), Ok(None)) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    impl Worker {
+        fn start(cli: &mut Command, socket: &Path, pid: &Path) -> Self {
+            let mut worker = Self(cli.stdout(Stdio::null()).spawn().unwrap());
+            let deadline = Instant::now() + WAIT;
+            let expected_pid = worker.0.id().to_string();
+            while fs::read_to_string(pid).map_or(true, |text| text.trim() != expected_pid) {
+                assert!(
+                    worker.0.try_wait().unwrap().is_none(),
+                    "daemon exited before publishing its PID"
+                );
+                assert!(Instant::now() < deadline, "daemon did not publish its PID");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(status(socket).is_object());
+            worker
+        }
+
+        fn stop(&mut self) {
+            use rustix::process::{Pid, Signal, kill_process};
+
+            let pid = Pid::from_raw(i32::try_from(self.0.id()).unwrap()).unwrap();
+            kill_process(pid, Signal::TERM).unwrap();
+            let status = self.wait_for_exit();
+            assert!(status.success(), "daemon exit: {status}");
+        }
+
+        fn wait_for_exit(&mut self) -> ExitStatus {
+            let deadline = Instant::now() + WAIT;
+            loop {
+                if let Some(status) = self.0.try_wait().unwrap() {
+                    return status;
+                }
+                assert!(Instant::now() < deadline, "daemon did not exit");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    fn status(socket: &Path) -> Value {
+        use locket_agent::{DEFAULT_MAX_MESSAGE_SIZE, decode_response_frame, encode_frame};
+
+        let mut stream = UnixStream::connect(socket).unwrap();
+        stream.set_read_timeout(Some(WAIT)).unwrap();
+        stream.set_write_timeout(Some(WAIT)).unwrap();
+        let request = RequestEnvelope::new("status", AgentMethod::Status, Value::Null);
+        stream.write_all(&encode_frame(&request, DEFAULT_MAX_MESSAGE_SIZE).unwrap()).unwrap();
+        let mut prefix = [0; 4];
+        stream.read_exact(&mut prefix).unwrap();
+        let len = u32::from_le_bytes(prefix) as usize;
+        assert!(len <= DEFAULT_MAX_MESSAGE_SIZE);
+        let mut frame = prefix.to_vec();
+        frame.resize(prefix.len() + len, 0);
+        stream.read_exact(&mut frame[prefix.len()..]).unwrap();
+        success(decode_response_frame(&frame, DEFAULT_MAX_MESSAGE_SIZE).unwrap().0)
+    }
+
+    fn daemon_state(socket: &Path, pid: &Path, secondary_failed: bool) -> String {
+        format!(
+            "[socket |-> {}, pidFile |-> {}, secondaryFailed |-> {}]",
+            tla_bool(socket.exists()),
+            tla_bool(pid.exists()),
+            tla_bool(secondary_failed)
+        )
+    }
+
+    #[test]
+    fn daemon_endpoint_lifecycle() {
+        if cli(Path::new(".")).is_none() {
+            return;
+        }
+        let root = tempdir();
+        let Some(command) = cli(root.path()) else { return };
+        let socket = root.path().join("daemon.sock");
+        let pid = root.path().join("daemon.pid");
+        let mut trace = Trace::default();
+        trace.record("init", "<<>>", &daemon_state(&socket, &pid, false));
+
+        let mut primary = Worker::start(&mut serve(command, &socket, &pid), &socket, &pid);
+        trace.record("start", "<<>>", &daemon_state(&socket, &pid, false));
+        let before = fs::metadata(&socket).unwrap().ino();
+        let mut secondary = Worker(
+            serve(cli(root.path()).unwrap(), &socket, &pid)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let secondary_failed = !secondary.wait_for_exit().success();
+        assert!(secondary_failed);
+        assert_eq!(fs::metadata(&socket).unwrap().ino(), before);
+        assert_eq!(fs::read_to_string(&pid).unwrap().trim(), primary.0.id().to_string());
+        assert!(status(&socket).is_object());
+        trace.record("contend", "<<>>", &daemon_state(&socket, &pid, secondary_failed));
+
+        primary.stop();
+        trace.record("stop", "<<>>", &daemon_state(&socket, &pid, true));
+        assert!(!socket.exists() && !pid.exists());
+        trace.emit("AgentDaemonLifecycle");
+    }
+
+    fn initialize_egress_project(root: &Path, upstream: SocketAddr) -> (PathBuf, PathBuf) {
+        let instance = LocketInstance::Dev;
+        let dirs = instance.project_dirs().unwrap();
+        let data_base = if cfg!(target_os = "macos") {
+            root.join("Library/Application Support")
+        } else {
+            root.join("data")
+        };
+        let data = data_base.join(dirs.project_path());
+        fs::create_dir_all(&data).unwrap();
+        let mut store = Store::open(data.join("store.db")).unwrap();
+        store.initialize_schema().unwrap();
+        let project = ProjectId::generate().unwrap();
+        let profile = ProfileId::generate().unwrap();
+        store.insert_project_if_absent(project.as_str(), "trace-egress", 1).unwrap();
+        store
+            .insert_profile_if_absent(profile.as_str(), project.as_str(), "default", false, 1)
+            .unwrap();
+        let path = root.join("locket.toml");
+        let program =
+            serde_json::to_string(std::env::current_exe().unwrap().to_str().unwrap()).unwrap();
+        let policy = format!(
+            r#"
+schema_version = 1
+project_id = "{project}"
+name = "trace-egress"
+default_profile = "default"
+[commands.probe]
+argv = [{program}, "--exact", "cli_traces::egress_probe_child", "--nocapture"]
+required_secrets = ["TOKEN"]
+external_env_sources = [{{file = ".settings"}}]
+env_mode = "strict"
+"#,
+        );
+        fs::write(&path, &policy).unwrap();
+        fs::write(root.join(".settings"), "TOKEN=synthetic-egress-trace-token\n").unwrap();
+        fs::write(root.join(".trace-egress-upstream"), upstream.to_string()).unwrap();
+        let root_text = root.to_str().unwrap();
+        store
+            .trust_project_root(
+                project.as_str(),
+                &Sha256::digest(root_text).into(),
+                Some(root_text),
+                1,
+            )
+            .unwrap();
+        let doc: toml::Value = toml::from_str(&policy).unwrap();
+        let digest = locket_core::policy::policy_source_digest(&doc, "probe").unwrap();
+        store
+            .upsert_command_policy_index(
+                project.as_str(),
+                "probe",
+                &json!(doc["commands"]["probe"]),
+                &json!({"source_path": path, "source_digest": digest}),
+                1,
+                None,
+            )
+            .unwrap();
+        let agent = instance.agent_data_dir(std::env::consts::OS, root, Some(root.as_os_str()));
+        (agent.join("agent.sock"), agent.join("agent.pid"))
+    }
+
+    #[test]
+    fn egress_probe_child() {
+        let Ok(target) = fs::read_to_string(".trace-egress-upstream") else { return };
+        let proxy = std::env::var("HTTP_PROXY").unwrap();
+        let (credentials, address) =
+            proxy.strip_prefix("http://").unwrap().split_once('@').unwrap();
+        let address: SocketAddr = address.parse().unwrap();
+        assert!(address.ip().is_loopback());
+        let token = std::env::var("TOKEN").unwrap();
+        assert_ne!(token, "synthetic-egress-trace-token");
+        let auth = data_encoding::BASE64.encode(credentials.as_bytes());
+        for (label, header) in [
+            ("missing", String::new()),
+            ("valid", format!("Proxy-Authorization: Basic {auth}\r\n")),
+        ] {
+            let mut stream = TcpStream::connect_timeout(&address, WAIT).unwrap();
+            stream.set_read_timeout(Some(WAIT)).unwrap();
+            stream.set_write_timeout(Some(WAIT)).unwrap();
+            write!(stream,
+                "GET http://{target}/ HTTP/1.1\r\nHost: {target}\r\nAuthorization: Bearer {token}\r\n{header}\r\n"
+            ).unwrap();
+            let mut status = String::new();
+            BufReader::new(stream).read_line(&mut status).unwrap();
+            writeln!(std::io::stdout().lock(), "{label}: {}", status.trim_end()).unwrap();
+        }
+    }
+
+    #[test]
+    fn egress_authentication_and_destination_screening() {
+        if cli(Path::new(".")).is_none() {
+            return;
+        }
+        let dir = tempdir();
+        let root = dir.path().canonicalize().unwrap();
+        let Some(mut command) = cli(&root) else { return };
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        upstream.set_nonblocking(true).unwrap();
+        let (socket, pid) = initialize_egress_project(&root, upstream.local_addr().unwrap());
+        let mut worker =
+            Worker::start(&mut serve(cli(&root).unwrap(), &socket, &pid), &socket, &pid);
+        // The fixture has no OS keychain entry. The later run-policy audit
+        // can fail after the child and broker have already finished.
+        let output = command
+            .args([
+                "run",
+                "--egress-host",
+                "TOKEN=127.0.0.1",
+                "--no-egress-tls-mitm",
+                "--allow-uncontained-egress",
+                "probe",
+            ])
+            .output()
+            .unwrap();
+        let diagnostics = String::from_utf8(output.stderr).unwrap();
+        assert!(diagnostics.contains("Locket blocked 2 egress request(s)"), "{diagnostics}");
+        let transcript = String::from_utf8(output.stdout).unwrap();
+        assert!(transcript.contains("test result: ok. 1 passed"), "{transcript}");
+        let forwarded = match upstream.accept() {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+            Err(error) => panic!("could not check for upstream connections: {error}"),
+        };
+        assert!(!forwarded);
+        let trace_for = |auth: &str, status: &str| {
+            assert!(transcript.lines().any(|line| line == status), "{transcript}");
+            let mut trace = Trace::default();
+            trace.record("init", "<<>>", r#"[phase |-> "start", forwarded |-> FALSE]"#);
+            trace.record(
+                "request",
+                format!("<<{auth:?}>>"),
+                &format!(r#"[phase |-> "rejected", forwarded |-> {}]"#, tla_bool(forwarded)),
+            );
+            trace
+        };
+        let screened = trace_for("valid", "valid: HTTP/1.1 403 Forbidden");
+        let unauthenticated =
+            trace_for("missing", "missing: HTTP/1.1 407 Proxy Authentication Required");
+        worker.stop();
+        screened.emit_with_rejection("EgressProxyAndRedaction", Some(unauthenticated));
+    }
+
+    fn inspect(root: &Path, path: &str) -> (bool, Value) {
+        let mut child = cli(root)
+            .unwrap()
+            .arg("mcp")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(
+            child.stdin.take().unwrap(),
+            "{}",
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "locket_inspect_env_keys", "arguments": {"path": path}},
+            })
+        )
+        .unwrap();
+        let response: Value = serde_json::from_str(&ok(child.wait_with_output().unwrap())).unwrap();
+        let result = &response["result"];
+        let content = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        (result["isError"].as_bool().unwrap(), content)
+    }
+
+    #[test]
+    fn mcp_env_file_boundary() {
+        use std::os::unix::fs::symlink;
+
+        if cli(Path::new(".")).is_none() {
+            return;
+        }
+        let home = tempdir();
+        let root = home.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join(".env"), "TOKEN=synthetic-mcp-plaintext\n").unwrap();
+        let external = home.path().join(".outside");
+        fs::write(&external, "PRIVATE_OUTSIDE=synthetic-outside-plaintext\n").unwrap();
+        symlink(external, root.join(".link")).unwrap();
+
+        let observed = |path: &str, is_link: bool| {
+            let (failed, content) = inspect(&root, path);
+            let response = content.to_string();
+            assert_eq!(failed, is_link, "{response}");
+            assert!(!response.contains("synthetic-outside-plaintext"));
+            assert!(!response.contains("PRIVATE_OUTSIDE"));
+            let mut fields = Vec::new();
+            if content["keys"].as_array().is_some_and(|keys| keys.iter().any(|key| key == "TOKEN"))
+            {
+                fields.push(r#""secret-name""#);
+            }
+            if response.contains("synthetic-mcp-plaintext") {
+                fields.push(r#""plaintext-secret""#);
+            }
+            let mut trace = Trace::default();
+            trace.record("init", "<<>>", "[phase |-> \"idle\", response |-> {}]");
+            trace.record(
+                "inspect",
+                format!("<<{}>>", tla_bool(is_link)),
+                &format!("[phase |-> \"done\", response |-> {{{}}}]", fields.join(", ")),
+            );
+            trace
+        };
+        observed(".env", false)
+            .emit_with_rejection("McpAndDesktopBoundary", Some(observed(".link", true)));
+    }
+}

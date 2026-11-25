@@ -75,3 +75,6 @@ pub use update_manifest::{
 };
 
 pub use formats::team_package;
+
+#[cfg(kani)]
+mod kani_proofs;

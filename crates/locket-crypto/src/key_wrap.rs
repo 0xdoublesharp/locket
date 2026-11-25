@@ -111,11 +111,18 @@ fn decrypt_key(
 ///
 /// Returns an error if random generation or encryption fails.
 pub fn wrap_dek_v1(wrapping_key: &KeyBytes, dek: &KeyBytes, aad: &[u8]) -> CryptoResult<Vec<u8>> {
-    let wrap_nonce = random_bytes::<NONCE_LEN>()?;
-    let wrap_ciphertext = aead_encrypt(wrapping_key, &wrap_nonce, dek, aad)?;
+    wrap_dek_with_nonce_v1(wrapping_key, dek, aad, &random_bytes::<NONCE_LEN>()?)
+}
 
+pub fn wrap_dek_with_nonce_v1(
+    wrapping_key: &KeyBytes,
+    dek: &KeyBytes,
+    aad: &[u8],
+    wrap_nonce: &NonceBytes,
+) -> CryptoResult<Vec<u8>> {
+    let wrap_ciphertext = aead_encrypt(wrapping_key, wrap_nonce, dek, aad)?;
     let mut wrapped = Vec::with_capacity(NONCE_LEN + wrap_ciphertext.len());
-    wrapped.extend_from_slice(&wrap_nonce);
+    wrapped.extend_from_slice(wrap_nonce);
     wrapped.extend_from_slice(&wrap_ciphertext);
     Ok(wrapped)
 }
@@ -130,6 +137,11 @@ pub fn unwrap_dek_v1(
     encrypted_dek: &[u8],
     aad: &[u8],
 ) -> CryptoResult<Zeroizing<KeyBytes>> {
+    let (wrap_nonce, wrap_ciphertext) = split_wrapped_dek_v1(encrypted_dek)?;
+    decrypt_key(wrapping_key, wrap_nonce, wrap_ciphertext, aad)
+}
+
+pub fn split_wrapped_dek_v1(encrypted_dek: &[u8]) -> CryptoResult<(&NonceBytes, &[u8])> {
     let expected_len = NONCE_LEN + KEY_LEN + TAG_LEN;
     if encrypted_dek.len() != expected_len {
         return Err(CryptoError::InvalidWrappedKey);
@@ -138,7 +150,7 @@ pub fn unwrap_dek_v1(
     let (wrap_nonce, wrap_ciphertext) = encrypted_dek.split_at(NONCE_LEN);
     let wrap_nonce: &NonceBytes =
         wrap_nonce.try_into().map_err(|_| CryptoError::InvalidWrappedKey)?;
-    decrypt_key(wrapping_key, wrap_nonce, wrap_ciphertext, aad)
+    Ok((wrap_nonce, wrap_ciphertext))
 }
 
 /// Wraps a master key under the 32-byte `WebAuthn` PRF output for `project_id`.

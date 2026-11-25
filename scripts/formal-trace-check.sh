@@ -18,7 +18,8 @@ work=$(mktemp -d "$scratch_tmp/formal-trace-check.XXXXXXXX")
 trap 'rm -rf -- "$work"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-export TMPDIR="$work"
+export TMPDIR="$scratch/locket/t"
+mkdir -p -- "$TMPDIR"
 
 jar=${TLA2TOOLS_JAR:-"$HOME/.local/share/tla2tools/tla2tools.jar"}
 [[ -f "$jar" && -r "$jar" ]] || die "TLA+ tools jar unavailable at $jar"
@@ -26,12 +27,28 @@ jar=$(cd -- "$(dirname -- "$jar")" && pwd -P)/$(basename -- "$jar")
 java_bin=$(command -v "${JAVA:-java}") || die "Java unavailable. Set JAVA to an installed JVM."
 java_bin=$(cd -- "$(dirname -- "$java_bin")" && pwd -P)/$(basename -- "$java_bin")
 
+command -v python3 >/dev/null || die "Python 3 is required to read Cargo artifact metadata"
 cd -- "$root"
+build_args=(build -p locket-cli --bin locket --offline --locked --message-format=json-render-diagnostics)
 cargo_args=(test -p locket-agent --test tla_trace_conformance --offline --locked)
 if [[ -n "${COMPUTE_JOBS:-}" ]]; then
+    build_args+=(-j "$COMPUTE_JOBS")
     cargo_args+=(-j "$COMPUTE_JOBS")
 fi
-LOCKET_TLA_TRACE_DIR="$work/traces" cargo "${cargo_args[@]}"
+# Cargo reports the executable location even when a wrapper routes its build directory.
+cargo "${build_args[@]}" >"$work/cli-build.jsonl"
+cli=$(python3 -c '
+import json
+import sys
+
+for line in sys.stdin:
+    event = json.loads(line)
+    if event["reason"] == "compiler-artifact" and event.get("executable") and event["target"]["name"] == "locket":
+        print(event["executable"])
+' <"$work/cli-build.jsonl")
+[[ -x "$cli" ]] || die "Cargo did not report an executable Locket CLI"
+
+LOCKET_TLA_CLI="$cli" LOCKET_TLA_TRACE_DIR="$work/traces" cargo "${cargo_args[@]}"
 
 run_tlc() (
     local dir=$1 model=$2
@@ -78,10 +95,15 @@ check_model() {
 }
 
 check_model AgentUnlockGrantLifecycle
+check_model AgentAuthzProtocol
+check_model AutomationClientAuth
 check_model SecretLifecycleAuditChain
 check_model BackupAndRecoveryLifecycle
 check_model SharedVaultIsolation
 check_model TeamSyncAndAuditWitness
+check_model EgressProxyAndRedaction
+check_model AgentDaemonLifecycle
+check_model McpAndDesktopBoundary
 
 # Keep the actual first create's after-state and strip only its audit event.
 # TLC must report deadlock at the initial observation. Parse failures, failed

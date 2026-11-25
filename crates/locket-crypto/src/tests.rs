@@ -1039,3 +1039,250 @@ fn generated_recovery_material_round_trips_and_binds_to_its_salt() -> Result<(),
     assert_ne!(derive_recovery_key_v1(&code, &other_salt, params)?, key);
     Ok(())
 }
+
+fn hex(vector: &str) -> Vec<u8> {
+    let digits: Vec<_> = vector.bytes().filter(|byte| !byte.is_ascii_whitespace()).collect();
+    let (pairs, remainder) = digits.as_chunks::<2>();
+    assert_eq!(remainder, [0_u8; 0]);
+    pairs
+        .iter()
+        .map(|pair| {
+            let nibble = |byte| char::from(byte).to_digit(16).and_then(|n| u8::try_from(n).ok());
+            (nibble(pair[0]).unwrap_or_else(|| unreachable!("invalid vector")) << 4)
+                | nibble(pair[1]).unwrap_or_else(|| unreachable!("invalid vector"))
+        })
+        .collect()
+}
+
+#[test]
+fn xchacha20_poly1305_ietf_vector_and_corruptions() -> Result<(), CryptoError> {
+    use super::aead::{aead_decrypt, aead_encrypt};
+
+    // draft-irtf-cfrg-xchacha-03, Appendix A.3.1.
+    let key = std::array::from_fn(|i| (0x80..=0x9f).nth(i).unwrap_or_default());
+    let nonce = std::array::from_fn(|i| (0x40..=0x57).nth(i).unwrap_or_default());
+    let aad = hex("50515253c0c1c2c3c4c5c6c7");
+    let plaintext = hex("4c616469657320616e642047656e746c656d656e206f662074686520636c6173
+         73206f66202739393a204966204920636f756c64206f6666657220796f75206f
+         6e6c79206f6e652074697020666f7220746865206675747572652c2073756e73
+         637265656e20776f756c642062652069742e");
+    let ciphertext = hex("bd6d179d3e83d43b9576579493c0e939572a1700252bfaccbed2902c21396cbb
+         731c7f1b0b4aa6440bf3a82f4eda7e39ae64c6708c54c216cb96b72e1213b452
+         2f8c9ba40db5d945b11b69b982c1bb9e3f3fac2bc369488f76b2383565d3fff9
+         21f9664c97637da9768812f615c68b13b52e
+         c0875924c1c7987947deafd8780acf49");
+    assert_eq!(aead_encrypt(&key, &nonce, &plaintext, &aad)?, ciphertext);
+    assert_eq!(*aead_decrypt(&key, &nonce, &ciphertext, &aad)?, plaintext);
+
+    for len in 0..ciphertext.len() {
+        assert_eq!(
+            aead_decrypt(&key, &nonce, &ciphertext[..len], &aad).err(),
+            Some(CryptoError::DecryptionFailed),
+            "truncated to {len} bytes"
+        );
+    }
+    let mut corrupted = ciphertext.clone();
+    for i in 0..ciphertext.len() {
+        for bit in 0..8 {
+            let mask = 1 << bit;
+            corrupted[i] ^= mask;
+            assert_eq!(
+                aead_decrypt(&key, &nonce, &corrupted, &aad).err(),
+                Some(CryptoError::DecryptionFailed),
+                "bit {bit} of ciphertext byte {i}"
+            );
+            corrupted[i] ^= mask;
+        }
+    }
+    assert_eq!(
+        aead_decrypt(&key, &nonce, &ciphertext, &[]).err(),
+        Some(CryptoError::DecryptionFailed)
+    );
+    Ok(())
+}
+
+#[test]
+fn hkdf_sha256_rfc5869_empty_salt_and_info() -> Result<(), hkdf::InvalidLength> {
+    // RFC 5869, Appendix A.3. Locket's wrapping schedule uses the same zero salt.
+    let hkdf = hkdf::Hkdf::<sha2::Sha256>::new(None, &[0x0b; 22]);
+    let mut output = [0; 42];
+    hkdf.expand(&[], &mut output)?;
+    assert_eq!(
+        output.as_slice(),
+        hex("8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8")
+    );
+    Ok(())
+}
+
+#[test]
+fn secret_blobs_reject_cross_context_swaps_with_the_same_key() -> Result<(), CryptoError> {
+    use super::encrypt_secret_value_v1;
+
+    let contexts = [
+        SecretBlobAad::new("project", "profile", "id", "SECRET", 1),
+        SecretBlobAad::new("other", "profile", "id", "SECRET", 1),
+        SecretBlobAad::new("project", "other", "id", "SECRET", 1),
+        SecretBlobAad::new("project", "profile", "other", "SECRET", 1),
+        SecretBlobAad::new("project", "profile", "id", "OTHER", 1),
+        SecretBlobAad::new("project", "profile", "id", "SECRET", 2),
+    ];
+    // Fix the wrapping context so any rejection must come from the value AAD.
+    let (_, wrap_aad) = canonical_secret_aads()?;
+    let aads = contexts.iter().map(secret_blob_aad_v1).collect::<Result<Vec<_>, _>>()?;
+    for (sender, aad) in aads.iter().enumerate() {
+        let blob = encrypt_secret_value_v1(&PROFILE_SECRET_KEY, "fixture", aad, &wrap_aad)?;
+        for (receiver, target) in aads.iter().enumerate() {
+            let opened = decrypt_secret_value_v1(&PROFILE_SECRET_KEY, &blob, target, &wrap_aad);
+            if sender == receiver {
+                assert_eq!(opened?.as_str(), "fixture");
+            } else {
+                assert_eq!(
+                    opened.err(),
+                    Some(CryptoError::DecryptionFailed),
+                    "{sender} -> {receiver}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn key_wraps_reject_each_context_and_each_other_purpose() -> Result<(), CryptoError> {
+    use KeyWrapPurpose::{Audit, ProfileFingerprint, ProfileSecret, ProjectMetadata, SecretDek};
+
+    let contexts = [
+        KeyWrapAad::new("project", "key", Some("profile"), 1, ProfileSecret),
+        KeyWrapAad::new("other", "key", Some("profile"), 1, ProfileSecret),
+        KeyWrapAad::new("project", "other", Some("profile"), 1, ProfileSecret),
+        KeyWrapAad::new("project", "key", Some("other"), 1, ProfileSecret),
+        KeyWrapAad::new("project", "key", None, 1, ProfileSecret),
+        KeyWrapAad::new("project", "key", Some("profile"), 2, ProfileSecret),
+        KeyWrapAad::new("project", "key", Some("profile"), 1, Audit),
+        KeyWrapAad::new("project", "key", Some("profile"), 1, ProfileFingerprint),
+        KeyWrapAad::new("project", "key", Some("profile"), 1, ProjectMetadata),
+        KeyWrapAad::new("project", "key", Some("profile"), 1, SecretDek),
+    ];
+    let aads = contexts.iter().map(key_wrap_aad_v1).collect::<Result<Vec<_>, _>>()?;
+    for (sender, aad) in aads.iter().enumerate() {
+        let wrap = wrap_key_material_v1(&MASTER_KEY, &PROFILE_SECRET_KEY, aad)?;
+        let embedded = wrap_dek_v1(&MASTER_KEY, &PROFILE_SECRET_KEY, aad)?;
+        for (receiver, target) in aads.iter().enumerate() {
+            let separate = unwrap_key_material_v1(&MASTER_KEY, &wrap, target);
+            let embedded = unwrap_dek_v1(&MASTER_KEY, &embedded, target);
+            if sender == receiver {
+                assert_eq!(*separate?, PROFILE_SECRET_KEY);
+                assert_eq!(*embedded?, PROFILE_SECRET_KEY);
+            } else {
+                assert_eq!(
+                    separate.err(),
+                    Some(CryptoError::DecryptionFailed),
+                    "{sender} -> {receiver}"
+                );
+                assert_eq!(
+                    embedded.err(),
+                    Some(CryptoError::DecryptionFailed),
+                    "{sender} -> {receiver}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn wrapping_domains_and_schema_versions_are_authenticated() -> Result<(), CryptoError> {
+    let project = "project";
+    let domains = [
+        (passkey_prf_wrap_aad_v1(project)?, super::PASSKEY_PRF_WRAP_V1_PREFIX.len()),
+        (
+            passphrase_fallback_aad_v1(project, "argon2")?,
+            super::aad::PASSPHRASE_FALLBACK_AAD_V1_PREFIX.len(),
+        ),
+        (
+            recovery_entry_aad_v1("argon2", "master", project)?,
+            super::aad::RECOVERY_ENTRY_AAD_V1_PREFIX.len(),
+        ),
+    ];
+    for (aad, version_offset) in &domains {
+        let wrapped = wrap_key_material_v1(&MASTER_KEY, &PROFILE_SECRET_KEY, aad)?;
+        assert_eq!(*unwrap_key_material_v1(&MASTER_KEY, &wrapped, aad)?, PROFILE_SECRET_KEY);
+        let mut unknown_version = aad.clone();
+        unknown_version[*version_offset..*version_offset + 2].copy_from_slice(&2_u16.to_le_bytes());
+        let mut targets = domains.iter().map(|(target, _)| target).filter(|target| *target != aad);
+        assert!(targets.all(|target| {
+            unwrap_key_material_v1(&MASTER_KEY, &wrapped, target).err()
+                == Some(CryptoError::DecryptionFailed)
+        }));
+        assert_eq!(
+            unwrap_key_material_v1(&MASTER_KEY, &wrapped, &unknown_version).err(),
+            Some(CryptoError::DecryptionFailed)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn recovery_entries_reject_profile_kind_id_and_schema_substitution() -> Result<(), CryptoError> {
+    let contexts = [
+        ("argon-a", "project-master-key", "project-a"),
+        ("argon-b", "project-master-key", "project-a"),
+        ("argon-a", "device-key", "project-a"),
+        ("argon-a", "project-master-key", "project-b"),
+    ];
+    for (sender, (profile, kind, id)) in contexts.into_iter().enumerate() {
+        let (nonce, ciphertext) =
+            seal_recovery_entry_v1(&MASTER_KEY, profile, kind, id, b"fixture")?;
+        for (receiver, (profile, kind, id)) in contexts.into_iter().enumerate() {
+            let opened =
+                open_recovery_entry_v1(&MASTER_KEY, profile, kind, id, &nonce, &ciphertext);
+            if sender == receiver {
+                assert_eq!(opened?.as_slice(), b"fixture");
+            } else {
+                assert_eq!(
+                    opened.err(),
+                    Some(CryptoError::DecryptionFailed),
+                    "{sender} -> {receiver}"
+                );
+            }
+        }
+
+        // Authenticate the envelope's version independently of the entry KDF.
+        let key = recovery_entry_key_v1(&MASTER_KEY, kind, id, profile)?;
+        let mut aad = recovery_entry_aad_v1(profile, kind, id)?;
+        let offset = super::aad::RECOVERY_ENTRY_AAD_V1_PREFIX.len();
+        aad[offset..offset + 2].copy_from_slice(&2_u16.to_le_bytes());
+        assert_eq!(
+            super::aead::aead_decrypt(&key, &nonce, &ciphertext, &aad).err(),
+            Some(CryptoError::DecryptionFailed)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn wrapping_key_and_fingerprint_match_independent_sha256_fixtures() -> Result<(), CryptoError> {
+    // Compute the pinned bytes with an independent HMAC-SHA256 implementation.
+    // For the single HKDF block, HMAC the canonical info plus the counter 0x01.
+    let info = HkdfWrapInfo::new("project", Some("profile"), KeyPurpose::ProfileSecret);
+    assert_eq!(
+        derive_wrapping_key_v1(&MASTER_KEY, &info)?.as_slice(),
+        hex("cd4c4b8b5a2f533a62825dde818d4995f774ee22b7a07a76205694e35da804e9"),
+    );
+    assert_eq!(
+        secret_fingerprint_v1(&MASTER_KEY, "fixture")?.as_slice(),
+        hex("71e3bcafcb16630be020c22c62b00f3f89eda777cd3d0606befea45dbb5c4833"),
+    );
+    Ok(())
+}
+
+#[test]
+fn passphrase_derivation_matches_argon2id_reference_vector() -> Result<(), CryptoError> {
+    // PHC reference implementation, src/test.c, Argon2id v19 (256 KiB, two lanes).
+    let params = PassphraseKdfParams { m_cost: 256, t_cost: 2, p_cost: 2, output_len: 32 };
+    assert_eq!(
+        derive_passphrase_fallback_key_v1(b"password", b"somesalt", params)?.as_slice(),
+        hex("6d093c501fd5999645e0ea3bf620d7b8be7fd2db59c20d9fff9539da2bf57037"),
+    );
+    Ok(())
+}

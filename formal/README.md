@@ -16,9 +16,30 @@ installed and uses only the bundled standard library.
 
 `./scripts/formal-trace-check.sh` runs live Rust tests in
 [tla_trace_conformance.rs](../crates/locket-agent/tests/tla_trace_conformance.rs)
-to emit concrete transition traces and replays every trace through TLC trace
-validators under `formal/tla/traces/`, including a negative illegal-trace canary
-that proves TLC rejects un-audited mutations.
+to emit concrete transition traces and replays observations against all ten
+models. The runner builds the CLI offline for the Unix process-level tests and
+uses Python 3 to locate the built executable.
+The negative canary removes the audit row from a real secret mutation and
+requires TLC to reject the first transition.
+
+| Trace model | Observed behavior |
+| --- | --- |
+| AgentUnlockGrantLifecycle | Project unlock, grant scope and revocation, expiry, and native session lock. |
+| AgentAuthzProtocol | Verified unlock, dangerous-profile confirmation, audit rollback, and grant cleanup on lock. |
+| AutomationClientAuth | Verified registration, signed prepare, invalid signature rejection, persistent nonce replay rejection, and revocation. |
+| SecretLifecycleAuditChain | Audited writes, rotation, source and version selection, purge, and tombstones. |
+| EgressProxyAndRedaction | The live broker rejects both a request without credentials and an authenticated request to a screened loopback destination. |
+| TeamSyncAndAuditWitness | Signed team publications, recipient updates, and audit witness persistence. |
+| BackupAndRecoveryLifecycle | Bundle export and import with audit and rollback observations. |
+| SharedVaultIsolation | Independent unlock and lock state, and confirmed cross-vault secret copies. |
+| AgentDaemonLifecycle | A competing worker fails while the primary PID and socket remain live. The primary removes its endpoint on shutdown. |
+| McpAndDesktopBoundary | MCP env-file inspection returns a key name from a regular file and refuses an out-of-root symlink. |
+
+`./scripts/kani-check.sh` runs bounded checks of crypto framing, single-bit
+tag corruption on a fixed fixture, name and URI parsing, and ACL matching.
+`./scripts/miri-check.sh` interprets the crypto, core, and scanner tests on
+nightly. Both runners skip when their verifier is absent. Set `STRICT=1` to
+make a missing verifier fail.
 
 TLC state, Java temporary files, and the Lake build go into a disposable
 directory under `/Volumes/Scratch/locket/tmp`. The runner builds a Scratch copy

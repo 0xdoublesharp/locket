@@ -113,3 +113,6 @@ pub type FingerprintBytes = [u8; FINGERPRINT_LEN];
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(kani)]
+mod kani_proofs;
