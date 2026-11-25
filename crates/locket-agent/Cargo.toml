@@ -14,10 +14,10 @@ version.workspace = true
 workspace = true
 
 [dependencies]
-locket-crypto = { version = "0.1.1", path = "../locket-crypto" }
-locket-core = { version = "0.1.1", path = "../locket-core" }
-locket-platform = { version = "0.1.1", path = "../locket-platform" }
-locket-store = { version = "0.1.1", path = "../locket-store" }
+locket-crypto = { version = "0.2.0", path = "../locket-crypto" }
+locket-core = { version = "0.2.0", path = "../locket-core" }
+locket-platform = { version = "0.2.0", path = "../locket-platform" }
+locket-store = { version = "0.2.0", path = "../locket-store" }
 data-encoding = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
