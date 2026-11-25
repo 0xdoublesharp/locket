@@ -33,6 +33,30 @@ static RESOURCE_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 static SELECTED_PROJECT: std::sync::Mutex<Option<DesktopProjectContext>> =
     std::sync::Mutex::new(None);
 
+type CopySecretFuture =
+    std::pin::Pin<Box<dyn Future<Output = Result<(), super::ClipboardError>> + Send>>;
+
+/// Native effects are supplied by the desktop, outside webview IPC.
+pub(crate) struct DesktopHandoff {
+    pub(crate) terminal: fn(&Path, &Path, &[&str]) -> Result<(), String>,
+    #[cfg(target_os = "macos")]
+    pub(crate) picker_program: PathBuf,
+    pub(crate) copy_text: fn(String) -> Result<(), super::ClipboardError>,
+    pub(crate) copy_secret: fn(String, Duration) -> CopySecretFuture,
+}
+
+impl Default for DesktopHandoff {
+    fn default() -> Self {
+        Self {
+            terminal: launch_terminal,
+            #[cfg(target_os = "macos")]
+            picker_program: "/usr/bin/osascript".into(),
+            copy_text: super::clipboard::copy_plain_text,
+            copy_secret: |value, ttl| Box::pin(super::clipboard::copy_with_ttl(value, ttl)),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct DesktopProjectContext {
     root: String,
@@ -512,12 +536,21 @@ pub(crate) async fn desktop_mcp_config_snippet() -> Result<DesktopMcpConfigSnipp
 }
 
 #[tauri::command]
-pub(crate) async fn desktop_copy_text_plain(text: String) -> Result<(), String> {
+pub(crate) async fn desktop_copy_text_plain(
+    handoff: tauri::State<'_, DesktopHandoff>,
+    text: String,
+) -> Result<(), String> {
+    copy_plain_text_with(text, handoff.copy_text).await
+}
+
+async fn copy_plain_text_with(
+    text: String,
+    copy: fn(String) -> Result<(), super::ClipboardError>,
+) -> Result<(), String> {
     if text.is_empty() || text.len() > PLAIN_CLIPBOARD_MAX_BYTES {
         return Err("Clipboard text must be between 1 byte and 16 KiB.".into());
     }
-    blocking(move || super::clipboard::copy_plain_text(text).map_err(|error| error.to_string()))
-        .await
+    blocking(move || copy(text).map_err(|error| error.to_string())).await
 }
 
 #[tauri::command]
@@ -631,12 +664,13 @@ fn parse_picker_output(
 
 #[cfg(target_os = "macos")]
 async fn pick_path(
+    program: PathBuf,
     mode: PickerMode,
     title: Option<String>,
     default_name: Option<String>,
 ) -> Result<Option<String>, String> {
     blocking(move || {
-        let output = Command::new("/usr/bin/osascript")
+        let output = Command::new(program)
             .args(picker_arguments(mode, title.as_deref(), default_name.as_deref()))
             .output()
             .map_err(|_| "Could not start the macOS picker.".to_owned())?;
@@ -647,21 +681,23 @@ async fn pick_path(
 
 #[tauri::command]
 pub(crate) async fn desktop_pick_directory(
+    handoff: tauri::State<'_, DesktopHandoff>,
     title: Option<String>,
 ) -> Result<Option<String>, String> {
     #[cfg(target_os = "macos")]
     {
-        pick_path(PickerMode::Directory, title, None).await
+        pick_path(handoff.picker_program.clone(), PickerMode::Directory, title, None).await
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = title;
+        let _ = (handoff, title);
         Err("The native folder picker is available on macOS.".into())
     }
 }
 
 #[tauri::command]
 pub(crate) async fn desktop_pick_file(
+    handoff: tauri::State<'_, DesktopHandoff>,
     title: Option<String>,
     save: Option<bool>,
     default_name: Option<String>,
@@ -669,11 +705,11 @@ pub(crate) async fn desktop_pick_file(
     #[cfg(target_os = "macos")]
     {
         let mode = if save == Some(true) { PickerMode::Save } else { PickerMode::File };
-        pick_path(mode, title, default_name).await
+        pick_path(handoff.picker_program.clone(), mode, title, default_name).await
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (title, save, default_name);
+        let _ = (handoff, title, save, default_name);
         Err("The native file picker is available on macOS.".into())
     }
 }
@@ -822,27 +858,42 @@ fn posix_terminal_command_for(
 
 #[cfg(target_os = "macos")]
 fn launch_terminal(cli: &Path, root: &Path, args: &[&str]) -> Result<(), String> {
+    launch_macos_terminal(
+        cli,
+        root,
+        args,
+        |plan| execute_cli(Path::new("/usr/bin/open"), plan, Duration::from_secs(10)),
+        |path| {
+            // Terminal normally removes the script when it opens. Reap
+            // abandoned launchers too, including when Terminal declines the file.
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(300));
+                let _ = fs::remove_file(path);
+            });
+        },
+    )
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn launch_macos_terminal(
+    cli: &Path,
+    root: &Path,
+    args: &[&str],
+    open: impl FnOnce(&CliPlan) -> Result<(), String>,
+    expire: impl FnOnce(PathBuf),
+) -> Result<(), String> {
     let file = write_terminal_launcher(cli, root, args)?;
     let (_handle, path) = file.keep().map_err(metadata_error)?;
-    let result = execute_cli(
-        Path::new("/usr/bin/open"),
-        &CliPlan {
-            cwd: root.into(),
-            args: vec!["-a".into(), "Terminal".into(), path.to_string_lossy().into_owned()],
-            input: None,
-        },
-        Duration::from_secs(10),
-    );
+    let result = open(&CliPlan {
+        cwd: root.into(),
+        args: vec!["-a".into(), "Terminal".into(), path.to_string_lossy().into_owned()],
+        input: None,
+    });
     if result.is_err() {
         let _ = fs::remove_file(&path);
         return Err("Cannot open Terminal. Check that Terminal is installed and try again.".into());
     }
-    // The script deletes itself once Terminal opens it. Remove abandoned
-    // launchers too, including when Terminal declines to open the file.
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(300));
-        let _ = fs::remove_file(path);
-    });
+    expire(path);
     Ok(())
 }
 
@@ -1241,13 +1292,15 @@ pub(crate) async fn desktop_start_agent(request: DesktopStartAgentRequest) -> Re
 }
 #[tauri::command]
 pub(crate) async fn desktop_run_policy(
+    handoff: tauri::State<'_, DesktopHandoff>,
     request: DesktopRunPolicyRequest,
 ) -> Result<DesktopRunResponse, String> {
     let store = super::default_store_path().map_err(|error| error.to_string())?;
+    let launch = handoff.terminal;
     blocking(move || {
         let context = policy_context(&store, &request.project_id, &request.policy_name)?;
         let cli = resolve_cli()?;
-        launch_terminal(&cli, Path::new(&context.root), &["run", &request.policy_name])?;
+        launch(&cli, Path::new(&context.root), &["run", &request.policy_name])?;
         Ok(DesktopRunResponse {
             launched: true,
             command: format!("locket run {}", posix_quote(&request.policy_name)),
@@ -1275,11 +1328,12 @@ fn scan_project_with(
 
 #[tauri::command]
 pub(crate) async fn desktop_scan_project(
+    handoff: tauri::State<'_, DesktopHandoff>,
     request: DesktopScanProjectRequest,
 ) -> Result<DesktopRunResponse, String> {
     let store = super::default_store_path().map_err(|error| error.to_string())?;
-    blocking(move || scan_project_with(&store, &request.project_id, resolve_cli, launch_terminal))
-        .await
+    let launch = handoff.terminal;
+    blocking(move || scan_project_with(&store, &request.project_id, resolve_cli, launch)).await
 }
 
 #[tauri::command]

@@ -143,9 +143,15 @@ mod tests {
 
     use super::*;
 
+    fn socket_directory() -> io::Result<tempfile::TempDir> {
+        // Keep room for the production socket name under macOS's sockaddr_un
+        // limit, even when Cargo uses a worktree-qualified temporary directory.
+        tempfile::Builder::new().prefix("").tempdir()
+    }
+
     #[test]
     fn second_instance_wakes_the_owner_and_quit_releases_the_socket() -> io::Result<()> {
-        let directory = tempfile::tempdir()?;
+        let directory = socket_directory()?;
         let path = directory.path().join(SOCKET_NAME);
         let mut owner = DesktopInstance::acquire(directory.path())?
             .ok_or_else(|| io::Error::other("Expected first instance to own the socket"))?;
@@ -166,7 +172,7 @@ mod tests {
 
     #[test]
     fn refused_socket_is_recovered_but_a_non_socket_entry_is_preserved() -> io::Result<()> {
-        let directory = tempfile::tempdir()?;
+        let directory = socket_directory()?;
         let path = directory.path().join(SOCKET_NAME);
         drop(UnixListener::bind(&path)?);
         let owner = DesktopInstance::acquire(directory.path())?
@@ -180,7 +186,7 @@ mod tests {
 
     #[test]
     fn unknown_request_closes_without_waking_the_owner() -> io::Result<()> {
-        let directory = tempfile::tempdir()?;
+        let directory = socket_directory()?;
         let mut owner = DesktopInstance::acquire(directory.path())?
             .ok_or_else(|| io::Error::other("Expected a socket owner"))?;
         let shows = Arc::new(AtomicUsize::new(0));
@@ -194,6 +200,25 @@ mod tests {
         client.write_all(b"quit\n")?;
         assert_eq!(client.read(&mut [0; 1])?, 0);
         assert_eq!(shows.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_acknowledgement_preserves_the_existing_socket_entry() -> io::Result<()> {
+        let directory = socket_directory()?;
+        let path = directory.path().join(SOCKET_NAME);
+        let listener = UnixListener::bind(&path)?;
+        let peer = std::thread::spawn(move || {
+            let (mut client, _) = listener.accept()?;
+            let mut request = [0; SHOW.len()];
+            client.read_exact(&mut request)?;
+            assert_eq!(&request, SHOW);
+            client.write_all(b"no\n")
+        });
+        let result = DesktopInstance::acquire(directory.path());
+        assert!(matches!(result, Err(error) if error.kind() == ErrorKind::InvalidData));
+        peer.join().map_err(|_| io::Error::other("acknowledgement peer failed"))??;
+        assert!(fs::symlink_metadata(path)?.file_type().is_socket());
         Ok(())
     }
 }

@@ -45,6 +45,7 @@ tempfile = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+tauri = { version = "2", features = ["test"] }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 

@@ -55,7 +55,7 @@ fn mcp_snippet_preserves_command_and_arguments() -> Result<(), Box<dyn Error>> {
 async fn plain_copy_rejects_empty_and_over_limit_text_before_opening_the_clipboard() {
     for text in [String::new(), "é".repeat(PLAIN_CLIPBOARD_MAX_BYTES / 2 + 1)] {
         assert_eq!(
-            desktop_copy_text_plain(text).await.err().as_deref(),
+            copy_plain_text_with(text, |_| Ok(())).await.err().as_deref(),
             Some("Clipboard text must be between 1 byte and 16 KiB."),
         );
     }
@@ -1494,5 +1494,128 @@ async fn desktop_crud_sends_metadata_and_revokes_native_grants_after_success_and
     );
     assert!(error.get("value").is_none());
     server.await?.map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_spawn_failures_and_incomplete_input_return_safe_operation_errors()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let plan = CliPlan {
+        cwd: fixture.root,
+        args: vec!["command".into()],
+        input: Some(vec![b'x'; 1024 * 1024]),
+    };
+    let timeout = Duration::from_secs(5);
+    assert_eq!(
+        execute_cli(&plan.cwd.join("absent"), &plan, timeout),
+        Err("The Locket executable is missing or is not executable. Reinstall Locket CLI.".into()),
+    );
+    let bad_interpreter = executable(fixture.directory.path(), "")?;
+    fs::write(&bad_interpreter, "#!/no/such/fixture-interpreter\n")?;
+    assert_eq!(
+        execute_cli(&bad_interpreter, &plan, timeout),
+        Err("Cannot launch Locket CLI. Check its installation and permissions.".into()),
+    );
+    let refusing_version = executable(fixture.directory.path(), "exit 1")?;
+    assert_eq!(
+        verify_cli_version(&refusing_version, timeout),
+        Err("The CLI version check failed. Reinstall Locket.".into()),
+    );
+    let skips_input = executable(fixture.directory.path(), "exit 0")?;
+    assert_eq!(
+        execute_cli(&skips_input, &plan, timeout),
+        Err("Locket CLI did not accept the complete policy request.".into()),
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn macos_terminal_handoff_cleans_up_refused_launch_and_only_expires_accepted_launcher()
+-> Result<(), Box<dyn Error>> {
+    use std::cell::RefCell;
+    use std::os::unix::fs::PermissionsExt as _;
+    let fixture = Fixture::new()?;
+    let recorded = RefCell::new(None::<PathBuf>);
+    let cli = fixture.directory.path().join("locket CLI");
+    for accepted in [false, true] {
+        let result = launch_macos_terminal(
+            &cli,
+            &fixture.root,
+            &["run", "policy ' ; exit"],
+            |plan| {
+                assert_eq!(plan.cwd, fixture.root);
+                assert_eq!(&plan.args[..2], ["-a", "Terminal"]);
+                assert!(plan.input.is_none());
+                let script = PathBuf::from(&plan.args[2]);
+                assert_eq!(
+                    fs::metadata(&script).map_err(metadata_error)?.permissions().mode() & 0o777,
+                    0o700
+                );
+                let contents = fs::read_to_string(&script).map_err(metadata_error)?;
+                assert_eq!(
+                    contents,
+                    terminal_script(&cli, &fixture.root, &["run", "policy ' ; exit"])
+                );
+                recorded.replace(Some(script));
+                if accepted { Ok(()) } else { Err("private helper stderr".into()) }
+            },
+            |script| {
+                assert!(accepted);
+                assert_eq!(recorded.borrow().as_ref(), Some(&script));
+            },
+        );
+        let path = recorded.take().ok_or("launcher path")?;
+        if accepted {
+            result?;
+            assert!(path.is_file());
+            fs::remove_file(path)?;
+        } else {
+            assert_eq!(
+                result,
+                Err("Cannot open Terminal. Check that Terminal is installed and try again.".into())
+            );
+            assert!(!path.exists());
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn project_open_rejects_invalid_folder_store_schema_and_profile_without_creating_data()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let missing_store = fixture.directory.path().join("absent.db");
+    let lookup = |path| open_project_at(&fixture.store, path).err().unwrap_or_default();
+    assert_eq!(
+        open_project_at(&missing_store, &fixture.root).err().as_deref(),
+        Some("No local vault exists. Initialize this project with Locket first."),
+    );
+    assert_eq!(find_shared_vault_at(&missing_store, None, None)?, None);
+    assert!(!missing_store.exists());
+
+    let unrelated = fixture.root.join("other.toml");
+    fs::write(&unrelated, "not a project config")?;
+    assert_eq!(lookup(&unrelated), "Select a project folder or its locket.toml file.");
+    assert_eq!(
+        initialize_plan(&unrelated).err().as_deref(),
+        Some("Initialize requires an existing folder.")
+    );
+    assert_eq!(
+        lookup(fixture.directory.path()),
+        "No readable locket.toml exists in the selected folder. Initialize it first.",
+    );
+
+    let config = fixture.root.join("locket.toml");
+    let original = fs::read_to_string(&config)?;
+    fs::write(&config, original.replace("schema_version = 1", "schema_version = 999"))?;
+    assert_eq!(lookup(&fixture.root), "Unsupported locket.toml schema. Update Locket.");
+    fs::write(&config, original.replace("default_profile = 'dev'", "default_profile = 'missing'"))?;
+    assert_eq!(
+        lookup(&fixture.root),
+        "The configured profile is missing from this vault. Run `locket doctor`.",
+    );
     Ok(())
 }

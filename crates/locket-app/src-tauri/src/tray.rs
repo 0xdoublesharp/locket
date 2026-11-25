@@ -364,14 +364,7 @@ impl From<TrayState> for TrayIconState {
 /// tests can assert on it without spinning up a full Tauri runtime.
 #[must_use]
 pub fn icon_bytes_for(state: TrayIconState) -> &'static [u8] {
-    if cfg!(target_os = "macos") {
-        macos_bytes(state)
-    } else {
-        // Without a webview to consult we default to the dark variant.
-        // `update_tray_state` overrides this when a `WebviewWindow` is
-        // available and reports a concrete theme.
-        dark_bytes(state)
-    }
+    icon_bytes_for_theme(icon_is_template(), None, state)
 }
 
 /// Pure mapping from a tray icon state to its tooltip string. Sourced
@@ -487,13 +480,24 @@ const fn dark_bytes(state: TrayIconState) -> &'static [u8] {
 /// `WebviewWindow::theme()` and returns the matching full-color variant,
 /// falling back to the dark variant if the theme can't be resolved.
 fn platform_icon_bytes<R: Runtime>(app: &AppHandle<R>, state: TrayIconState) -> &'static [u8] {
-    if cfg!(target_os = "macos") {
-        return macos_bytes(state);
-    }
-    let theme = app.get_webview_window("main").and_then(|window| window.theme().ok());
-    match theme {
-        Some(tauri::Theme::Light) => light_bytes(state),
-        _ => dark_bytes(state),
+    let template = icon_is_template();
+    let theme = if template {
+        None
+    } else {
+        app.get_webview_window("main").and_then(|window| window.theme().ok())
+    };
+    icon_bytes_for_theme(template, theme, state)
+}
+
+fn icon_bytes_for_theme(
+    template: bool,
+    theme: Option<tauri::Theme>,
+    state: TrayIconState,
+) -> &'static [u8] {
+    match (template, theme) {
+        (true, _) => macos_bytes(state),
+        (false, Some(tauri::Theme::Light)) => light_bytes(state),
+        (false, _) => dark_bytes(state),
     }
 }
 
@@ -520,15 +524,13 @@ const fn icon_is_template() -> bool {
 /// or the tray icon, decoding the baked-in PNG bytes, or registering
 /// the icon with the app.
 pub fn setup_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
-    let initial = TrayIconState::AgentStopped;
-    let bytes = platform_icon_bytes(app, initial);
-    let image = Image::from_bytes(bytes)?;
+    let (image, tooltip) = initial_tray_presentation(app)?;
     let selection = current_selection_state();
     let menu = build_tray_menu_with(app, selection)?;
     TrayIconBuilder::<R>::with_id(LOCKET_TRAY_ID)
         .icon(image)
         .icon_as_template(icon_is_template())
-        .tooltip(tooltip_for(initial))
+        .tooltip(tooltip)
         .menu(&menu)
         .on_menu_event(|app, event| handle_tray_menu_event(app, &event))
         .on_tray_icon_event(|_tray, _event| {
@@ -539,6 +541,14 @@ pub fn setup_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         .build(app)?;
     start_tray_status_subscription(app.clone());
     Ok(())
+}
+
+fn initial_tray_presentation<R: Runtime>(
+    app: &AppHandle<R>,
+) -> tauri::Result<(Image<'static>, &'static str)> {
+    let state = TrayIconState::AgentStopped;
+    let image = Image::from_bytes(platform_icon_bytes(app, state))?;
+    Ok((image, tooltip_for(state)))
 }
 
 /// Cached vault + secret-selection state pushed in by the webview via
@@ -617,29 +627,41 @@ pub fn build_tray_menu_with<R: Runtime>(
     app: &AppHandle<R>,
     selection: TraySelectionState,
 ) -> tauri::Result<Menu<R>> {
-    let mut builder = MenuBuilder::new(app)
-        .text(MENU_OPEN_APP, TrayMenuAction::OpenApp.label())
-        .separator()
-        .text(MENU_LOCK_VAULT, TrayMenuAction::LockVault.label())
-        .text(MENU_UNLOCK_VAULT, TrayMenuAction::UnlockVault.label())
-        .separator()
-        .text(MENU_SWITCH_PROFILE, TrayMenuAction::SwitchProfile.label())
-        .text(MENU_RUN_POLICY, TrayMenuAction::RunPolicy.label())
-        .text(MENU_START_SCAN, TrayMenuAction::StartScan.label())
-        .separator();
-
-    for action in [TrayMenuAction::RevealSecret, TrayMenuAction::CopySecret] {
-        let enablement = tray_menu_action_enablement(action, selection);
-        let label = match enablement.disabled_reason {
-            Some(reason) => format!("{} - {}", action.label(), reason),
-            None => action.label().to_owned(),
+    let mut builder = MenuBuilder::new(app);
+    for entry in tray_menu_layout(selection) {
+        builder = if let Some((action, text, enabled)) = entry {
+            let item = MenuItemBuilder::with_id(action.id(), text).enabled(enabled).build(app)?;
+            builder.item(&item)
+        } else {
+            builder.separator()
         };
-        let item =
-            MenuItemBuilder::with_id(action.id(), label).enabled(enablement.enabled).build(app)?;
-        builder = builder.item(&item);
     }
+    builder.build()
+}
 
-    builder.separator().text(MENU_QUIT_APP, TrayMenuAction::QuitApp.label()).build()
+fn tray_menu_layout(
+    selection: TraySelectionState,
+) -> impl Iterator<Item = Option<(TrayMenuAction, String, bool)>> {
+    tray_menu_actions().iter().copied().flat_map(move |action| {
+        let (label, enabled) = menu_action_display(action, selection);
+        let separator = matches!(
+            action,
+            TrayMenuAction::OpenApp
+                | TrayMenuAction::UnlockVault
+                | TrayMenuAction::StartScan
+                | TrayMenuAction::CopySecret
+        );
+        std::iter::once(Some((action, label, enabled))).chain(separator.then_some(None))
+    })
+}
+
+fn menu_action_display(action: TrayMenuAction, selection: TraySelectionState) -> (String, bool) {
+    let enablement = tray_menu_action_enablement(action, selection);
+    let label = match enablement.disabled_reason {
+        Some(reason) => format!("{} - {}", action.label(), reason),
+        None => action.label().to_owned(),
+    };
+    (label, enablement.enabled)
 }
 
 /// Backwards-compatible wrapper used by `setup_tray` and tests that
@@ -667,7 +689,7 @@ pub fn refresh_tray_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     Ok(())
 }
 
-fn handle_tray_menu_event<R: Runtime>(app: &AppHandle<R>, event: &MenuEvent) {
+pub(crate) fn handle_tray_menu_event<R: Runtime>(app: &AppHandle<R>, event: &MenuEvent) {
     let Some(action) = tray_menu_action_for_id(event.id().as_ref()) else {
         return;
     };
@@ -706,58 +728,32 @@ pub(crate) fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
     }
 }
 
-fn start_tray_status_subscription<R: Runtime>(app: AppHandle<R>) {
+pub(crate) fn start_tray_status_subscription<R: Runtime>(app: AppHandle<R>) {
     tauri::async_runtime::spawn(async move {
-        let path = crate::agent_client::resolve_socket_path();
+        let event_app = app.clone();
         let cancel = crate::status_subscription_cancel_token();
-        let mut last_delay: Option<std::time::Duration> = None;
-        while !cancel.is_cancelled() {
-            let (sender, mut receiver) = tokio::sync::mpsc::channel::<StatusEvent>(16);
-            let updater_app = app.clone();
-            let updater = tauri::async_runtime::spawn(async move {
-                while let Some(event) = receiver.recv().await {
-                    if !event.is_state_change() {
-                        continue;
-                    }
-                    let _ = update_tray_status(&updater_app, &event.status);
+        crate::agent_client::maintain_status_stream(
+            &crate::agent_client::resolve_socket_path(),
+            &cancel,
+            move |event| {
+                if event.is_state_change() {
+                    let _ = update_tray_status(&event_app, &event.status);
                 }
-            });
-            let result =
-                crate::agent_client::stream_status_events_with_cancel(&path, sender, &cancel).await;
-            let _ = updater.await;
-            if cancel.is_cancelled() {
-                break;
-            }
-            if result.is_err() {
-                let _ = update_tray_state(&app, TrayIconState::AgentStopped);
-            }
-            // Reconnect with the shared exponential backoff so the tray
-            // recovers automatically once the agent restarts.
-            let delay = crate::agent_client::next_reconnect_delay(last_delay);
-            last_delay = Some(delay);
-            tokio::select! {
-                biased;
-                () = cancel.cancelled() => break,
-                () = tokio::time::sleep(delay) => {}
-            }
-        }
+            },
+            |error| {
+                if error.is_some() {
+                    let _ = update_tray_state(&app, TrayIconState::AgentStopped);
+                }
+            },
+        )
+        .await;
     });
 }
 
 fn update_tray_status<R: Runtime>(app: &AppHandle<R>, status: &StatusPayload) -> tauri::Result<()> {
-    let Some(tray) = app.tray_by_id(LOCKET_TRAY_ID) else {
-        return Ok(());
-    };
-    let state = tray_state_for_status(status);
-    let bytes = platform_icon_bytes(app, state);
-    let image = Image::from_bytes(bytes)?;
-    tray.set_icon(Some(image))?;
-    if let Ok(mut guard) = CURRENT_TRAY_STATE.lock() {
-        *guard = state;
-    }
-    let context = current_privacy_context();
-    tray.set_tooltip(Some(tooltip_for_status_context(status, &context)))?;
-    Ok(())
+    update_tray_presentation(app, tray_state_for_status(status), |context| {
+        tooltip_for_status_context(status, context)
+    })
 }
 
 /// Update the registered tray icon to reflect a new `TrayIconState`.
@@ -778,18 +774,39 @@ pub fn update_tray_state<R: Runtime>(
     app: &AppHandle<R>,
     state: TrayIconState,
 ) -> tauri::Result<()> {
+    update_tray_presentation(app, state, |context| tooltip_for_context(state, context))
+}
+
+fn update_tray_presentation<R: Runtime>(
+    app: &AppHandle<R>,
+    state: TrayIconState,
+    tooltip: impl FnOnce(&TrayPrivacyContext) -> String,
+) -> tauri::Result<()> {
     let Some(tray) = app.tray_by_id(LOCKET_TRAY_ID) else {
         return Ok(());
     };
-    let bytes = platform_icon_bytes(app, state);
-    let image = Image::from_bytes(bytes)?;
-    tray.set_icon(Some(image))?;
+    render_tray_presentation(
+        state,
+        platform_icon_bytes(app, state),
+        tooltip,
+        |image| tray.set_icon(Some(image)),
+        |tooltip| tray.set_tooltip(Some(tooltip)),
+    )
+}
+
+fn render_tray_presentation(
+    state: TrayIconState,
+    icon_bytes: &[u8],
+    tooltip: impl FnOnce(&TrayPrivacyContext) -> String,
+    set_icon: impl FnOnce(Image<'static>) -> tauri::Result<()>,
+    set_tooltip: impl FnOnce(String) -> tauri::Result<()>,
+) -> tauri::Result<()> {
+    let image = Image::from_bytes(icon_bytes)?;
+    set_icon(image)?;
     if let Ok(mut guard) = CURRENT_TRAY_STATE.lock() {
         *guard = state;
     }
-    let context = current_privacy_context();
-    tray.set_tooltip(Some(tooltip_for_context(state, &context)))?;
-    Ok(())
+    set_tooltip(tooltip(&current_privacy_context()))
 }
 
 #[cfg(test)]
@@ -804,6 +821,132 @@ mod tests {
     use locket_agent::{LockState, StatusEvent, StatusPayload};
     use locket_app::{TrayIconState, tray_icon_states};
     use std::collections::BTreeSet;
+
+    #[test]
+    fn tray_starts_with_disconnected_icon_and_metadata_only_menu() -> tauri::Result<()> {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))?;
+        let (image, tooltip) = super::initial_tray_presentation(app.handle())?;
+        let expected = super::Image::from_bytes(icon_bytes_for(TrayIconState::AgentStopped))?;
+        assert_eq!(image.rgba(), expected.rgba());
+        assert_eq!(tooltip, tooltip_for(TrayIconState::AgentStopped));
+        assert_eq!(super::current_selection_state(), TraySelectionState::default());
+
+        use TrayMenuAction::*;
+        let layout = super::tray_menu_layout(TraySelectionState::default()).collect::<Vec<_>>();
+        assert_eq!(
+            layout
+                .iter()
+                .map(|entry| entry.as_ref().map(|(action, _, _)| *action))
+                .collect::<Vec<_>>(),
+            [
+                Some(OpenApp),
+                None,
+                Some(LockVault),
+                Some(UnlockVault),
+                None,
+                Some(SwitchProfile),
+                Some(RunPolicy),
+                Some(StartScan),
+                None,
+                Some(RevealSecret),
+                Some(CopySecret),
+                None,
+                Some(QuitApp),
+            ],
+        );
+        for (action, text, enabled) in layout.into_iter().flatten() {
+            if action.requires_selection() {
+                assert!(!enabled);
+                assert_eq!(
+                    text,
+                    format!("{} - Unlock the vault to use this action.", action.label())
+                );
+            } else {
+                assert!(enabled);
+                assert_eq!(text, action.label());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_tray_style_respects_template_icons_and_theme_fallback() {
+        use super::icon_bytes_for_theme;
+        for &state in tray_icon_states() {
+            assert_eq!(
+                icon_bytes_for_theme(true, Some(tauri::Theme::Light), state),
+                macos_bytes(state)
+            );
+            assert_eq!(
+                icon_bytes_for_theme(false, Some(tauri::Theme::Light), state),
+                light_bytes(state)
+            );
+            assert_eq!(
+                icon_bytes_for_theme(false, Some(tauri::Theme::Dark), state),
+                dark_bytes(state)
+            );
+            assert_eq!(icon_bytes_for_theme(false, None, state), dark_bytes(state));
+        }
+    }
+
+    #[test]
+    fn native_menu_labels_explain_disabled_value_access() {
+        let action = TrayMenuAction::CopySecret;
+        for (selection, reason) in [
+            (
+                TraySelectionState { vault_unlocked: false, secret_selected: true },
+                Some("Unlock the vault to use this action."),
+            ),
+            (
+                TraySelectionState { vault_unlocked: true, secret_selected: false },
+                Some("Select a secret in the desktop list first."),
+            ),
+            (TraySelectionState { vault_unlocked: true, secret_selected: true }, None),
+        ] {
+            let (label, enabled) = super::menu_action_display(action, selection);
+            assert_eq!(enabled, reason.is_none());
+            assert_eq!(
+                label,
+                reason.map_or_else(
+                    || action.label().to_owned(),
+                    |reason| format!("{} - {reason}", action.label()),
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn tray_presentation_decodes_the_icon_before_committing_state_and_rendering_text()
+    -> tauri::Result<()> {
+        use super::{current_tray_state, render_tray_presentation};
+        let before = current_tray_state();
+        let state = TrayIconState::ScanWarning;
+        let refused = render_tray_presentation(
+            state,
+            icon_bytes_for(state),
+            |_| String::new(),
+            |_| Err(tauri::Error::AssetNotFound("fixture".into())),
+            |_| unreachable!("tooltip must wait for the icon write"),
+        );
+        assert!(refused.is_err());
+        assert_eq!(current_tray_state(), before);
+        render_tray_presentation(
+            state,
+            icon_bytes_for(state),
+            |context| tooltip_for_context(state, context),
+            |image| {
+                assert_eq!((image.width(), image.height()), (32, 32));
+                assert_eq!(current_tray_state(), before);
+                Ok(())
+            },
+            |text| {
+                assert_eq!(text, tooltip_for(state));
+                assert_eq!(current_tray_state(), state);
+                Ok(())
+            },
+        )
+    }
 
     #[test]
     fn icon_bytes_are_non_empty_for_every_state() {

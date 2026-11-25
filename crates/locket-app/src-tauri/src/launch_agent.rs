@@ -157,6 +157,29 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn launch_agent_refuses_symlink_and_relative_program() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let home = tempfile::tempdir()?;
+        let agent = LaunchAgent::new(home.path(), LocketInstance::Dev);
+        assert_eq!(
+            plist(LocketInstance::Dev, Path::new("relative/locket"))
+                .err()
+                .map(|error| error.kind()),
+            Some(ErrorKind::InvalidInput),
+        );
+        let target = home.path().join("unrelated.plist");
+        fs::write(&target, "keep this file")?;
+        fs::create_dir_all(home.path().join("Library/LaunchAgents"))?;
+        std::os::unix::fs::symlink(&target, &agent.path)?;
+        assert_eq!(agent.enabled().err().map(|error| error.kind()), Some(ErrorKind::InvalidData));
+        assert_eq!(agent.disable().err().map(|error| error.kind()), Some(ErrorKind::InvalidData));
+        assert!(fs::symlink_metadata(&agent.path)?.file_type().is_symlink());
+        assert_eq!(fs::read_to_string(target)?, "keep this file");
+        Ok(())
+    }
+
     #[test]
     fn enable_and_disable_keep_the_two_instances_separate() -> Result<(), Box<dyn std::error::Error>>
     {

@@ -11,7 +11,7 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
 use tauri::Manager as _;
-use tauri::{Emitter as _, RunEvent};
+use tauri::{Emitter as _, RunEvent, Runtime};
 use zeroize::Zeroizing;
 
 // Test-only dev-deps; suppress `unused_crate_dependencies` for the lib-test target.
@@ -28,6 +28,9 @@ mod launch_agent;
 #[cfg(unix)]
 mod macos_lifecycle;
 mod tray;
+
+#[cfg(all(test, unix))]
+mod command_tests;
 
 pub use agent_client::{
     AgentClientError, CancelToken, RECONNECT_INITIAL_BACKOFF, RECONNECT_MAX_BACKOFF, fetch_status,
@@ -334,7 +337,9 @@ async fn agent_status() -> Result<locket_agent::StatusPayload, AgentClientError>
 /// subsequent calls are no-ops so the webview can call this on every
 /// mount without spawning multiple sockets.
 #[tauri::command]
-async fn agent_subscribe_status(app: tauri::AppHandle) -> Result<(), AgentClientError> {
+async fn agent_subscribe_status<R: Runtime>(
+    app: tauri::AppHandle<R>,
+) -> Result<(), AgentClientError> {
     if !mark_status_subscription_started() {
         return Ok(());
     }
@@ -343,41 +348,34 @@ async fn agent_subscribe_status(app: tauri::AppHandle) -> Result<(), AgentClient
     Ok(())
 }
 
-fn spawn_status_subscription(app: tauri::AppHandle, cancel: agent_client::CancelToken) {
+fn spawn_status_subscription<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    cancel: agent_client::CancelToken,
+) {
     tauri::async_runtime::spawn(async move {
         run_status_subscription_loop(app, cancel).await;
     });
 }
 
-async fn run_status_subscription_loop(app: tauri::AppHandle, cancel: agent_client::CancelToken) {
-    let path = agent_client::resolve_socket_path();
-    let mut last_delay: Option<std::time::Duration> = None;
-    while !cancel.is_cancelled() {
-        let (sender, mut receiver) = tokio::sync::mpsc::channel::<locket_agent::StatusEvent>(16);
-        let event_app = app.clone();
-        let forwarder = tauri::async_runtime::spawn(async move {
-            while let Some(event) = receiver.recv().await {
-                let _emit_result = event_app.emit(AGENT_STATUS_EVENT, &event);
+async fn run_status_subscription_loop<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    cancel: agent_client::CancelToken,
+) {
+    let event_app = app.clone();
+    agent_client::maintain_status_stream(
+        &agent_client::resolve_socket_path(),
+        &cancel,
+        move |event| {
+            let _ = event_app.emit(AGENT_STATUS_EVENT, &event);
+        },
+        |error| {
+            if let Some(error) = error {
+                let _ = app.emit(AGENT_STATUS_ERROR_EVENT, &error);
             }
-        });
-        let stream_result =
-            agent_client::stream_status_events_with_cancel(&path, sender, &cancel).await;
-        let _ = forwarder.await;
-        if cancel.is_cancelled() {
-            break;
-        }
-        if let Err(error) = stream_result {
-            let _emit_result = app.emit(AGENT_STATUS_ERROR_EVENT, &error);
-        }
-        let _emit_result = app.emit(AGENT_STATUS_DISCONNECTED_EVENT, ());
-        let delay = agent_client::next_reconnect_delay(last_delay);
-        last_delay = Some(delay);
-        tokio::select! {
-            biased;
-            () = cancel.cancelled() => break,
-            () = tokio::time::sleep(delay) => {}
-        }
-    }
+            let _ = app.emit(AGENT_STATUS_DISCONNECTED_EVENT, ());
+        },
+    )
+    .await;
 }
 
 /// Tauri command exposing the agent's `Lock` RPC to the webview and tray.
@@ -431,7 +429,7 @@ struct AgentUnlockPayload<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     passphrase: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    method: Option<&'static str>,
+    method: Option<locket_agent::UnlockMethod>,
     #[serde(skip_serializing_if = "Option::is_none")]
     audit: Option<&'a DesktopUnlockAudit>,
 }
@@ -446,7 +444,7 @@ impl DesktopUnlockRequest {
             project_id: &self.project_id,
             ttl_seconds: self.ttl_seconds,
             passphrase,
-            method: passphrase.map(|_| "passphrase"),
+            method: passphrase.map(|_| locket_agent::UnlockMethod::Passphrase),
             audit: self.audit.as_ref(),
         }
     }
@@ -981,6 +979,7 @@ enum DesktopClipboardCopyResponse {
 /// timer.
 #[tauri::command]
 async fn agent_copy_secret(
+    handoff: tauri::State<'_, desktop_actions::DesktopHandoff>,
     request: DesktopClipboardCopyRequest,
 ) -> Result<DesktopClipboardCopyResponse, AgentClientError> {
     if matches!(clipboard::clipboard_platform(), clipboard::ClipboardPlatform::Wayland) {
@@ -1009,14 +1008,11 @@ async fn agent_copy_secret(
     )
     .await?;
     let ttl_seconds = request.ttl_seconds.unwrap_or(response.ttl_seconds.max(1));
-    clipboard::copy_with_ttl(
-        response.value,
-        std::time::Duration::from_secs(u64::from(ttl_seconds)),
-    )
-    .await
-    .map_err(|error| AgentClientError::Protocol {
-        reason: format!("clipboard write failed: {error}"),
-    })?;
+    (handoff.copy_secret)(response.value, std::time::Duration::from_secs(u64::from(ttl_seconds)))
+        .await
+        .map_err(|error| AgentClientError::Protocol {
+            reason: format!("clipboard write failed: {error}"),
+        })?;
     Ok(DesktopClipboardCopyResponse::Copied { ttl_seconds })
 }
 
@@ -1028,7 +1024,10 @@ async fn agent_copy_secret(
 /// typed [`AgentClientError`] because tray failures are local rendering
 /// faults, not agent protocol faults.
 #[tauri::command]
-async fn tray_set_state(app: tauri::AppHandle, state: TrayState) -> Result<(), String> {
+async fn tray_set_state<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    state: TrayState,
+) -> Result<(), String> {
     tray::update_tray_state(&app, state.into()).map_err(|error| error.to_string())
 }
 
@@ -1041,8 +1040,8 @@ async fn tray_set_state(app: tauri::AppHandle, state: TrayState) -> Result<(), S
 /// Carries booleans only — never a secret name, value, or id — so the
 /// tray surface remains metadata-only per the desktop spec.
 #[tauri::command]
-async fn tray_set_selection(
-    app: tauri::AppHandle,
+async fn tray_set_selection<R: Runtime>(
+    app: tauri::AppHandle<R>,
     selection: TraySelectionState,
 ) -> Result<(), String> {
     let previous = tray::store_selection_state(selection);
@@ -1054,8 +1053,8 @@ async fn tray_set_selection(
 
 /// Tauri command pushing redaction-aware tray tooltip context from the webview.
 #[tauri::command]
-async fn tray_set_privacy_context(
-    app: tauri::AppHandle,
+async fn tray_set_privacy_context<R: Runtime>(
+    app: tauri::AppHandle<R>,
     context: TrayPrivacyContext,
 ) -> Result<(), String> {
     let previous = tray::store_privacy_context(context.clone());
@@ -1063,6 +1062,132 @@ async fn tray_set_privacy_context(
         return Ok(());
     }
     tray::refresh_tray_tooltip(&app).map_err(|error| error.to_string())
+}
+
+fn register_commands<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
+    builder.invoke_handler(tauri::generate_handler![
+        desktop_actions::desktop_list_projects,
+        desktop_actions::desktop_open_project,
+        desktop_actions::desktop_open_shared_vault,
+        desktop_actions::desktop_inspect_project_folder,
+        desktop_actions::desktop_initialize_project,
+        desktop_actions::desktop_import_env,
+        desktop_actions::desktop_create_profile,
+        desktop_actions::desktop_delete_secret,
+        desktop_actions::desktop_copy_secret_to_shared,
+        desktop_actions::desktop_detect_commands,
+        desktop_actions::desktop_start_agent,
+        desktop_actions::desktop_run_policy,
+        desktop_actions::desktop_scan_project,
+        desktop_actions::desktop_save_policy,
+        desktop_actions::desktop_variable_readiness,
+        desktop_actions::desktop_team_sync_status,
+        desktop_actions::desktop_team_sync_configure,
+        desktop_actions::desktop_team_sync_now,
+        desktop_actions::desktop_team_sync_rename_profile,
+        desktop_actions::desktop_team_sync_preserve_override,
+        desktop_actions::desktop_get_launch_at_login,
+        desktop_actions::desktop_set_launch_at_login,
+        desktop_actions::desktop_pick_directory,
+        desktop_actions::desktop_pick_file,
+        desktop_actions::desktop_copy_text_plain,
+        desktop_actions::desktop_mcp_config_snippet,
+        agent_status,
+        agent_subscribe_status,
+        agent_lock,
+        agent_unlock,
+        agent_set_active_profile,
+        agent_reveal,
+        agent_copy,
+        agent_scan,
+        agent_resolve,
+        agent_prepare_exec,
+        agent_policy_doctor,
+        agent_export_bundle,
+        agent_import_bundle,
+        agent_verify_bundle,
+        agent_recovery_rotate,
+        agent_list_runtime_sessions,
+        agent_list_policies,
+        agent_register_command_policies,
+        agent_list_device_members,
+        agent_list_secrets,
+        agent_discover_secrets,
+        agent_list_projects,
+        agent_set_secret,
+        agent_rotate_secret,
+        agent_read_config,
+        agent_write_config,
+        agent_list_audit,
+        agent_verify_audit,
+        agent_list_versions,
+        agent_copy_secret,
+        tray_set_state,
+        tray_set_selection,
+        tray_set_privacy_context,
+    ])
+}
+
+fn desktop_builder<R: Runtime>(
+    builder: tauri::Builder<R>,
+    install_tray: impl FnOnce(&tauri::AppHandle<R>) -> tauri::Result<()> + Send + 'static,
+) -> tauri::Builder<R> {
+    register_commands(builder.manage(desktop_actions::DesktopHandoff::default()))
+        .on_window_event(|window, event| {
+            #[cfg(target_os = "macos")]
+            if window.label() == "main"
+                && let tauri::WindowEvent::CloseRequested { api, .. } = event
+            {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (window, event);
+        })
+        .setup(move |app| {
+            if let Ok(path) = app.path().resource_dir() {
+                desktop_actions::set_resource_root(path);
+            }
+            #[cfg(debug_assertions)]
+            {
+                if let Some(window) = app.get_webview_window("main") {
+                    window.open_devtools();
+                }
+            }
+            install_tray(app.handle())?;
+            Ok(())
+        })
+}
+
+fn run_app<R: Runtime>(
+    app: tauri::App<R>,
+    #[cfg(unix)] mut owner: macos_lifecycle::DesktopInstance,
+) -> tauri::Result<()> {
+    #[cfg(unix)]
+    {
+        let handle = app.handle().clone();
+        owner.start(move || {
+            let handle_for_show = handle.clone();
+            handle.run_on_main_thread(move || tray::show_main_window(&handle_for_show)).is_ok()
+        })?;
+    }
+    #[cfg(unix)]
+    let mut instance = Some(owner);
+
+    app.run(move |_app, event| {
+        if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
+            cancel_status_subscription();
+        }
+        #[cfg(target_os = "macos")]
+        if matches!(event, RunEvent::Reopen { has_visible_windows: false, .. }) {
+            tray::show_main_window(_app);
+        }
+        #[cfg(unix)]
+        if matches!(event, RunEvent::Exit) {
+            drop(instance.take());
+        }
+    });
+    Ok(())
 }
 
 /// Run the Locket desktop application.
@@ -1079,129 +1204,25 @@ async fn tray_set_privacy_context(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() -> tauri::Result<()> {
     #[cfg(unix)]
-    let mut instance = {
+    let owner = {
         let directories = project_dirs().map_err(std::io::Error::other)?;
         let Some(owner) = macos_lifecycle::DesktopInstance::acquire(directories.data_dir())? else {
             return Ok(());
         };
-        Some(owner)
+        owner
     };
 
     // keyring-core 1.0 requires registering a credential store before any
     // Entry can resolve. A failure here surfaces later as the same error
     // from whichever agent command first touches the keychain.
     let _ = locket_platform::init_platform_keyring();
-    let app = tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![
-            desktop_actions::desktop_list_projects,
-            desktop_actions::desktop_open_project,
-            desktop_actions::desktop_open_shared_vault,
-            desktop_actions::desktop_inspect_project_folder,
-            desktop_actions::desktop_initialize_project,
-            desktop_actions::desktop_import_env,
-            desktop_actions::desktop_create_profile,
-            desktop_actions::desktop_delete_secret,
-            desktop_actions::desktop_copy_secret_to_shared,
-            desktop_actions::desktop_detect_commands,
-            desktop_actions::desktop_start_agent,
-            desktop_actions::desktop_run_policy,
-            desktop_actions::desktop_scan_project,
-            desktop_actions::desktop_save_policy,
-            desktop_actions::desktop_variable_readiness,
-            desktop_actions::desktop_team_sync_status,
-            desktop_actions::desktop_team_sync_configure,
-            desktop_actions::desktop_team_sync_now,
-            desktop_actions::desktop_team_sync_rename_profile,
-            desktop_actions::desktop_team_sync_preserve_override,
-            desktop_actions::desktop_get_launch_at_login,
-            desktop_actions::desktop_set_launch_at_login,
-            desktop_actions::desktop_pick_directory,
-            desktop_actions::desktop_pick_file,
-            desktop_actions::desktop_copy_text_plain,
-            desktop_actions::desktop_mcp_config_snippet,
-            agent_status,
-            agent_subscribe_status,
-            agent_lock,
-            agent_unlock,
-            agent_set_active_profile,
-            agent_reveal,
-            agent_copy,
-            agent_scan,
-            agent_resolve,
-            agent_prepare_exec,
-            agent_policy_doctor,
-            agent_export_bundle,
-            agent_import_bundle,
-            agent_verify_bundle,
-            agent_recovery_rotate,
-            agent_list_runtime_sessions,
-            agent_list_policies,
-            agent_register_command_policies,
-            agent_list_device_members,
-            agent_list_secrets,
-            agent_discover_secrets,
-            agent_list_projects,
-            agent_set_secret,
-            agent_rotate_secret,
-            agent_read_config,
-            agent_write_config,
-            agent_list_audit,
-            agent_verify_audit,
-            agent_list_versions,
-            agent_copy_secret,
-            tray_set_state,
-            tray_set_selection,
-            tray_set_privacy_context,
-        ])
-        .on_window_event(|window, event| {
-            #[cfg(target_os = "macos")]
-            if window.label() == "main"
-                && let tauri::WindowEvent::CloseRequested { api, .. } = event
-            {
-                api.prevent_close();
-                let _ = window.hide();
-            }
-            #[cfg(not(target_os = "macos"))]
-            let _ = (window, event);
-        })
-        .setup(|app| {
-            if let Ok(path) = app.path().resource_dir() {
-                desktop_actions::set_resource_root(path);
-            }
-            #[cfg(debug_assertions)]
-            {
-                if let Some(window) = app.get_webview_window("main") {
-                    window.open_devtools();
-                }
-            }
-            tray::setup_tray(app.handle())?;
-            Ok(())
-        })
+    let app = desktop_builder(tauri::Builder::default(), tray::setup_tray)
         .build(tauri::generate_context!())?;
-
-    #[cfg(unix)]
-    if let Some(owner) = &mut instance {
-        let handle = app.handle().clone();
-        owner.start(move || {
-            let handle_for_show = handle.clone();
-            handle.run_on_main_thread(move || tray::show_main_window(&handle_for_show)).is_ok()
-        })?;
-    }
-
-    app.run(move |_app, event| {
-        if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
-            cancel_status_subscription();
-        }
-        #[cfg(target_os = "macos")]
-        if matches!(event, RunEvent::Reopen { has_visible_windows: false, .. }) {
-            tray::show_main_window(_app);
-        }
+    run_app(
+        app,
         #[cfg(unix)]
-        if matches!(event, RunEvent::Exit) {
-            drop(instance.take());
-        }
-    });
-    Ok(())
+        owner,
+    )
 }
 
 #[cfg(test)]
@@ -1247,6 +1268,15 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn discovery_does_not_lossily_encode_an_explicit_nonunicode_store_path() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let path = PathBuf::from(std::ffi::OsString::from_vec(b"vault-\xff.db".to_vec()));
+        assert!(matches!(super::resolve_discovery_store_path(Some(path)),
+            Err(AgentClientError::Protocol { reason }) if reason == "Locket store path must be valid Unicode"));
+    }
+
     #[test]
     fn missing_path_uses_default_or_propagates_lookup_error() -> Result<(), AgentClientError> {
         let path = PathBuf::from("default/store.db");
@@ -1260,7 +1290,7 @@ mod tests {
         Ok(())
     }
 
-    fn sample_policy() -> locket_agent::CommandPolicySnapshot {
+    pub(super) fn sample_policy() -> locket_agent::CommandPolicySnapshot {
         locket_agent::CommandPolicySnapshot {
             project_id: "lk_proj_test".to_owned(),
             name: "serve".to_owned(),
@@ -1313,7 +1343,7 @@ mod tests {
         let payload = serde_json::to_value(request.agent_payload())?;
         assert_eq!(payload["project_id"], "lk_proj_test");
         assert_eq!(payload["ttl_seconds"], 900);
-        assert_eq!(payload["method"], "passphrase");
+        assert_eq!(payload["method"], "Passphrase");
         assert_eq!(payload["passphrase"], "secret");
         assert_eq!(payload["audit"]["store_path"], "/vault/store.db");
         assert_eq!(payload["audit"]["profile_id"], "lk_prof_test");

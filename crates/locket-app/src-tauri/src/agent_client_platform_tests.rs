@@ -429,3 +429,150 @@ async fn meaningful_change_resets_heartbeat_deadline() -> Result<(), Box<dyn std
     );
     Ok(())
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancellation_releases_a_unix_status_reader_with_a_full_consumer_channel()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::future::{Future as _, poll_fn};
+    use std::task::Poll;
+    use tokio::io::AsyncWriteExt as _;
+
+    let (mut peer, mut client) = tokio::net::UnixStream::pair()?;
+    let next = StatusEvent::status(2, StatusPayload::locked("backpressure fixture"));
+    let frame = locket_agent::ResponseEnvelope::Success(locket_agent::SuccessEnvelope::new(
+        "status",
+        serde_json::to_value(&next)?,
+    ));
+    peer.write_all(&locket_agent::encode_frame(&frame, locket_agent::DEFAULT_MAX_MESSAGE_SIZE)?)
+        .await?;
+    client.readable().await?;
+
+    let (sender, mut receiver) = mpsc::channel(1);
+    sender.send(StatusEvent::status(1, StatusPayload::locked("initial fixture"))).await?;
+    let cancel = CancelToken::new();
+    let mut forwarding = std::pin::pin!(super::read_status_stream(&mut client, sender, &cancel));
+    assert!(poll_fn(|cx| Poll::Ready(forwarding.as_mut().poll(cx))).await.is_pending());
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(1), forwarding).await??;
+    assert_eq!(receiver.try_recv()?.sequence, 1);
+    assert!(receiver.try_recv().is_err(), "cancelled status must not replace the queued event");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unary_deadlines_distinguish_unknown_mutation_outcomes_from_read_failures()
+-> Result<(), Box<dyn std::error::Error>> {
+    use locket_agent::AgentMethod;
+    for (mutation, method, reason) in [
+        (false, AgentMethod::Status, "request timed out"),
+        (
+            true,
+            AgentMethod::CreateProfile,
+            "request timed out; outcome is unknown. Refresh before retrying",
+        ),
+    ] {
+        let (peer, client) = tokio::net::UnixStream::pair()?;
+        let frame = super::encode_request("deadline-test", method, &())?;
+        let response =
+            super::exchange_with_deadline(client, frame, Duration::from_millis(20), mutation).await;
+        assert!(
+            matches!(response, Err(AgentClientError::Protocol { reason: actual }) if actual == reason)
+        );
+        // Keep the connection open through the timeout to model a stalled
+        // operation, rather than a peer that failed to send any response.
+        drop(peer);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unary_reader_accepts_a_chunked_large_reply_and_fails_closed_on_bad_frames()
+-> Result<(), Box<dyn std::error::Error>> {
+    use locket_agent::{AgentMethod, DEFAULT_MAX_MESSAGE_SIZE, ResponseEnvelope, SuccessEnvelope};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let payload = serde_json::json!({"padding": "x".repeat(2 * super::FRAME_READ_CHUNK_SIZE)});
+    let reply = locket_agent::encode_frame(
+        &ResponseEnvelope::Success(SuccessEnvelope::new("framing-test", payload.clone())),
+        DEFAULT_MAX_MESSAGE_SIZE,
+    )?;
+    let too_big = u32::try_from(DEFAULT_MAX_MESSAGE_SIZE + 1)?.to_le_bytes();
+    for (bytes, expected_error) in [
+        (reply.as_slice(), None),
+        (
+            &too_big,
+            Some(
+                locket_agent::ProtocolError::MessageTooLarge {
+                    length: DEFAULT_MAX_MESSAGE_SIZE + 1,
+                    maximum: DEFAULT_MAX_MESSAGE_SIZE,
+                }
+                .to_string(),
+            ),
+        ),
+        (&[], Some("agent closed connection before response".to_owned())),
+    ] {
+        let (mut peer, client) = tokio::net::UnixStream::pair()?;
+        let server = async move {
+            let len = peer.read_u32_le().await? as usize;
+            let mut request = vec![0; len];
+            peer.read_exact(&mut request).await?;
+            for chunk in bytes.chunks(1024) {
+                peer.write_all(chunk).await?;
+            }
+            Ok::<(), std::io::Error>(())
+        };
+        let frame = super::encode_request("framing-test", AgentMethod::Status, &())?;
+        let (response, sent) =
+            tokio::join!(super::round_trip(client, AgentMethod::Status, frame), server,);
+        sent?;
+        if let Some(reason) = expected_error {
+            assert!(
+                matches!(response, Err(AgentClientError::Protocol { reason: actual }) if actual == reason)
+            );
+        } else {
+            assert_eq!(super::decode_payload::<serde_json::Value>(response?)?, payload);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn oversized_request_is_rejected_before_it_can_reach_an_agent() {
+    let secret = "private-fixture"
+        .repeat(locket_agent::DEFAULT_MAX_MESSAGE_SIZE / "private-fixture".len() + 1);
+    let error = super::invoke_method::<_, ()>(
+        Path::new("socket-should-never-be-opened"),
+        locket_agent::AgentMethod::Unlock,
+        &serde_json::json!({"passphrase": secret}),
+    )
+    .await;
+    assert!(matches!(error, Err(AgentClientError::Protocol { reason })
+        if reason.contains("exceeds maximum") && !reason.contains("private-fixture")));
+}
+
+#[test]
+fn a_success_envelope_with_the_wrong_payload_type_cannot_be_treated_as_a_status() {
+    let response = locket_agent::ResponseEnvelope::Success(locket_agent::SuccessEnvelope::new(
+        "wrong-payload",
+        serde_json::json!({"agent_version":"fixture","lock_state":999}),
+    ));
+    assert!(matches!(super::decode_payload::<StatusPayload>(response),
+        Err(AgentClientError::Protocol { reason })
+        if reason.starts_with("malformed response payload:")));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stale_socket_is_reported_as_unavailable_with_the_attempted_path()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let socket = directory.path().join("s");
+    drop(tokio::net::UnixListener::bind(&socket)?);
+    let error = super::fetch_status(&socket).await;
+    assert!(matches!(error, Err(AgentClientError::Unavailable {
+        reason, socket_path, ..
+    }) if reason.starts_with("connect failed:") && socket_path == socket.to_string_lossy()));
+    Ok(())
+}

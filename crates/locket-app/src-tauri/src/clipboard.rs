@@ -12,7 +12,6 @@
 //!   through expiry. Linux needs that owner alive to serve paste requests;
 //!   creating and dropping a clipboard for each operation loses the selection.
 
-use std::env;
 use std::time::Duration;
 
 use thiserror::Error;
@@ -72,14 +71,26 @@ pub enum ClipboardError {
 /// the rest of the workspace.
 #[must_use]
 pub fn clipboard_platform() -> ClipboardPlatform {
-    if cfg!(target_os = "linux") {
-        let session = env::var("XDG_SESSION_TYPE").unwrap_or_default();
-        let wayland_display = env::var("WAYLAND_DISPLAY").unwrap_or_default();
-        if session.eq_ignore_ascii_case("wayland") || !wayland_display.is_empty() {
-            return ClipboardPlatform::Wayland;
-        }
+    #[cfg(target_os = "linux")]
+    {
+        linux_clipboard_platform(
+            &std::env::var("XDG_SESSION_TYPE").unwrap_or_default(),
+            &std::env::var("WAYLAND_DISPLAY").unwrap_or_default(),
+        )
     }
-    ClipboardPlatform::Standard
+    #[cfg(not(target_os = "linux"))]
+    {
+        ClipboardPlatform::Standard
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_clipboard_platform(session: &str, wayland_display: &str) -> ClipboardPlatform {
+    if session.eq_ignore_ascii_case("wayland") || !wayland_display.is_empty() {
+        ClipboardPlatform::Wayland
+    } else {
+        ClipboardPlatform::Standard
+    }
 }
 
 /// Pure mapping from "what the clipboard now holds" to the clear
@@ -136,34 +147,55 @@ impl ClipboardBackend for arboard::Clipboard {
 /// At expiry, macOS checks pasteboard ownership. Elsewhere the worker retains
 /// the selection and checks whether it still holds the value.
 pub(crate) async fn copy_with_ttl(value: String, ttl: Duration) -> Result<(), ClipboardError> {
+    copy_with_worker(value, ttl, |value, ttl, ready| {
+        #[cfg(target_os = "macos")]
+        copy_concealed_on_worker(
+            value,
+            ttl,
+            ready,
+            locket_platform::write_concealed_secret,
+            locket_platform::clear_if_unchanged,
+            std::thread::sleep,
+        );
+        #[cfg(not(target_os = "macos"))]
+        copy_on_worker(value, ttl, ready, ClipboardSession::new, std::thread::sleep);
+    })
+    .await
+}
+
+async fn copy_with_worker(
+    value: String,
+    ttl: Duration,
+    worker: impl FnOnce(Zeroizing<String>, Duration, oneshot::Sender<Result<(), ClipboardError>>)
+    + Send
+    + 'static,
+) -> Result<(), ClipboardError> {
     let value = Zeroizing::new(value);
     let (ready, written) = oneshot::channel();
     std::thread::Builder::new()
         .name("locket-clipboard".into())
-        .spawn(move || {
-            #[cfg(target_os = "macos")]
-            copy_concealed_on_worker(value, ttl, ready);
-            #[cfg(not(target_os = "macos"))]
-            copy_on_worker(value, ttl, ready, ClipboardSession::new, std::thread::sleep);
-        })
+        .spawn(move || worker(value, ttl, ready))
         .map_err(|error| ClipboardError::Backend(error.to_string()))?;
     written.await.map_err(|_| ClipboardError::Backend("clipboard worker stopped".into()))?
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn copy_concealed_on_worker(
     value: Zeroizing<String>,
     ttl: Duration,
     ready: oneshot::Sender<Result<(), ClipboardError>>,
+    write: impl FnOnce(&str) -> Result<i64, locket_platform::PlatformError>,
+    clear: impl FnOnce(i64) -> Result<bool, locket_platform::PlatformError>,
+    wait: impl FnOnce(Duration),
 ) {
-    let change_count = locket_platform::write_concealed_secret(&value);
+    let change_count = write(&value);
     drop(value);
     match change_count {
         Ok(change_count) => {
             if ready.send(Ok(())).is_ok() {
-                std::thread::sleep(ttl);
+                wait(ttl);
             }
-            let _ = locket_platform::clear_if_unchanged(change_count);
+            let _ = clear(change_count);
         }
         Err(error) => {
             let _ = ready.send(Err(ClipboardError::Backend(error.to_string())));
@@ -235,9 +267,12 @@ mod tests {
     use std::time::Duration;
     use zeroize::Zeroizing;
 
+    #[cfg(target_os = "linux")]
+    use super::clipboard_platform;
     use super::{
-        ClipboardBackend, ClipboardCopyDecision, ClipboardCopyOutcome, ClipboardError,
-        ClipboardPlatform, clipboard_platform, copy_on_worker, decide_clear,
+        ClipboardBackend, ClipboardCopyDecision, ClipboardError, ClipboardPlatform,
+        copy_concealed_on_worker, copy_on_worker, copy_with_worker, decide_clear,
+        linux_clipboard_platform,
     };
 
     struct OwnedClipboard {
@@ -384,21 +419,61 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_platform_returns_a_known_variant() {
-        // The function is platform-dependent so we just assert the
-        // probe terminates and returns one of the documented variants.
-        match clipboard_platform() {
-            ClipboardPlatform::Standard | ClipboardPlatform::Wayland => {}
+    fn wayland_is_detected_from_either_linux_session_hint() {
+        for (session, display) in [("WaYLaNd", ""), ("x11", "wayland-test"), ("", "wayland-test")] {
+            assert_eq!(linux_clipboard_platform(session, display), ClipboardPlatform::Wayland);
         }
+        assert_eq!(linux_clipboard_platform("x11", ""), ClipboardPlatform::Standard);
+        assert_eq!(linux_clipboard_platform("", ""), ClipboardPlatform::Standard);
     }
 
     #[test]
-    fn unsupported_outcome_surfaces_a_stable_wayland_reason_code() {
-        let outcome =
-            ClipboardCopyOutcome::Unsupported { unsupported_reason: "wayland-session".to_owned() };
-        assert!(matches!(&outcome, ClipboardCopyOutcome::Unsupported { .. }));
-        if let ClipboardCopyOutcome::Unsupported { unsupported_reason } = outcome {
-            assert_eq!(unsupported_reason, "wayland-session");
-        }
+    fn concealed_copy_acknowledges_before_waiting_and_clears_only_the_original_change_count() {
+        let (ready, mut written) = tokio::sync::oneshot::channel();
+        let count = Cell::new(0);
+        let cleared = Cell::new(false);
+        copy_concealed_on_worker(
+            Zeroizing::new("test secret".into()),
+            Duration::from_secs(5),
+            ready,
+            |value| {
+                assert_eq!(value, "test secret");
+                count.set(41);
+                Ok(41)
+            },
+            |expected| {
+                assert_eq!(expected, 41);
+                cleared.set(count.get() == expected);
+                Ok(cleared.get())
+            },
+            |ttl| {
+                assert_eq!(ttl, Duration::from_secs(5));
+                assert!(matches!(written.try_recv(), Ok(Ok(()))));
+                count.set(42);
+            },
+        );
+        assert_eq!(count.get(), 42);
+        assert!(!cleared.get());
+    }
+
+    #[tokio::test]
+    async fn concealed_write_failure_reaches_the_caller_without_starting_an_expiry_timer() {
+        let result = copy_with_worker(
+            "fixture secret".into(),
+            Duration::from_secs(30),
+            |value, ttl, ready| {
+                copy_concealed_on_worker(
+                    value,
+                    ttl,
+                    ready,
+                    |_| Err(locket_platform::PlatformError::MasterKeyNotFound),
+                    |_| unreachable!("failed writes must not clear the existing clipboard"),
+                    |_| unreachable!("failed writes must not start the expiry timer"),
+                );
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(ClipboardError::Backend(message))
+            if message == locket_platform::PlatformError::MasterKeyNotFound.to_string()));
     }
 }

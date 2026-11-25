@@ -100,9 +100,9 @@ fn attributed_command_names(source: &str) -> std::collections::BTreeSet<String> 
             .map(|pos| pos + "fn ".len())
             .expect("command function line must contain fn");
         let function_name = function_line[name_start..]
-            .split_once('(')
+            .split_once(['(', '<'])
             .map(|(name, _)| name.trim())
-            .expect("command function line must include an argument list");
+            .expect("command function line must include an argument or generic parameter list");
         assert!(
             commands.insert(function_name.to_owned()),
             "duplicate #[tauri::command] function {function_name}",

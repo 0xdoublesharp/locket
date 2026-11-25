@@ -66,6 +66,38 @@ pub fn next_reconnect_delay(previous: Option<Duration>) -> Duration {
     if doubled >= RECONNECT_MAX_BACKOFF { RECONNECT_MAX_BACKOFF } else { doubled }
 }
 
+/// Keep a status consumer connected until the desktop shuts down.
+pub(crate) async fn maintain_status_stream(
+    path: &Path,
+    cancel: &CancelToken,
+    on_event: impl Fn(StatusEvent) + Clone + Send + 'static,
+    on_disconnect: impl Fn(Option<AgentClientError>),
+) {
+    let mut last_delay = None;
+    while !cancel.is_cancelled() {
+        let (sender, mut receiver) = mpsc::channel(16);
+        let on_event = on_event.clone();
+        let forwarder = tokio::spawn(async move {
+            while let Some(event) = receiver.recv().await {
+                on_event(event);
+            }
+        });
+        let result = stream_status_events_with_cancel(path, sender, cancel).await;
+        let _ = forwarder.await;
+        if cancel.is_cancelled() {
+            break;
+        }
+        on_disconnect(result.err());
+        let delay = next_reconnect_delay(last_delay);
+        last_delay = Some(delay);
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => break,
+            () = tokio::time::sleep(delay) => {}
+        }
+    }
+}
+
 /// Cancellation token shared between the desktop shell and the
 /// streaming client task.
 ///
@@ -252,7 +284,7 @@ pub async fn stream_status_events(
 
 /// Cancellable variant of [`stream_status_events`].
 ///
-/// Cancellation stops an in-flight request or a blocked event send on Windows.
+/// Cancellation stops the status read or a blocked event send.
 /// Unix sends a best-effort `CancelSubscription` envelope before closing its
 /// dedicated stream. App shutdown can therefore stop both transport variants.
 ///
@@ -358,7 +390,7 @@ async fn connect(socket_path: &Path) -> Result<AgentStream, AgentClientError> {
 }
 
 async fn round_trip(
-    mut stream: AgentStream,
+    stream: AgentStream,
     method: AgentMethod,
     frame: Zeroizing<Vec<u8>>,
 ) -> Result<ResponseEnvelope, AgentClientError> {
@@ -376,18 +408,24 @@ async fn round_trip(
         _ if mutation => Duration::from_secs(30),
         _ => REQUEST_TIMEOUT,
     };
-    let result = tokio::time::timeout(timeout, exchange_frame(&mut stream, frame)).await;
-    match result {
-        Ok(Ok(envelope)) => Ok(envelope),
-        Ok(Err(error)) => Err(error),
-        Err(_) => Err(AgentClientError::Protocol {
+    exchange_with_deadline(stream, frame, timeout, mutation).await
+}
+
+async fn exchange_with_deadline(
+    mut stream: AgentStream,
+    frame: Zeroizing<Vec<u8>>,
+    timeout: Duration,
+    mutation: bool,
+) -> Result<ResponseEnvelope, AgentClientError> {
+    tokio::time::timeout(timeout, exchange_frame(&mut stream, frame)).await.map_err(|_| {
+        AgentClientError::Protocol {
             reason: if mutation {
                 "request timed out; outcome is unknown. Refresh before retrying".to_owned()
             } else {
                 "request timed out".to_owned()
             },
-        }),
-    }
+        }
+    })?
 }
 
 async fn exchange_frame(
@@ -514,7 +552,12 @@ async fn read_status_stream(
             });
         };
         let event = decode_payload::<StatusEvent>(response)?;
-        if sender.send(event).await.is_err() {
+        let sent = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Ok(()),
+            sent = sender.send(event) => sent,
+        };
+        if sent.is_err() {
             return Ok(());
         }
     }
