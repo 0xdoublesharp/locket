@@ -1887,6 +1887,8 @@ fn run_with_context(
             vault::recovery::recovery_command(context, output, command)?;
         }
         Command::InternalAgentServe(args) => {
+            #[cfg(all(target_os = "macos", not(debug_assertions), not(test)))]
+            let _ = locket_platform::disable_debugger_attach();
             agent::run_internal_agent_serve(&args, &context.store_path)?;
         }
         Command::InternalClipboardClear(args) => {

@@ -34,6 +34,8 @@ pub use automation_client_key::{
     AutomationClientKeyStore, AutomationClientKeychainRef, KeyringAutomationClientKeyStore,
     MemoryAutomationClientKeyStore,
 };
+#[cfg(target_os = "macos")]
+pub use core_dumps::disable_debugger_attach;
 pub use core_dumps::{CoreDumpHardening, core_dump_hardening_state, disable_core_dumps};
 pub use device_private_key::{
     DEVICE_PRIVATE_KEY_SCHEMA_VERSION, LocalDevicePrivateKeyStorage, MemoryDevicePrivateKeyStorage,
@@ -51,7 +53,9 @@ pub use master_key::{
     KeyringMasterKeyStore, MasterKeyStore, MemoryMasterKeyStore, MockMasterKeyStore,
     MockMasterKeyStoreFailure,
 };
-pub use memory_lock::{MemoryLockHardening, lock_process_memory, memory_lock_hardening_state};
+pub use memory_lock::{
+    LockedBytes, MemoryLockHardening, lock_process_memory, memory_lock_hardening_state,
+};
 pub use passkey::{
     DefaultPlatformPasskeyRegistrar, MemoryPlatformPasskeyOutcome, MemoryPlatformPasskeyRegistrar,
     PasskeyAssertionContext, PasskeyRegistration, PlatformPasskeyRegistrar,

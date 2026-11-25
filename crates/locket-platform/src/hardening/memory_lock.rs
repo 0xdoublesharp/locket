@@ -7,10 +7,231 @@
 //! process's working set; otherwise the call falls back to
 //! `Degraded` and `locket doctor` surfaces the gap.
 //!
-//! Windows support is out of scope for this slice; the helper returns
-//! `Unsupported` there.
+//! `LockedBytes` locks individual buffers independently of process-wide
+//! locking, including on macOS and Windows.
 
-use std::fmt::{self, Display};
+use std::fmt::{self, Debug, Display};
+
+use zeroize::Zeroizing;
+
+/// Owns secret bytes in a stable allocation and wipes them on drop.
+///
+/// On Unix and Windows, each buffer gets its own virtual memory pages.
+/// Page locks are not reference-counted by the OS, so sharing a page
+/// could let one buffer's drop unlock a second buffer that is still live.
+/// Locking is best-effort. If the OS rejects it, the bytes remain usable
+/// and are still wiped on drop.
+pub struct LockedBytes {
+    storage: Storage,
+}
+
+enum Storage {
+    #[cfg(any(unix, windows))]
+    Mapping(mapping::Mapping),
+    Heap(Zeroizing<Box<[u8]>>),
+}
+
+impl LockedBytes {
+    /// Copies bytes into a buffer, attempting to lock its pages before copying.
+    #[must_use]
+    pub fn new(bytes: &[u8]) -> Self {
+        #[cfg(any(unix, windows))]
+        if let Some(mut mapping) = mapping::Mapping::new(bytes.len()) {
+            mapping.as_mut_slice().copy_from_slice(bytes);
+            return Self { storage: Storage::Mapping(mapping) };
+        }
+        Self { storage: Storage::Heap(Zeroizing::new(Box::from(bytes))) }
+    }
+
+    /// Borrows the secret bytes.
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        match &self.storage {
+            #[cfg(any(unix, windows))]
+            Storage::Mapping(mapping) => mapping.as_slice(),
+            Storage::Heap(bytes) => bytes,
+        }
+    }
+
+    /// Reports whether the OS successfully locked this buffer's pages.
+    #[must_use]
+    pub const fn is_locked(&self) -> bool {
+        match &self.storage {
+            #[cfg(any(unix, windows))]
+            Storage::Mapping(mapping) => mapping.is_locked(),
+            Storage::Heap(_) => false,
+        }
+    }
+}
+
+impl Debug for LockedBytes {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LockedBytes([REDACTED])")
+    }
+}
+
+#[cfg(any(unix, windows))]
+#[allow(unsafe_code)]
+mod mapping {
+    use std::{ptr::NonNull, slice};
+
+    use zeroize::Zeroize;
+
+    pub(super) struct Mapping {
+        ptr: NonNull<u8>,
+        len: usize,
+        locked: bool,
+    }
+
+    // SAFETY: The mapping is owned exclusively, has no thread affinity,
+    // and can only be written or released through an exclusive borrow.
+    unsafe impl Send for Mapping {}
+    // SAFETY: Shared access exposes only immutable bytes.
+    unsafe impl Sync for Mapping {}
+
+    impl Mapping {
+        pub(super) fn new(len: usize) -> Option<Self> {
+            if len == 0 || len > isize::MAX as usize {
+                return None;
+            }
+            let ptr = allocate(len)?;
+            let locked = lock(ptr, len);
+            Some(Self { ptr, len, locked })
+        }
+
+        pub(super) const fn as_slice(&self) -> &[u8] {
+            // SAFETY: The live mapping holds len initialized bytes, and
+            // we only expose a shared borrow tied to its lifetime.
+            unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+        }
+
+        pub(super) const fn as_mut_slice(&mut self) -> &mut [u8] {
+            // SAFETY: The live mapping holds len initialized bytes, and
+            // the exclusive borrow prevents overlapping Rust references.
+            unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+        }
+
+        pub(super) const fn is_locked(&self) -> bool {
+            self.locked
+        }
+
+        fn wipe_and_unlock(&mut self, unlock_pages: impl FnOnce(NonNull<u8>, usize)) {
+            self.as_mut_slice().zeroize();
+            if self.locked {
+                unlock_pages(self.ptr, self.len);
+                self.locked = false;
+            }
+        }
+    }
+
+    impl Drop for Mapping {
+        fn drop(&mut self) {
+            self.wipe_and_unlock(unlock);
+            release(self.ptr, self.len);
+        }
+    }
+
+    #[cfg(unix)]
+    fn allocate(len: usize) -> Option<NonNull<u8>> {
+        use rustix::mm::{MapFlags, ProtFlags, mmap_anonymous};
+
+        // SAFETY: No fixed address is requested. The OS supplies a fresh,
+        // private, zero-filled mapping and owns the page-size rounding.
+        let ptr = unsafe {
+            mmap_anonymous(
+                std::ptr::null_mut(),
+                len,
+                ProtFlags::READ | ProtFlags::WRITE,
+                MapFlags::PRIVATE,
+            )
+        }
+        .ok()?;
+        NonNull::new(ptr.cast())
+    }
+
+    #[cfg(unix)]
+    fn lock(ptr: NonNull<u8>, len: usize) -> bool {
+        // SAFETY: ptr starts an exclusively owned mapping covering len
+        // bytes and the full pages the OS rounds the range to.
+        unsafe { rustix::mm::mlock(ptr.as_ptr().cast(), len) }.is_ok()
+    }
+
+    #[cfg(unix)]
+    fn unlock(ptr: NonNull<u8>, len: usize) {
+        // SAFETY: The wiped mapping is still live and owns the whole
+        // page-rounded range. Its lock succeeded before we got here.
+        let _ = unsafe { rustix::mm::munlock(ptr.as_ptr().cast(), len) };
+    }
+
+    #[cfg(unix)]
+    fn release(ptr: NonNull<u8>, len: usize) {
+        // SAFETY: ptr and len describe the original mapping. The slice
+        // borrows have ended, and no other owner can release this range.
+        let _ = unsafe { rustix::mm::munmap(ptr.as_ptr().cast(), len) };
+    }
+
+    #[cfg(windows)]
+    fn allocate(len: usize) -> Option<NonNull<u8>> {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+
+        // SAFETY: A null address asks the OS for a new, zero-filled
+        // region with read/write access covering at least len bytes.
+        let ptr = unsafe {
+            VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        };
+        NonNull::new(ptr.cast())
+    }
+
+    #[cfg(windows)]
+    fn lock(ptr: NonNull<u8>, len: usize) -> bool {
+        // SAFETY: The OS committed this entire range in allocate().
+        unsafe { windows_sys::Win32::System::Memory::VirtualLock(ptr.as_ptr().cast(), len) != 0 }
+    }
+
+    #[cfg(windows)]
+    fn unlock(ptr: NonNull<u8>, len: usize) {
+        // SAFETY: The wiped range remains committed and was locked by
+        // this buffer. No other buffer shares these pages.
+        let _ =
+            unsafe { windows_sys::Win32::System::Memory::VirtualUnlock(ptr.as_ptr().cast(), len) };
+    }
+
+    #[cfg(windows)]
+    fn release(ptr: NonNull<u8>, _len: usize) {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+
+        // SAFETY: ptr is the base from VirtualAlloc. MEM_RELEASE takes
+        // length zero and no Rust borrow of the region remains live.
+        let _ = unsafe { VirtualFree(ptr.as_ptr().cast(), 0, MEM_RELEASE) };
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{Mapping, unlock};
+
+        #[test]
+        fn bytes_are_zero_by_the_time_pages_unlock() -> Result<(), &'static str> {
+            let mut mapping = Mapping::new(32).ok_or("could not allocate a page")?;
+            mapping.as_mut_slice().fill(0x42);
+            let was_locked = mapping.is_locked();
+            let mut unlocked = false;
+            mapping.wipe_and_unlock(|ptr, len| {
+                // SAFETY: The mapping outlives the callback and is
+                // initialized and exclusively held by the test.
+                let bytes = unsafe { std::slice::from_raw_parts(ptr.as_ptr(), len) };
+                assert_eq!(bytes, [0; 32]);
+                unlock(ptr, len);
+                unlocked = true;
+            });
+            assert_eq!(unlocked, was_locked);
+            assert_eq!(mapping.as_slice(), [0; 32]);
+            assert!(!mapping.is_locked());
+            Ok(())
+        }
+    }
+}
 
 /// Outcome of a [`lock_process_memory`] call.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,8 +243,8 @@ pub enum MemoryLockHardening {
     /// fall-back state.
     Unsupported,
     /// The lock attempt failed (most often `RLIMIT_MEMLOCK` is too
-    /// small for the working set). Key material is still wrapped in
-    /// `Zeroizing` buffers, but pages may reach swap.
+    /// small for the working set). Individual buffers can still try
+    /// to lock their pages through [`LockedBytes`].
     Degraded,
 }
 
@@ -64,11 +285,8 @@ pub fn lock_process_memory() -> MemoryLockHardening {
         target_os = "openbsd"
     )))]
     {
-        // macOS does not provide `mlockall`; per-buffer `mlock` is the
-        // only option and isn't useful for the small key buffers
-        // Locket already wraps in `Zeroizing`. Windows has no
-        // equivalent. Both surface as `Unsupported` so doctor can
-        // report the gap.
+        // This status describes process-wide locking. Per-buffer
+        // locking is available on macOS and Windows via LockedBytes.
         MemoryLockHardening::Unsupported
     }
 }
@@ -107,7 +325,61 @@ mod mlockall_supported {
 
 #[cfg(test)]
 mod tests {
-    use super::{MemoryLockHardening, lock_process_memory, memory_lock_hardening_state};
+    use super::{
+        LockedBytes, MemoryLockHardening, lock_process_memory, memory_lock_hardening_state,
+    };
+
+    #[test]
+    fn locked_bytes_preserve_contents_but_redact_debug() {
+        let source = b"secret vault key";
+        let bytes = LockedBytes::new(source);
+        assert_eq!(bytes.as_slice(), source);
+        assert_eq!(format!("{bytes:?}"), "LockedBytes([REDACTED])");
+    }
+
+    #[test]
+    fn empty_buffer_reports_unlocked() {
+        let bytes = LockedBytes::new(&[]);
+        assert_eq!(bytes.as_slice(), b"");
+        assert!(!bytes.is_locked());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn small_key_buffer_locks_on_macos() {
+        let first = LockedBytes::new(&[1; 32]);
+        let second = LockedBytes::new(&[2; 32]);
+        assert!(first.is_locked());
+        assert!(second.is_locked());
+        assert_eq!(first.as_slice(), [1; 32]);
+        drop(first);
+        assert_eq!(second.as_slice(), [2; 32]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lock_denial_preserves_bytes_and_drop_releases_lock_quota() -> std::io::Result<()> {
+        use rustix::process::{Resource, Rlimit, setrlimit};
+
+        crate::hardening::with_isolated_process(
+            concat!(module_path!(), "::lock_denial_preserves_bytes_and_drop_releases_lock_quota"),
+            || {
+                const LIMIT: usize = 1024 * 1024;
+                let limit = Some(LIMIT as u64);
+                setrlimit(Resource::Memlock, Rlimit { current: limit, maximum: limit })?;
+                let reservation = LockedBytes::new(&vec![0x42; LIMIT]);
+                assert!(reservation.is_locked());
+
+                let key = [42; 32];
+                let buffer = LockedBytes::new(&key);
+                assert!(!buffer.is_locked());
+                assert_eq!(buffer.as_slice(), key);
+                drop(reservation);
+                assert!(LockedBytes::new(&key).is_locked());
+                Ok(())
+            },
+        )
+    }
 
     #[test]
     fn hardening_outcomes_render_as_doctor_labels() {

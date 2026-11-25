@@ -11,11 +11,10 @@
 //! On Linux this lowers `RLIMIT_CORE` to zero (so the kernel writes no
 //! core file even if the user's shell raised the limit) and clears
 //! `PR_SET_DUMPABLE` (so `/proc/<pid>/mem` and `ptrace` from same-uid
-//! debuggers don't yield key material). On macOS only `RLIMIT_CORE = 0`
-//! is available — `prctl` has no equivalent for an unprivileged
-//! user-space process; system-wide controls (`sysctl kern.coredump`,
-//! codesigning entitlements) are out of scope. On Windows the
-//! supported mitigation is `SetErrorMode(SEM_NOGPFAULTERRORBOX |
+//! debuggers don't yield key material). On macOS `RLIMIT_CORE = 0`
+//! suppresses core dumps and the release agent separately calls
+//! `ptrace(PT_DENY_ATTACH, 0, 0, 0)` to deny debugger attachment.
+//! On Windows the supported mitigation is `SetErrorMode(SEM_NOGPFAULTERRORBOX |
 //! SEM_FAILCRITICALERRORS)`, which suppresses Windows Error Reporting
 //! crash dumps and the system "this program has stopped responding"
 //! dialog. The Windows path is implemented through
@@ -29,11 +28,10 @@ use std::fmt::{self, Display};
 pub enum CoreDumpHardening {
     /// All available mitigations succeeded on this platform.
     Active,
-    /// On Windows, `SetErrorMode` suppressed the Windows Error
-    /// Reporting crash dialog. Reported separately from `Active` so
-    /// `locket doctor` can surface that no `RLIMIT_CORE`-equivalent
-    /// is meaningful on this platform; the suppression is best-effort
-    /// per Windows semantics.
+    /// Core dumps are suppressed without a verified debugger-attach
+    /// mitigation. On macOS this means `RLIMIT_CORE = 0` and no
+    /// `PT_DENY_ATTACH` call. On Windows, this indicates best-effort
+    /// suppression via `SetErrorMode`.
     Suppressed,
     /// The platform has no implementation in this build. Diagnostics
     /// should surface this so users know the fall-back state.
@@ -61,8 +59,9 @@ impl Display for CoreDumpHardening {
 ///
 /// - **Linux:** [`unix::disable_linux_core_dumps`] —
 ///   `prctl(PR_SET_DUMPABLE, 0)` plus `setrlimit(RLIMIT_CORE, 0, 0)`.
-/// - **macOS / other BSD Unixes:** [`unix::disable_macos_core_dumps`] —
-///   `setrlimit(RLIMIT_CORE, 0, 0)` only (no `prctl` equivalent).
+/// - **macOS / other BSD Unixes:** `setrlimit(RLIMIT_CORE, 0, 0)`.
+///   macOS release agents also call `disable_debugger_attach()`
+///   at their daemon entry point.
 /// - **Windows:** [`windows_impl::disable_windows_core_dumps`] —
 ///   `SetErrorMode(SEM_NOGPFAULTERRORBOX | SEM_FAILCRITICALERRORS)`
 ///   to suppress Windows Error Reporting crash dumps.
@@ -76,7 +75,7 @@ pub fn disable_core_dumps() -> CoreDumpHardening {
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
-        unix::disable_macos_core_dumps()
+        unix::disable_unix_core_dumps()
     }
     #[cfg(target_os = "windows")]
     {
@@ -91,9 +90,9 @@ pub fn disable_core_dumps() -> CoreDumpHardening {
 /// Returns the current core-dump hardening state without changing it.
 ///
 /// This is what `locket doctor` reports — `disable_core_dumps()` is
-/// already called once at process startup, so this just inspects
-/// `RLIMIT_CORE` (and `PR_GET_DUMPABLE` on Linux) and reports whether
-/// the mitigations stuck. On Windows the call queries the current
+/// already called once at process startup, so this inspects
+/// `RLIMIT_CORE` and either `PR_GET_DUMPABLE` on Linux or the recorded
+/// `PT_DENY_ATTACH` result on macOS. On Windows the call queries the current
 /// process error-mode bits via `GetErrorMode` and returns
 /// `Suppressed` when both `SEM_NOGPFAULTERRORBOX` and
 /// `SEM_FAILCRITICALERRORS` are set.
@@ -110,6 +109,53 @@ pub fn core_dump_hardening_state() -> CoreDumpHardening {
     #[cfg(not(any(unix, target_os = "windows")))]
     {
         CoreDumpHardening::Unsupported
+    }
+}
+
+#[cfg(target_os = "macos")]
+static DEBUGGER_ATTACH_DENIED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Denies debugger attachment to the calling macOS release agent.
+///
+/// Call this at daemon startup after disabling core dumps. macOS
+/// terminates the process if a debugger is already attached. Debug
+/// and unit-test builds skip the `ptrace` call.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn disable_debugger_attach() -> CoreDumpHardening {
+    #[cfg(all(target_os = "macos", not(debug_assertions), not(test)))]
+    DEBUGGER_ATTACH_DENIED.get_or_init(macos_ptrace::deny_attach);
+    core_dump_hardening_state()
+}
+
+#[cfg(target_os = "macos")]
+const fn macos_status(
+    core_zeroed: bool,
+    debugger_attach_denied: Option<bool>,
+) -> CoreDumpHardening {
+    match (core_zeroed, debugger_attach_denied) {
+        (true, Some(true)) => CoreDumpHardening::Active,
+        (true, None) => CoreDumpHardening::Suppressed,
+        _ => CoreDumpHardening::Degraded,
+    }
+}
+
+#[cfg(all(target_os = "macos", any(test, not(debug_assertions))))]
+#[allow(unsafe_code)]
+mod macos_ptrace {
+    use std::ffi::{c_char, c_int};
+
+    const PT_DENY_ATTACH: c_int = 31;
+
+    #[link(name = "System")]
+    unsafe extern "C" {
+        fn ptrace(request: c_int, pid: c_int, addr: *mut c_char, data: c_int) -> c_int;
+    }
+
+    pub(super) fn deny_attach() -> bool {
+        // SAFETY: PT_DENY_ATTACH ignores pid, addr, and data. The
+        // kernel receives no Rust memory to read or write.
+        unsafe { ptrace(PT_DENY_ATTACH, 0, std::ptr::null_mut(), 0) == 0 }
     }
 }
 
@@ -138,29 +184,35 @@ mod unix {
         if core_ok && dumpable_ok { CoreDumpHardening::Active } else { CoreDumpHardening::Degraded }
     }
 
-    /// macOS / BSD entry point: `setrlimit(RLIMIT_CORE, 0, 0)` only.
-    ///
-    /// Documented limitation: macOS exposes no `prctl(PR_SET_DUMPABLE)`
-    /// equivalent for an unprivileged user-space process. A same-uid
-    /// debugger (`lldb attach`) can still inspect address space; that is
-    /// mitigated separately by the session-lock and zeroize layers.
-    /// System-wide controls (`sysctl kern.coredump`, codesigning
-    /// entitlements) require privileges this agent does not assume and
-    /// are out of scope for this slice.
+    /// macOS / BSD entry point: `setrlimit(RLIMIT_CORE, 0, 0)`.
     #[cfg(not(target_os = "linux"))]
-    pub fn disable_macos_core_dumps() -> CoreDumpHardening {
-        if set_core_rlimit_zero() { CoreDumpHardening::Active } else { CoreDumpHardening::Degraded }
+    pub fn disable_unix_core_dumps() -> CoreDumpHardening {
+        core_dump_status(set_core_rlimit_zero())
     }
 
     pub fn core_dump_hardening_state() -> CoreDumpHardening {
         let core_zeroed =
             matches!(getrlimit(Resource::Core), Rlimit { current: Some(0), maximum: Some(0) });
-        let dumpable_cleared = dumpable_flag_cleared();
-        if core_zeroed && dumpable_cleared {
+        core_dump_status(core_zeroed)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn core_dump_status(core_zeroed: bool) -> CoreDumpHardening {
+        if core_zeroed && dumpable_flag_cleared() {
             CoreDumpHardening::Active
         } else {
             CoreDumpHardening::Degraded
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn core_dump_status(core_zeroed: bool) -> CoreDumpHardening {
+        super::macos_status(core_zeroed, super::DEBUGGER_ATTACH_DENIED.get().copied())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    const fn core_dump_status(core_zeroed: bool) -> CoreDumpHardening {
+        if core_zeroed { CoreDumpHardening::Active } else { CoreDumpHardening::Degraded }
     }
 
     fn set_core_rlimit_zero() -> bool {
@@ -181,13 +233,6 @@ mod unix {
             rustix::process::dumpable_behavior(),
             Ok(rustix::process::DumpableBehavior::NotDumpable)
         )
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    const fn dumpable_flag_cleared() -> bool {
-        // Mirrors the macOS/BSD `disable_macos_core_dumps` path: there's
-        // nothing to query off Linux, so treat as the success state.
-        true
     }
 }
 
@@ -266,6 +311,13 @@ mod windows_impl {
 mod tests {
     use super::{CoreDumpHardening, core_dump_hardening_state, disable_core_dumps};
 
+    #[cfg(unix)]
+    const CORE_DUMPS_DISABLED: CoreDumpHardening = if cfg!(target_os = "macos") {
+        CoreDumpHardening::Suppressed
+    } else {
+        CoreDumpHardening::Active
+    };
+
     #[test]
     fn hardening_outcomes_render_as_doctor_labels() {
         assert_eq!(CoreDumpHardening::Active.to_string(), "active");
@@ -295,7 +347,7 @@ mod tests {
         use rustix::process::{Resource, getrlimit};
 
         let outcome = disable_core_dumps();
-        assert_eq!(outcome, CoreDumpHardening::Active);
+        assert_eq!(outcome, CORE_DUMPS_DISABLED);
 
         let limit = getrlimit(Resource::Core);
         assert_eq!(limit.current, Some(0));
@@ -307,8 +359,8 @@ mod tests {
     fn disable_core_dumps_is_idempotent() {
         let first = disable_core_dumps();
         let second = disable_core_dumps();
-        assert_eq!(first, CoreDumpHardening::Active);
-        assert_eq!(second, CoreDumpHardening::Active);
+        assert_eq!(first, CORE_DUMPS_DISABLED);
+        assert_eq!(second, CORE_DUMPS_DISABLED);
     }
 
     /// Subtask 1: explicit Linux entry-point smoke test — confirms
@@ -331,12 +383,35 @@ mod tests {
         assert!(matches!(dumpable_behavior(), Ok(DumpableBehavior::NotDumpable)));
     }
 
-    /// Subtask 2: macOS / BSD entry-point returns `Active` after
-    /// `RLIMIT_CORE = 0`.
-    #[cfg(all(unix, not(target_os = "linux")))]
+    #[cfg(target_os = "macos")]
     #[test]
-    fn disable_macos_core_dumps_returns_ok() {
-        assert_eq!(super::unix::disable_macos_core_dumps(), CoreDumpHardening::Active);
+    fn macos_test_build_suppresses_core_dumps_without_denying_attach() {
+        assert_eq!(disable_core_dumps(), CoreDumpHardening::Suppressed);
+        assert_eq!(super::disable_debugger_attach(), CoreDumpHardening::Suppressed);
+        assert_eq!(core_dump_hardening_state(), CoreDumpHardening::Suppressed);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_status_distinguishes_skipped_and_failed_debugger_protection() {
+        use super::macos_status;
+
+        assert_eq!(macos_status(true, Some(true)), CoreDumpHardening::Active);
+        assert_eq!(macos_status(true, None), CoreDumpHardening::Suppressed);
+        assert_eq!(macos_status(true, Some(false)), CoreDumpHardening::Degraded);
+        assert_eq!(macos_status(false, Some(true)), CoreDumpHardening::Degraded);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_ptrace_succeeds_in_isolated_process() -> std::io::Result<()> {
+        crate::hardening::with_isolated_process(
+            concat!(module_path!(), "::macos_ptrace_succeeds_in_isolated_process"),
+            || {
+                assert!(super::macos_ptrace::deny_attach());
+                Ok(())
+            },
+        )
     }
 
     /// Windows entry-point compile + behaviour test: `SetErrorMode`

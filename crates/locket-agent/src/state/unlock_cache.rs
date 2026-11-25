@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use locket_platform::LockedBytes;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -26,11 +27,11 @@ pub enum UnlockMethod {
     RecoveryEnvelope,
 }
 
-/// One per-project unlock entry. The key is `Zeroizing` so it is
-/// wiped when the entry drops.
+/// One per-project unlock entry.
 pub struct UnlockEntry {
-    /// Unwrapped key material. Wiped on drop.
-    key: Zeroizing<Vec<u8>>,
+    /// Unwrapped key material. Its pages are locked when supported and
+    /// permitted, and it is wiped on drop.
+    key: LockedBytes,
     /// Insertion timestamp in nanoseconds since the Unix epoch.
     inserted_at_unix_nanos: i128,
     /// TTL after which `lookup` should treat the entry as expired.
@@ -46,7 +47,8 @@ pub struct UnlockEntry {
 impl std::fmt::Debug for UnlockEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UnlockEntry")
-            .field("key_len", &self.key.len())
+            .field("key", &self.key)
+            .field("key_len", &self.key.as_slice().len())
             .field("inserted_at_unix_nanos", &self.inserted_at_unix_nanos)
             .field("ttl", &self.ttl)
             .field("method", &self.method)
@@ -76,13 +78,22 @@ impl UnlockEntry {
         Self::new_zeroizing(Zeroizing::new(key), inserted_at_unix_nanos, ttl, method)
     }
 
-    pub(crate) const fn new_zeroizing(
+    pub(crate) fn new_zeroizing(
         key: Zeroizing<Vec<u8>>,
         inserted_at_unix_nanos: i128,
         ttl: Duration,
         method: UnlockMethod,
     ) -> Self {
-        Self { key, inserted_at_unix_nanos, ttl, method, audit_context: None, store_identity: None }
+        let locked_key = LockedBytes::new(&key);
+        drop(key);
+        Self {
+            key: locked_key,
+            inserted_at_unix_nanos,
+            ttl,
+            method,
+            audit_context: None,
+            store_identity: None,
+        }
     }
 
     /// Adds metadata-only audit context to an unlock entry.
@@ -116,7 +127,7 @@ impl UnlockEntry {
     #[must_use]
     #[allow(dead_code)]
     pub(crate) fn key_bytes(&self) -> &[u8] {
-        &self.key
+        self.key.as_slice()
     }
 
     /// Returns metadata-only audit context for this cached key.
@@ -414,6 +425,7 @@ mod tests {
             UnlockMethod::Passphrase,
         );
         let debug = format!("{entry:?}");
+        assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("super-secret"));
         assert!(debug.contains("key_len"));
     }
