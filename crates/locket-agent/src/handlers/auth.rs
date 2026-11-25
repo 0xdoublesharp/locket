@@ -7,7 +7,8 @@ use data_encoding::BASE64URL_NOPAD;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use locket_core::LocketError;
 use locket_store::{
-    AuditWrite, AutomationClientNonceRecord, AutomationClientRecord, Store, StoreError,
+    AuditWrite, AutomationClientNonceRecord, AutomationClientRecord, SCHEMA_VERSION, Store,
+    StoreError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -133,14 +134,28 @@ async fn authenticate_request(
     context: AuthContext,
 ) -> Result<(), AuthError> {
     let now = i64::try_from(now_unix_nanos).unwrap_or(i64::MAX);
-    let (mut store, _) = crate::keys::open_verified_store_for_state(
+    let (read_only_store, identity) = crate::keys::open_verified_store_for_state_with(
         state,
         &context.project_id,
         &context.store_path,
         now_unix_nanos,
+        true,
     )
     .await
     .map_err(StoreError::from)?;
+    let found = read_only_store.current_schema_version()?.unwrap_or(0);
+    match found.cmp(&i64::from(SCHEMA_VERSION)) {
+        std::cmp::Ordering::Greater => {
+            return Err(StoreError::UnsupportedSchema { found, supported: SCHEMA_VERSION }.into());
+        }
+        std::cmp::Ordering::Less => {
+            return Err(StoreError::OutdatedSchema { found, supported: SCHEMA_VERSION }.into());
+        }
+        std::cmp::Ordering::Equal => {}
+    }
+    drop(read_only_store);
+    let (mut store, _) =
+        state.open_store(&context.store_path, Some(&identity), false).map_err(StoreError::from)?;
     let client = store
         .get_automation_client(&context.project_id, &context.auth.client_id)?
         .ok_or(AuthError::NotTrusted("client not registered"))?;
