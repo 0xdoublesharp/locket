@@ -14,14 +14,16 @@ permissions:
 env:
   CARGO_INCREMENTAL: "0"
   CARGO_JOBS: "2"
-  LOCKET_RELEASE_RUNNER_ATTESTED: ${{ vars.LOCKET_RELEASE_RUNNER_ID }}
   RUST_BACKTRACE: "1"
 
 jobs:
   build:
     env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      LOCKET_RELEASE_RUNNER_ATTESTED: ${{ vars.LOCKET_RELEASE_RUNNER_ID }}
       PYTHONDONTWRITEBYTECODE: "1"
     name: auditable release build
+    # Runner selection happens before environment variables are available.
     runs-on: ${{ fromJSON(vars.LOCKET_RELEASE_RUNNER_LABELS || '["ubuntu-24.04"]') }}
     environment: release
     steps:
@@ -33,13 +35,28 @@ jobs:
         run: exit 1
 
       - name: Require isolated runner attestation
-        run: test -n "${LOCKET_RELEASE_RUNNER_ATTESTED}"
+        shell: bash
+        run: |
+          if [[ -z "$LOCKET_RELEASE_RUNNER_ATTESTED" || "$LOCKET_RELEASE_RUNNER_ATTESTED" == local-dev ]]; then
+            echo '::error::Set LOCKET_RELEASE_RUNNER_ID to the verified release runner identity.'
+            exit 1
+          fi
 
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: '11.21.0'
 
       - name: Verify release versions
         env:
@@ -49,6 +66,20 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show
 
+      - name: Install Tauri Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev
+
       - name: Cache cargo
         id: cargo-cache
         uses: actions/cache/restore@v4
@@ -56,10 +87,10 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: cargo-release-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+            target/release
+          key: cargo-release-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
-            cargo-release-${{ runner.os }}-
+            cargo-release-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Configure Cargo Steward wrapper
         if: runner.os != 'Windows'
@@ -76,9 +107,7 @@ jobs:
           mode: start
           target-dir: ${{ github.workspace }}/target
       - name: Install release audit tools
-        run: |
-          cargo install cargo-auditable --locked
-          cargo install cargo-audit --locked
+        run: cargo install --locked --jobs "$CARGO_JOBS" cargo-auditable rust-audit-info cargo-audit cargo-cyclonedx
 
       - name: Validate package manifests and signing inputs
         run: make distribution-check
@@ -87,33 +116,44 @@ jobs:
         run: cargo fetch --locked
 
       - name: Generate release quality artifacts
+        id: quality
         run: |
           make supply-chain-exceptions
           make third-party-notices
           STRICT=1 make audit
           make unsafe-inventory
-          make sbom
+          STRICT=1 make sbom
+          git diff --exit-code -- Cargo.lock
+
+      - name: Build desktop UI
+        run: |
+          pnpm --dir crates/locket-app/ui install --frozen-lockfile
+          pnpm --dir crates/locket-app/ui build
 
       - name: Build auditable binaries
         run: make release-auditable
 
-      - name: Upload release binaries
-        uses: actions/upload-artifact@v4
-        with:
-          name: locket-release-${{ github.ref_name }}
-          path: |
-            target/release/locket
-            target/release/locket-desktop
-            dist/installers/package-matrix.json
-            dist/homebrew/locket.rb.in
-          if-no-files-found: error
-
       - name: Attest release binaries
+        id: provenance
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: |
             target/release/locket
             target/release/locket-desktop
+
+      - name: Verify release attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROVENANCE_BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+        shell: bash
+        run: |
+          test -s "$PROVENANCE_BUNDLE"
+          source_digest="$(git rev-parse HEAD)"
+          for binary in target/release/locket target/release/locket-desktop; do
+            gh attestation verify "$binary" --bundle "$PROVENANCE_BUNDLE" \
+              --repo "$GITHUB_REPOSITORY" --signer-workflow "${GITHUB_WORKFLOW_REF%@*}" \
+              --source-ref "$GITHUB_REF" --source-digest "$source_digest"
+          done
 
       - name: Verify configured provenance policy
         env:
@@ -130,15 +170,26 @@ jobs:
             make slsa-provenance
           fi
 
+      - name: Upload release binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: locket-release-${{ github.ref_name }}
+          path: |
+            target/release/locket
+            target/release/locket-desktop
+            dist/installers/package-matrix.json
+            dist/homebrew/locket.rb.in
+          if-no-files-found: error
+
       - name: Upload release quality reports
-        if: always()
+        if: ${{ !cancelled() && (steps.quality.outcome == 'success' || steps.quality.outcome == 'failure') }}
         uses: actions/upload-artifact@v4
         with:
           name: locket-release-quality-${{ github.ref_name }}
           path: |
             target/quality/**
             supply-chain-exceptions.json
-          if-no-files-found: error
+          if-no-files-found: ${{ steps.quality.outcome == 'success' && 'error' || 'warn' }}
       - name: Trim Cargo build cache
         if: runner.os != 'Windows'
         uses: 0xdoublesharp/cargo-steward@v0.2.2
@@ -154,7 +205,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
+            target/release
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   validate-packages:

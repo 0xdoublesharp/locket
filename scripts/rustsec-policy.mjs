@@ -14,7 +14,10 @@ const ledger = JSON.parse(await readFile(ledgerJson, "utf8"));
 
 const scopeByPackage = packageScopes(metadata);
 const exceptions = exceptionIndex(ledger);
-const findings = audit?.vulnerabilities?.list ?? [];
+const findings = audit?.vulnerabilities?.list;
+if (!Array.isArray(findings)) {
+  throw new Error("cargo-audit report is missing its vulnerability list");
+}
 const rows = [];
 let blocking = false;
 

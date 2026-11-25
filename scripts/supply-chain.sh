@@ -100,14 +100,14 @@ audit_with_policy() {
   status=$?
   set -e
 
-  if [[ ! -s "${audit_json}" ]]; then
-    echo "cargo-audit did not write a JSON report" >&2
-    exit "${status:-1}"
-  fi
-
   if [[ "${status}" -gt 1 ]]; then
     echo "cargo-audit failed before policy evaluation; see ${audit_json}" >&2
     exit "${status}"
+  fi
+
+  if [[ ! -s "${audit_json}" ]]; then
+    echo "cargo-audit did not write a JSON report" >&2
+    exit 1
   fi
 
   scripts/rustsec-policy.mjs \
@@ -160,7 +160,22 @@ unsafe_inventory_fallback() {
 
 sbom() {
   if command -v cargo-cyclonedx >/dev/null 2>&1; then
-    cargo cyclonedx --format json --output-cdx --output-prefix "${quality_dir}/locket"
+    metadata
+    CARGO_NET_OFFLINE=true "${cargo_bin}" cyclonedx --format json --target all
+    # cargo-cyclonedx writes one BOM next to each workspace member's manifest.
+    node --input-type=module - "${quality_dir}" <<'NODE'
+import { copyFileSync, readFileSync, unlinkSync } from "node:fs";
+import { dirname, join } from "node:path";
+
+const output = process.argv[2];
+const { packages, workspace_members } = JSON.parse(readFileSync(join(output, "cargo-metadata.json"), "utf8"));
+for (const pkg of packages.filter(({ id }) => workspace_members.includes(id))) {
+  const name = `${pkg.name}.cdx.json`;
+  const source = join(dirname(pkg.manifest_path), name);
+  copyFileSync(source, join(output, name));
+  unlinkSync(source);
+}
+NODE
     return 0
   fi
 

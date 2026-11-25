@@ -24,11 +24,10 @@
 #
 # Install requirements (offline-friendly, run once per host):
 #
-#   cargo install cargo-auditable
-#   cargo install cargo-audit --features=fix
+#   cargo install --locked cargo-auditable cargo-audit rust-audit-info
 #
-# Both tools are pinned to the user's cargo bin directory; this script does
-# not auto-install them. If either tool is missing, the script reports the
+# These tools are installed in the user's cargo bin directory; this script does
+# not auto-install them. If a tool is missing, the script reports the
 # install command and exits non-zero unless invoked with --skip-missing.
 #
 # Usage:
@@ -36,14 +35,13 @@
 #   scripts/release-build.sh --print-deps    # build, then print embedded SBOM
 #   scripts/release-build.sh --skip-missing  # skip steps whose tool is absent
 #
-# CI release builds must set LOCKET_RELEASE_RUNNER_ATTESTED to the repository
+# CI release builds must set LOCKET_RELEASE_RUNNER_ATTESTED to the configured
 # variable that identifies the isolated runner pool. For local release-build
 # debugging only, set LOCKET_RELEASE_RUNNER_ATTESTED=local-dev; artifacts built
 # that way must not be signed or published.
 
 set -euo pipefail
 
-cargo_bin="${CARGO:-cargo}"
 cargo_auditable_cmd="${CARGO_AUDITABLE:-cargo auditable}"
 cargo_audit_cmd="${CARGO_AUDIT:-cargo audit}"
 source "$(dirname "${BASH_SOURCE[0]}")/cargo-jobs.sh"
@@ -112,9 +110,10 @@ require_tool() {
 
 build_auditable() {
   local crate="$1"
-  echo "==> cargo auditable build --release -p ${crate} -j ${jobs}"
+  shift
+  echo "==> cargo auditable build --release --locked -p ${crate} -j ${jobs} $*"
   # shellcheck disable=SC2086
-  ${cargo_auditable_cmd} build --release -p "${crate}" -j "${jobs}"
+  ${cargo_auditable_cmd} build --release --locked -p "${crate}" -j "${jobs}" "$@"
 }
 
 audit_binary() {
@@ -130,23 +129,15 @@ audit_binary() {
 
 print_embedded_deps() {
   local binary_path="$1"
-  if [[ ! -x "${binary_path}" ]]; then
-    echo "binary not found: ${binary_path}" >&2
-    exit 1
-  fi
-  # `cargo audit bin --json` round-trips the embedded SBOM. We pipe through
-  # a tiny Node filter to extract just the package list so the output is
-  # deterministic and easy to diff in CI.
   echo "==> embedded dependencies in ${binary_path}"
-  # shellcheck disable=SC2086
-  ${cargo_audit_cmd} bin --json "${binary_path}" \
+  rust-audit-info "${binary_path}" \
     | node -e '
         let input = "";
         process.stdin.setEncoding("utf8");
         process.stdin.on("data", chunk => { input += chunk; });
         process.stdin.on("end", () => {
           const report = JSON.parse(input);
-          const packages = [...(report.lockfile?.packages ?? [])]
+          const packages = report.packages
             .sort((a, b) => String(a.name).localeCompare(String(b.name)) || String(a.version).localeCompare(String(b.version)));
           for (const pkg of packages) console.log(`${pkg.name} ${pkg.version}`);
           console.log(`# total: ${packages.length} packages`);
@@ -160,18 +151,35 @@ fi
 
 for entry in "${shipped_binaries[@]}"; do
   crate="${entry%%:*}"
-  build_auditable "${crate}"
+  if [[ "${crate}" == locket-desktop ]]; then
+    # Tauri's production protocol embeds frontendDist and uses the release CSP.
+    build_auditable "${crate}" --features tauri/custom-protocol
+  else
+    build_auditable "${crate}"
+  fi
 done
 
 # The audit step is best-effort under --skip-missing: a host without
 # cargo-audit can still produce auditable binaries, but cannot verify them.
 if require_tool "cargo-audit" ${cargo_audit_cmd}; then
+  if ! command -v rust-audit-info >/dev/null 2>&1; then
+    echo "rust-audit-info is required to verify embedded dependencies; install with: cargo install --locked rust-audit-info" >&2
+    if [[ "${skip_missing}" == "0" ]]; then
+      exit 127
+    fi
+  fi
   for entry in "${shipped_binaries[@]}"; do
     binary_name="${entry##*:}"
-    audit_binary "${release_dir}/${binary_name}"
-    if [[ "${print_deps}" == "1" ]]; then
-      print_embedded_deps "${release_dir}/${binary_name}"
+    binary_path="${release_dir}/${binary_name}"
+    if command -v rust-audit-info >/dev/null 2>&1; then
+      # cargo audit bin can fall back to a partial scan when the SBOM is absent.
+      if [[ "${print_deps}" == "1" ]]; then
+        print_embedded_deps "${binary_path}"
+      else
+        rust-audit-info "${binary_path}" >/dev/null
+      fi
     fi
+    audit_binary "${binary_path}"
   done
 fi
 
