@@ -183,6 +183,8 @@ test('policy allow-list dedupes order-preserved across rows', () => {
       { allowed_secrets: ['DATABASE_URL', 'REDIS_URL'] },
       { allowed_secrets: ['REDIS_URL', 'API_KEY'] },
       { required_secrets: ['API_KEY'], optional_secrets: ['EXTRA'] },
+      { allowed_secrets: ['', 'EXTRA'] },
+      {},
     ],
   });
   assert.deepEqual([...names], ['DATABASE_URL', 'REDIS_URL', 'API_KEY', 'EXTRA']);
@@ -195,6 +197,7 @@ test('uuidV4FromBytes formats version and variant bits', () => {
   }
   const id = uuidV4FromBytes(bytes);
   assert.match(id, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u);
+  assert.throws(() => uuidV4FromBytes(bytes.subarray(1)), /requires at least 16 bytes/u);
 });
 
 test('agent error message uses typed display copy when available', () => {

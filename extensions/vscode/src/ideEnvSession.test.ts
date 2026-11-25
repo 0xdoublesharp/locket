@@ -5,7 +5,7 @@ import * as path from 'node:path';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { AgentClient, RequestEnvelope } from './agentClient';
+import { AgentClient, AgentMethod, RequestEnvelope } from './agentClient';
 import { ResolvedLocketProject } from './commandsModel';
 import {
   LOCKET_IDE_ENV_SESSION_VARIABLE,
@@ -213,6 +213,24 @@ test('applyIdeEnvSessionToTerminals replaces and clears LOCKET_IDE_ENV_SESSION',
   assert.deepEqual(calls, [
     ['replace', LOCKET_IDE_ENV_SESSION_VARIABLE, 'session-uuid'],
     ['delete', LOCKET_IDE_ENV_SESSION_VARIABLE],
+  ]);
+});
+
+test('session registration is best-effort when either operation fails unexpectedly', async (t) => {
+  const agentClient = new AgentClient({ socketPath: 'fixture' });
+  let listAvailable = false;
+  const invoke = t.mock.method(agentClient, 'invoke', async (method: AgentMethod) => {
+    if (listAvailable && method === 'ListPolicies') { return { rows: [{ allowed_secrets: ['API_KEY'] }] }; }
+    throw new Error('connection lost');
+  });
+  const deps = { agentClient, project: PROJECT, storePath: '/fixture/store.db' };
+  assert.equal(await registerIdeEnvSessionWithAgent(deps), undefined);
+  assert.deepEqual(invoke.mock.calls.map(({ arguments: args }) => args[0]), ['ListPolicies']);
+
+  listAvailable = true;
+  assert.equal(await registerIdeEnvSessionWithAgent(deps), undefined);
+  assert.deepEqual(invoke.mock.calls.map(({ arguments: args }) => args[0]), [
+    'ListPolicies', 'ListPolicies', 'RegisterIdeEnvSession',
   ]);
 });
 

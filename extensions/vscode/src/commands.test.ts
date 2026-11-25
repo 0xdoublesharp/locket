@@ -11,12 +11,14 @@ const registered = new Map<string, RegisteredCommand>();
 const project: ProjectContext = { root:'/workspace/demo/nested', projectId:'lk_proj_actual', defaultProfileId:'lk_prof_actual', profileName:'staging', storePath:'/local/store.db', cliPath:'/trusted/bin/locket', projectName:'demo' };
 const inputs: string[]=[];
 const prompts: string[]=[];
+const maskedInputs: boolean[]=[];
 const errors: string[]=[];
 const infos: string[]=[];
 const terminals: Array<Record<string,unknown>>=[];
 let trusted=true;
 let pick='deploy';
 let terminalShown=false;
+let terminalError: Error | undefined;
 class Disposable {
   public constructor(private readonly disposeFn:()=>void=()=>undefined) {}
   public dispose():void {this.disposeFn();}
@@ -25,12 +27,20 @@ const vscodeStub={
   commands:{registerCommand:(id:string,callback:RegisteredCommand)=>{registered.set(id,callback);return new Disposable(()=>registered.delete(id));}},
   workspace:{get isTrusted(){return trusted;},workspaceFolders:[{name:'demo',uri:{fsPath:'/workspace/demo'}}]},
   window:{
-    showInputBox:async (options:{prompt?:string})=>{prompts.push(options.prompt??'');return inputs.shift();},
+    showInputBox:async (options:{prompt?:string;password?:boolean})=>{
+      prompts.push(options.prompt??'');
+      maskedInputs.push(options.password === true);
+      return inputs.shift();
+    },
     showQuickPick:async <T extends {label:string}>(items:readonly T[])=>items.find(item=>item.label===pick),
     showInformationMessage:async(message:string)=>{infos.push(message);return undefined;},
     showWarningMessage:async(message:string)=>{errors.push(message);return undefined;},
     showErrorMessage:async(message:string)=>{errors.push(message);return undefined;},
-    createTerminal:(options:Record<string,unknown>)=>{terminals.push(options);return {show:()=>{terminalShown=true;}};},
+    createTerminal:(options:Record<string,unknown>)=>{
+      if (terminalError !== undefined) { throw terminalError; }
+      terminals.push(options);
+      return {show:()=>{terminalShown=true;}};
+    },
     createWebviewPanel:()=>({dispose:()=>undefined,onDidDispose:()=>undefined,webview:{html:''}}),
   },
   env:{clipboard:{writeText:async()=>undefined,readText:async()=>''}},
@@ -42,11 +52,29 @@ loader._load=function(request,parent,isMain):unknown {return request==='vscode'?
 let register: (client:AgentClient,deps?:{resolveProject:()=>Promise<ProjectContext|undefined>})=>Disposable;
 test.before(async()=>{register=(await import('./commands.js')).registerLocketCommands as unknown as typeof register;});
 test.after(()=>{loader._load=originalLoad;});
-test.beforeEach(()=>{registered.clear();inputs.length=0;prompts.length=0;errors.length=0;infos.length=0;terminals.length=0;trusted=true;pick='deploy';terminalShown=false;});
+test.beforeEach(()=>{
+  registered.clear();
+  for (const entries of [inputs, prompts, maskedInputs, errors, infos, terminals]) { entries.length = 0; }
+  trusted = true;
+  pick = 'deploy';
+  terminalShown = false;
+  terminalError = undefined;
+});
 function client(invoke:(method:AgentMethod,payload:unknown)=>Promise<unknown>):AgentClient {return {invoke,status:async()=>({project_id:'wrong-stale-project'})} as unknown as AgentClient;}
-async function command(id:string,agent:AgentClient):Promise<void> {
-  const disposable=register(agent,{resolveProject:async()=>project});
-  try {await registered.get(id)?.();}finally{disposable.dispose();}
+async function command(
+  id: string,
+  agent: AgentClient,
+  resolveProject: () => Promise<ProjectContext | undefined> = async () => project,
+): Promise<void> {
+  const disposable = register(agent, { resolveProject });
+  try {
+    const callback = registered.get(id);
+    assert.ok(callback, `missing command ${id}`);
+    await callback();
+  } finally {
+    disposable.dispose();
+  }
+  assert.equal(registered.size, 0);
 }
 
 test('run policy executes the trusted CLI in an interactive terminal using real resolved project',async()=>{
@@ -149,4 +177,107 @@ test('untrusted workspace never resolves or invokes a process-backed action',asy
   const disposable=register(client(async()=>{calls++;return {};}),{resolveProject:async()=>{resolutions++;return project;}});
   try{await registered.get('locket.runPolicy')?.();}finally{disposable.dispose();}
   assert.equal(resolutions,0);assert.equal(calls,0);assert.equal(terminals.length,0);
+});
+
+test('lock sends the desktop source and only announces success on acknowledgement', async () => {
+  const calls: unknown[] = [];
+  await command('locket.lock', client(async (method, payload) => { calls.push({ method, payload }); }));
+  assert.deepEqual(calls, [{ method: 'Lock', payload: { source: 'desktop' } }]);
+  assert.deepEqual(infos, ['Locket vault is locked.']);
+
+  await command('locket.lock', client(async () => { throw AgentClientError.protocol('invalid lock response'); }));
+  assert.deepEqual(errors, ['Locket agent protocol error: invalid lock response']);
+  assert.equal(infos.length, 1);
+});
+
+test('unlock uses a masked prompt and surfaces a failed retry', async () => {
+  const passphrases: unknown[] = [];
+  inputs.push('fixture passphrase');
+  await command('locket.unlock', client(async (_, payload) => {
+    passphrases.push((payload as { passphrase: unknown }).passphrase);
+    throw AgentClientError.agent({ error: 'UnlockRequired', message: 'unlock required', retryable: true });
+  }));
+  assert.deepEqual(maskedInputs, [true]);
+  assert.deepEqual(passphrases, [null, 'fixture passphrase']);
+  assert.deepEqual(errors, ['passphrase did not authenticate']);
+});
+
+test('open project commands stop when selection is cancelled', async () => {
+  const agent = client(async () => assert.fail('unexpected RPC'));
+  for (const id of ['revealSecret', 'unlock', 'switchProfile', 'runPolicy', 'scanWorkspace', 'openAuditView']) {
+    await command(`locket.${id}`, agent, async () => undefined);
+  }
+  assert.deepEqual([prompts, infos, errors, terminals], [[], [], [], []]);
+});
+
+test('project resolver failures surface through the command without attempting an RPC', async () => {
+  const agent = client(async () => assert.fail('unexpected RPC'));
+  await command('locket.revealSecret', agent, async () => { throw new Error('project unavailable'); });
+  await command('locket.revealSecret', agent, async () => { throw undefined; });
+  assert.deepEqual(errors, ['project unavailable', 'Locket project metadata is unavailable.']);
+  assert.deepEqual(prompts, []);
+});
+
+test('cancelling secret and profile prompts leaves project state untouched', async () => {
+  const agent = client(async () => assert.fail('unexpected RPC'));
+  await command('locket.revealSecret', agent);
+  await command('locket.switchProfile', agent);
+  assert.deepEqual(prompts, ['Secret name', 'Profile name']);
+  assert.deepEqual([infos, errors, terminals], [[], [], []]);
+});
+
+test('invalid profile and audit inputs are reported before any agent request', async () => {
+  const agent = client(async () => assert.fail('unexpected RPC'));
+  inputs.push(' ');
+  await command('locket.switchProfile', agent);
+  await command('locket.openAuditView', agent, async () => ({ ...project, storePath: '' }));
+  assert.deepEqual(errors, ['profile name is required', 'store path is required']);
+});
+
+for (const confirmation of [undefined, 'staging']) {
+  test(`dangerous profile switch stops on ${confirmation === undefined ? 'cancelled' : 'mismatched'} confirmation`, async () => {
+    let calls = 0;
+    inputs.push('prod');
+    if (confirmation !== undefined) { inputs.push(confirmation); }
+    await command('locket.switchProfile', client(async () => {
+      calls += 1;
+      throw AgentClientError.agent({ error: 'ConfirmationFailed', message: 'confirmation required', retryable: false });
+    }));
+    assert.equal(calls, 1);
+    assert.deepEqual(infos, []);
+    assert.deepEqual(errors, confirmation === undefined ? [] : ['Profile confirmation did not match.']);
+  });
+}
+
+test('profile, policy, and audit commands report RPC errors without success messages', async () => {
+  const agent = client(async () => { throw AgentClientError.protocol('invalid response'); });
+  inputs.push('dev');
+  for (const id of ['switchProfile', 'runPolicy', 'openAuditView']) {
+    await command(`locket.${id}`, agent);
+  }
+  assert.deepEqual(errors, Array(3).fill('Locket agent protocol error: invalid response'));
+  assert.deepEqual([infos, terminals], [[], []]);
+});
+
+test('policy command handles invalid metadata, an empty list, a dismissed picker, and an option-like name', async () => {
+  await command('locket.runPolicy', client(async () => assert.fail('unexpected RPC')),
+    async () => ({ ...project, projectId: '' }));
+  await command('locket.runPolicy', client(async () => ({ rows: [] })));
+  const agent = client(async () => ({
+    rows: [{ id: 'p1', name: '--help', command_kind: 'argv', command_preview: 'echo hello' }],
+  }));
+  await command('locket.runPolicy', agent);
+  pick = '--help';
+  await command('locket.runPolicy', agent);
+  assert.deepEqual(infos, ['Locket has no saved command policies for this project.']);
+  assert.deepEqual(errors, ['This policy name cannot be launched from the editor.']);
+  assert.deepEqual(terminals, []);
+});
+
+test('terminal creation failure is reported for a workspace scan', async () => {
+  terminalError = new Error('terminal unavailable');
+  await command('locket.scanWorkspace', client(async () => assert.fail('unexpected RPC')));
+  assert.deepEqual(errors, ['Locket command failed.']);
+  assert.deepEqual(infos, []);
+  assert.equal(terminalShown, false);
 });

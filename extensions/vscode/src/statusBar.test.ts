@@ -12,10 +12,11 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { setImmediate } from 'node:timers/promises';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { AgentClient, RequestEnvelope } from './agentClient';
+import { AgentClient, AgentClientError, RequestEnvelope, StatusEvent } from './agentClient';
 import type { StatusBarHost } from './statusBar';
 import { StatusBarPlan } from './statusBarModel';
 
@@ -313,6 +314,92 @@ test('dispose sends CancelSubscription and tears down the stream', async () => {
     server.close();
     await cleanup();
   }
+});
+
+test('failed subscriptions back off, recover, and ignore a late error after disposal', async (t) => {
+  const { LocketStatusBarController } = await loadStatusBarModule();
+  const client = new AgentClient({ socketPath: 'fixture' });
+  const stream = { dispose: t.mock.fn() };
+  const failures = [new Error('ordinary connection failure'), 'unknown failure', AgentClientError.protocol('invalid frame')];
+  let signalError: ((error: AgentClientError) => void) | undefined;
+  const subscribe = t.mock.method(client, 'subscribeStatus', async (
+    onEvent: (event: StatusEvent) => void, onError: (error: AgentClientError) => void,
+  ) => {
+    if (failures.length > 0) { throw failures.shift(); }
+    signalError = onError;
+    onEvent({
+      kind: 'status', sequence: 1, lock_state: 'locked', live_grant_count: 0, agent_version: 'fixture',
+    });
+    return stream;
+  });
+  const cancel = t.mock.method(client, 'invoke', async () => { throw new Error('agent shut down'); });
+  const host = recordingHost();
+  const controller = new LocketStatusBarController(client, host);
+  t.after(() => controller.dispose());
+  controller.start();
+  for (const delay of [500, 1000, 2000]) {
+    await setImmediate();
+    assert.equal(host.timers[0]?.delay, delay);
+    assert.equal(host.plans.at(-1)?.background, 'warning');
+    host.fireNextTimer();
+  }
+  await setImmediate();
+  assert.match(host.plans[3]?.tooltip ?? '', /invalid frame/u);
+  assert.equal(host.plans.at(-1)?.text, '$(lock) Locket');
+  assert.ok(signalError);
+  signalError(AgentClientError.unavailable('disconnected again'));
+  assert.equal(host.timers[0]?.delay, 500);
+
+  controller.dispose();
+  controller.dispose();
+  signalError(AgentClientError.unavailable('late callback'));
+  assert.equal(cancel.mock.callCount(), 1);
+  assert.deepEqual(host.cleared, [4]);
+  assert.equal(host.timers.length, 1);
+  host.fireNextTimer(); // A callback already queued when the timer was cleared.
+  assert.equal(subscribe.mock.callCount(), 4);
+});
+
+test('disposing during a pending subscription closes the stream when it arrives', async (t) => {
+  const { LocketStatusBarController } = await loadStatusBarModule();
+  const client = new AgentClient({ socketPath: 'fixture' });
+  type Stream = { dispose: () => void };
+  let finishSubscription: ((stream: Stream) => void) | undefined;
+  const pending = new Promise<Stream>((resolve) => { finishSubscription = resolve; });
+  t.mock.method(client, 'subscribeStatus', () => pending);
+  t.mock.method(client, 'invoke', async () => null);
+  const disposeStream = t.mock.fn();
+  const host = recordingHost();
+  const controller = new LocketStatusBarController(client, host);
+  controller.start();
+  controller.dispose();
+  assert.ok(finishSubscription);
+  finishSubscription({ dispose: disposeStream });
+  await setImmediate();
+  assert.equal(disposeStream.mock.callCount(), 1);
+  assert.equal(host.itemDisposed, true);
+  assert.deepEqual(host.timers, []);
+});
+
+test('a host that tears down the badge while rendering an error does not schedule a retry', async (t) => {
+  const { LocketStatusBarController } = await loadStatusBarModule();
+  const client = new AgentClient({ socketPath: 'fixture' });
+  t.mock.method(client, 'subscribeStatus', async () => { throw AgentClientError.protocol('invalid frame'); });
+  t.mock.method(client, 'invoke', async () => null);
+  const host = recordingHost();
+  const controller = new LocketStatusBarController(client, {
+    ...host,
+    apply: (plan) => {
+      host.apply(plan);
+      if (plan.background === 'warning') { controller.dispose(); }
+    },
+  });
+  t.after(() => controller.dispose());
+  controller.start();
+  await setImmediate();
+  assert.equal(host.itemDisposed, true);
+  assert.equal(host.plans.at(-1)?.background, 'warning');
+  assert.deepEqual(host.timers, []);
 });
 
 async function waitFor(condition: () => boolean, timeoutMs = 1500): Promise<void> {

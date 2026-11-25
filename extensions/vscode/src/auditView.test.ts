@@ -87,3 +87,16 @@ test('audit view shows empty state when there are no rows', () => {
   });
   assert.match(html, /No audit rows match the current filters\./u);
 });
+
+test('audit view renders unavailable integrity and invalid timestamps without throwing', () => {
+  const html = buildAuditWebviewHtml({
+    nonce: 'nonce-test',
+    rows: [Number.NaN, Number.MAX_VALUE].map((timestamp, sequence) => ({
+      sequence, timestamp, profile_id: null, command: null, secret_name: null,
+      action: 'LOCK', status: 'OK',
+    })),
+    chainStatus: { hmac_ok: null, first_break_sequence: null, rows_verified: 2, locked: false },
+  });
+  assert.match(html, /Chain status unavailable\. 2 rows shown\./u);
+  assert.equal(html.match(/<td><code><\/code><\/td>/gu)?.length, 2);
+});

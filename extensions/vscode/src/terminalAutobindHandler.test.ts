@@ -5,7 +5,7 @@ import * as path from 'node:path';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { AgentClient, RequestEnvelope } from './agentClient';
+import { AgentClient, AgentClientError, RequestEnvelope } from './agentClient';
 import { ResolvedLocketProject } from './commandsModel';
 import { LOCKET_IDE_ENV_SESSION_VARIABLE } from './ideEnvSession';
 import { WarnOnceLatch } from './terminalAutobindModel';
@@ -279,4 +279,47 @@ test('async terminal resolution registers actual project/profile/store metadata 
   assert.equal(registration.store_path,'/actual/context/store.db');
   assert.equal(registration.project_id,PROJECT.projectId);
   assert.equal(registration.profile_id,PROJECT.defaultProfileId);
+});
+
+test('terminal metadata failure clears stale global state and skips agent calls', async (t) => {
+  const agentClient = new AgentClient({ socketPath: 'fixture' });
+  const invoke = t.mock.method(agentClient, 'invoke', async () => assert.fail('unexpected RPC'));
+  const deleteVariable = t.mock.fn();
+  const deps: TerminalAutobindHandlerDeps = {
+    agentClient,
+    environmentVariableCollection: { replace: () => assert.fail('unexpected global update'), delete: deleteVariable },
+    autobindContext: { resolveProject: () => assert.fail('unexpected fallback'), pid: 1, processStartTime: 'fixture' },
+    resolveProject: async () => { throw new Error('metadata unavailable'); },
+    storePath: '/fixture/store.db',
+    notifyDirectoryGrantRejected: () => assert.fail('unexpected warning'),
+    warnOnce: new WarnOnceLatch(),
+  };
+  assert.deepEqual(await handleOpenTerminal(PROJECT.root, deps), { applied: false });
+  assert.equal(invoke.mock.callCount(), 0);
+  assert.deepEqual(deleteVariable.mock.calls[0]?.arguments, [LOCKET_IDE_ENV_SESSION_VARIABLE]);
+});
+
+test('directory grant transport failures preserve the latch for agent denials', async (t) => {
+  const agentClient = new AgentClient({ socketPath: 'fixture' });
+  const invoke = t.mock.method(agentClient, 'invoke', async () => {
+    throw AgentClientError.agent({ error: 'ProjectRootUntrusted', message: 'denied', retryable: false });
+  });
+  invoke.mock.mockImplementationOnce(async () => { throw new Error('unexpected transport error'); }, 0);
+  invoke.mock.mockImplementationOnce(async () => { throw AgentClientError.unavailable('disconnected'); }, 1);
+  const notify = t.mock.fn();
+  const deps: TerminalAutobindHandlerDeps = {
+    agentClient,
+    environmentVariableCollection: { replace: () => undefined, delete: () => undefined },
+    autobindContext: { resolveProject: () => PROJECT, pid: 1, processStartTime: 'fixture' },
+    storePath: '/fixture/store.db', notifyDirectoryGrantRejected: notify, warnOnce: new WarnOnceLatch(),
+  };
+  const grant = {
+    project_id: PROJECT.projectId, profile_id: PROJECT.defaultProfileId, action: 'ResolveReference' as const,
+    ttl_seconds: 60, binding: { pid: 1, process_start_time: 'fixture' },
+  };
+  await requestDirectoryGrant(deps, grant);
+  await requestDirectoryGrant(deps, grant);
+  assert.equal(notify.mock.callCount(), 0);
+  await requestDirectoryGrant(deps, grant);
+  assert.equal(notify.mock.callCount(), 1);
 });

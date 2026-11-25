@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, writeFile, chmod, rm, access, symlink } from 'node:fs/promises';
+import fs, { mkdtemp, mkdir, writeFile, chmod, rm, access, symlink } from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import test from 'node:test';
@@ -38,11 +38,37 @@ test('CLI discovery skips relative PATH entries and executables within workspace
   } finally { await fixture.cleanup(); }
 });
 
-test('metadata resolver rejects malformed or unrelated-root metadata without invented IDs', async () => {
+test('metadata resolver rejects invalid JSON, missing fields, and unrelated roots', async () => {
   const fixture = await makeFixture();
   try {
-    await writeFile(path.join(fixture.bin,'locket'), `#!${process.execPath}\nprocess.stdout.write(JSON.stringify({root:'/elsewhere',project_id:'lk_proj_bad'}));\n`);
-    await assert.rejects(resolveProjectContext({ trusted: true, cwd: fixture.nested, workspaceRoots: [fixture.workspace], pathEnvironment: fixture.bin }), /metadata/iu);
+    const options = { trusted: true, cwd: fixture.nested, workspaceRoots: [fixture.workspace], pathEnvironment: fixture.bin };
+    const executable = path.join(fixture.bin, 'locket');
+    const unrelated = {
+      root: fixture.bin, project_id: 'fixture', project_name: 'demo', profile_id: 'dev',
+      profile_name: 'dev', store_path: path.join(fixture.directory, 'store.db'),
+    };
+    for (const [output, message] of [
+      ['{', /invalid project metadata/u],
+      ['null', /invalid project metadata/u],
+      ['{"root":"/elsewhere"}', /invalid project metadata/u],
+      [JSON.stringify(unrelated), /unrelated project metadata/u],
+    ] as const) {
+      await writeFile(executable, `#!${process.execPath}\nprocess.stdout.write(${JSON.stringify(output)});\n`);
+      await assert.rejects(resolveProjectContext(options), message);
+    }
+  } finally { await fixture.cleanup(); }
+});
+
+test('project resolution requires workspace membership and an executable CLI on PATH', async () => {
+  const fixture = await makeFixture();
+  try {
+    const options = { trusted: true, cwd: fixture.bin, workspaceRoots: [fixture.workspace], pathEnvironment: fixture.bin };
+    await assert.rejects(resolveProjectContext(options), /inside the selected workspace/u);
+
+    const executable = path.join(fixture.bin, 'locket');
+    await rm(executable);
+    await mkdir(executable);
+    await assert.rejects(resolveProjectContext({ ...options, cwd: fixture.nested }), /Install the Locket CLI/u);
   } finally { await fixture.cleanup(); }
 });
 
@@ -99,4 +125,25 @@ test('valid workspace metadata resolves when an unrelated multiroot folder is mi
   } finally {
     await fixture.cleanup();
   }
+});
+
+test('an unavailable workspace root with no reachable parent does not block a healthy project', async (t) => {
+  const fixture = await makeFixture();
+  t.after(fixture.cleanup);
+  const volumeRoot = path.parse(fixture.directory).root;
+  const missingFolder = path.join(volumeRoot, 'unavailable-fixture');
+  const filesystem: { realpath: (candidate: string) => Promise<string> } = fs;
+  const originalRealpath = filesystem.realpath;
+  const realpath = t.mock.method(filesystem, 'realpath', async (candidate: string) => {
+    if (candidate === missingFolder || candidate === volumeRoot) { throw new Error('root no longer accessible'); }
+    return originalRealpath(candidate);
+  });
+  const project = await resolveProjectContext({
+    trusted: true,
+    cwd: fixture.nested,
+    workspaceRoots: [fixture.workspace, missingFolder],
+    pathEnvironment: fixture.bin,
+  });
+  assert.equal(project.root, fixture.nested);
+  assert.ok(realpath.mock.calls.some(({ arguments: args }) => args[0] === volumeRoot));
 });

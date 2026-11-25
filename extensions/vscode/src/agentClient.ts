@@ -393,7 +393,10 @@ export class AgentClient {
           onEvent(unwrapResponse<StatusEvent>(decoded.response));
         }
       } catch (error) {
-        onError(toClientError(error));
+        if (!disposed) {
+          disposed = true;
+          onError(toClientError(error));
+        }
         socket.destroy();
       }
     });

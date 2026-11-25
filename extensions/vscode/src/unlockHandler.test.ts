@@ -12,7 +12,7 @@ import * as path from 'node:path';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { AgentClient, RequestEnvelope } from './agentClient';
+import { AgentClient, AgentClientError, RequestEnvelope } from './agentClient';
 import { UnlockHandlerUi, runUnlockFlow } from './unlockHandler';
 
 const PROJECT_ID = 'lk_proj_demo';
@@ -256,6 +256,42 @@ test('cancelling the project prompt skips the network entirely', async () => {
     server.close();
     await cleanup();
   }
+});
+
+test('cancelled store path and invalid metadata stop unlock before an agent request', async (t) => {
+  const agent = new AgentClient({ socketPath: 'fixture' });
+  const invoke = t.mock.method(agent, 'invoke', async () => assert.fail('unexpected RPC'));
+  const ui = recordedUi();
+  assert.deepEqual(await runUnlockFlow(agent, { ...ui, promptStorePath: async () => undefined }), { status: 'cancelled' });
+  assert.deepEqual(await runUnlockFlow(agent, { ...ui, promptStorePath: async () => ' ' }), { status: 'invalid_input' });
+  assert.equal(invoke.mock.callCount(), 0);
+  assert.deepEqual(ui.warnings, ['store path is required']);
+  assert.equal(ui.passphrasePrompts.count, 0);
+});
+
+test('dismissing the passphrase prompt cancels without retrying unlock', async (t) => {
+  const agent = new AgentClient({ socketPath: 'fixture' });
+  const invoke = t.mock.method(agent, 'invoke', async () => {
+    throw AgentClientError.agent({ error: 'UnlockRequired', message: 'passphrase needed', retryable: true });
+  });
+  const ui = { ...recordedUi(), promptPassphrase: async () => undefined };
+  assert.deepEqual(await runUnlockFlow(agent, ui), { status: 'cancelled' });
+  assert.equal(invoke.mock.callCount(), 1);
+  assert.deepEqual([ui.info, ui.errors], [[], []]);
+});
+
+test('a non-authentication retry error retains its agent code', async (t) => {
+  const agent = new AgentClient({ socketPath: 'fixture' });
+  const invoke = t.mock.method(agent, 'invoke', async () => { throw AgentClientError.unavailable('socket closed'); });
+  invoke.mock.mockImplementationOnce(async () => {
+    throw AgentClientError.agent({ error: 'UnlockRequired', message: 'passphrase needed', retryable: true });
+  });
+  const ui = recordedUi();
+  assert.deepEqual(await runUnlockFlow(agent, ui), { status: 'agent_error', code: 'AgentUnavailable' });
+  assert.equal(invoke.mock.callCount(), 2);
+  assert.equal(ui.passphrasePrompts.count, 1);
+  assert.deepEqual(ui.info, []);
+  assert.match(ui.errors[0] ?? '', /agent.*unavailable/u);
 });
 
 async function temporarySocketPath(): Promise<{ socketPath: string; cleanup: () => Promise<void> }> {
