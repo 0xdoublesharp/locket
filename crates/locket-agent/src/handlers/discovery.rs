@@ -314,6 +314,20 @@ mod tests {
                  'manual', 1, 'active', 0, 0, 'Platform', '[\"service\"]', 0);
              DROP TABLE blobs;",
         )?;
+        let now = i64::try_from(crate::server::current_unix_nanos())?;
+        store.set_secret_expiry_policy(
+            "lk_sec_one",
+            locket_store::SecretExpiryPolicy { expires_at: Some(now - 1), rotate_after_days: None },
+            now,
+        )?;
+        store.set_secret_expiry_policy(
+            "lk_sec_two",
+            locket_store::SecretExpiryPolicy {
+                expires_at: Some(now + 86_400_000_000_000),
+                rotate_after_days: None,
+            },
+            now,
+        )?;
         let state = AgentSocketState::locked("test");
         let list =
             RequestEnvelope::new("list", AgentMethod::ListProjects, json!({"store_path": path}));
@@ -337,6 +351,9 @@ mod tests {
         assert_eq!(search.payload["secrets"][0]["reference"], "lk://dev/SERVICE_KEY");
         assert_eq!(search.payload["secrets"][1]["reference"], "lk://prod/SERVICE_TOKEN");
 
+        assert_eq!(search.payload["secrets"][0]["expiry_status"], "expired");
+        assert_eq!(search.payload["secrets"][1]["expiry_status"], "expiring_soon");
+
         let search = RequestEnvelope::new(
             "redact",
             AgentMethod::DiscoverSecrets,
@@ -348,6 +365,15 @@ mod tests {
             return Err("could not redact secret metadata".into());
         };
         assert_eq!(search.payload["secrets"].as_array().ok_or("expected rows")?.len(), 1);
+        assert_eq!(search.payload["secrets"][0]["expiry_status"], "expiring_soon");
+        assert_eq!(
+            search.payload["secrets"][0]["reference"],
+            format!(
+                "lk://{}/{}",
+                privacy_alias("profile", "lk_prof_two"),
+                privacy_alias("secret", "SERVICE_TOKEN"),
+            )
+        );
         let payload = search.payload.to_string();
         for hidden in ["SERVICE_TOKEN", "prod", "Second project", "Platform"] {
             assert!(!payload.contains(hidden));

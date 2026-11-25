@@ -1660,6 +1660,94 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn prepared_child_grant_is_capped_and_cannot_be_used_by_issuer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::process::{Command, Stdio};
+
+        let fixture = build_fixture()?;
+        let state = AgentSocketState::locked("child grant fixture");
+        state.seed_master_key(PROJECT_ID, &fixture.master_key)?;
+        let unlock = RequestEnvelope::new(
+            "unlock",
+            AgentMethod::Unlock,
+            json!({"project_id": PROJECT_ID, "ttl_seconds": 60}),
+        );
+        assert!(matches!(crate::dispatch(&unlock, &state).await, ResponseEnvelope::Success(_)));
+        let document = locket_core::PolicyDocument::from_toml_str(
+            "schema_version=1\n[commands.deploy]\nargv=['deploy']\nrequired_secrets=['DATABASE_URL']\nttl='120s'\n",
+        )?;
+        state
+            .set_command_policies_for_tests(vec![crate::CommandPolicySnapshot::from_policy(
+                PROJECT_ID,
+                &document.commands[POLICY_NAME],
+                1,
+            )])
+            .await;
+        let mut child =
+            Command::new("/bin/cat").stdin(Stdio::piped()).stdout(Stdio::null()).spawn()?;
+        let result = async {
+            let child_pid = child.id();
+            let live = locket_platform::process_binding_for_pid(child_pid)?;
+            let binding = GrantBinding::new(child_pid, live.process_start_time)
+                .with_execution(POLICY_NAME, fixture.directory.path().canonicalize()?);
+            let issuer = crate::PeerIdentity {
+                uid: state.daemon_uid,
+                pid: Some(std::process::id()),
+                connection_id: 1,
+            };
+            let delegate = crate::PeerIdentity { pid: Some(child_pid), connection_id: 2, ..issuer };
+            let prepare = RequestEnvelope::new(
+                "prepare",
+                AgentMethod::PrepareExec,
+                json!({
+                    "project_id": PROJECT_ID, "profile_id": PROFILE_ID,
+                    "policy_name": POLICY_NAME, "binding": binding,
+                }),
+            );
+            for bad in [
+                binding.clone().with_execution("wrong-policy", fixture.directory.path().to_owned()),
+                binding.clone().with_execution(POLICY_NAME, PathBuf::from(".")),
+                GrantBinding::new(child_pid, "wrong-start")
+                    .with_execution(POLICY_NAME, fixture.directory.path().to_owned()),
+            ] {
+                let mut request = prepare.clone();
+                request.payload["binding"] = serde_json::to_value(bad)?;
+                assert_eq!(
+                    error_code(crate::dispatch_with_peer(&request, &state, Some(issuer)).await)?,
+                    "AccessDenied"
+                );
+            }
+            assert!(state.grants.lock().await.is_empty());
+            let ResponseEnvelope::Success(prepared) =
+                crate::dispatch_with_peer(&prepare, &state, Some(issuer)).await
+            else {
+                return Err("live child handoff was rejected".into());
+            };
+            assert_eq!(prepared.payload["ttl_seconds"], 60);
+            let mut resolve = resolve_request(&fixture);
+            resolve.grant_id = prepared.payload["grant_id"].as_str().map(str::to_owned);
+            resolve.binding = Some(binding);
+            let request = RequestEnvelope::new(
+                "child-read",
+                AgentMethod::ResolveReference,
+                serde_json::to_value(resolve)?,
+            );
+            let denied = crate::dispatch_with_peer(&request, &state, Some(issuer)).await;
+            assert!(!serde_json::to_string(&denied)?.contains(&fixture.expected_value));
+            assert_eq!(error_code(denied)?, "GrantRequired");
+            let value =
+                resolve_payload(crate::dispatch_with_peer(&request, &state, Some(delegate)).await)?;
+            assert_eq!(value.value, fixture.expected_value);
+            Ok(())
+        }
+        .await;
+        drop(child.stdin.take());
+        assert!(child.wait()?.success());
+        result
+    }
+
     #[tokio::test]
     async fn resolve_refuses_expired_secret_before_decryption()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1761,7 +1849,7 @@ mod tests {
             &mut store,
             2,
             version_two_value,
-            None,
+            Some(5),
             &fixture.profile_secret_key,
             &fixture.profile_fingerprint_key,
         )?;
@@ -1775,6 +1863,16 @@ mod tests {
         let pinned = resolve_payload(pinned)?;
         assert_eq!(pinned.version, 2);
         assert_eq!(pinned.value, version_two_value);
+        let grace =
+            resolve_payload(resolve_with_fixture(&fixture, "lk://dev/DATABASE_URL@v1", 4).await?)?;
+        assert_eq!(grace.value, fixture.expected_value);
+        let denied = resolve_with_fixture(&fixture, "lk://dev/DATABASE_URL@v1", 5).await?;
+        assert!(!serde_json::to_string(&denied)?.contains(&fixture.expected_value));
+        assert_eq!(error_code(denied)?, "SecretVersionExpired");
+        let audit = resolve_audit_metadata(&fixture)?;
+        assert_eq!(audit[2]["grace_until"], 5);
+        assert_eq!(audit[3]["failure_reason"], "SecretVersionExpired");
+
         Ok(())
     }
 

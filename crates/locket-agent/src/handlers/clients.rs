@@ -273,7 +273,7 @@ pub async fn handle_revoke_client(
             return ResponseEnvelope::Error(ErrorEnvelope::new(
                 request.id.clone(),
                 "PolicyNotFound",
-                format!("automation client not found: {}", payload.client),
+                "automation client not found",
                 false,
             ));
         }

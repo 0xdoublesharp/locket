@@ -2779,3 +2779,75 @@ mod frame_tests {
         Ok(())
     }
 }
+
+#[cfg(all(test, unix))]
+mod connection_failure_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt as _;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[tokio::test]
+    async fn malformed_and_oversized_frames_close_without_dispatching_queued_requests() -> TestResult
+    {
+        let valid = encode_frame(
+            &RequestEnvelope::new("queued", AgentMethod::Status, serde_json::Value::Null),
+            DEFAULT_MAX_MESSAGE_SIZE,
+        )?;
+        let oversized = u32::try_from(DEFAULT_MAX_MESSAGE_SIZE + 1)?.to_le_bytes();
+        for malformed in [&oversized[..], &[3, 0, 0, 0, b'n', b'o', b'!'][..]] {
+            let (mut client, server) = UnixStream::pair()?;
+            let state = AgentSocketState::locked("framing test");
+            let mut bytes = malformed.to_vec();
+            bytes.extend_from_slice(&valid);
+            client.write_all(&bytes).await?;
+            client.shutdown().await?;
+            let outcome = handle_connection(server, state).await;
+            assert_eq!(outcome, ConnectionOutcome::Errored);
+            let mut response = Vec::new();
+            match client.read_to_end(&mut response).await {
+                Ok(0) => {}
+                Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
+                result => return Err(format!("unexpected frame response: {result:?}").into()),
+            }
+            assert_eq!(response, Vec::<u8>::new());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disconnect_during_partial_frame_does_not_dispatch() -> TestResult {
+        let (mut client, server) = UnixStream::pair()?;
+        client.write_all(&[24, 0, 0, 0, b'{']).await?;
+        client.shutdown().await?;
+        assert_eq!(
+            handle_connection(server, AgentSocketState::locked("framing test")).await,
+            ConnectionOutcome::PeerClosed
+        );
+        let mut response = Vec::new();
+        assert_eq!(client.read_to_end(&mut response).await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn subscription_disconnect_and_invalid_frames_stop_stream() -> TestResult {
+        for (tail, expected) in [
+            (&[][..], ConnectionOutcome::PeerClosed),
+            (&[2, 0, 0, 0, b'b', b'!'][..], ConnectionOutcome::Errored),
+        ] {
+            let (mut client, server) = UnixStream::pair()?;
+            let state = AgentSocketState::locked("subscription test");
+            let request = RequestEnvelope::new(
+                "stream",
+                AgentMethod::SubscribeStatus,
+                serde_json::Value::Null,
+            );
+            let mut frame = encode_frame(&request, DEFAULT_MAX_MESSAGE_SIZE)?;
+            frame.extend_from_slice(tail);
+            client.write_all(&frame).await?;
+            client.shutdown().await?;
+            assert_eq!(handle_connection(server, state).await, expected);
+        }
+        Ok(())
+    }
+}

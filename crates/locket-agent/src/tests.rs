@@ -1450,7 +1450,9 @@ async fn native_session_gate_rejects_unlock_and_grants_until_resume() {
         )
         .await
         .unwrap();
-    for request in [&unlock, &grant] {
+    let prepare = RequestEnvelope::new("prepare", AgentMethod::PrepareExec, json!({}));
+    let register = RequestEnvelope::new("register", AgentMethod::RegisterIdeEnvSession, json!({}));
+    for request in [&unlock, &grant, &prepare, &register] {
         let response = crate::dispatch(request, &state).await;
         assert!(
             matches!(response, crate::ResponseEnvelope::Error(ref error) if error.error == "UnlockRequired"),
@@ -1975,7 +1977,6 @@ async fn daemon_verification_gates_unlock_grants_and_client_registration()
     store.insert_project_if_absent("p", "fixture", 1)?;
     store.insert_profile_if_absent("dev", "p", "dev", false, 1)?;
     store.insert_profile_if_absent("prod", "p", "prod", true, 1)?;
-    insert_wrapped_audit_key(&store, "p", &[42; 32], &[11; 32])?;
 
     let rejected = crate::AgentSocketState::locked("test")
         .with_canonical_store_path(path.clone())
@@ -2021,10 +2022,33 @@ async fn daemon_verification_gates_unlock_grants_and_client_registration()
         crate::dispatch_with_peer(&grant("Reveal", "dev", false), &approved, Some(peer)).await,
         "UnlockRequired",
     );
+    assert_denied(
+        crate::dispatch_with_peer(&unlock, &approved, Some(peer)).await,
+        "AuditIntegrityFailed",
+    );
+    assert!(approved.unlock_cache.lock().await.is_empty());
+    insert_wrapped_audit_key(&store, "p", &[42; 32], &[11; 32])?;
+    store.connection().execute_batch(
+        "CREATE TRIGGER require_committable_audit BEFORE INSERT ON audit_log
+         WHEN NEW.action IN ('UNLOCK', 'AGENT_GRANT') BEGIN SELECT RAISE(ABORT, 'fixture denied'); END",
+    )?;
+    assert_denied(crate::dispatch_with_peer(&unlock, &approved, Some(peer)).await, "CorruptDb");
+    assert!(approved.unlock_cache.lock().await.is_empty());
+    store.connection().execute_batch("DROP TRIGGER require_committable_audit")?;
     assert!(matches!(
         crate::dispatch_with_peer(&unlock, &approved, Some(peer)).await,
         ResponseEnvelope::Success(_)
     ));
+    store.connection().execute_batch(
+        "CREATE TRIGGER deny_grant_audit BEFORE INSERT ON audit_log
+         WHEN NEW.action = 'AGENT_GRANT' BEGIN SELECT RAISE(ABORT, 'fixture denied'); END",
+    )?;
+    assert_denied(
+        crate::dispatch_with_peer(&grant("Reveal", "dev", false), &approved, Some(peer)).await,
+        "AuditIntegrityFailed",
+    );
+    assert!(approved.grants.lock().await.is_empty());
+    store.connection().execute_batch("DROP TRIGGER deny_grant_audit")?;
     for action in ["Reveal", "Copy", "Export"] {
         let request = grant(action, "dev", false);
         assert_denied(
@@ -2189,6 +2213,17 @@ async fn daemon_verification_gates_resolve_and_prepare_exec_and_binds_policy()
         matches!(&unconfirmed_prod, ResponseEnvelope::Error(error) if error.error == "ConfirmationFailed"),
         "PrepareExec on dangerous profile must require confirmation: {unconfirmed_prod:?}"
     );
+
+    store.connection().execute_batch(
+        "CREATE TRIGGER deny_prepare_audit BEFORE INSERT ON audit_log
+         WHEN NEW.action = 'AGENT_GRANT' BEGIN SELECT RAISE(ABORT, 'fixture denied'); END",
+    )?;
+    assert!(matches!(
+        crate::dispatch_with_peer(&prepare_req("dev", "policy-a", false), &approved, Some(peer)).await,
+        ResponseEnvelope::Error(error) if error.error == "AuditIntegrityFailed"
+    ));
+    assert!(approved.grants.lock().await.is_empty());
+    store.connection().execute_batch("DROP TRIGGER deny_prepare_audit")?;
 
     let ResponseEnvelope::Success(prepared) =
         crate::dispatch_with_peer(&prepare_req("dev", "policy-a", false), &approved, Some(peer))
@@ -3231,6 +3266,47 @@ async fn set_active_profile_switches_profile_revokes_project_grants_and_audits()
     Ok(())
 }
 
+#[tokio::test]
+async fn set_active_profile_preserves_config_and_grants_when_audit_rejects_switch()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let store_path = directory.path().join("store.db");
+    let config_path = directory.path().join("locket.toml");
+    let project_id = "lk_proj_agent_profile";
+    seed_profile_test_store(&store_path, project_id)?;
+    write_profile_test_config(&config_path, project_id, "dev")?;
+    let initial = std::fs::read(&config_path)?;
+    let store = locket_store::Store::open(&store_path)?;
+    store.connection().execute_batch(
+        "CREATE TRIGGER deny_profile_change BEFORE INSERT ON audit_log
+         WHEN NEW.action = 'PROFILE_CHANGE' BEGIN SELECT RAISE(ABORT, 'fixture denied'); END",
+    )?;
+    let state = crate::AgentSocketState::locked("test");
+    unlock_profile_test_state(&state, project_id).await;
+    let mut grant = test_grant_record("profile-grant", i128::MAX);
+    grant.project_id = project_id.to_owned();
+    grant.profile_id = "lk_prof_dev".to_owned();
+    state.grants.lock().await.insert(grant);
+
+    let mut request = RequestEnvelope::new(
+        "profile",
+        AgentMethod::SetActiveProfile,
+        json!({
+            "config_path": config_path, "store_path": store_path, "project_id": project_id,
+            "profile_name": "dev", "privacy_redact_names": true,
+        }),
+    );
+    assert!(matches!(crate::dispatch(&request, &state).await, ResponseEnvelope::Success(success)
+        if success.payload["changed"] == false && success.payload["live_grants_revoked"] == 0));
+    request.payload["profile_name"] = json!("staging");
+    assert!(matches!(crate::dispatch(&request, &state).await, ResponseEnvelope::Error(error)
+        if error.error == "CorruptDb"));
+    assert_eq!(std::fs::read(&config_path)?, initial);
+    assert!(state.grants.lock().await.get("profile-grant").is_some());
+    assert_eq!(store.list_recent_audit_actions(project_id, 5)?, Vec::<String>::new());
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn set_active_profile_locked_vault_fails_before_writing()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -3437,6 +3513,17 @@ async fn set_active_profile_rejects_invalid_missing_and_unconfirmed_dangerous_pr
     };
     assert_eq!(error.error, "ConfirmationFailed");
 
+    let mut wrong_context = dangerous.clone();
+    let foreign_config = directory.path().join("foreign.toml");
+    write_profile_test_config(&foreign_config, "lk_proj_other_context", "dev")?;
+    wrong_context.payload["config_path"] = json!(foreign_config);
+    assert!(matches!(dispatch(&wrong_context, &state).await, ResponseEnvelope::Error(error)
+        if error.error == "MetadataInvalid" && error.message.contains("project_id does not match")));
+    let unsupported = std::fs::read_to_string(&config_path)?
+        .replace("schema_version = 1", "schema_version = 999");
+    std::fs::write(&foreign_config, unsupported)?;
+    assert!(matches!(dispatch(&wrong_context, &state).await, ResponseEnvelope::Error(error)
+        if error.error == "MetadataInvalid" && error.message.contains("unsupported")));
     let config = read_profile_test_config(&directory.path().join("locket.toml"))?;
     assert_eq!(config.default_profile.as_str(), "dev");
     let store = locket_store::Store::open(directory.path().join("store.db"))?;
@@ -4613,9 +4700,8 @@ async fn policy_doctor_reports_denied_and_missing_references()
     drop(store);
 
     let state = AgentSocketState::locked("test-version");
-    unlock_profile_test_state(&state, "p-doctor-fail").await;
 
-    let request = RequestEnvelope::new(
+    let mut request = RequestEnvelope::new(
         "doctor-fail",
         AgentMethod::PolicyDoctor,
         json!({
@@ -4626,7 +4712,7 @@ async fn policy_doctor_reports_denied_and_missing_references()
                 "project_id": "p-doctor-fail",
                 "name": "deploy",
                 "command_kind": "argv",
-                "command_preview": "echo lk://dev/DATABASE_URL lk://dev/API_KEY",
+                "command_preview": "echo 'lk://dev/DATABASE_URL' lk://dev/API_KEY `lk://` lk://absent/DATABASE_URL",
                 "required_secrets": ["DATABASE_URL"],
                 "optional_secrets": [],
                 "allowed_secrets": ["DATABASE_URL"],
@@ -4639,22 +4725,35 @@ async fn policy_doctor_reports_denied_and_missing_references()
                 "override_mode": "locket",
                 "updated_at_unix_nanos": 10,
             },
-            "references": ["lk://dev/DATABASE_URL", "lk://dev/API_KEY"],
         }),
     );
+    assert!(matches!(dispatch(&request, &state).await, ResponseEnvelope::Error(error)
+        if error.error == "UnlockRequired"));
+    unlock_profile_test_state(&state, "p-doctor-fail").await;
+    let mut foreign = request.clone();
+    foreign.payload["policy"]["project_id"] = json!("other-project");
+    assert!(matches!(dispatch(&foreign, &state).await, ResponseEnvelope::Error(error)
+        if error.error == "ProtocolError"));
+    foreign = request.clone();
+    foreign.payload["store_path"] = json!(directory.path().join("missing").join("other.db"));
+    assert!(matches!(dispatch(&foreign, &state).await, ResponseEnvelope::Error(error)
+        if error.error == "AccessDenied"));
+    request.payload["policy"]["ttl_seconds"] = json!(u64::MAX);
     let ResponseEnvelope::Success(success) = dispatch(&request, &state).await else {
         return Err("PolicyDoctor must return a report for failed references".into());
     };
     assert_eq!(success.payload["status"], "fail");
     assert_eq!(
         success.payload["references_failed"],
-        json!(["lk://dev/DATABASE_URL", "lk://dev/API_KEY"])
+        json!(["lk://dev/DATABASE_URL", "lk://dev/API_KEY", "lk://", "lk://absent/DATABASE_URL"])
     );
+    assert_eq!(success.payload["ttl_seconds"], u32::MAX);
     assert_eq!(success.payload["env_mode_denied"], json!(["API_KEY"]));
     Ok(())
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[allow(clippy::too_many_lines)] // Compare denied and committed publication against the same audit chain.
 async fn register_command_policies_does_not_drop_other_projects()
 -> Result<(), Box<dyn std::error::Error>> {
     use crate::CommandPolicySnapshot;
@@ -4730,6 +4829,48 @@ async fn register_command_policies_does_not_drop_other_projects()
             }],
         }),
     );
+    {
+        let mut cache = state.unlock_cache.lock().await;
+        let entry = cache.evict("p-a").ok_or("test unlock missing")?;
+        cache.insert(
+            "p-a".to_owned(),
+            crate::UnlockEntry::new(
+                vec![42; 31],
+                crate::server::current_unix_nanos(),
+                std::time::Duration::from_secs(60),
+                crate::UnlockMethod::Passphrase,
+            ),
+        );
+        drop(cache);
+        assert!(matches!(dispatch(&request, &state).await, ResponseEnvelope::Error(error)
+            if error.error == "CorruptDb" && error.message == "invalid cached key"));
+        state.unlock_cache.lock().await.insert("p-a".to_owned(), entry);
+    }
+    let store = locket_store::Store::open(&store_path)?;
+    let mut denied = request.clone();
+    denied.payload["project_id"] = json!("locked-project");
+    assert!(matches!(dispatch(&denied, &state).await, ResponseEnvelope::Error(error)
+        if error.error == "UnlockRequired"));
+    denied = request.clone();
+    denied.payload["store_path"] = json!(directory.path().join("missing/other.db"));
+    assert!(matches!(dispatch(&denied, &state).await, ResponseEnvelope::Error(error)
+        if error.error == "CorruptDb" && error.message.contains("open")));
+    let foreign_path = directory.path().join("empty.db");
+    let mut foreign = locket_store::Store::open(&foreign_path)?;
+    foreign.initialize_schema()?;
+    denied.payload["store_path"] = json!(foreign_path);
+    assert!(matches!(dispatch(&denied, &state).await, ResponseEnvelope::Error(error)
+        if error.error == "CorruptDb" && error.message.contains("audit key")));
+
+    store.connection().execute_batch(
+        "CREATE TRIGGER deny_policy_audit BEFORE INSERT ON audit_log
+         WHEN NEW.action = 'POLICY_UPDATE' BEGIN SELECT RAISE(ABORT, 'fixture denied'); END",
+    )?;
+    assert!(matches!(dispatch(&request, &state).await, ResponseEnvelope::Error(error)
+        if error.error == "CorruptDb" && error.message.contains("append")));
+    assert!(state.command_policies.lock().await.iter().all(|policy| policy.project_id != "p-a"));
+    assert_eq!(store.list_recent_audit_actions("p-a", 5)?, Vec::<String>::new());
+    store.connection().execute_batch("DROP TRIGGER deny_policy_audit")?;
     assert!(matches!(dispatch(&request, &state).await, ResponseEnvelope::Success(_)));
 
     let snapshot_counts = {
@@ -4853,17 +4994,31 @@ async fn register_client_rejects_invalid_metadata() -> Result<(), Box<dyn std::e
         json!({
             "project_id": "p-bad-clients",
             "store_path": store_path,
-            "name": "BadName",
+            "name": "ci",
             "public_key": public_key,
             "storage": "external",
             "allowed_actions": ["run-policy"],
             "allowed_policies": ["deploy"],
         }),
     );
-    let ResponseEnvelope::Error(error) = dispatch(&request, &state).await else {
-        return Err("invalid name must be rejected".into());
-    };
-    assert_eq!(error.error, "MetadataInvalid");
+    let canary = "client-request-metadata-canary";
+    for (field, invalid, message) in [
+        ("name", json!(" "), "client name cannot be empty"),
+        ("name", json!("BadName"), "client name must match ^[a-z][a-z0-9_-]{0,63}$"),
+        ("allowed_actions", json!([]), "at least one allowed_action is required"),
+        ("allowed_actions", json!(["reveal", canary]), "unsupported automation-client action"),
+        ("allowed_policies", json!([]), "at least one allowed_policy is required"),
+        ("allowed_policies", json!(["*"]), "wildcard or empty client policies are not supported"),
+        ("storage", json!(canary), "unsupported automation client private-key storage"),
+    ] {
+        let mut invalid_request = request.clone();
+        invalid_request.payload[field] = invalid;
+        assert!(matches!(dispatch(&invalid_request, &state).await,
+            ResponseEnvelope::Error(error)
+                if error.error == "MetadataInvalid" && error.message == message));
+    }
+    let store = locket_store::Store::open(&store_path)?;
+    assert_eq!(store.list_recent_audit_actions("p-bad-clients", 10)?, Vec::<String>::new());
     Ok(())
 }
 
@@ -4910,6 +5065,26 @@ async fn revoke_client_marks_row_and_appends_audit() -> Result<(), Box<dyn std::
             "client": client_id.clone(),
         }),
     );
+    let canary = "client-selector-secret-canary";
+    let mut unknown = revoke.clone();
+    unknown.payload["client"] = json!(canary);
+    assert!(matches!(dispatch(&unknown, &state).await, ResponseEnvelope::Error(error)
+        if error.error == "PolicyNotFound" && !error.message.contains(canary)));
+
+    let db = locket_store::Store::open(&store_path)?;
+    db.connection().execute_batch(
+        "CREATE TRIGGER deny_client_revoke_audit BEFORE INSERT ON audit_log
+         WHEN NEW.action = 'CLIENT_REVOKE' BEGIN SELECT RAISE(ABORT, 'fixture denied'); END",
+    )?;
+    assert!(matches!(dispatch(&revoke, &state).await, ResponseEnvelope::Error(error)
+        if error.error == "CorruptDb"));
+    assert!(
+        db.get_automation_client("p-rev", &client_id)?
+            .ok_or("client missing")?
+            .revoked_at
+            .is_none()
+    );
+    db.connection().execute_batch("DROP TRIGGER deny_client_revoke_audit")?;
     let ResponseEnvelope::Success(success) = dispatch(&revoke, &state).await else {
         return Err("RevokeClient should succeed".into());
     };
@@ -5210,6 +5385,28 @@ async fn unlock_and_grant_reject_invalid_ttls() -> Result<(), Box<dyn std::error
             }
         }
     }
+    let desktop = RequestEnvelope::new(
+        "single-use-desktop",
+        AgentMethod::RequestGrant,
+        json!({"project_id":"ttl-project", "profile_id":"ttl-profile", "action":"CreateProfile",
+            "binding": {"pid":42, "process_start_time":"test"}, "ttl_seconds":3600}),
+    );
+    assert!(matches!(crate::dispatch(&desktop, &state).await, ResponseEnvelope::Success(success)
+        if success.payload["ttl_seconds"] == 30));
+    let document = locket_core::PolicyDocument::from_toml_str(
+        "schema_version = 1\n[commands.deploy]\nargv = ['deploy']\n",
+    )?;
+    let mut snapshot =
+        crate::CommandPolicySnapshot::from_policy("ttl-project", &document.commands["deploy"], 1);
+    snapshot.ttl_seconds = 3601;
+    state.set_command_policies_for_tests(vec![snapshot]).await;
+    let mut run = desktop;
+    run.payload["action"] = json!("RunPolicy");
+    run.payload["policy_name"] = json!("deploy");
+    let prior_grants = state.grants.lock().await.len();
+    assert!(matches!(crate::dispatch(&run, &state).await, ResponseEnvelope::Error(error)
+        if error.error == "MetadataInvalid" && error.message.contains("policy grant TTL")));
+    assert_eq!(state.grants.lock().await.len(), prior_grants);
     Ok(())
 }
 
@@ -5478,5 +5675,296 @@ async fn policy_doctor_respects_source_precedence_and_deprecation_grace()
     assert_eq!(report.status, "fail");
     assert_eq!(report.references_failed, failures);
     assert_eq!(report.references_ok, 4);
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalid_request_payloads_produce_typed_redacted_errors() {
+    use crate::server::{AgentSocketState, dispatch};
+
+    let state = AgentSocketState::locked("dispatch test");
+    let canary = "unexpected-private-input-f615";
+    for (method, payload) in [
+        (AgentMethod::Status, json!({"project_id": canary.len()})),
+        (AgentMethod::Lock, json!(canary)),
+        (AgentMethod::Shutdown, json!(canary)),
+        (AgentMethod::Unlock, json!(canary)),
+        (AgentMethod::RequestGrant, json!(canary)),
+        (AgentMethod::ExpireGrant, json!(canary)),
+        (AgentMethod::RevokeGrant, json!(canary)),
+        (AgentMethod::RegisterCommandPolicies, json!(canary)),
+        (AgentMethod::PolicyDoctor, json!(canary)),
+        (AgentMethod::ListPolicies, json!(canary)),
+        (AgentMethod::ListRuntimeSessions, json!(canary)),
+        (AgentMethod::ListDeviceMembers, json!(canary)),
+        (AgentMethod::ListSecrets, json!(canary)),
+        (AgentMethod::ListVersions, json!(canary)),
+        (AgentMethod::ListAudit, json!(canary)),
+        (AgentMethod::VerifyAudit, json!(canary)),
+        (AgentMethod::ListProjects, json!(canary)),
+        (AgentMethod::DiscoverSecrets, json!(canary)),
+        (AgentMethod::ReadConfig, json!(canary)),
+        (AgentMethod::WriteConfig, json!(canary)),
+        (AgentMethod::SetActiveProfile, json!(canary)),
+        (AgentMethod::RegisterClient, json!(canary)),
+        (AgentMethod::RevokeClient, json!(canary)),
+        (AgentMethod::CreateProfile, json!(canary)),
+        (AgentMethod::DeleteSecret, json!(canary)),
+        (AgentMethod::CopySecretToShared, json!(canary)),
+    ] {
+        let expected = match method {
+            AgentMethod::CreateProfile
+            | AgentMethod::DeleteSecret
+            | AgentMethod::CopySecretToShared => "MetadataInvalid",
+            _ => "ProtocolError",
+        };
+        let request = RequestEnvelope::new("bad-payload", method, payload);
+        let response = dispatch(&request, &state).await;
+        assert!(
+            matches!(&response, ResponseEnvelope::Error(error)
+            if error.id == request.id && error.error == expected
+            && !error.message.contains(canary)),
+            "{method:?}: {response:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn metadata_rpcs_enforce_vault_identity_and_report_corrupt_metadata()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::server::{AgentSocketState, dispatch};
+    use locket_store::Store;
+
+    let directory = tempfile::tempdir()?;
+    let store_path = directory.path().join("store.db");
+    let mut store = Store::open(&store_path)?;
+    store.initialize_schema()?;
+    store.insert_project_if_absent("metadata-project", "Synthetic vault", 1)?;
+    store.insert_profile_if_absent("metadata-profile", "metadata-project", "dev", false, 1)?;
+    store.connection().execute_batch(
+        "INSERT INTO secrets(id,project_id,profile_id,name,source,origin,required,current_version,state,created_at,updated_at)
+         VALUES ('metadata-token','metadata-project','metadata-profile','ACTUAL_TOKEN','user-local','manual',0,1,'active',1,1);
+         INSERT INTO secret_versions(secret_id,version,source,origin,state,created_at)
+         VALUES ('metadata-token',1,'user-local','manual','current',1);",
+    )?;
+    let state =
+        AgentSocketState::locked("metadata test").with_canonical_store_path(store_path.clone());
+    let alternate = directory.path().join("alternate.db");
+    let mut alternate_db = Store::open(&alternate)?;
+    alternate_db.initialize_schema()?;
+    let payload = json!({
+        "store_path": store_path, "project_id": "metadata-project", "profile_id": "metadata-profile",
+        "now_unix_nanos": 100, "redact_names": true
+    });
+    for method in [
+        AgentMethod::ListVersions,
+        AgentMethod::ListSecrets,
+        AgentMethod::ListDeviceMembers,
+        AgentMethod::ListProjects,
+        AgentMethod::DiscoverSecrets,
+    ] {
+        let mut foreign = payload.clone();
+        foreign["store_path"] = json!(alternate);
+        let request = RequestEnvelope::new("foreign", method, foreign);
+        assert!(matches!(dispatch(&request, &state).await, ResponseEnvelope::Error(error)
+            if error.error == "AccessDenied"));
+    }
+
+    let mut no_project = payload.clone();
+    no_project["project"] = json!("private-not-a-project");
+    let missing = RequestEnvelope::new("missing", AgentMethod::DiscoverSecrets, no_project);
+    assert!(matches!(dispatch(&missing, &state).await, ResponseEnvelope::Error(error)
+        if error.error == "ProjectNotFound" && !error.message.contains("private-not-a-project")));
+    store.insert_project_if_absent("other-metadata", "Synthetic vault", 1)?;
+    let mut duplicate = payload.clone();
+    duplicate["project"] = json!("Synthetic vault");
+    let ambiguous = RequestEnvelope::new("ambiguous", AgentMethod::DiscoverSecrets, duplicate);
+    assert!(matches!(dispatch(&ambiguous, &state).await, ResponseEnvelope::Error(error)
+        if error.error == "AmbiguousProject"));
+    let versions = RequestEnvelope::new("versions", AgentMethod::ListVersions, payload.clone());
+    let ResponseEnvelope::Success(success) = dispatch(&versions, &state).await else {
+        return Err("metadata-only version listing rejected".into());
+    };
+    assert_eq!(success.payload["rows"][0]["version"], 1);
+    assert_eq!(success.payload["rows"][0]["pinned_reference_eligible"], true);
+    assert!(!success.payload.to_string().contains("ACTUAL_TOKEN"));
+
+    store
+        .connection()
+        .execute_batch("DROP TABLE secret_versions; DROP TABLE secrets; DROP TABLE devices;")?;
+    for method in [
+        AgentMethod::ListVersions,
+        AgentMethod::ListSecrets,
+        AgentMethod::ListDeviceMembers,
+        AgentMethod::DiscoverSecrets,
+    ] {
+        let request = RequestEnvelope::new("corrupt", method, payload.clone());
+        assert!(
+            matches!(dispatch(&request, &state).await, ResponseEnvelope::Error(error)
+            if error.error == "CorruptDb"),
+            "{method:?}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn unlock_denies_missing_or_invalid_fallback_without_disclosing_passphrase()
+-> Result<(), Box<dyn std::error::Error>> {
+    use locket_platform::{MemoryMasterKeyStore, PassphraseFallbackMasterKeyStore};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let passphrase = "passphrase-error-canary-d572";
+    let project = "invalid-fallback";
+    let state = crate::AgentSocketState::with_stores(
+        "test",
+        0,
+        Arc::new(MemoryMasterKeyStore::default()),
+        Arc::new(PassphraseFallbackMasterKeyStore::new(dir.path())),
+    );
+    let request = RequestEnvelope::new(
+        "unlock",
+        AgentMethod::Unlock,
+        json!({
+            "project_id": project, "passphrase": passphrase, "ttl_seconds": 30,
+        }),
+    );
+    assert!(matches!(crate::dispatch(&request, &state).await, ResponseEnvelope::Error(error)
+        if error.error == "UnlockRequired" && !error.message.contains(passphrase)));
+    std::fs::write(
+        dir.path().join(format!("{project}.toml")),
+        r#"
+version = 999
+algorithm = "none"
+kdf_profile_id = ""
+salt = ""
+m_cost = 0
+t_cost = 0
+p_cost = 0
+output_len = 0
+nonce = ""
+wrapped_master_key = ""
+created_at = 0
+"#,
+    )?;
+    assert!(matches!(crate::dispatch(&request, &state).await, ResponseEnvelope::Error(error)
+        if error.error == "IntegrityFailure" && !error.message.contains(passphrase)));
+    assert!(state.unlock_cache.lock().await.is_empty());
+    assert!(state.grants.lock().await.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn automation_auth_rejects_stale_requests_expired_challenges_and_nonce_mismatches()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let store_path = directory.path().join("store.db");
+    let store = seed_automation_client_store(
+        &store_path,
+        automation_signing_key().verifying_key().as_bytes(),
+    )?;
+    let state = crate::AgentSocketState::locked("challenge test");
+    unlock_auth_project(&state).await;
+    for (fault, message, reason) in [
+        ("request", "request timestamp expired", "expired"),
+        ("challenge", "challenge expired", "expired"),
+        ("nonce", "challenge mismatch", "challenge_mismatch"),
+    ] {
+        let mut request =
+            sign_automation_request(&state, automation_grant_request(&store_path, "RunPolicy"))
+                .await?;
+        let id =
+            request.payload["auth"]["challenge_id"].as_str().ok_or("challenge missing")?.to_owned();
+        let nonce = request.payload["auth"]["nonce"].as_str().ok_or("nonce missing")?.to_owned();
+        match fault {
+            "request" => request.payload["auth"]["request_timestamp"] = json!(0),
+            "challenge" => {
+                state
+                    .automation_challenges
+                    .lock()
+                    .await
+                    .get_mut(&id)
+                    .ok_or("challenge lost")?
+                    .issued_at = 0;
+            }
+            _ => {
+                request.payload["auth"]["nonce"] =
+                    json!(data_encoding::BASE64URL_NOPAD.encode(&[0; 24]));
+            }
+        }
+        let response = crate::dispatch(&request, &state).await;
+        assert!(matches!(response, ResponseEnvelope::Error(error)
+            if error.error == "AutomationClientNotTrusted"
+                && error.message.contains(message)
+                && !error.message.contains(&nonce)));
+        let audit: String = store.connection().query_row(
+            "SELECT metadata_json FROM audit_log
+             WHERE action = 'CLIENT_AUTH' AND status = 'DENIED'
+             ORDER BY sequence DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&audit)?["failure_reason"], reason);
+        assert!(!audit.contains(&nonce));
+    }
+    assert_no_successful_automation_auth(&store)?;
+    assert!(state.grants.lock().await.is_empty());
+    assert!(
+        store.verify_audit_chain_read_only("lk_proj_auth", &AgentAuditFixture::AUDIT_KEY)?.hmac_ok
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_unlock_fails_closed_on_invalid_verification_policy_and_honors_trusted_roots()
+-> Result<(), Box<dyn std::error::Error>> {
+    use sha2::{Digest, Sha256};
+
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("store.db");
+    let mut store = locket_store::Store::open(&path)?;
+    store.initialize_schema()?;
+    store.insert_project_if_absent("p", "verification", 1)?;
+    let user_config = directory.path().join("settings.toml");
+    let state = crate::AgentSocketState::locked("test")
+        .with_canonical_store_path(path)
+        .with_user_config_path(user_config.clone());
+    state.seed_master_key("p", &[42; 32])?;
+    let unlock = RequestEnvelope::new(
+        "unlock",
+        AgentMethod::Unlock,
+        json!({"project_id":"p", "ttl_seconds":60}),
+    );
+
+    std::fs::write(&user_config, "[user_verification_required_for]\nunlock = true\n")?;
+    assert!(matches!(crate::dispatch(&unlock, &state).await, ResponseEnvelope::Error(error)
+        if error.error == "UserVerificationFailed"));
+    std::fs::write(&user_config, "[user_verification_required_for]\nunlock = false\n")?;
+    let canary = "verification-policy-plaintext-canary";
+    for invalid in [canary.to_owned(), json!({"unlock":canary}).to_string()] {
+        store.connection().execute(
+            "UPDATE projects SET user_verification_policy_json = ?1 WHERE id = 'p'",
+            [invalid],
+        )?;
+        assert!(matches!(crate::dispatch(&unlock, &state).await, ResponseEnvelope::Error(error)
+            if error.error == "AccessDenied" && !error.message.contains(canary)));
+        assert!(state.unlock_cache.lock().await.is_empty());
+    }
+    store
+        .connection()
+        .execute("UPDATE projects SET user_verification_policy_json = '{}' WHERE id = 'p'", [])?;
+    let root = directory.path().join("project");
+    std::fs::create_dir(&root)?;
+    let root = root.canonicalize()?;
+    let missing = root.join("removed-folder");
+    store.trust_project_root("p", &[99; 32], missing.to_str(), 1)?;
+    let hash = Sha256::digest(root.to_string_lossy().as_bytes()).into();
+    store.trust_project_root("p", &hash, root.to_str(), 1)?;
+    std::fs::write(root.join("locket.toml"), "[user_verification_required_for]\nunlock = true\n")?;
+    assert!(matches!(crate::dispatch(&unlock, &state).await, ResponseEnvelope::Error(error)
+        if error.error == "UserVerificationFailed"));
+    assert!(state.unlock_cache.lock().await.is_empty());
+    assert!(state.grants.lock().await.is_empty());
     Ok(())
 }

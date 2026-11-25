@@ -1258,6 +1258,70 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn set_secret_rejects_unsafe_metadata_and_implicit_cross_source_writes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = build_fixture()?;
+        let mut first = request(&fixture);
+        first.source = Some("machine-local".to_owned());
+        let original = success_payload(set_with_request(first, &fixture).await?)?;
+        let state = unlocked_state(&fixture).await;
+        let existing_value = fixture_value("one");
+        let candidate = fixture_value("two");
+        for (field, value, code) in [
+            ("description", json!(existing_value), "MetadataLooksLikeSecret"),
+            ("owner", json!("abc0123456789defghijklmnopqr"), "MetadataLooksLikeSecret"),
+            ("tags", json!(["group\u{1b}"]), "MetadataInvalid"),
+            ("source", json!("unrecognized"), "MetadataInvalid"),
+            ("source", serde_json::Value::Null, "SecretAlreadyExists"),
+            ("value", json!(""), "InvalidReference"),
+            ("value", json!("invalid\0value"), "MetadataInvalid"),
+        ] {
+            let mut payload = serde_json::to_value(request(&fixture))?;
+            payload["value"] = json!(candidate);
+            payload[field] = value;
+            let request = RequestEnvelope::new("protected", AgentMethod::SetSecret, payload);
+            let reply = handle_set_secret(&request, &state, NOW + 1).await;
+            let wire = serde_json::to_string(&reply)?;
+            assert!(!wire.contains(&existing_value) && !wire.contains(&candidate));
+            assert_eq!(error_code(reply)?, code, "{field}");
+        }
+        let store = Store::open(&fixture.store_path)?;
+        let record = store
+            .get_active_secret(PROJECT_ID, PROFILE_ID, SECRET_NAME, "machine-local")?
+            .ok_or("original source disappeared")?;
+        assert_eq!(record.id, original.secret_id);
+        assert_eq!(record.current_version, 1);
+        assert!(
+            store.get_active_secret(PROJECT_ID, PROFILE_ID, SECRET_NAME, "user-local")?.is_none()
+        );
+        assert_eq!(audit_metadata(&fixture)?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn set_secret_with_preexisting_grant_denies_profile_removed_since_issuance()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = build_fixture()?;
+        let state = unlocked_state(&fixture).await;
+        let store = Store::open(&fixture.store_path)?;
+        store.connection().execute("DELETE FROM profiles WHERE id = ?1", [PROFILE_ID])?;
+        let request = RequestEnvelope::new(
+            "removed-profile",
+            AgentMethod::SetSecret,
+            serde_json::to_value(request(&fixture))?,
+        );
+        let response = handle_set_secret(&request, &state, NOW).await;
+        assert!(!serde_json::to_string(&response)?.contains(&fixture_value("one")));
+        assert_eq!(error_code(response)?, "ProfileNotFound");
+        assert_eq!(audit_metadata(&fixture)?, Vec::<serde_json::Value>::new());
+        assert_eq!(
+            store.list_secrets_by_profile(PROJECT_ID, PROFILE_ID)?,
+            Vec::<locket_store::SecretRecord>::new()
+        );
+        Ok(())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn set_secret_rejects_duplicate_create() -> Result<(), Box<dyn std::error::Error>> {
         let fixture = build_fixture()?;

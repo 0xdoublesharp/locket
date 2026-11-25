@@ -595,6 +595,93 @@ mod tests {
         Ok(store)
     }
 
+    #[tokio::test]
+    async fn sync_rpcs_reject_invalid_scope_and_keep_configured_vault_unchanged()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{AgentMethod, dispatch};
+        use serde_json::{Value, json};
+        use std::fs;
+
+        let dir = tempfile::tempdir()?;
+        let private = dir.path().join("private");
+        let share = dir.path().join("share");
+        fs::create_dir(&private)?;
+        fs::create_dir(&share)?;
+        let path = private.join("store.db");
+        let store = receiver_store(&path)?;
+        let owner =
+            locket_core::team_package::DeviceIdentity::new("owner".into(), [3; 32], [4; 32]);
+        store.connection().execute(
+            "INSERT INTO team_sync_anchors VALUES ('project','team',?1,1)",
+            [serde_json::to_string(&owner)?],
+        )?;
+        let state = cached_projects(&path).await;
+        let rpc = |method, payload| {
+            let request = RequestEnvelope::new("sync", method, payload);
+            let state = &state;
+            async move { dispatch(&request, state).await }
+        };
+        let mut request = json!({
+            "project_id": "project", "store_path": path, "profile_id":"profile",
+            "binding": GrantBinding::new(42, "start"), "folder": share,
+            "incoming_profile_id":"incoming",
+            "action":{"kind":"preserve_override","local_secret_id":"local"}
+        });
+        for method in [
+            AgentMethod::TeamSyncStatus,
+            AgentMethod::TeamSyncConfigure,
+            AgentMethod::TeamSyncNow,
+            AgentMethod::TeamSyncReconcile,
+        ] {
+            assert!(matches!(rpc(method, Value::Null).await,
+                ResponseEnvelope::Error(error) if error.error == "ProtocolError"));
+            if method != AgentMethod::TeamSyncStatus {
+                assert!(matches!(rpc(method, request.clone()).await,
+                    ResponseEnvelope::Error(error) if error.error == "GrantRequired"));
+            }
+        }
+        request["grant_id"] = json!("project");
+        let mut foreign = request.clone();
+        foreign["store_path"] = json!(dir.path().join("different.db"));
+        assert!(matches!(rpc(AgentMethod::TeamSyncStatus, foreign.clone()).await,
+            ResponseEnvelope::Error(error) if error.error == "AccessDenied"));
+        for method in [
+            AgentMethod::TeamSyncConfigure,
+            AgentMethod::TeamSyncNow,
+            AgentMethod::TeamSyncReconcile,
+        ] {
+            assert!(matches!(rpc(method, foreign.clone()).await,
+                ResponseEnvelope::Error(error) if error.error == "TeamSyncRejected"));
+        }
+        assert!(team_sync::status(&store, "project")?.folder.is_none());
+        assert!(matches!(rpc(AgentMethod::TeamSyncNow, request.clone()).await,
+            ResponseEnvelope::Success(result) if result.payload["epoch"] == 0));
+        assert!(matches!(
+            rpc(AgentMethod::TeamSyncConfigure, request.clone()).await,
+            ResponseEnvelope::Success(_)
+        ));
+        assert!(matches!(rpc(AgentMethod::TeamSyncReconcile, request.clone()).await,
+            ResponseEnvelope::Error(error)
+                if error.error == "TeamSyncRejected" && error.message.contains("active local device missing")));
+        assert!(matches!(rpc(AgentMethod::TeamSyncNow, request.clone()).await,
+            ResponseEnvelope::Error(error)
+                if error.error == "TeamSyncRejected" && error.message.contains("active local device missing")));
+        let status = team_sync::status(&store, "project")?;
+        assert!(status.folder.is_some());
+        assert_eq!(status.epoch, 0);
+        assert!(
+            status.last_error.is_some_and(|error| error.contains("active local device missing"))
+        );
+
+        request["project_id"] = json!("other");
+        request["grant_id"] = json!("other");
+        assert!(matches!(rpc(AgentMethod::TeamSyncNow, request).await,
+            ResponseEnvelope::Error(error)
+                if error.error == "TeamSyncRejected" && error.message.contains("unlock context")));
+        assert!(!dir.path().join("different.db").exists());
+        Ok(())
+    }
+
     #[test]
     fn shared_vault_team_sync_has_status_and_requires_owner_pin()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -671,6 +758,60 @@ mod tests {
                 assert!(store.verify_audit_chain_read_only("project", &[23; 32])?.hmac_ok);
             }
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn terminal_sync_with_audit_failure_still_erases_cached_authorization()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("store.db");
+        let store = receiver_store(&path)?;
+        store.connection().execute_batch(
+            "INSERT INTO team_sync_heads VALUES ('project',1,'digest','[]','removed',1);
+             CREATE TRIGGER deny_lock_audit BEFORE INSERT ON audit_log
+             WHEN NEW.action = 'LOCK' BEGIN SELECT RAISE(ABORT, 'fixture denied'); END",
+        )?;
+        let state = cached_projects(&path).await;
+        let request = RequestEnvelope::new(
+            "status",
+            crate::AgentMethod::TeamSyncStatus,
+            serde_json::json!({"project_id":"project"}),
+        );
+        assert!(matches!(handle_team_sync_status(&request, &state).await,
+            ResponseEnvelope::Error(error) if error.error == "MetadataInvalid"
+                && error.message == "team lock audit unavailable"));
+        assert_project_invalidated(&state).await;
+        assert_eq!(team_sync::status(&store, "project")?.state, "removed");
+        assert_eq!(store.list_recent_audit_actions("project", 5)?, Vec::<String>::new());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn status_never_turns_unreadable_pending_package_into_verified_details()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("store.db");
+        let store = receiver_store(&path)?;
+        store.connection().execute_batch(
+            "INSERT INTO team_sync_heads VALUES ('project',1,'digest','[]','pending-values',1);
+             INSERT INTO team_sync_pending_packages VALUES ('project',1,'digest',X'00');
+             INSERT INTO team_sync_pending_profiles VALUES ('project','profile','consent-required');",
+        )?;
+        let state = cached_projects(&path).await;
+        let request = RequestEnvelope::new(
+            "status",
+            crate::AgentMethod::TeamSyncStatus,
+            serde_json::json!({"project_id":"project"}),
+        );
+        assert!(matches!(handle_team_sync_status(&request, &state).await,
+            ResponseEnvelope::Success(success)
+                if success.payload["state"] == "pending-values"
+                    && success.payload["pending_profiles"]["profile"] == "consent-required"
+                    && success.payload["pending_details"] == serde_json::json!([])
+                    && success.payload["last_error"].as_str().is_some_and(|text| text.contains("active local device missing"))));
+        assert_eq!(store.list_profiles("project")?, Vec::<locket_store::ProfileRecord>::new());
+        assert!(state.grants.lock().await.get("project").is_some());
         Ok(())
     }
 

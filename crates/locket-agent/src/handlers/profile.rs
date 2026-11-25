@@ -185,25 +185,42 @@ async fn set_active_profile(
         }
     }
 
-    let live_grants_to_revoke = {
-        let grants = state.grants.lock().await;
-        grants.count_for_project(&request.project_id)
-    };
     project_config.default_profile = profile_name;
-    write_project_config(&request.config_path, &project_config)?;
-    append_profile_change_audit(
-        &mut store,
-        request,
-        &prior_profile,
-        &new_profile,
-        u32::try_from(live_grants_to_revoke).unwrap_or(u32::MAX),
-        audit_key.as_ref(),
-        i64::try_from(now_unix_nanos).unwrap_or(i64::MAX),
-    )?;
-    let revoked = {
-        let mut grants = state.grants.lock().await;
-        grants.revoke_for_project(&request.project_id)
-    };
+    let document = updated_project_config(&request.config_path, &project_config)?;
+    let candidate = document.rendered_source()?;
+    let mut grants = state.grants.lock().await;
+    let live_grants_to_revoke = grants.count_for_project(&request.project_id);
+    // Write the audit first and compensate for a saved file if the database commit fails.
+    let mut file_saved = false;
+    let committed = store.with_atomic_write(|store| {
+        append_profile_change_audit(
+            store,
+            request,
+            &prior_profile,
+            &new_profile,
+            u32::try_from(live_grants_to_revoke).unwrap_or(u32::MAX),
+            audit_key.as_ref(),
+            i64::try_from(now_unix_nanos).unwrap_or(i64::MAX),
+        )?;
+        if let Err(error) = document.save() {
+            file_saved =
+                fs::read_to_string(&request.config_path).is_ok_and(|text| text == candidate);
+            return Err(SetActiveProfileError::from(error));
+        }
+        file_saved = true;
+        Ok(())
+    });
+    if let Err(error) = committed {
+        if file_saved && document.restore_if_current(&candidate).is_err() {
+            grants.revoke_for_project(&request.project_id);
+            return Err(SetActiveProfileError::MetadataInvalid(
+                "profile switch has a partial outcome; reload the project before retrying".into(),
+            ));
+        }
+        return Err(error);
+    }
+    let revoked = grants.revoke_for_project(&request.project_id);
+    drop(grants);
     state.publish_status_snapshot(now_unix_nanos).await;
     Ok(response_payload(
         true,
@@ -226,7 +243,10 @@ fn read_project_config(path: &Path) -> Result<ProjectConfig, SetActiveProfileErr
     Ok(config)
 }
 
-fn write_project_config(path: &Path, config: &ProjectConfig) -> Result<(), SetActiveProfileError> {
+fn updated_project_config(
+    path: &Path,
+    config: &ProjectConfig,
+) -> Result<locket_platform::PolicyFileDocument, SetActiveProfileError> {
     let mut document = locket_platform::PolicyFileDocument::read(path)?;
     let replacement: toml::Value = toml::from_str(&toml::to_string_pretty(config)?)?;
     if let (Some(current), Some(fields)) = (document.as_table_mut(), replacement.as_table()) {
@@ -234,8 +254,7 @@ fn write_project_config(path: &Path, config: &ProjectConfig) -> Result<(), SetAc
             current.insert(key.clone(), value.clone());
         }
     }
-    document.save()?;
-    Ok(())
+    Ok(document)
 }
 
 fn append_profile_change_audit(

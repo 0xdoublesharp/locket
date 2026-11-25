@@ -615,10 +615,16 @@ pub fn apply_package_with_consent_guarded(
         }
     }
     for member in statement.members.iter().filter(|m| !m.removed) {
-        if store
-            .get_team_member_by_device(&statement.team_id, &member.device.id)?
-            .is_some_and(|m| m.removed_at.is_some())
-        {
+        // Removed memberships remain authoritative even if a later roster omitted them.
+        let removed: bool = store.connection().query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM team_members
+                WHERE team_id = ?1 AND device_id = ?2 AND removed_at IS NOT NULL
+            )",
+            (&statement.team_id, &member.device.id),
+            |row| row.get(0),
+        )?;
+        if removed {
             return Err(reject("removed membership cannot be reinstated"));
         }
     }

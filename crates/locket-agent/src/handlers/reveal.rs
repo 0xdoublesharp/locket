@@ -1087,6 +1087,87 @@ mod tests {
         assert_eq!(error.error, "ProtocolError");
     }
 
+    #[tokio::test]
+    async fn denied_value_access_leaves_only_authenticated_denial_metadata()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = build_fixture()?;
+        let state = state_with_grant(&fixture, GrantAction::Reveal).await;
+        let valid = serde_json::to_value(reveal_request(&fixture, GrantAction::Reveal))?;
+        for (field, replacement, code) in [
+            ("grant_id", serde_json::Value::Null, "GrantRequired"),
+            ("project_id", serde_json::Value::Null, "ProtocolError"),
+            ("store_path", serde_json::Value::Null, "ProtocolError"),
+            (
+                "binding",
+                json!(GrantBinding::new(std::process::id(), "reused-pid")),
+                "GrantRequired",
+            ),
+            ("secret_name", json!("invalid name"), "InvalidSecretName"),
+        ] {
+            let mut payload = valid.clone();
+            payload[field] = replacement;
+            let request = RequestEnvelope::new("denied", AgentMethod::Reveal, payload);
+            let response = super::handle_reveal(&request, &state, 1).await;
+            assert!(!serde_json::to_string(&response)?.contains(&fixture.expected_value));
+            assert_eq!(error_code(response)?, code);
+        }
+        let request = RequestEnvelope::new("wrong-action", AgentMethod::Copy, valid);
+        let response = super::handle_copy(&request, &state, 1).await;
+        assert_eq!(error_code(response)?, "GrantRequired");
+        let malformed = RequestEnvelope::new("bad-copy", AgentMethod::Copy, json!({}));
+        assert_eq!(error_code(super::handle_copy(&malformed, &state, 1).await)?, "ProtocolError");
+
+        let store = Store::open(&fixture.store_path)?;
+        for row in store.list_audit_rows_since(PROJECT_ID, PROFILE_ID, 0)? {
+            assert_eq!(row.action, "AGENT_REVOKE");
+            assert_eq!(row.status, "DENIED");
+            assert!(row.secret_name.is_none());
+        }
+        assert_eq!(store.list_audit_rows_since(PROJECT_ID, PROFILE_ID, 0)?.len(), 3);
+        assert!(store.connection().query_row(
+            "SELECT NOT EXISTS (SELECT 1 FROM audit_log WHERE instr(metadata_json, ?1) > 0)",
+            [&fixture.expected_value],
+            |row| row.get::<_, bool>(0),
+        )?);
+        assert!(store.verify_audit_chain_read_only(PROJECT_ID, &[10; 32])?.hmac_ok);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reveal_denies_corrupt_blob_and_withholds_valid_values_when_audit_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = build_fixture()?;
+        let state = state_with_grant(&fixture, GrantAction::Reveal).await;
+        let store = Store::open(&fixture.store_path)?;
+        let request = RequestEnvelope::new(
+            "read",
+            AgentMethod::Reveal,
+            serde_json::to_value(reveal_request(&fixture, GrantAction::Reveal))?,
+        );
+        store.connection().execute_batch(
+            "CREATE TRIGGER refuse_value_audit BEFORE INSERT ON audit_log
+             WHEN NEW.action = 'REVEAL' BEGIN SELECT RAISE(ABORT, 'fixture denied'); END",
+        )?;
+        let response = super::handle_reveal(&request, &state, 1).await;
+        assert!(!serde_json::to_string(&response)?.contains(&fixture.expected_value));
+        assert_eq!(error_code(response)?, "CorruptDb");
+        assert_eq!(audit_metadata(&fixture)?, Vec::<serde_json::Value>::new());
+
+        store.connection().execute_batch("DROP TRIGGER refuse_value_audit")?;
+        store
+            .connection()
+            .execute("UPDATE blobs SET ciphertext = zeroblob(length(ciphertext))", [])?;
+        let response = super::handle_reveal(&request, &state, 1).await;
+        assert!(!serde_json::to_string(&response)?.contains(&fixture.expected_value));
+        assert_eq!(error_code(response)?, "CorruptDb");
+        let audit = audit_metadata(&fixture)?;
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0]["status"], "FAILURE");
+        assert_eq!(audit[0]["failure_reason"], "CorruptDb");
+        assert!(store.verify_audit_chain_read_only(PROJECT_ID, &[10; 32])?.hmac_ok);
+        Ok(())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn handle_reveal_returns_value_with_live_grant_and_unlock()
     -> Result<(), Box<dyn std::error::Error>> {

@@ -482,6 +482,20 @@ fn owner_poll_publishes_only_changes_and_offboarding_rotates_keys()
         )?;
     }
     team_sync::initialize_owner(&mut owner_store, "project", &statement.publisher, 100)?;
+    for (role, profiles, reason) in [
+        ("owner", vec!["profile".into()], "invalid recipient or role"),
+        ("developer", vec!["foreign-profile".into()], "profile outside project"),
+        (
+            "developer",
+            vec!["profile".into(), "profile".into()],
+            "recipient revoked or duplicate scope",
+        ),
+    ] {
+        assert!(matches!(team_sync::add_recipient(
+            &mut owner_store, "project", &statement.recipient, "receiver", role, &profiles, 100,
+        ), Err(team_sync::SyncError::Rejected(message)) if message == reason));
+        assert!(owner_store.find_device("project", &statement.recipient.id)?.is_none());
+    }
     team_sync::add_recipient(
         &mut owner_store,
         "project",
@@ -515,6 +529,25 @@ fn owner_poll_publishes_only_changes_and_offboarding_rotates_keys()
     let storage =
         locket_platform::WrappedLocalFileDevicePrivateKeyStorage::new(&key_root, "project", memory);
     storage.for_signing().store(&statement.publisher.fingerprint, &signer.to_bytes())?;
+    let inside_key_root = key_root.join("nested-share");
+    std::fs::create_dir(&inside_key_root)?;
+    assert!(
+        matches!(team_sync::configure_folder(&owner_store, "project", &inside_key_root, &key_root, true),
+        Err(team_sync::SyncError::Rejected(message)) if message.contains("must be separate"))
+    );
+    #[cfg(unix)]
+    {
+        let link = dir.path().join("shared-link");
+        std::os::unix::fs::symlink(&folder, &link)?;
+        assert!(
+            matches!(team_sync::configure_folder(&owner_store, "project", &link, &key_root, true),
+            Err(team_sync::SyncError::Rejected(message)) if message.contains("existing regular shared folder"))
+        );
+    }
+    team_sync::configure_folder(&owner_store, "project", &folder, &key_root, false)?;
+    assert!(matches!(team_sync::sync_folder(&mut owner_store, "project", &[22; 32], 150),
+        Err(team_sync::SyncError::Rejected(message)) if message.contains("explicit folder consent")));
+    assert_eq!(std::fs::read_dir(&folder)?.count(), 0);
     team_sync::configure_folder(&owner_store, "project", &folder, &key_root, true)?;
     assert_eq!(team_sync::sync_folder(&mut owner_store, "project", &[22; 32], 150)?.published, 2);
     assert_eq!(team_sync::sync_folder(&mut owner_store, "project", &[22; 32], 151)?.published, 0);
@@ -554,6 +587,10 @@ fn owner_poll_publishes_only_changes_and_offboarding_rotates_keys()
         team_sync::remove_member(&mut owner_store, "project", "receiver", &[22; 32], 152)?,
         vec!["TOKEN"]
     );
+    assert!(matches!(team_sync::add_recipient(
+        &mut owner_store, "project", &statement.recipient, "receiver", "developer",
+        &["profile".into()], 153,
+    ), Err(team_sync::SyncError::Rejected(message)) if message.contains("recipient revoked")));
     let new_key = team_sync::load_key(
         &owner_store,
         "project",
@@ -1132,15 +1169,21 @@ fn local_profile_name_collision_does_not_block_authenticated_head()
     Ok(())
 }
 
-#[test]
+#[tokio::test]
 #[allow(clippy::too_many_lines)] // Full independent-store collision/retention regression fixture.
-fn pending_profiles_preserve_security_keys_and_local_values_until_explicit_retry()
+async fn pending_profiles_preserve_security_keys_and_local_values_until_explicit_retry()
 -> Result<(), Box<dyn std::error::Error>> {
     for reason in ["consent-required", "secret-name-collision", "profile-name-collision"] {
         let dir = tempfile::tempdir()?;
-        let mut store = receiver(&dir.path().join("receiver.db"))?;
+        let path = dir.path().join("receiver.db");
+        let mut store = receiver(&path)?;
         let (mut statement, signer, sealing) = fixture()?;
         insert_local(&store, &statement.recipient)?;
+        let now = i64::try_from(
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),
+        )?;
+        statement.issued_at = now - 1;
+        statement.expires_at = now + 300;
         let first = SignedStatement::sign(&statement, &signer)?;
         team_sync::apply_package(
             &mut store,
@@ -1150,7 +1193,7 @@ fn pending_profiles_preserve_security_keys_and_local_values_until_explicit_retry
             &statement.recipient,
             "project",
             Some(&statement.publisher.fingerprint),
-            150,
+            now,
         )?;
         store.connection().execute("INSERT INTO secrets(id,project_id,profile_id,name,source,origin,required,current_version,state,created_at,updated_at) VALUES ('existing-local','project','profile','TOKEN','user-local','manual',0,1,'active',1,1)",[])?;
         store.connection().execute("INSERT INTO secret_versions(secret_id,version,source,origin,state,created_at) VALUES ('existing-local',1,'user-local','manual','current',1)",[])?;
@@ -1286,7 +1329,7 @@ fn pending_profiles_preserve_security_keys_and_local_values_until_explicit_retry
             &statement.recipient,
             "project",
             None,
-            150,
+            now,
             reason != "consent-required",
             None,
         )?;
@@ -1363,7 +1406,7 @@ fn pending_profiles_preserve_security_keys_and_local_values_until_explicit_retry
                 &sealing,
                 &statement.recipient,
                 false,
-                150,
+                now,
                 Some(&denied),
             )?;
             assert_eq!(held.pending_profiles, 1);
@@ -1390,17 +1433,12 @@ fn pending_profiles_preserve_security_keys_and_local_values_until_explicit_retry
             &statement.recipient,
             "project",
             None,
-            150,
+            now,
         )?;
         assert!(duplicate.duplicate);
         assert_eq!(team_sync::status(&store, "project")?.pending_profiles.len(), 1);
-        let details = team_sync::pending_profile_details(
-            &store,
-            "project",
-            &sealing,
-            &statement.recipient,
-            150,
-        )?;
+        let agent = ReconciliationAgent::new(&path, &statement.recipient.id, &sealing).await?;
+        let details = agent.status().await?.pending_details;
         assert_eq!(details.len(), 1);
         let dto = serde_json::to_string(&details)?;
         assert!(
@@ -1417,7 +1455,7 @@ fn pending_profiles_preserve_security_keys_and_local_values_until_explicit_retry
                     &sealing,
                     &statement.recipient,
                     true,
-                    150,
+                    now,
                     Some(&denied)
                 )
                 .is_err()
@@ -1434,7 +1472,7 @@ fn pending_profiles_preserve_security_keys_and_local_values_until_explicit_retry
                     &[22; 32],
                     &sealing,
                     &statement.recipient,
-                    150,
+                    now,
                     None
                 )
                 .is_err()
@@ -1448,7 +1486,7 @@ fn pending_profiles_preserve_security_keys_and_local_values_until_explicit_retry
                     &[22; 32],
                     &sealing,
                     &statement.recipient,
-                    150,
+                    now,
                     Some(&denied)
                 )
                 .is_err()
@@ -1463,7 +1501,7 @@ fn pending_profiles_preserve_security_keys_and_local_values_until_explicit_retry
                     &[22; 32],
                     &sealing,
                     &statement.recipient,
-                    150,
+                    now,
                     None
                 )
                 .is_err()
@@ -1477,17 +1515,14 @@ fn pending_profiles_preserve_security_keys_and_local_values_until_explicit_retry
             let versions = store.list_secret_versions("local-collision")?;
             let blobs =
                 [store.get_blob("local-collision", 1)?, store.get_blob("local-collision", 2)?];
-            team_sync::preserve_collision_as_override(
-                &mut store,
-                "project",
-                "profile",
-                "local-collision",
-                &[22; 32],
-                &sealing,
-                &statement.recipient,
-                150,
-                None,
-            )?;
+            agent
+                .reconcile(
+                    pending_id,
+                    locket_agent::TeamSyncAction::PreserveOverride {
+                        local_secret_id: "local-collision".into(),
+                    },
+                )
+                .await?;
             assert_eq!(
                 store.list_secret_versions("local-collision")?,
                 versions,
@@ -1584,7 +1619,7 @@ fn pending_profiles_preserve_security_keys_and_local_values_until_explicit_retry
                 3
             );
         }
-        if reason == "profile-name-collision" {
+        let delivery = if reason == "profile-name-collision" {
             assert_eq!(
                 details[0].colliding_profile.as_ref().ok_or("collision missing")?.id,
                 "personal-profile"
@@ -1600,7 +1635,7 @@ fn pending_profiles_preserve_security_keys_and_local_values_until_explicit_retry
                         &[22; 32],
                         &sealing,
                         &statement.recipient,
-                        150,
+                        now,
                         None
                     )
                     .is_err()
@@ -1616,24 +1651,41 @@ fn pending_profiles_preserve_security_keys_and_local_values_until_explicit_retry
                     &[22; 32],
                     &sealing,
                     &statement.recipient,
-                    150,
+                    now,
                     None
                 )
                 .is_err()
             );
-            team_sync::rename_local_profile_for_pending(
-                &mut store,
-                "project",
-                "incoming-profile",
-                "personal-profile",
-                "prod-local",
-                &[22; 32],
-                &sealing,
-                &statement.recipient,
-                150,
-                None,
-            )?;
-        }
+            let exchange = tempfile::tempdir()?;
+            let folder = exchange.path().join("share");
+            std::fs::create_dir(&folder)?;
+            let config = locket_agent::TeamSyncConfigureRequest {
+                scope: agent.scope.clone(),
+                folder: folder.clone(),
+                allow_dangerous: false,
+            };
+            let configured =
+                agent.sync_rpc(locket_agent::AgentMethod::TeamSyncConfigure, &config).await;
+            std::fs::remove_dir(&folder)?;
+            assert_eq!(configured?.epoch, 2);
+            // Saving the local resolution succeeds even when delivery later fails.
+            agent
+                .reconcile(
+                    pending_id,
+                    locket_agent::TeamSyncAction::RenameProfile {
+                        local_profile_id: "personal-profile".into(),
+                        new_name: "prod-local".into(),
+                    },
+                )
+                .await?;
+            assert!(agent.status().await?.last_error.is_some_and(|error| {
+                error.contains("Local resolution saved; delivery retry failed")
+            }));
+            std::fs::create_dir(&folder)?;
+            Some(exchange)
+        } else {
+            None
+        };
         let resumed = team_sync::resume_pending_profiles_guarded(
             &mut store,
             "project",
@@ -1641,11 +1693,16 @@ fn pending_profiles_preserve_security_keys_and_local_values_until_explicit_retry
             &sealing,
             &statement.recipient,
             true,
-            150,
+            now,
             None,
         )?;
         assert_eq!(resumed.pending_profiles, 0);
         assert_eq!(resumed.conflicts, 0, "rewrap must not invent local drift");
+        if let Some(_exchange) = delivery {
+            let status =
+                agent.sync_rpc(locket_agent::AgentMethod::TeamSyncNow, &agent.scope).await?;
+            assert!(status.last_error.is_none());
+        }
         assert_eq!(team_sync::status(&store, "project")?.state, "verified");
         assert!(team_sync::status(&store, "project")?.pending_profiles.is_empty());
         assert!(store.verify_audit_chain_read_only("project", &[23; 32])?.hmac_ok);
@@ -1994,6 +2051,223 @@ fn folder_gap_in_earlier_window_is_retryable_and_does_not_block_pending_consent(
     assert_eq!(caught_up.epoch, 4);
     assert_eq!(caught_up.state, "verified");
     assert_eq!(caught_up.applied, 2, "both predecessor and retained successor apply in order");
+    assert!(store.verify_audit_chain_read_only("project", &[23; 32])?.hmac_ok);
+    Ok(())
+}
+
+struct ReconciliationAgent {
+    state: locket_agent::AgentSocketState,
+    scope: locket_agent::TeamSyncRequest,
+}
+
+impl ReconciliationAgent {
+    async fn new(
+        path: &std::path::Path,
+        device_id: &str,
+        sealing: &[u8; 32],
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        use locket_agent::{AgentMethod, GrantBinding};
+        use locket_platform::{LocalDevicePrivateKeyStorage, MasterKeyStore};
+        use serde_json::json;
+        use std::sync::Arc;
+
+        let root = path.parent().ok_or("vault storage missing")?;
+        let master = Arc::new(locket_platform::MemoryMasterKeyStore::default());
+        master.store_master_key("project", &[22; 32])?;
+        locket_platform::WrappedLocalFileDevicePrivateKeyStorage::new(
+            root,
+            "project",
+            master.clone(),
+        )
+        .store(device_id, sealing)?;
+        let state = locket_agent::AgentSocketState::with_stores(
+            "test",
+            0,
+            master,
+            Arc::new(locket_platform::PassphraseFallbackMasterKeyStore::new(root.join("fallback"))),
+        );
+        let unlock = locket_agent::RequestEnvelope::new(
+            "unlock",
+            AgentMethod::Unlock,
+            json!({"project_id":"project", "store_path": path, "ttl_seconds": 60}),
+        );
+        assert!(matches!(
+            locket_agent::dispatch(&unlock, &state).await,
+            locket_agent::ResponseEnvelope::Success(_)
+        ));
+        let binding = GrantBinding::new(std::process::id(), "test client");
+        let grant = locket_agent::RequestEnvelope::new(
+            "grant",
+            AgentMethod::RequestGrant,
+            json!({"project_id": "project", "profile_id": "profile", "action": "TeamSync",
+                "binding": binding, "ttl_seconds": 60, "confirm_dangerous": true}),
+        );
+        let locket_agent::ResponseEnvelope::Success(grant) =
+            locket_agent::dispatch(&grant, &state).await
+        else {
+            return Err("team sync grant rejected".into());
+        };
+        let grant_id = grant.payload["grant_id"].as_str().ok_or("missing grant id")?.to_owned();
+        Ok(Self {
+            state,
+            scope: locket_agent::TeamSyncRequest {
+                project_id: "project".into(),
+                store_path: Some(path.to_owned()),
+                profile_id: Some("profile".into()),
+                grant_id: Some(grant_id),
+                binding: Some(binding),
+            },
+        })
+    }
+
+    async fn status(&self) -> Result<team_sync::SyncStatus, Box<dyn std::error::Error>> {
+        self.sync_rpc(locket_agent::AgentMethod::TeamSyncStatus, &self.scope).await
+    }
+
+    async fn reconcile(
+        &self,
+        incoming: &str,
+        action: locket_agent::TeamSyncAction,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let status = self
+            .sync_rpc(
+                locket_agent::AgentMethod::TeamSyncReconcile,
+                &locket_agent::TeamSyncReconcileRequest {
+                    scope: self.scope.clone(),
+                    incoming_profile_id: incoming.to_owned(),
+                    action,
+                },
+            )
+            .await?;
+        assert_eq!(status.epoch, 2);
+        assert_eq!(status.pending_profiles.len(), 1);
+        Ok(())
+    }
+
+    async fn sync_rpc(
+        &self,
+        method: locket_agent::AgentMethod,
+        payload: &(impl serde::Serialize + Sync),
+    ) -> Result<team_sync::SyncStatus, Box<dyn std::error::Error>> {
+        let request =
+            locket_agent::RequestEnvelope::new("sync", method, serde_json::to_value(payload)?);
+        match locket_agent::dispatch(&request, &self.state).await {
+            locket_agent::ResponseEnvelope::Success(success) => {
+                Ok(serde_json::from_value(success.payload)?)
+            }
+            locket_agent::ResponseEnvelope::Error(error) => {
+                Err(format!("{}: {}", error.error, error.message).into())
+            }
+        }
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // The three signed snapshots share the same verified history.
+fn signed_update_cannot_erase_personal_values_or_reinstate_removed_members()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let mut store = receiver(&dir.path().join("receiver.db"))?;
+    let (mut statement, signer, sealing) = fixture()?;
+    let observer = TeamMember {
+        id: "observer-member".into(),
+        name: "observer".into(),
+        role: "read-only".into(),
+        profiles: Vec::new(),
+        device: DeviceIdentity::new(
+            "observer-device".into(),
+            SigningKey::from_bytes(&[30; 32]).verifying_key().to_bytes(),
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from([31; 32])).to_bytes(),
+        ),
+        removed: false,
+    };
+    statement.members.push(observer.clone());
+    let first = SignedStatement::sign(&statement, &signer)?;
+    let bytes = first.seal(&statement.recipient.sealing_key)?;
+    let local = &statement.recipient;
+    let owner_pin = &statement.publisher.fingerprint;
+    assert_eq!(
+        team_sync::join_package_checkpoint(&bytes, &sealing, local, "project", owner_pin, 150)?.0,
+        1
+    );
+    assert!(
+        team_sync::join_package_checkpoint(&bytes, &sealing, local, "project", owner_pin, 801)
+            .is_err()
+    );
+    assert!(matches!(team_sync::apply_package(
+        &mut store, &bytes, &[22; 32], &sealing, local, "project", Some(owner_pin), 150,
+    ), Err(team_sync::SyncError::Rejected(message)) if message == "prepare a local device before joining"));
+    insert_local(&store, local)?;
+    assert!(matches!(team_sync::apply_package(
+        &mut store, &bytes, &[22; 32], &sealing, &statement.publisher, "project", Some(owner_pin), 150,
+    ), Err(team_sync::SyncError::Rejected(message)) if message == "recipient differs from local device"));
+    assert_eq!(team_sync::status(&store, "project")?.epoch, 0);
+    team_sync::apply_package(
+        &mut store,
+        &bytes,
+        &[22; 32],
+        &sealing,
+        local,
+        "project",
+        Some(owner_pin),
+        150,
+    )?;
+    store.connection().execute(
+        "INSERT INTO secrets(id,project_id,profile_id,name,source,origin,required,current_version,state,created_at,updated_at)
+         VALUES ('local-token','project','profile','TOKEN','user-local','manual',0,1,'active',1,1)",
+        [],
+    )?;
+    statement.epoch = 2;
+    statement.previous_digest = locket_core::team_package::digest(&first.statement);
+    statement.profiles[0].secrets.clear();
+    statement.members.retain(|member| member.id != observer.id);
+
+    let next =
+        SignedStatement::sign(&statement, &signer)?.seal(&statement.recipient.sealing_key)?;
+    let apply = team_sync::apply_package(
+        &mut store,
+        &next,
+        &[22; 32],
+        &sealing,
+        &statement.recipient,
+        "project",
+        None,
+        151,
+    )?;
+    assert_eq!(apply.conflicts, 0);
+    assert_eq!(team_sync::status(&store, "project")?.epoch, 2);
+    let shared = store
+        .get_secret_by_source("project", "profile", "TOKEN", "team-managed")?
+        .ok_or("shared tombstone missing")?;
+    assert_eq!(shared.state, "deleted");
+    assert!(shared.deleted_at.is_some());
+    assert_eq!(
+        store
+            .get_active_secret("project", "profile", "TOKEN", "user-local")?
+            .ok_or("local value missing")?
+            .id,
+        "local-token"
+    );
+    let revoked =
+        store.get_team_member("team", "observer-member")?.ok_or("observer membership missing")?;
+    assert!(revoked.removed_at.is_some());
+    let removed = SignedStatement::sign(&statement, &signer)?;
+    statement.epoch = 3;
+    statement.previous_digest = locket_core::team_package::digest(&removed.statement);
+    statement.members.push(observer);
+    let reinstated =
+        SignedStatement::sign(&statement, &signer)?.seal(&statement.recipient.sealing_key)?;
+    assert!(matches!(team_sync::apply_package(
+        &mut store, &reinstated, &[22; 32], &sealing, &statement.recipient, "project", None, 152,
+    ), Err(team_sync::SyncError::Rejected(message)) if message == "removed membership cannot be reinstated"));
+    assert_eq!(team_sync::status(&store, "project")?.epoch, 2);
+    assert!(
+        store
+            .get_team_member("team", "observer-member")?
+            .ok_or("observer membership missing")?
+            .removed_at
+            .is_some()
+    );
     assert!(store.verify_audit_chain_read_only("project", &[23; 32])?.hmac_ok);
     Ok(())
 }

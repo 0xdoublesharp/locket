@@ -683,6 +683,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_stored_config_types_return_redacted_errors_without_rewriting_files()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("config.toml");
+        let state = AgentSocketState::locked("test");
+        let read =
+            RequestEnvelope::new("read", AgentMethod::ReadConfig, json!({"config_path": path}));
+        let canary = "config-secret-canary";
+        for (contents, expected) in [
+            (format!("privacy = '{canary}'\n"), "config section is not a table"),
+            (
+                format!("[privacy]\nredact_names = '{canary}'\n"),
+                "invalid stored config value for privacy.redact_names",
+            ),
+            (
+                "[agent]\nunlock_ttl = 30\n".to_owned(),
+                "invalid stored config value for agent.unlock_ttl",
+            ),
+            (format!("[agent]\nunlock_ttl = '{canary}'\n"), "invalid config duration"),
+        ] {
+            fs::write(&path, &contents)?;
+            assert!(matches!(dispatch(&read, &state).await, ResponseEnvelope::Error(error)
+                if error.error == "MetadataInvalid" && error.message == expected
+                    && !error.message.contains(canary)));
+            assert_eq!(fs::read_to_string(&path)?, contents);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn read_config_defaults_missing_values() {
         let directory = tempdir().expect("tempdir");
         let request = ReadConfigRequest {

@@ -360,14 +360,6 @@ impl ConflictResolution {
             BundleConflictMode::Review => Self::Review,
         }
     }
-
-    const fn label(self) -> &'static str {
-        match self {
-            Self::AcceptIncoming => "accept-incoming",
-            Self::AcceptLocal => "accept-local",
-            Self::Review => "review",
-        }
-    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -765,39 +757,45 @@ fn import_bundle(
         });
     }
     let timestamp = current_unix_nanos_i64();
-    let outcome = apply_bundle_payload(
-        &mut store,
-        &request.project_id,
-        &payload,
-        resolution,
-        &unlocked.master_key,
-        timestamp,
-        request.confirm_dangerous,
-    )?;
-    let (applied, conflicts) = match outcome {
-        ApplyOutcome::Applied { applied, conflicts } => (applied, conflicts),
-        ApplyOutcome::ReviewRequired { divergent } => {
-            return Err((
-                "InvalidReference",
-                format!(
-                    "bundle conflicts require accept-incoming or accept-local: {}",
-                    divergent.join(", ")
-                ),
-            ));
-        }
-    };
-    write_import_audit(
-        &mut store,
-        &request.project_id,
-        &unlocked.master_key,
-        &bundle.manifest,
-        &counts,
-        &applied,
-        &conflicts,
-        resolution.label(),
-        request.include_audit,
-        timestamp,
-    )?;
+    let (applied, conflicts) = store
+        .with_atomic_write(|store| {
+            let outcome = apply_bundle_payload(
+                store,
+                &request.project_id,
+                &payload,
+                resolution,
+                &unlocked.master_key,
+                timestamp,
+                request.confirm_dangerous,
+            )
+            .map_err(AtomicImportError)?;
+            let (applied, conflicts) = match outcome {
+                ApplyOutcome::Applied { applied, conflicts } => (applied, conflicts),
+                ApplyOutcome::ReviewRequired { divergent } => {
+                    return Err(AtomicImportError((
+                        "InvalidReference",
+                        format!(
+                            "bundle conflicts require accept-incoming or accept-local: {}",
+                            divergent.join(", ")
+                        ),
+                    )));
+                }
+            };
+            write_import_audit(
+                store,
+                &request.project_id,
+                &unlocked.master_key,
+                &bundle.manifest,
+                &counts,
+                &applied,
+                &conflicts,
+                request.include_audit,
+                timestamp,
+            )
+            .map_err(AtomicImportError)?;
+            Ok((applied, conflicts))
+        })
+        .map_err(|error: AtomicImportError| error.0)?;
     Ok(BackupActionResponse {
         action: "import-bundle".to_owned(),
         status: "applied".to_owned(),
@@ -813,6 +811,14 @@ fn import_bundle(
             conflicts.rejected,
         ),
     })
+}
+
+struct AtomicImportError((&'static str, String));
+
+impl From<locket_store::StoreError> for AtomicImportError {
+    fn from(error: locket_store::StoreError) -> Self {
+        Self(("CorruptDb", format!("could not commit bundle import: {error}")))
+    }
 }
 
 fn decrypt_local_bundle(
@@ -1058,7 +1064,7 @@ fn external_env_source_label(source: &ExternalEnvSource) -> String {
 }
 
 fn validate_bundle_project_scope(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &rusqlite::Connection,
     project_id: &str,
     payload: &SealedBundlePayloadV1,
     confirm_dangerous: bool,
@@ -1179,7 +1185,7 @@ fn apply_bundle_payload(
     let mut divergent = Vec::new();
     let transaction = store
         .connection_mut()
-        .transaction()
+        .savepoint()
         .map_err(|error| ("CorruptDb", format!("apply transaction begin failed: {error}")))?;
 
     validate_bundle_project_scope(&transaction, project_id, payload, confirm_dangerous)?;
@@ -1562,7 +1568,7 @@ fn apply_bundle_payload(
     }
 
     if !divergent.is_empty() && resolution == ConflictResolution::Review {
-        transaction.rollback().map_err(|error| {
+        transaction.finish().map_err(|error| {
             ("CorruptDb", format!("apply transaction rollback failed: {error}"))
         })?;
         return Ok(ApplyOutcome::ReviewRequired { divergent });
@@ -1629,7 +1635,7 @@ struct LocalProfileRow {
 }
 
 fn read_local_profile(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &rusqlite::Connection,
     project_id: &str,
     profile_id: &str,
 ) -> BackupResult<Option<LocalProfileRow>> {
@@ -1667,7 +1673,7 @@ struct LocalSecretRow {
 }
 
 fn read_local_secret(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &rusqlite::Connection,
     secret_id: &str,
 ) -> BackupResult<Option<LocalSecretRow>> {
     use rusqlite::OptionalExtension;
@@ -1709,7 +1715,7 @@ struct LocalSecretVersionRow {
 }
 
 fn read_local_secret_version(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &rusqlite::Connection,
     secret_id: &str,
     version: u32,
 ) -> BackupResult<Option<LocalSecretVersionRow>> {
@@ -1744,7 +1750,7 @@ struct LocalBlobRow {
 }
 
 fn read_local_blob(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &rusqlite::Connection,
     secret_id: &str,
     version: u32,
 ) -> BackupResult<Option<LocalBlobRow>> {
@@ -1778,7 +1784,7 @@ fn read_local_blob(
 }
 
 fn deprecate_local_current_version(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &rusqlite::Connection,
     secret_id: &str,
     now: i64,
 ) -> BackupResult<()> {
@@ -1794,7 +1800,7 @@ fn deprecate_local_current_version(
 }
 
 fn insert_secret_version(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &rusqlite::Connection,
     version: &SealedBundleSecretVersionV1,
 ) -> BackupResult<()> {
     transaction
@@ -1820,10 +1826,7 @@ fn insert_secret_version(
     Ok(())
 }
 
-fn insert_blob(
-    transaction: &rusqlite::Transaction<'_>,
-    blob: &SecretBlobRecord,
-) -> BackupResult<()> {
+fn insert_blob(transaction: &rusqlite::Connection, blob: &SecretBlobRecord) -> BackupResult<()> {
     transaction
         .execute(
             "INSERT INTO blobs(
@@ -1845,10 +1848,7 @@ fn insert_blob(
     Ok(())
 }
 
-fn update_blob(
-    transaction: &rusqlite::Transaction<'_>,
-    blob: &SecretBlobRecord,
-) -> BackupResult<()> {
+fn update_blob(transaction: &rusqlite::Connection, blob: &SecretBlobRecord) -> BackupResult<()> {
     transaction
         .execute(
             "UPDATE blobs
@@ -1900,10 +1900,7 @@ fn parse_key_purpose(value: &str) -> BackupResult<KeyPurpose> {
     match value {
         v if v == KeyPurpose::ProfileSecret.as_str() => Ok(KeyPurpose::ProfileSecret),
         v if v == KeyPurpose::ProfileFingerprint.as_str() => Ok(KeyPurpose::ProfileFingerprint),
-        other => Err((
-            "BundleVerificationFailed",
-            format!("unknown profile key purpose in bundle: {other}"),
-        )),
+        _ => Err(("BundleVerificationFailed", "unknown profile key purpose in bundle".to_owned())),
     }
 }
 
@@ -2114,7 +2111,6 @@ fn write_import_audit(
     decrypted: &ImportedBundleCounts,
     applied: &AppliedBundleCounts,
     conflicts: &BundleConflictCounts,
-    conflict_policy: &str,
     include_audit_requested: bool,
     timestamp: i64,
 ) -> BackupResult<()> {
@@ -2140,13 +2136,14 @@ fn write_import_audit(
         "applied_blob_count": applied.blob_count,
         "applied_command_policy_count": applied.command_policy_count,
         "applied_profile_key_count": applied.profile_key_count,
-        "conflict_policy": conflict_policy,
-        "conflict_identical": conflicts.identical,
-        "conflict_newer_incoming": conflicts.newer_incoming,
-        "conflict_divergent": conflicts.divergent,
-        "conflict_deleted_vs_active": conflicts.deleted_vs_active,
-        "conflict_applied": conflicts.applied,
-        "conflict_rejected": conflicts.rejected,
+        "conflict_counts": {
+            "identical": conflicts.identical,
+            "newer_incoming": conflicts.newer_incoming,
+            "divergent": conflicts.divergent,
+            "deleted_vs_active": conflicts.deleted_vs_active,
+            "applied": conflicts.applied,
+            "rejected": conflicts.rejected,
+        },
         "include_audit_requested": include_audit_requested,
         "metadata_only": true,
         "client_kind": "agent",
@@ -2358,6 +2355,9 @@ fn error_response(envelope: &RequestEnvelope, error: &str, message: &str) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[path = "backup_rpc_tests.rs"]
+    mod rpc;
+
     #[tokio::test]
     async fn verify_bundle_rejects_digest_mismatch() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
@@ -2384,6 +2384,14 @@ mod tests {
         let response = crate::dispatch(&request, &state).await;
         assert!(matches!(response, ResponseEnvelope::Error(error)
             if error.error == "BundleVerificationFailed" && error.message.contains("digest")));
+        let invalid_body = b"private-input-invalid-age-header".to_vec();
+        let mut invalid_manifest = bundle.manifest.clone();
+        invalid_manifest.payload_digest = bundle_encrypted_payload_digest(&invalid_body);
+        // A correct digest alone must never pass structural verification.
+        fs::write(&path, BundleContainer::new(invalid_manifest, invalid_body)?.serialize()?)?;
+        assert!(matches!(crate::dispatch(&request, &state).await,
+            ResponseEnvelope::Error(error) if error.error == "BundleVerificationFailed"
+                && !error.message.contains("private-input-invalid-age-header")));
         bundle.manifest.payload_digest = bundle_encrypted_payload_digest(&bundle.encrypted_payload);
         fs::write(&path, bundle.serialize()?)?;
         assert!(matches!(crate::dispatch(&request, &state).await, ResponseEnvelope::Success(_)));

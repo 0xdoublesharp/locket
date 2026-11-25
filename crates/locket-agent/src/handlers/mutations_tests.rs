@@ -986,3 +986,195 @@ async fn copy_to_shared_requires_both_unlocks_and_rotates_only_with_explicit_ove
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn copy_to_shared_rejects_stale_sources_and_invalid_destinations_without_writes()
+-> Result<(), Box<dyn std::error::Error>> {
+    const TARGET: &str = "lk_prof_global_default";
+    let fixture = Fixture::new()?;
+    let db = fixture.store();
+    let action = GrantAction::CopySecretToShared;
+    let state = fixture.state(action).await;
+    let method = crate::AgentMethod::CopySecretToShared;
+    let request = crud_request(method, &fixture.scope, json!({"secret_name":"TOKEN"}));
+    import_dotenv_with_master(&fixture.import(&format!("TOKEN={CANARY}\n"), false), &MASTER, 2)?;
+    let original = db
+        .get_active_secret(PROJECT, PROFILE, "TOKEN", "user-local")?
+        .ok_or("source not stored")?;
+    assert_eq!(code(call_crud(&state, &request).await), "ProjectNotFound");
+    db.insert_project_if_absent(SHARED_PROJECT, "@shared", 1)?;
+    unlock_fixture(&state, SHARED_PROJECT, &MASTER).await;
+
+    fixture.grant(&state, action).await;
+    assert_eq!(code(call_crud(&state, &request).await), "ProfileNotFound");
+    db.insert_profile_if_absent(TARGET, SHARED_PROJECT, "default", true, 1)?;
+    insert_wrapped_keys(&db, SHARED_PROJECT, TARGET, &MASTER, &AUDIT)?;
+    fixture.grant(&state, action).await;
+    assert_eq!(code(call_crud(&state, &request).await), "ConfirmationFailed");
+    db.set_profile_dangerous(SHARED_PROJECT, "default", false)?;
+
+    let foreign = fixture.directory.path().join("different.db");
+    let _foreign_store = Store::open(&foreign)?;
+    let mut pinned =
+        UnlockEntry::new(MASTER.to_vec(), 0, Duration::from_secs(60), UnlockMethod::Passphrase);
+    pinned.store_identity = Some(crate::keys::StoreFileIdentity::capture(&foreign)?.1);
+    state.unlock_cache.lock().await.insert(SHARED_PROJECT.to_owned(), pinned);
+    fixture.grant(&state, action).await;
+    assert_eq!(code(call_crud(&state, &request).await), "AccessDenied");
+    unlock_fixture(&state, SHARED_PROJECT, &MASTER).await;
+
+    for (field, value, expected) in [
+        ("source", json!(CANARY), "InvalidReference"),
+        ("source", json!("team-managed"), "SecretNotFound"),
+        ("secret_name", json!("invalid name"), "InvalidSecretName"),
+    ] {
+        let mut request = request.clone();
+        request.payload[field] = value;
+        fixture.grant(&state, action).await;
+        assert_eq!(code(call_crud(&state, &request).await), expected);
+        assert!(state.grants.lock().await.is_empty());
+    }
+
+    db.set_secret_expiry_policy(
+        &original.id,
+        locket_store::SecretExpiryPolicy { expires_at: Some(5), rotate_after_days: None },
+        original.updated_at,
+    )?;
+    fixture.grant(&state, action).await;
+    assert_eq!(code(call_crud(&state, &request).await), "MetadataInvalid");
+    db.set_secret_expiry_policy(
+        &original.id,
+        locket_store::SecretExpiryPolicy { expires_at: None, rotate_after_days: None },
+        original.updated_at,
+    )?;
+    db.connection().execute(
+        "UPDATE secret_versions SET state = 'deprecated', deprecated_at = 5 WHERE secret_id = ?1",
+        [&original.id],
+    )?;
+    fixture.grant(&state, action).await;
+    assert_eq!(code(call_crud(&state, &request).await), "SecretVersionExpired");
+    db.connection().execute(
+        "UPDATE secret_versions SET state = 'current', deprecated_at = NULL WHERE secret_id = ?1",
+        [&original.id],
+    )?;
+    db.connection().execute(
+        "INSERT INTO secrets(id,project_id,profile_id,name,source,origin,required,current_version,state,created_at,updated_at,deleted_at)
+         VALUES ('target-tombstone',?1,?2,'TOKEN','user-local','manual',0,1,'deleted',1,1,1)",
+        [SHARED_PROJECT, TARGET],
+    )?;
+    let mut overwrite = request.clone();
+    overwrite.payload["overwrite"] = json!(true);
+    fixture.grant(&state, action).await;
+    assert_eq!(code(call_crud(&state, &overwrite).await), "SecretDeleted");
+    assert_eq!(
+        db.get_secret_by_source(SHARED_PROJECT, TARGET, "TOKEN", "user-local")?
+            .ok_or("tombstone was lost")?
+            .state,
+        "deleted"
+    );
+    assert!(db.get_active_secret(SHARED_PROJECT, TARGET, "TOKEN", "user-local")?.is_none());
+    assert_eq!(db.list_recent_audit_actions(SHARED_PROJECT, 5)?, Vec::<String>::new());
+    assert_eq!(db.get_active_secret(PROJECT, PROFILE, "TOKEN", "user-local")?, Some(original));
+    Ok(())
+}
+
+#[tokio::test]
+async fn policy_create_rename_delete_keep_grant_snapshots_in_sync_with_durable_authority()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = Fixture::new()?;
+    let path = fixture.scope.project_root.join("locket.toml");
+    let original = std::fs::read(&path)?;
+    let action = GrantAction::ApplyPolicy;
+    let method = crate::AgentMethod::ApplyPolicy;
+    let state = fixture.state(action).await;
+    let store = fixture.store();
+    let mut request = fixture.policy();
+    request.mode = "create".into();
+    request.original_name.clear();
+    assert_eq!(
+        code(handle_apply_policy(&envelope(method, &request), &state, NOW).await),
+        "SecretAlreadyExists"
+    );
+    request.mode = "edit".into();
+    request.original_name = "missing".into();
+    assert_eq!(
+        code(handle_apply_policy(&envelope(method, &request), &state, NOW).await),
+        "PolicyNotFound"
+    );
+    request.original_name = "dev".into();
+    request.policy.optional_secrets = request.policy.required_secrets.clone();
+    assert_eq!(
+        code(handle_apply_policy(&envelope(method, &request), &state, NOW).await),
+        "MetadataInvalid"
+    );
+    assert!(state.command_policies.lock().await.is_empty());
+    assert_eq!(std::fs::read(&path)?, original);
+    assert!(store.get_command_policy_index(PROJECT, "dev")?.is_none());
+
+    let mut raw = String::from_utf8(original)?;
+    raw = raw.replace("['ide']", "['parent', { file = '.env' }, 'compose', 'ide']");
+    std::fs::write(&path, raw)?;
+    request.policy.optional_secrets.clear();
+    request.policy.allowed_secrets.push("SECOND_TOKEN".into());
+    request.policy.command_kind = "shell".into();
+    request.policy.command_preview = "printf 'fixture'".into();
+    assert!(matches!(
+        handle_apply_policy(&envelope(method, &request), &state, NOW).await,
+        ResponseEnvelope::Success(_)
+    ));
+    let patched = PolicyDocument::from_toml_str(&std::fs::read_to_string(&path)?)?;
+    assert_eq!(
+        patched.commands["dev"].optional_secrets.iter().map(SecretName::as_str).collect::<Vec<_>>(),
+        ["SECOND_TOKEN"]
+    );
+    assert_eq!(patched.commands["dev"].external_env_sources.len(), 4);
+
+    request.policy.name = "renamed".into();
+    assert!(matches!(
+        handle_apply_policy(&envelope(method, &request), &state, NOW + 1).await,
+        ResponseEnvelope::Success(_)
+    ));
+    let snapshots = state.command_policies.lock().await;
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].name, "renamed");
+    assert_eq!(snapshots[0].command_kind, "shell");
+    drop(snapshots);
+    assert!(store.get_command_policy_index(PROJECT, "dev")?.is_none());
+    assert!(store.get_command_policy_index(PROJECT, "renamed")?.is_some());
+
+    request.mode = "delete".into();
+    request.original_name.clear();
+    assert!(matches!(
+        handle_apply_policy(&envelope(method, &request), &state, NOW + 2).await,
+        ResponseEnvelope::Success(_)
+    ));
+    assert!(state.command_policies.lock().await.is_empty());
+    assert!(store.get_command_policy_index(PROJECT, "renamed")?.is_none());
+    assert!(PolicyDocument::from_toml_str(&std::fs::read_to_string(path)?)?.commands.is_empty());
+    assert_eq!(store.list_recent_audit_actions(PROJECT, 10)?, vec!["POLICY_UPDATE"; 3]);
+    assert!(store.verify_audit_chain_read_only(PROJECT, &AUDIT)?.hmac_ok);
+    Ok(())
+}
+
+#[test]
+fn dotenv_no_overwrite_keeps_prior_ciphertext_and_only_audits_new_names()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = Fixture::new()?;
+    import_dotenv_with_master(&fixture.import(&format!("TOKEN={CANARY}\n"), false), &MASTER, 1)?;
+    let store = fixture.store();
+    let original = store
+        .get_active_secret(PROJECT, PROFILE, "TOKEN", "user-local")?
+        .ok_or("original source missing")?;
+    let blob = store.get_blob(&original.id, 1)?.ok_or("original ciphertext missing")?;
+    let import = fixture.import("TOKEN=unexpected\nNEW_TOKEN=new\n", false);
+    let applied = import_dotenv_with_master(&import, &MASTER, 2)?;
+    assert_eq!((applied.imported, applied.skipped, applied.overwritten), (1, 1, 0));
+    assert_eq!(store.get_active_secret(PROJECT, PROFILE, "TOKEN", "user-local")?, Some(original));
+    assert_eq!(store.get_blob(&blob.secret_id, 1)?, Some(blob));
+    let rows = store.list_audit_rows_since(PROJECT, PROFILE, 0)?;
+    assert!(rows.iter().all(|row| row.action == "IMPORT"));
+    let names: Vec<_> = rows.iter().filter_map(|row| row.secret_name.as_deref()).collect();
+    assert_eq!(names, ["TOKEN", "NEW_TOKEN"]);
+    assert!(store.verify_audit_chain_read_only(PROJECT, &AUDIT)?.hmac_ok);
+    Ok(())
+}
