@@ -36,15 +36,16 @@ CARGO_OFFLINE_FLAG :=
 endif
 
 .PHONY: ci ci-local ci-strict fmt fmt-check clippy test nextest coverage coverage-html coverage-branch mutation supply-chain supply-chain-local audit deny vet unsafe-inventory sbom third-party-notices supply-chain-exceptions dependency-hygiene machete udeps bench-fixtures bench bench-ci bench-report bench-regression perf-agent-idle-memory perf-passphrase-unlock perf-recovery-envelope-unlock perf-cli-cold-start slsa-provenance fuzz-list fuzz-smoke fuzz fuzz-nightly fuzz-minimize leak-canary formal-check docs-check distribution-check app-ui-install app-ui-check app-ui-build vscode-vsix-package release-auditable release-auditable-print-deps clean
+.PHONY: kani-check miri-check tauri-security-check reproducible-check
 
 # Local default gate. It avoids network by default and skips missing optional tools
 # with explicit warnings. Use `make ci-strict OFFLINE=0 STRICT=1` for release-style
 # blocking checks.
 ci: ci-local
 
-ci-local: fmt-check clippy test leak-canary bench-ci supply-chain-local dependency-hygiene
+ci-local: fmt-check tauri-security-check clippy test leak-canary bench-ci supply-chain-local dependency-hygiene
 
-ci-strict: fmt-check clippy test coverage coverage-branch mutation leak-canary docs-check bench-ci deny audit vet unsafe-inventory sbom dependency-hygiene slsa-provenance fuzz-smoke
+ci-strict: fmt-check tauri-security-check clippy test coverage coverage-branch mutation leak-canary docs-check bench-ci deny audit vet unsafe-inventory sbom dependency-hygiene slsa-provenance fuzz-smoke
 
 fmt:
 	$(CARGO) fmt --all
@@ -187,11 +188,26 @@ leak-canary:
 formal-check:
 	scripts/formal-check.sh
 
+kani-check miri-check:
+	@if [ -f "scripts/$@.sh" ]; then \
+		CARGO="$(CARGO)" STRICT="$(STRICT)" bash "scripts/$@.sh"; \
+	elif [ "$(STRICT)" = "1" ]; then \
+		echo "scripts/$@.sh is required for $@" >&2; exit 127; \
+	else \
+		echo "skip: scripts/$@.sh is unavailable"; \
+	fi
+
 docs-check:
 	scripts/docs-check.mjs
 
 distribution-check:
 	scripts/validate-distribution.sh
+
+tauri-security-check:
+	node scripts/check-tauri-security.mjs
+
+reproducible-check:
+	CARGO="$(CARGO)" CARGO_JOBS="$(CARGO_JOBS)" scripts/reproducible-build-check.sh
 
 app-ui-install:
 	@if [ -z "$(PNPM)" ]; then \

@@ -109,11 +109,15 @@ jobs:
       - name: Install release audit tools
         run: cargo install --locked --jobs "$CARGO_JOBS" cargo-auditable rust-audit-info cargo-audit cargo-cyclonedx
 
-      - name: Validate package manifests and signing inputs
+      - name: Validate package manifests, signing inputs, and desktop security
         run: make distribution-check
 
       - name: Fetch locked dependencies for offline quality checks
         run: cargo fetch --locked
+
+      - name: Verify reproducible CLI builds
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        run: make reproducible-check
 
       - name: Generate release quality artifacts
         id: quality

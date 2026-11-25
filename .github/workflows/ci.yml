@@ -48,6 +48,11 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show
 
+      - name: Install Node for distribution checks
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
       - name: Install Tauri Linux system dependencies
         run: |
           sudo apt-get update
@@ -96,7 +101,7 @@ jobs:
       - name: Generate third-party notices
         run: make third-party-notices
 
-      - name: Validate distribution package definitions
+      - name: Validate distribution definitions and desktop security
         run: make distribution-check
 
       - name: Probe OS-host validation harnesses

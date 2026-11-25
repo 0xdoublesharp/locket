@@ -2,7 +2,9 @@
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 unmaintained = "workspace"
+unsound = "workspace"
 yanked = "deny"
+unused-ignored-advisory = "deny"
 ignore = []
 
 [licenses]
@@ -38,9 +40,17 @@ exceptions = [
 
 [bans]
 multiple-versions = "warn"
+multiple-versions-include-dev = true
 wildcards = "deny"
 allow-wildcard-paths = true
 highlight = "all"
+deny = [
+  # Use one reviewed version of each cryptography and bundled SQLite dependency.
+  { crate = "aws-lc-rs", deny-multiple-versions = true },
+  { crate = "aws-lc-sys", deny-multiple-versions = true },
+  { crate = "libsqlite3-sys", deny-multiple-versions = true },
+  { crate = "rusqlite", deny-multiple-versions = true },
+]
 skip = []
 skip-tree = []
 
@@ -48,3 +58,4 @@ skip-tree = []
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

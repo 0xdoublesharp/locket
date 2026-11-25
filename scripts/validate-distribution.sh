@@ -21,11 +21,13 @@ skip_or_check() {
 }
 
 check node scripts/distribution.mjs versions
+check node scripts/check-tauri-security.mjs
 check node --test scripts/distribution.test.mjs
-check python3 scripts/package_contents_test.py
+check python3 -B scripts/package_contents_test.py
 check bash -n scripts/package-vscode-extension.sh
 check bash -n scripts/package-native-installers.sh
 check bash -n scripts/package-cargo-auditable.sh
+check bash -n scripts/reproducible-build-check.sh
 check bash -n scripts/render-homebrew-formula.sh
 check bash -n scripts/release-operator-runbook.sh
 check bash -n scripts/validate-local-user-auth-real-host.sh

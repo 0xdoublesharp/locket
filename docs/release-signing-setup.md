@@ -178,3 +178,56 @@ path and a matching public key ID. Its single detached signature must not be
 mistaken for proof of the documented 3-of-5 release quorum. Verify that full
 ceremony and downstream quorum checks before a public release, and keep its
 private material off build runners.
+
+## Verify reproducible CLI builds
+
+From the release commit, run `make reproducible-check` with the pinned Rust
+toolchain, the native compiler and SDK used for the target, and the locked Cargo
+dependencies already cached. The release workflow runs this check on Linux and
+macOS after fetching the locked dependencies. On a local Mac, use the shared
+compute broker.
+
+```sh
+TMPDIR=/Volumes/Scratch/locket/t compute run --class heavy --where local --sync "$PWD" -- make reproducible-check
+```
+
+The check builds the release-profile `locket` CLI offline in two fresh build
+directories. It uses the current commit timestamp as `SOURCE_DATE_EPOCH`, remaps
+compiler paths, disables incremental compilation, and requires identical SHA-256
+digests. Local build directories live under `/Volumes/Scratch/locket/tmp`. CI
+places them under `TMPDIR`. To diagnose a mismatch, rerun with
+`LOCKET_KEEP_REPRO_BUILDS=1` and compare the two retained binaries.
+
+The digests apply to the CLI produced by this command on the same host and
+toolchain. Verify the provenance of the separately built auditable release
+binaries, and verify native signatures and notarization on the packaged artifacts.
+
+## Set up Cargo Vet
+
+Run `cargo vet init` once at the workspace root and review the generated
+`supply-chain/` files alongside `Cargo.lock`. Initialization creates exemptions
+for the current dependency graph. Replace those exemptions with review records
+as audits are completed. Use `safe-to-deploy` for shipped dependencies and
+`safe-to-run` for test-only dependencies. For the dependencies below, require
+`safe-to-deploy` coverage for every version used by a shipped target before
+approving the release. [Cargo Vet setup](https://mozilla.github.io/cargo-vet/setup.html).
+
+| Dependency | Review scope |
+| --- | --- |
+| `aws-lc-sys` | Bundled AWS-LC source provenance, native build and linking, and the Rust FFI boundary. |
+| `rusqlite` | Rust bindings and bundled SQLite provenance, with a corresponding review of `libsqlite3-sys`. |
+| `objc2` | Objective-C runtime calls, ownership and lifetime assumptions, and enabled Apple framework bindings. |
+| `windows-sys` | Generated bindings, enabled Win32 API families, and every locked version in a shipped Windows target. |
+
+Record a versioned audit with `cargo vet certify <crate> <version> --criteria
+safe-to-deploy` after reviewing the published source. Review the diff from the
+last audited version when upgrading. Import third-party audits only after
+verifying the audit publisher, review criteria, and version coverage. Require
+version-specific audits for the four dependencies above and keep any other
+temporary exemptions scoped to a version with an owner, reason, and expiry.
+[Cargo Vet audit commands](https://mozilla.github.io/cargo-vet/commands.html#cargo-vet-certify).
+
+Commit the vetted `supply-chain/` records with the lockfile and run
+`cargo vet --locked --frozen` against the cached graph and recorded audits.
+Continue running `make supply-chain-local` for the separate RustSec, license,
+and source checks.
