@@ -5,6 +5,7 @@ use std::fs;
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 
+use clap::{Args, Subcommand, ValueEnum};
 use locket_agent::DiscoveryFilters;
 use locket_core::{LocketError, PolicyDocument, SecretName};
 use locket_crypto::KeyPurpose;
@@ -28,6 +29,7 @@ use crate::commands::secrets::set::{
     SecretWriteKeys, WriteRequest, WriteTarget, confirm_write, validate_write_metadata, write_value,
 };
 use crate::runtime::error::{access_denied_error, typed_cli_error};
+use crate::support::handoff::shell_quote;
 use crate::{
     CliError, LOCKET_TOML, PROJECT_CONFIG_SCHEMA_VERSION, ProjectConfig, RuntimeContext,
     SecretMetadataFlags, SecretSourceArg, load_project_key, metadata_invalid_error, now_unix_nanos,
@@ -39,6 +41,75 @@ const DEFAULT_ENV_SCAN_DEPTH: i64 = 5;
 const MAX_ENV_SCAN_DEPTH: i64 = 10;
 const ENV_PATH_SCOPE: &str =
     "dotenv path must be inside the working directory or a trusted project root";
+
+#[derive(Args, Debug)]
+pub struct McpArgs {
+    #[command(subcommand)]
+    pub command: Option<McpCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum McpCommand {
+    /// Print a ready-to-paste MCP client configuration.
+    Config {
+        /// Format for the target client.
+        #[arg(long, value_enum, default_value = "json")]
+        client: McpClient,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum McpClient {
+    Json,
+    Claude,
+    Codex,
+}
+
+pub fn write_config(output: &mut impl Write, client: McpClient) -> Result<(), CliError> {
+    let executable = std::env::current_exe().ok();
+    let command = executable.as_deref().and_then(Path::to_str).unwrap_or("locket");
+    write_client_config(output, client, command)
+}
+
+fn write_client_config(
+    output: &mut impl Write,
+    client: McpClient,
+    command: &str,
+) -> Result<(), CliError> {
+    match client {
+        McpClient::Json => {
+            let config =
+                json!({ "mcpServers": { "locket": { "command": command, "args": ["mcp"] } } });
+            serde_json::to_writer_pretty(&mut *output, &config)?;
+            writeln!(output)?;
+        }
+        McpClient::Claude => {
+            writeln!(output, "claude mcp add locket -- {} mcp", shell_quote(command))?;
+        }
+        McpClient::Codex => {
+            writeln!(output, "codex mcp add locket -- {} mcp", shell_quote(command))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    #[test]
+    fn mcp_config_quotes_executable_paths_for_shells() -> Result<(), CliError> {
+        for (client, prefix) in [(McpClient::Claude, "claude"), (McpClient::Codex, "codex")] {
+            let mut output = Vec::new();
+            write_client_config(&mut output, client, "/opt/Locket's CLI/locket")?;
+            assert_eq!(
+                String::from_utf8_lossy(&output),
+                format!("{prefix} mcp add locket -- '/opt/Locket'\\''s CLI/locket' mcp\n")
+            );
+        }
+        Ok(())
+    }
+}
 
 pub fn serve(
     input: &mut impl BufRead,

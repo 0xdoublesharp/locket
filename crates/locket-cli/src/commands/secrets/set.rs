@@ -13,7 +13,9 @@ use locket_store::{
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
-use crate::commands::discovery::{select_project, write_json_result};
+use crate::commands::discovery::{
+    GLOBAL_VAULT, SHARED_PROJECT_PREFIX, select_project, write_json_result,
+};
 use crate::runtime::RuntimeContext;
 use crate::runtime::error::{CliError, invalid_secret_name_error, typed_cli_error};
 use crate::runtime::key_access::{load_profile_key, load_project_key};
@@ -221,7 +223,19 @@ fn existing_for_write(
             return Err(secret_deleted_error("secret source is deleted"));
         }
         if !request.upsert {
-            return Err(secret_already_exists_error("secret exists; use rotate or --upsert"));
+            let (command, rotation_scope) = if target.project.name == GLOBAL_VAULT
+                && target.project.id.starts_with(SHARED_PROJECT_PREFIX)
+            {
+                ("locket shared", " for the default Global Vault profile")
+            } else {
+                ("locket", " from the target project's root and profile")
+            };
+            let source = request
+                .source
+                .map_or_else(String::new, |_| format!(" --source {}", request.source()));
+            return Err(secret_already_exists_error(format!(
+                "secret {name} already exists. Use `{command} set {name} --upsert{source}` with the same target flags, or run `{command} rotate {name}{source}`{rotation_scope}."
+            )));
         }
         return Ok(Some(secret));
     }
@@ -229,7 +243,7 @@ fn existing_for_write(
         && !store.list_secrets_by_name(project_id, profile_id, name)?.is_empty()
     {
         return Err(secret_already_exists_error(
-            "secret exists in another source; pass --source to choose a target",
+            "secret already exists in another source; pass --source to choose a target",
         ));
     }
     Ok(None)

@@ -46,6 +46,38 @@ mod unix_tests {
     }
 
     #[test]
+    fn mcp_config_prints_client_snippets_without_initializing_the_vault()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let home = tempfile::tempdir()?;
+        let workspace = tempfile::tempdir()?;
+        let run = |args: &[&str]| command(home.path(), workspace.path()).args(args).output();
+        let default = run(&["mcp", "config"])?;
+        assert!(default.status.success(), "{:?}", String::from_utf8_lossy(&default.stderr));
+        let explicit = run(&["mcp", "config", "--client", "json"])?;
+        assert!(explicit.status.success());
+        assert_eq!(default.stdout, explicit.stdout);
+        let config: Value = serde_json::from_slice(&default.stdout)?;
+        let executable = Path::new(env!("CARGO_BIN_EXE_locket")).canonicalize()?;
+        let command_path = config["mcpServers"]["locket"]["command"].as_str().ok_or("command")?;
+        assert_eq!(Path::new(command_path).canonicalize()?, executable);
+        assert_eq!(
+            config,
+            json!({"mcpServers":{"locket":{"command": command_path,"args":["mcp"]}}})
+        );
+        for client in ["claude", "codex"] {
+            let output = run(&["mcp", "config", "--client", client])?;
+            assert!(output.status.success());
+            let snippet = String::from_utf8(output.stdout)?;
+            let prefix = format!("{client} mcp add locket -- ");
+            let launch = snippet.trim_end().strip_prefix(&prefix).ok_or("invalid MCP snippet")?;
+            let quoted = command_path.replace('\'', "'\\''");
+            assert!(launch == format!("{command_path} mcp") || launch == format!("'{quoted}' mcp"));
+        }
+        assert_eq!(fs::read_dir(home.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
     fn standalone_commands_leave_local_vault_directories_untouched()
     -> Result<(), Box<dyn std::error::Error>> {
         let home = tempfile::tempdir()?;

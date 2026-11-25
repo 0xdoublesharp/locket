@@ -38,7 +38,8 @@ pub(crate) use support::secret_helpers::resolve_pinned_version;
 use support::secret_helpers::{
     PolicySecretSelection, ResolvedSecret, SecretEncryptRequest, decrypt_secret_version,
     encrypt_secret_version, resolve_active_secret_for_source, resolve_secret_for_source,
-    secret_audit_metadata, select_copy_profiles_and_sources, summarize_names,
+    secret_audit_metadata, select_copy_profiles_and_sources, select_secret_for_source,
+    summarize_names,
 };
 pub(crate) use support::time::{
     format_optional_str, format_optional_unix_nanos, format_unix_nanos, optional_i64,
@@ -161,12 +162,14 @@ Start & Vaults
 
 Secrets
   list, set, import, env keys, env scan, generate, discover, get, rotate, rm
+  locket shared list|set|get|import   Work with the Global Vault (@shared).
 
 Commands & Execution
   run, exec, policy detect, policy add, env inspect, compose
 
 AI Agents & Safety
   mcp, scan, redact, context, ai-safe, audit
+  locket mcp config   Print a client configuration snippet.
 
 Environments, Team & Recovery
   profile, use, team, device, export, recover, agent, doctor
@@ -225,7 +228,7 @@ enum Command {
     /// Check profile parity and workspace plaintext drift.
     Parity(commands::parity::ParityArgs),
     /// Serve tools over stdio using MCP.
-    Mcp,
+    Mcp(commands::mcp::McpArgs),
     /// Import secrets from an env file.
     Import(ImportCommandArgs),
     /// Get secret metadata, reveal, or copy.
@@ -601,6 +604,12 @@ struct CpArgs {
 
 #[derive(Debug, Args)]
 struct SourceKeyArgs {
+    /// Select the Global Vault.
+    #[arg(long, value_parser = [commands::discovery::GLOBAL_VAULT])]
+    project: Option<String>,
+    /// Confirm a write to a dangerous Global Vault profile.
+    #[arg(long)]
+    use_dangerous: bool,
     /// Secret key name.
     key: String,
     #[command(flatten)]
@@ -629,6 +638,9 @@ struct PurgeArgs {
 
 #[derive(Debug, Args)]
 struct ListArgs {
+    /// Select the Global Vault.
+    #[arg(long, value_parser = [commands::discovery::GLOBAL_VAULT])]
+    project: Option<String>,
     /// Include deleted sources and deprecated version counts.
     #[arg(long)]
     all: bool,
@@ -969,6 +981,12 @@ struct AiSafeArgs {
 
 #[derive(Debug, Args)]
 struct RotateArgs {
+    /// Select the Global Vault.
+    #[arg(long, value_parser = [commands::discovery::GLOBAL_VAULT])]
+    project: Option<String>,
+    /// Confirm a write to a dangerous Global Vault profile.
+    #[arg(long)]
+    use_dangerous: bool,
     /// Secret key name.
     key: String,
     #[command(flatten)]
@@ -1697,6 +1715,14 @@ fn main() -> ProcessExitCode {
                 Err(error) => write_error_and_exit(&error),
             };
         }
+        Some(Command::Mcp(commands::mcp::McpArgs {
+            command: Some(commands::mcp::McpCommand::Config { client }),
+        })) => {
+            return match commands::mcp::write_config(&mut output, client) {
+                Ok(()) => ProcessExitCode::SUCCESS,
+                Err(error) => write_error_and_exit(&error),
+            };
+        }
         command => Cli { command },
     };
 
@@ -1779,7 +1805,12 @@ fn run_with_context(
             return commands::discovery::shared_command(context, output, command);
         }
         Command::Parity(args) => return commands::parity::parity_command(context, output, &args),
-        Command::Mcp => commands::mcp::serve(&mut io::stdin().lock(), output, context)?,
+        Command::Mcp(args) => match args.command {
+            None => commands::mcp::serve(&mut io::stdin().lock(), output, context)?,
+            Some(commands::mcp::McpCommand::Config { client }) => {
+                commands::mcp::write_config(output, client)?;
+            }
+        },
         Command::Import(args) => {
             return secrets::import::import_selected_command(
                 context,
@@ -2195,10 +2226,36 @@ fn preflight_rotate_secret_value(
     context: &RuntimeContext,
     args: &RotateArgs,
 ) -> Result<(), CliError> {
+    rotate_target(context, args)?;
+    commands::secrets::set::validate_write_metadata(&args.metadata, None)
+}
+
+fn rotate_target(
+    context: &RuntimeContext,
+    args: &RotateArgs,
+) -> Result<(Store, SecretRecord), CliError> {
     let name = SecretName::new(args.key.clone())
         .map_err(|err| invalid_secret_name_error(err.to_string()))?;
-    resolve_active_secret_for_source(context, name.as_str(), args.source.source)?;
-    commands::secrets::set::validate_write_metadata(&args.metadata, None)
+    let (store, profile) =
+        commands::secrets::lifecycle::lifecycle_target(context, args.project.as_deref())?;
+    if args.project.is_some() {
+        commands::secrets::set::confirm_write(
+            &profile,
+            args.use_dangerous,
+            "pass --use-dangerous to confirm the write",
+        )?;
+    }
+    let secret = select_secret_for_source(
+        &store,
+        &profile.project_id,
+        &profile.id,
+        &name,
+        args.source.source,
+    )?;
+    if secret.state == "deleted" {
+        return Err(secret_deleted_error("secret source is deleted"));
+    }
+    Ok((store, secret))
 }
 
 fn rotate_secret_value(
@@ -2208,33 +2265,29 @@ fn rotate_secret_value(
     timestamp: i64,
     grace_until: Option<i64>,
 ) -> Result<(String, u32), CliError> {
-    let name = SecretName::new(args.key.clone())
-        .map_err(|err| invalid_secret_name_error(err.to_string()))?;
     validate_secret_value_str(value)?;
-    let resolved_secret =
-        resolve_active_secret_for_source(context, name.as_str(), args.source.source)?;
-    let mut store = open_store(context)?;
+    let (mut store, secret) = rotate_target(context, args)?;
     commands::secrets::set::validate_write_metadata(&args.metadata, Some(value))?;
     let keys = commands::secrets::set::SecretWriteKeys::load(
         context,
         &store,
-        &resolved_secret.secret.project_id,
-        &resolved_secret.profile.id,
+        &secret.project_id,
+        &secret.profile_id,
     )?;
     let version = commands::secrets::set::rotate_value(
         &mut store,
         &keys,
-        &resolved_secret.secret,
+        &secret,
         &commands::secrets::set::Rotation {
             value,
-            origin: &resolved_secret.secret.origin,
+            origin: &secret.origin,
             timestamp,
             grace_until,
             metadata: &args.metadata,
             action: "ROTATE",
         },
     )?;
-    Ok((resolved_secret.secret.source, version))
+    Ok((secret.source, version))
 }
 
 struct CopySecretResult {

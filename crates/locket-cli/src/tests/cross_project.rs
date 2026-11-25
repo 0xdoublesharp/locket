@@ -67,6 +67,169 @@ fn init(context: &RuntimeContext, name: &str) -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn shared_commands_manage_global_secrets_from_outside_a_project() -> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let context = test_context_with_secret_value(&directory, CANARY);
+    let (_, vault) = json_run(&context, &["shared", "init", "--json"])?;
+    let (_, created) = json_run(
+        &context,
+        &["shared", "set", "GLOBAL_TOKEN", "--description", "Global API token", "--json"],
+    )?;
+    assert_eq!(created["project_id"], vault["project_id"]);
+    assert_eq!(created["version"], 1);
+    let store = crate::open_store(&context)?;
+    let project_id = vault["project_id"].as_str().ok_or("missing shared project id")?;
+    let profile = store.get_profile_by_name(project_id, "default")?.ok_or("missing profile")?;
+    let (_, updated) =
+        json_run(&context, &["shared", "set", "GLOBAL_TOKEN", "--upsert", "--json"])?;
+    assert_eq!(updated["operation"], "rotate");
+    assert_eq!(updated["version"], 2);
+    assert_eq!(
+        run(&context, &["shared", "get", "GLOBAL_TOKEN"])?,
+        run(&context, &["get", "GLOBAL_TOKEN", "--project", "@shared"])?
+    );
+    let (_, revealed) = run(&context, &["shared", "get", "GLOBAL_TOKEN", "--reveal", "--force"])?;
+    assert_eq!(revealed.trim_end(), CANARY);
+    assert!(Cli::try_parse_from(["locket", "shared", "get", "GLOBAL_TOKEN", "--force"]).is_err());
+
+    let dotenv = "GLOBAL_TOKEN=${literal}\nSKIP=ignore-this\n";
+    fs::write(directory.path().join(".env"), dotenv)?;
+    let import = [
+        "shared",
+        "import",
+        ".env",
+        "--overwrite",
+        "--literal",
+        "--only",
+        "GLOBAL_TOKEN,SKIP",
+        "--exclude",
+        "SKIP",
+        "--json",
+    ];
+    let mut preview_args = import.to_vec();
+    preview_args.push("--dry-run");
+    let (_, preview) = json_run(&context, &preview_args)?;
+    assert_eq!(preview["dry_run"], true);
+    assert_eq!(preview["overwritten_names"], json!(["GLOBAL_TOKEN"]));
+    assert_eq!(preview["filtered_out_names"], json!(["SKIP"]));
+    let (_, listed) = run(&context, &["shared", "list"])?;
+    assert_eq!(listed, "GLOBAL_TOKEN source=user-local version=2 state=active\n");
+    assert_eq!(listed, run(&context, &["list", "--project", "@shared"])?.1);
+    let (_, imported) = json_run(&context, &import)?;
+    assert_eq!(imported["project_id"], vault["project_id"]);
+    assert_eq!(imported["overwritten"], 1);
+    assert!(!imported.to_string().contains("${literal}"));
+    assert_eq!(fs::read_to_string(directory.path().join(".env"))?, dotenv);
+
+    let (_, rotated) = run(&context, &["shared", "rotate", "GLOBAL_TOKEN"])?;
+    assert!(rotated.contains("version=4"), "{rotated}");
+    assert!(store.set_profile_dangerous(project_id, "default", true)?);
+    for args in [
+        &["shared", "get", "GLOBAL_TOKEN", "--copy"][..],
+        &["shared", "rotate", "GLOBAL_TOKEN"],
+        &["shared", "rm", "GLOBAL_TOKEN"],
+    ] {
+        let error = run(&context, args).err().ok_or("dangerous operation must be denied")?;
+        assert!(error.to_string().contains("dangerous"), "{error}");
+    }
+    assert!(store.set_profile_dangerous(project_id, "default", false)?);
+    run(&context, &["shared", "rm", "GLOBAL_TOKEN"])?;
+    assert_eq!(run(&context, &["shared", "list"])?.1, "no secrets\n");
+    assert!(run(&context, &["shared", "list", "--all"])?.1.contains("state=deleted"));
+    let rows = store.list_audit_rows_since(project_id, &profile.id, 0)?;
+    let successful_writes = rows
+        .iter()
+        .filter(|row| row.status == "SUCCESS" && row.secret_name.as_deref() == Some("GLOBAL_TOKEN"))
+        .filter_map(|row| match row.action.as_str() {
+            action @ ("SET" | "ROTATE" | "DELETE") => Some(action),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(successful_writes, ["SET", "ROTATE", "ROTATE", "ROTATE", "DELETE"]);
+    Ok(())
+}
+
+#[test]
+fn set_duplicate_error_suggests_upsert_and_rotate() -> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let context = test_context_with_secret_value(&directory, CANARY);
+    init(&context, "app")?;
+    run(&context, &["set", "API_TOKEN"])?;
+    let (code, result) = json_run(&context, &["set", "API_TOKEN", "--json"])?;
+    assert_eq!(code, LocketError::SecretAlreadyExists.exit_code());
+    let message = result["error"]["message"].as_str().ok_or("missing error message")?;
+    assert!(message.contains("already exists"), "{message}");
+    assert!(message.contains("locket set API_TOKEN --upsert"), "{message}");
+    assert!(message.contains("locket rotate API_TOKEN"), "{message}");
+    Ok(())
+}
+
+#[test]
+fn policy_refresh_reviews_metadata_before_confirming_new_and_changed_approvals()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let context = test_context_with_secret_value(&directory, CANARY);
+    init(&context, "app")?;
+    run(&context, &["set", "API_TOKEN"])?;
+    let path = directory.path().join("locket.toml");
+    let mut source = fs::read_to_string(&path)?;
+    source.push_str(
+        r#"
+[commands.serve]
+argv = ["node", "server file.js", "lk://dev/API_TOKEN", "github_pat_sampleTokenValue123"]
+required_secrets = ["API_TOKEN"]
+optional_secrets = ["DEBUG_TOKEN"]
+shared_secrets = ["GLOBAL_TOKEN"]
+env_mode = "strict"
+override = "error"
+confirm = true
+require_user_verification = true
+require_agent = true
+
+[paths."apps/web"]
+required_secrets = ["WEB_TOKEN"]
+"#,
+    );
+    fs::write(&path, &source)?;
+    let confirmed = context_with_confirmation(&context, "serve\n");
+    let (_, first) = run(&confirmed, &["policy", "refresh", "serve"])?;
+    let prompt = first.find("type 'serve' to confirm policy refresh").ok_or("missing prompt")?;
+    for line in [
+        "status: new approval",
+        r#"argv: ["node","server file.js","lk://dev/API_TOKEN","#,
+        "required_secret_names: API_TOKEN",
+        "optional_secret_names: DEBUG_TOKEN",
+        "allowed_secret_names: API_TOKEN DEBUG_TOKEN",
+        "shared_secret_names: GLOBAL_TOKEN",
+        "env_mode: strict",
+        "override: error",
+        "path_scopes:",
+        "apps/web",
+        "WEB_TOKEN",
+        "confirm: true",
+        "require_user_verification: true",
+        "require_agent: true",
+        "metadata_only: yes",
+    ] {
+        assert!(first[..prompt].contains(line), "missing {line:?} in {first}");
+    }
+    assert!(!first.contains(CANARY));
+    assert!(!first.contains("github_pat_sampleTokenValue123"));
+    fs::write(&path, source.replace("server file.js", "other.js"))?;
+    let cli = Cli::try_parse_from(["locket", "policy", "refresh", "serve"])?;
+    let mut output = Vec::new();
+    let error =
+        run_with_context(cli, &context, &mut output).err().ok_or("wrong confirmation must fail")?;
+    assert_eq!(error.exit_code(), LocketError::ConfirmationFailed.exit_code());
+    let declined = String::from_utf8(output)?;
+    assert!(declined.contains("status: changed since last approval"), "{declined}");
+    assert!(declined.contains("other.js"));
+    let (_, changed) = run(&confirmed, &["policy", "refresh", "serve"])?;
+    assert!(changed.contains("status: changed since last approval"), "{changed}");
+    Ok(())
+}
+
+#[test]
 fn status_json_reports_project_metadata() -> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;
     let context = test_context_with_secret_value(&directory, CANARY);

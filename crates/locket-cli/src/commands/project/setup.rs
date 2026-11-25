@@ -2,6 +2,8 @@
 
 use std::io::{self, IsTerminal, Write};
 
+use locket_core::LocketError;
+
 use super::detect::detect_development_argv;
 
 use crate::{
@@ -149,7 +151,20 @@ pub fn offer_interactive_setup(
     context: &RuntimeContext,
     output: &mut impl Write,
 ) -> Result<(), CliError> {
-    if interactive_project_setup(context, output).is_err() {
+    if let Err(error) = interactive_project_setup(context, output) {
+        let detail = match &error {
+            CliError::Typed { kind: LocketError::InvalidPolicy, .. } => {
+                "Invalid project policy. Check locket.toml.".to_owned()
+            }
+            CliError::Store(error) => {
+                format!("Vault storage failed ({:?}).", error.locket_error())
+            }
+            CliError::Typed { .. } | CliError::Io(_) | CliError::Crypto(_) | CliError::Time => {
+                error.to_string()
+            }
+            _ => "vault operation failed".to_owned(),
+        };
+        writeln!(output, "setup_error: {}", detail.escape_debug())?;
         writeln!(
             output,
             "setup_step: skipped; initialization is intact. Run locket setup to retry, or locket import .env --literal for literal dollar expressions."
@@ -166,11 +181,19 @@ pub fn interactive_project_setup(
         return Ok(());
     };
     if resolved.root.join(".env").is_file() {
-        writeln!(output, "Existing .env found. Type 'import .env' to validate and encrypt it.")?;
+        writeln!(
+            output,
+            "Existing .env found. Import it into the encrypted vault and keep the original file? [Y/n]"
+        )?;
         output.flush()?;
         let confirmation = context.confirmation_reader.read_confirmation("import existing .env")?;
-        if confirmation.trim_end_matches(['\r', '\n']) == "import .env" {
-            crate::commands::secrets::import::import_command(
+        if !confirmation.is_empty()
+            && matches!(
+                confirmation.trim().to_ascii_lowercase().as_str(),
+                "" | "y" | "yes" | "import .env"
+            )
+        {
+            crate::commands::secrets::import::import_selected_command(
                 context,
                 output,
                 &crate::ImportArgs {
@@ -180,6 +203,7 @@ pub fn interactive_project_setup(
                     overwrite: false,
                     literal: false,
                 },
+                &crate::ImportSelectionArgs { keep: true, ..Default::default() },
             )?;
         }
     }
@@ -191,7 +215,7 @@ pub fn interactive_project_setup(
         match crate::commands::exec::run::approve_project_command(context, output, &resolved, argv)
         {
             Ok(()) => {}
-            Err(CliError::Typed { kind: locket_core::LocketError::ConfirmationFailed, .. }) => {
+            Err(CliError::Typed { kind: LocketError::ConfirmationFailed, .. }) => {
                 writeln!(output, "command: not approved")?;
             }
             Err(error) => return Err(error),
@@ -202,6 +226,70 @@ pub fn interactive_project_setup(
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
+
+    fn init(context: &crate::RuntimeContext) -> Result<(), Box<dyn std::error::Error>> {
+        crate::run_with_context(
+            crate::Cli::try_parse_from(["locket", "init", "--no-device", "--no-passkey"])?,
+            context,
+            &mut Vec::new(),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn setup_import_confirmation_keeps_dotenv() -> Result<(), Box<dyn std::error::Error>> {
+        for (confirmation, imported) in [
+            ("\n", true),
+            ("y\n", true),
+            ("YeS\r\n", true),
+            ("import .env\n", true),
+            ("n\n", false),
+            ("NO\n", false),
+            ("maybe\n", false),
+            ("", false),
+        ] {
+            let directory = tempfile::tempdir()?;
+            let context = crate::tests::test_context_with_confirmation(&directory, confirmation);
+            init(&context)?;
+            let path = directory.path().join(".env");
+            let contents = "API_TOKEN=onboarding-fixture\n";
+            std::fs::write(&path, contents)?;
+            let mut output = Vec::new();
+            super::interactive_project_setup(&context, &mut output)?;
+            let output = String::from_utf8(output)?;
+            assert!(output.contains("[Y/n]"), "{output}");
+            assert_eq!(output.contains("imported: 1"), imported, "{confirmation:?}");
+            assert!(!output.contains("delete_env_prompt"));
+            assert_eq!(std::fs::read_to_string(&path)?, contents);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn setup_reports_import_error_before_retry_guidance() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory = tempfile::tempdir()?;
+        let context = crate::tests::test_context_with_confirmation(&directory, "import .env\n");
+        init(&context)?;
+        let path = directory.path().join(".env");
+        let contents = "API_TOKEN=onboarding-fixture-${BASE}\n";
+        std::fs::write(&path, contents)?;
+        let mut output = Vec::new();
+        super::offer_interactive_setup(&context, &mut output)?;
+        let output = String::from_utf8(output)?;
+        let detail = output.find("setup_error: line 1:").ok_or("missing error detail")?;
+        let guidance = output.find("setup_step: skipped").ok_or("missing retry guidance")?;
+        assert!(detail < guidance);
+        assert!(
+            output[detail..guidance].contains("expansion syntax requires explicit literal mode")
+        );
+        assert!(output[guidance..].contains("locket import .env --literal"));
+        assert!(!output.contains("onboarding-fixture"));
+        assert_eq!(std::fs::read_to_string(path)?, contents);
+        Ok(())
+    }
+
     #[test]
     fn setup_detects_development_script_without_running_it()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -221,14 +309,9 @@ mod tests {
     #[test]
     fn setup_declining_detected_command_keeps_initialization_successful()
     -> Result<(), Box<dyn std::error::Error>> {
-        use clap::Parser;
         let directory = tempfile::tempdir()?;
         let context = crate::tests::test_context(&directory);
-        crate::run_with_context(
-            crate::Cli::try_parse_from(["locket", "init", "--no-device", "--no-passkey"])?,
-            &context,
-            &mut Vec::new(),
-        )?;
+        init(&context)?;
         std::fs::write(
             directory.path().join("package.json"),
             r#"{"scripts":{"dev":"touch should-not-run"}}"#,

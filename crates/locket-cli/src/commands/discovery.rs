@@ -11,8 +11,10 @@ use locket_store::{ProjectRecord, ProjectSelectorResolution, Store, StoreError};
 use rusqlite::{Transaction, TransactionBehavior};
 use serde_json::{Value, json};
 
+use super::secrets;
 use crate::{
-    CliError, LOCKET_TOML, ResolvedProject, RuntimeContext, ensure_project_metadata,
+    CliError, GetArgs, ImportCommandArgs, LOCKET_TOML, ListArgs, ResolvedProject, RotateArgs,
+    RuntimeContext, SecretWriteArgs, SourceKeyArgs, ensure_project_metadata,
     initialize_project_keys, metadata_invalid_error, now_unix_nanos, open_store,
     project_not_found_error, read_project_config, root_hash,
 };
@@ -64,6 +66,18 @@ pub enum SharedCommand {
         #[arg(long)]
         json: bool,
     },
+    /// List secrets in the Global Vault.
+    List(ListArgs),
+    /// Store a secret in the Global Vault.
+    Set(SecretWriteArgs),
+    /// Get metadata, reveal, or copy a Global Vault secret.
+    Get(GetArgs),
+    /// Import an env file into the Global Vault.
+    Import(ImportCommandArgs),
+    /// Rotate a Global Vault secret.
+    Rotate(RotateArgs),
+    /// Tombstone a Global Vault secret source.
+    Rm(SourceKeyArgs),
 }
 
 pub fn read_metadata_store(context: &RuntimeContext) -> Result<Option<Store>, CliError> {
@@ -83,6 +97,9 @@ pub fn select_project(
     cwd: &Path,
     selector: &str,
 ) -> Result<ProjectRecord, CliError> {
+    if selector == GLOBAL_VAULT {
+        return global_vault_project(store)?.ok_or_else(project_not_found_error);
+    }
     let mut result = store.resolve_project_selector(selector)?;
     let path = Path::new(selector);
     if result == ProjectSelectorResolution::NotFound && path.is_relative() {
@@ -266,7 +283,38 @@ pub fn shared_command(
     output: &mut impl Write,
     command: SharedCommand,
 ) -> Result<u8, CliError> {
-    let SharedCommand::Init { name, json } = command;
+    let (name, json) = match command {
+        SharedCommand::Init { name, json } => (name, json),
+        SharedCommand::List(mut args) => {
+            select_global_vault(&mut args.project)?;
+            return secrets::lifecycle::list_command(context, output, &args).map(|()| 0);
+        }
+        SharedCommand::Set(mut args) => {
+            select_global_vault(&mut args.target.project)?;
+            return secrets::set::set_command(context, output, &args);
+        }
+        SharedCommand::Get(mut args) => {
+            select_global_vault(&mut args.project)?;
+            return secrets::get::get_command(context, output, &args).map(|()| 0);
+        }
+        SharedCommand::Import(mut args) => {
+            select_global_vault(&mut args.selection.project)?;
+            return secrets::import::import_selected_command(
+                context,
+                output,
+                &args.import,
+                &args.selection,
+            );
+        }
+        SharedCommand::Rotate(mut args) => {
+            select_global_vault(&mut args.project)?;
+            return secrets::lifecycle::rotate_command(context, output, &args).map(|()| 0);
+        }
+        SharedCommand::Rm(mut args) => {
+            select_global_vault(&mut args.project)?;
+            return secrets::lifecycle::rm_command(context, output, &args).map(|()| 0);
+        }
+    };
     let result = shared_init(context, &name);
     if json {
         return write_json_result(output, result);
@@ -279,6 +327,16 @@ pub fn shared_command(
         field(&row, "project_id")
     )?;
     Ok(0)
+}
+
+fn select_global_vault(project: &mut Option<String>) -> Result<(), CliError> {
+    if project.as_deref().is_some_and(|selector| selector != GLOBAL_VAULT) {
+        return Err(crate::invalid_reference_error(
+            "locket shared targets the Global Vault (@shared)",
+        ));
+    }
+    *project = Some(GLOBAL_VAULT.to_owned());
+    Ok(())
 }
 
 pub const SHARED_PROJECT_PREFIX: &str = "lk_proj_shared_";

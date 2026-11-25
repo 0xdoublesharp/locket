@@ -96,15 +96,6 @@ pub(crate) fn import_env_to_target(
     Ok(serde_json::to_value(report)?)
 }
 
-pub fn import_command(
-    context: &RuntimeContext,
-    output: &mut impl Write,
-    args: &ImportArgs,
-) -> Result<(), CliError> {
-    import_selected_command(context, output, args, &ImportSelectionArgs::default())?;
-    Ok(())
-}
-
 pub fn import_selected_command(
     context: &RuntimeContext,
     output: &mut impl Write,

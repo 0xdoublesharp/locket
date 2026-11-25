@@ -355,6 +355,8 @@ pub(super) fn test_secret_write_args_for_source(
 
 pub(super) fn test_rotate_args(key: &str, grace_ttl: Option<&str>) -> super::RotateArgs {
     super::RotateArgs {
+        project: None,
+        use_dangerous: false,
         key: key.to_owned(),
         source: super::SourceArg { source: Some(super::SecretSourceArg::UserLocal) },
         metadata: super::SecretMetadataFlags::default(),

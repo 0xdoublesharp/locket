@@ -262,33 +262,35 @@ pub fn resolve_secret_for_source(
     let store = open_store(context)?;
     ensure_trusted_project_root(&store, &project)?;
     let profile = default_profile(&store, &project.config)?;
-    let secret = if let Some(source) = source {
-        let source = source_arg_to_str(source);
-        store
-            .get_secret_by_source(
-                project.config.project_id.as_str(),
-                &profile.id,
-                name.as_str(),
-                source,
-            )?
-            .ok_or_else(|| secret_not_found_error("secret not found"))?
-    } else {
-        let secrets = store.list_secrets_by_name(
-            project.config.project_id.as_str(),
-            &profile.id,
-            name.as_str(),
-        )?;
-        match secrets.as_slice() {
-            [] => return Err(secret_not_found_error("secret not found")),
-            [secret] => secret.clone(),
-            _ => {
-                return Err(invalid_reference_error(
-                    "multiple sources exist for this secret; pass --source",
-                ));
-            }
-        }
-    };
+    let secret = select_secret_for_source(
+        &store,
+        project.config.project_id.as_str(),
+        &profile.id,
+        &name,
+        source,
+    )?;
     Ok(ResolvedSecret { project, profile, secret })
+}
+
+pub fn select_secret_for_source(
+    store: &Store,
+    project_id: &str,
+    profile_id: &str,
+    name: &SecretName,
+    source: Option<SecretSourceArg>,
+) -> Result<SecretRecord, CliError> {
+    if let Some(source) = source {
+        let source = source_arg_to_str(source);
+        return store
+            .get_secret_by_source(project_id, profile_id, name.as_str(), source)?
+            .ok_or_else(|| secret_not_found_error("secret not found"));
+    }
+    let mut secrets = store.list_secrets_by_name(project_id, profile_id, name.as_str())?;
+    match secrets.len() {
+        0 => Err(secret_not_found_error("secret not found")),
+        1 => Ok(secrets.remove(0)),
+        _ => Err(invalid_reference_error("multiple sources exist for this secret; pass --source")),
+    }
 }
 
 pub fn select_copy_source_secret(

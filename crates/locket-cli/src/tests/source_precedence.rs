@@ -233,6 +233,8 @@ fn rotate_without_source_when_multiple_sources_exist_requires_explicit_source()
     setup_two_source_secret(&context, "TOKEN", "user-token", "machine-token", 1_000)?;
 
     let rotate_args = crate::RotateArgs {
+        project: None,
+        use_dangerous: false,
         key: "TOKEN".to_owned(),
         source: crate::SourceArg { source: None },
         metadata: crate::SecretMetadataFlags::default(),
@@ -257,6 +259,8 @@ fn rotate_with_explicit_source_rotates_only_that_source() -> Result<(), Box<dyn 
     setup_two_source_secret(&context, "TOKEN", "user-token-v1", "machine-token-v1", 1_000)?;
 
     let rotate_args = crate::RotateArgs {
+        project: None,
+        use_dangerous: false,
         key: "TOKEN".to_owned(),
         source: crate::SourceArg { source: Some(crate::SecretSourceArg::MachineLocal) },
         metadata: crate::SecretMetadataFlags::default(),
@@ -512,6 +516,8 @@ fn purge_resolves_explicit_source_for_version_purge() -> Result<(), Box<dyn std:
     let ul_args = test_secret_write_args_for_source("DB_PASS", crate::SecretSourceArg::UserLocal);
     crate::set_secret_value(&context, &ul_args, "user-pass-v1", "manual", 1_000)?;
     let rotate_args = crate::RotateArgs {
+        project: None,
+        use_dangerous: false,
         key: "DB_PASS".to_owned(),
         source: crate::SourceArg { source: Some(crate::SecretSourceArg::UserLocal) },
         metadata: crate::SecretMetadataFlags::default(),

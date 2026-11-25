@@ -4,9 +4,11 @@ use std::io::Write;
 
 use locket_core::SecretName;
 use locket_crypto::KeyPurpose;
-use locket_store::{AuditContext, AuditWrite};
+use locket_store::{AuditContext, AuditWrite, ProfileRecord, Store};
 use serde_json::json;
 
+use super::set::{confirm_write, select_target};
+use crate::commands::discovery::GLOBAL_VAULT;
 use crate::{
     CliError, CopyArgs, HistoryArgs, ListArgs, PurgeArgs, ResolvedSecret, RotateArgs,
     RuntimeContext, SourceKeyArgs, confirmation_failed_error, copy_secret_value, default_profile,
@@ -18,16 +20,35 @@ use crate::{
     source_arg_to_str,
 };
 
+pub fn lifecycle_target(
+    context: &RuntimeContext,
+    selector: Option<&str>,
+) -> Result<(Store, ProfileRecord), CliError> {
+    if let Some(selector) = selector {
+        if selector != GLOBAL_VAULT {
+            return Err(invalid_reference_error("expected the Global Vault selector (@shared)"));
+        }
+        let store = open_store(context)?;
+        let target = select_target(context, &store, Some(selector), None)?;
+        return Ok((store, target.profile));
+    }
+    let resolved = require_project(context)?;
+    let store = open_store(context)?;
+    ensure_trusted_project_root(&store, &resolved)?;
+    let profile = default_profile(&store, &resolved.config)?;
+    Ok((store, profile))
+}
+
 pub fn rm_command(
     context: &RuntimeContext,
     output: &mut impl Write,
     args: &SourceKeyArgs,
 ) -> Result<(), CliError> {
-    let resolved = require_project(context)?;
-    let store = open_store(context)?;
-    ensure_trusted_project_root(&store, &resolved)?;
-    let profile = default_profile(&store, &resolved.config)?;
-    let project_id = resolved.config.project_id.as_str();
+    let (store, profile) = lifecycle_target(context, args.project.as_deref())?;
+    let project_id = &profile.project_id;
+    if args.project.is_some() {
+        confirm_write(&profile, args.use_dangerous, "pass --use-dangerous to confirm the write")?;
+    }
     let secret = if let Some(source) = args.source.source {
         let source = source_arg_to_str(source);
         store
@@ -51,8 +72,7 @@ pub fn rm_command(
     };
     let source = secret.source.as_str();
     let timestamp = now_unix_nanos()?;
-    let audit_key =
-        load_project_key(context, &store, resolved.config.project_id.as_str(), KeyPurpose::Audit)?;
+    let audit_key = load_project_key(context, &store, project_id, KeyPurpose::Audit)?;
     let metadata = secret_audit_metadata(
         "DELETE",
         &secret.name,
@@ -61,7 +81,7 @@ pub fn rm_command(
         Some(secret.current_version),
     );
     let audit = AuditWrite {
-        project_id: resolved.config.project_id.as_str(),
+        project_id,
         profile_id: Some(&profile.id),
         action: "DELETE",
         status: "SUCCESS",
@@ -75,7 +95,9 @@ pub fn rm_command(
         timestamp,
         Some(AuditContext { key: audit_key.as_ref(), write: &audit }),
     )?;
-    refresh_example_for_project_if_enabled(context)?;
+    if args.project.is_none() {
+        refresh_example_for_project_if_enabled(context)?;
+    }
     writeln!(output, "removed {} ({source})", args.key)?;
     Ok(())
 }
@@ -92,7 +114,9 @@ pub fn rotate_command(
     let value = context.secret_value_reader.read_secret_value(&prompt)?;
     let (source, version) =
         rotate_secret_value(context, args, value.as_str(), timestamp, grace_until)?;
-    refresh_example_for_project_if_enabled(context)?;
+    if args.project.is_none() {
+        refresh_example_for_project_if_enabled(context)?;
+    }
     writeln!(output, "rotated {} ({source}) version={version}", args.key)?;
     Ok(())
 }
@@ -336,14 +360,11 @@ pub fn list_command(
     output: &mut impl Write,
     args: &ListArgs,
 ) -> Result<(), CliError> {
-    let resolved = require_project(context)?;
-    let store = open_store(context)?;
-    ensure_trusted_project_root(&store, &resolved)?;
-    let profile = default_profile(&store, &resolved.config)?;
+    let (store, profile) = lifecycle_target(context, args.project.as_deref())?;
     let secrets = if args.all {
-        store.list_secrets_by_profile(resolved.config.project_id.as_str(), &profile.id)?
+        store.list_secrets_by_profile(&profile.project_id, &profile.id)?
     } else {
-        store.list_active_secrets_by_profile(resolved.config.project_id.as_str(), &profile.id)?
+        store.list_active_secrets_by_profile(&profile.project_id, &profile.id)?
     };
     if secrets.is_empty() {
         writeln!(output, "no secrets")?;

@@ -282,35 +282,35 @@ fn refresh(
 ) -> Result<(), CliError> {
     validate_policy_name(&args.name)?;
     let resolved = require_project(context)?;
-    crate::ensure_trusted_project_root(&open_store(context)?, &resolved)?;
+    let store = open_store(context)?;
+    crate::ensure_trusted_project_root(&store, &resolved)?;
     let path = resolved.root.join(LOCKET_TOML);
     let source = read_locket_toml(&path)?;
     let parsed = PolicyDocument::from_toml_value(&source)
-        .map_err(|error| metadata_invalid_error(error.to_string()))?;
+        .map_err(|_| metadata_invalid_error("Invalid policy configuration. Check locket.toml."))?;
     let policy = parsed.commands.get(&args.name).ok_or_else(|| {
         policy_not_found_error(format!("command policy not found: {}", args.name))
     })?;
+    let status = if let Some(index) =
+        store.get_command_policy_index(resolved.config.project_id.as_str(), &args.name)?
+    {
+        let digest = locket_core::policy::policy_source_digest(&source, &args.name)?;
+        if policy_index_matches_source(&index, &resolved, &source, &args.name, &digest)? {
+            "already approved"
+        } else {
+            "changed since last approval"
+        }
+    } else {
+        "new approval"
+    };
+    drop(store);
     writeln!(output, "policy_refresh: {}", args.name)?;
-    writeln!(output, "review_source: {}", path.display())?;
-    writeln!(
-        output,
-        "allowed_secret_names: {}",
-        policy.allowed_secrets.iter().map(ToString::to_string).collect::<Vec<_>>().join(" ")
-    )?;
-    if !policy.shared_secrets.is_empty() {
-        writeln!(
-            output,
-            "shared_secret_names: {}",
-            policy.shared_secrets.iter().map(ToString::to_string).collect::<Vec<_>>().join(" ")
-        )?;
-    }
-    writeln!(
-        output,
-        "path_scopes: {}",
-        parsed.path_scopes.keys().cloned().collect::<Vec<_>>().join(" ")
-    )?;
+    writeln!(output, "status: {status}")?;
+    writeln!(output, "review_source: {:?}", path.display().to_string())?;
+    write_refresh_review(output, policy, &parsed)?;
     writeln!(output, "review the command, path scopes, and secret ACLs in this file")?;
-    writeln!(output, "type '{}' to approve the current policy source", args.name)?;
+    writeln!(output, "type '{}' to confirm policy refresh", args.name)?;
+    output.flush()?;
     let confirmation = context.confirmation_reader.read_confirmation("policy refresh")?;
     if confirmation.trim_end_matches(['\r', '\n']) != args.name {
         return Err(confirmation_failed_error("confirmation did not match policy name"));
@@ -331,6 +331,54 @@ fn refresh(
     )?;
     pump_policies_to_agent(context, resolved.config.project_id.as_str(), &parsed);
     write_policy_update(output, &args.name, "refresh")
+}
+
+fn write_refresh_review(
+    output: &mut impl Write,
+    policy: &CommandPolicy,
+    document: &PolicyDocument,
+) -> Result<(), CliError> {
+    // Show configured command metadata without resolving references or retrieving vault values.
+    let (kind, preview) = match &policy.command {
+        CommandSpec::Argv(argv) => {
+            let preview =
+                argv.iter().map(|arg| locket_scan::redact_text(arg).text).collect::<Vec<_>>();
+            ("argv", json!(preview))
+        }
+        CommandSpec::Shell(shell) => ("shell", json!(locket_scan::redact_text(shell).text)),
+    };
+    writeln!(output, "{kind}: {preview}")?;
+    for (label, names) in [
+        ("required_secret_names", &policy.required_secrets),
+        ("optional_secret_names", &policy.optional_secrets),
+        ("allowed_secret_names", &policy.allowed_secrets),
+        ("shared_secret_names", &policy.shared_secrets),
+    ] {
+        writeln!(output, "{label}: {}", secret_name_strings(names).join(" "))?;
+    }
+    writeln!(output, "env_mode: {}", policy.env_mode)?;
+    writeln!(output, "override: {}", policy.override_behavior)?;
+    writeln!(output, "path_scopes:")?;
+    if document.path_scopes.is_empty() {
+        writeln!(output, "  (none)")?;
+    }
+    for (path, scope) in &document.path_scopes {
+        writeln!(
+            output,
+            "  {}",
+            json!({
+                "path": path,
+                "profile": scope.profile.as_ref().map(locket_core::ProfileName::as_str),
+                "required_secret_names": secret_name_strings(&scope.required_secrets),
+                "optional_secret_names": secret_name_strings(&scope.optional_secrets),
+            })
+        )?;
+    }
+    writeln!(output, "confirm: {}", policy.confirm)?;
+    writeln!(output, "require_user_verification: {}", policy.require_user_verification)?;
+    writeln!(output, "require_agent: {}", policy.require_agent)?;
+    writeln!(output, "metadata_only: yes")?;
+    Ok(())
 }
 
 fn doctor(context: &RuntimeContext, output: &mut impl Write) -> Result<(), CliError> {
