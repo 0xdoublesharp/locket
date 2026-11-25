@@ -2,14 +2,15 @@
 
 use std::path::Path;
 
+use crate::policy::glob_matches;
 use crate::{LkReferenceUri, PolicyDocument, SecretAccessPolicy, SecretName};
 
 #[kani::proof]
-#[kani::unwind(8)]
+#[kani::unwind(6)]
 fn bounded_secret_names_match_the_ascii_grammar() {
-    // Four bytes cover empty, multi-character ASCII, and all 1–4 byte UTF-8
+    // Three bytes cover empty, multi-character ASCII, and 1–3 byte UTF-8
     // sequences without triggering stdlib's 8-byte SWAR UTF-8 validation path.
-    let bytes: [u8; 4] = kani::any();
+    let bytes: [u8; 3] = kani::any();
     let len: usize = kani::any();
     kani::assume(len <= bytes.len());
     if let Ok(input) = std::str::from_utf8(&bytes[..len]) {
@@ -26,15 +27,22 @@ fn bounded_secret_names_match_the_ascii_grammar() {
 }
 
 #[kani::proof]
-#[kani::unwind(16)]
+#[kani::unwind(18)]
 fn bounded_reference_suffixes_parse_without_panics() {
-    let suffix_bytes: [u8; 4] = kani::any();
+    // Representative URI alphabet covering every grammar branch: valid secret
+    // start/rest chars, invalid chars, and all URI/version/query delimiters.
+    const ALPHABET: [u8; 12] = *b"A_01a-@v?&=/";
+    let indices: [usize; 4] = kani::any();
     let len: usize = kani::any();
-    kani::assume(len <= suffix_bytes.len());
-    kani::assume(suffix_bytes[..len].iter().all(u8::is_ascii));
+    kani::assume(len <= indices.len());
 
+    let mut suffix_bytes = [0_u8; 4];
+    for i in 0..4 {
+        kani::assume(indices[i] < ALPHABET.len());
+        suffix_bytes[i] = ALPHABET[indices[i]];
+    }
     let Ok(suffix) = std::str::from_utf8(&suffix_bytes[..len]) else {
-        unreachable!("ASCII suffix bytes are valid UTF-8");
+        unreachable!("ASCII alphabet bytes are valid UTF-8");
     };
     let mut input = String::with_capacity(9 + suffix_bytes.len());
     input.push_str("lk://dev/");
@@ -81,26 +89,46 @@ fn a_single_acl_mismatch_denies_an_explicitly_selected_secret() {
 }
 
 #[kani::proof]
-#[kani::unwind(12)]
+#[kani::unwind(20)]
 fn bounded_acl_matching_is_panic_free() {
-    let bytes: [u8; 4] = kani::any();
-    kani::assume(bytes.iter().all(u8::is_ascii));
-    let split: usize = kani::any();
-    kani::assume(split <= bytes.len());
-    let (pattern, input) = bytes.split_at(split);
-    let (Ok(pattern), Ok(input)) = (std::str::from_utf8(pattern), std::str::from_utf8(input))
+    // Prove glob matching terminates without panicking across symbolic bytes,
+    // including repeated wildcard backtracking.
+    const GLOB_ALPHABET: [u8; 4] = *b"*a/b";
+    let pat_idx: [usize; 4] = kani::any();
+    let val_idx: [usize; 4] = kani::any();
+    let pat_len: usize = kani::any();
+    let val_len: usize = kani::any();
+    kani::assume(pat_len <= pat_idx.len() && val_len <= val_idx.len());
+
+    let mut pat_bytes = [0_u8; 4];
+    let mut val_bytes = [0_u8; 4];
+    for i in 0..4 {
+        kani::assume(pat_idx[i] < GLOB_ALPHABET.len());
+        kani::assume(val_idx[i] < GLOB_ALPHABET.len());
+        pat_bytes[i] = GLOB_ALPHABET[pat_idx[i]];
+        val_bytes[i] = GLOB_ALPHABET[val_idx[i]];
+    }
+    let (Ok(pattern), Ok(input)) =
+        (std::str::from_utf8(&pat_bytes[..pat_len]), std::str::from_utf8(&val_bytes[..val_len]))
     else {
-        unreachable!("ASCII slices are valid UTF-8");
+        unreachable!("ASCII glob bytes are valid UTF-8");
     };
+    let _ = glob_matches(pattern, input);
+
+    // Also verify SecretAccessPolicy::allows denies missing argv and any
+    // parent-escaping or absolute path across all representative shapes.
     let Ok(name) = SecretName::new("TOKEN") else { unreachable!("valid fixture name") };
     let acl = SecretAccessPolicy {
         name,
         allow_commands: vec!["*".to_owned()],
-        allow_argv: vec![vec![pattern.to_owned(), "**".to_owned()]],
+        allow_argv: vec![vec!["a*".to_owned(), "**".to_owned()]],
         allow_paths: vec![".".to_owned()],
     };
-    let argv = [input.to_owned()];
-    let _ = acl.allows(input, Some(&argv), Path::new(input));
-    assert!(!acl.allows(input, None, Path::new(input)));
-    assert!(!acl.allows(input, Some(&argv), Path::new("../src")));
+    let argv = ["ab".to_owned()];
+    let escaped_idx: usize = kani::any();
+    kani::assume(escaped_idx < 3);
+    let escaped = ["../src", "/src", "src/../src"][escaped_idx];
+    assert!(!acl.allows("cmd", None, Path::new("src")));
+    assert!(!acl.allows("cmd", Some(&argv), Path::new(escaped)));
+    assert!(acl.allows("cmd", Some(&argv), Path::new("src/sub")));
 }

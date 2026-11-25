@@ -22,6 +22,8 @@ pub use env_source::ExternalEnvSource;
 pub use error::PolicyParseError;
 pub use path_scope::PathEnvSet;
 pub use secret_acl::SecretAccessPolicy;
+#[cfg(kani)]
+pub(crate) use secret_acl::glob_matches;
 
 #[cfg(test)]
 mod tests {

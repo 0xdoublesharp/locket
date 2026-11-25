@@ -224,7 +224,17 @@ fn slash_path(path: &Path) -> Option<String> {
     Some(normalized)
 }
 
+#[cfg(kani)]
+pub(crate) const fn glob_matches(pattern: &str, value: &str) -> bool {
+    glob_matches_impl(pattern, value)
+}
+
+#[cfg(not(kani))]
 const fn glob_matches(pattern: &str, value: &str) -> bool {
+    glob_matches_impl(pattern, value)
+}
+
+const fn glob_matches_impl(pattern: &str, value: &str) -> bool {
     let pattern = pattern.as_bytes();
     let value = value.as_bytes();
     let (mut pattern_index, mut value_index) = (0, 0);

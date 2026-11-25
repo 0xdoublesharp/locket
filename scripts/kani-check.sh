@@ -38,6 +38,9 @@ fi
 # Kani cannot verify the inline assembly used for CPU feature detection or
 # all of the accelerated crypto intrinsics. Check the portable Rust backends.
 export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--cfg=chacha20_backend=\"soft\" --cfg=poly1305_backend=\"soft\""
-# Run harnesses sequentially by default so CBMC stays within GitHub runner RAM.
-cargo kani -p locket-crypto -p locket-core --lib --target-dir "$work" \
+# Run each crate sequentially by default so CBMC stays within GitHub runner RAM
+# and reports per-crate verification summaries as it progresses.
+cargo kani -p locket-crypto --lib --target-dir "$work" \
+    --output-format terse -j "${KANI_JOBS:-1}"
+cargo kani -p locket-core --lib --target-dir "$work" \
     --output-format terse -j "${KANI_JOBS:-1}"
