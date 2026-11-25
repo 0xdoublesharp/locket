@@ -10,7 +10,8 @@ use locket_store::{AuditWrite, ProfileRecord, Store};
 use serde_json::json;
 
 use super::run::{
-    RuntimeExecutionRequest, execute_prepared_with_runtime_session, unique_secret_names,
+    RuntimeExecutionRequest, execute_prepared_with_runtime_session, require_shared_vault_unlocked,
+    unique_secret_names,
 };
 use crate::commands::agent::ensure_agent_running_for_execution;
 use crate::commands::discovery::{SHARED_PROJECT_PREFIX, select_project, trusted_project_configs};
@@ -62,7 +63,7 @@ pub fn exec_command(
         confirm_exec_all_scope(context, output, &profile, &args.command, &secret_names)?;
     }
 
-    ensure_agent_running_for_execution(context)?;
+    let shared_project = authorize_exec_target(context, &project_id)?;
 
     let mut locket_env = locket_exec::EnvMap::new();
     let mut injected_sources = BTreeMap::new();
@@ -114,6 +115,7 @@ pub fn exec_command(
                 prepared: &prepared,
                 current_dir: Some(&context.cwd),
                 run_policy_grant: None,
+                shared_project,
             },
         )?
         .status
@@ -138,6 +140,18 @@ pub fn exec_command(
     }
     writeln!(output, "child exited with status {status}")?;
     Err(child_exit_error(status))
+}
+
+fn authorize_exec_target<'a>(
+    context: &RuntimeContext,
+    project_id: &'a str,
+) -> Result<Option<&'a str>, CliError> {
+    ensure_agent_running_for_execution(context)?;
+    if project_id.starts_with(SHARED_PROJECT_PREFIX) {
+        require_shared_vault_unlocked(context, project_id)?;
+        return Ok(Some(project_id));
+    }
+    Ok(None)
 }
 
 fn resolve_exec_target(

@@ -23,7 +23,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use zeroize::Zeroizing;
 
-use crate::commands::agent::ensure_agent_running_for_execution;
+use crate::commands::agent::{ensure_agent_running_for_execution, request_project_status_snapshot};
 use crate::commands::config::spec::{config_get_value, read_user_config};
 use crate::runtime::RuntimeContext;
 use crate::runtime::error::{
@@ -59,6 +59,8 @@ pub struct RuntimeExecutionRequest<'a> {
     pub current_dir: Option<&'a Path>,
     /// Optional live grant request for policy-driven `locket run`.
     pub run_policy_grant: Option<RunPolicyGrantRequest<'a>>,
+    /// Global Vault unlock scope required for shared-secret delivery.
+    pub shared_project: Option<&'a str>,
 }
 
 /// Policy-grant data needed before spawning a runtime child.
@@ -367,6 +369,7 @@ pub fn run_command_with_diagnostics(
                 resolved: &resolved,
                 ttl_seconds: policy.ttl.as_secs(),
             }),
+            shared_project: shared_project(&prepared_policy.selections),
         },
         protection,
     )?;
@@ -786,6 +789,7 @@ fn prepare_policy_execution(
     let selections = policy_secret_selections(store, resolved, profile, policy)?;
     check_policy_secret_availability(store, &selections)?;
     ensure_agent_running_for_execution(context)?;
+    require_shared_policy_vaults_unlocked(context, &selections, &profile.project_id)?;
     let parent_env = std::env::vars()
         .map(|(name, value)| (name, locket_exec::env_value(value)))
         .collect::<locket_exec::EnvMap>();
@@ -906,6 +910,63 @@ fn check_policy_secret_availability(
     }
     for secret in selections.iter().filter_map(|selection| selection.selected.as_ref()) {
         crate::commands::secrets::expiry::check_secret_expiry(store, &secret.id)?;
+    }
+    Ok(())
+}
+
+fn shared_project(selections: &[PolicySecretSelection]) -> Option<&str> {
+    selections.iter().find_map(|selection| {
+        selection
+            .selected
+            .as_ref()
+            .filter(|_| selection.shared)
+            .map(|secret| secret.project_id.as_str())
+    })
+}
+
+fn require_shared_policy_vaults_unlocked(
+    context: &RuntimeContext,
+    selections: &[PolicySecretSelection],
+    project_id: &str,
+) -> Result<(), CliError> {
+    if let Some(shared) = shared_project(selections) {
+        require_shared_vault_unlocked(context, shared)?;
+        require_vault_unlocked(context, project_id, "the policy's project vault")?;
+    }
+    Ok(())
+}
+
+pub(super) fn require_shared_vault_unlocked(
+    context: &RuntimeContext,
+    project_id: &str,
+) -> Result<(), CliError> {
+    require_vault_unlocked(context, project_id, "the Global Vault")
+}
+
+fn require_vault_unlocked(
+    context: &RuntimeContext,
+    project_id: &str,
+    vault_name: &str,
+) -> Result<(), CliError> {
+    // In-process command fixtures without an agent exercise local decryption.
+    #[cfg(test)]
+    if context.agent_data_dir.is_none() {
+        return Ok(());
+    }
+    let snapshot = request_project_status_snapshot(&crate::agent_socket_path(context), project_id)
+        .map_err(|error| {
+            typed_cli_error(
+                LocketError::AgentUnavailable,
+                format!("could not verify the unlock for {vault_name}: {error}"),
+            )
+        })?;
+    if snapshot["project_id"].as_str() != Some(project_id)
+        || snapshot["lock_state"].as_str() != Some("unlocked")
+    {
+        return Err(typed_cli_error(
+            LocketError::UnlockRequired,
+            format!("unlock {vault_name} before executing with shared secrets"),
+        ));
     }
     Ok(())
 }
@@ -1796,6 +1857,21 @@ fn execute_runtime_child(
         .run_policy_grant
         .map(|grant| request_run_policy_grant(context, request, grant))
         .transpose()?;
+    if let Some(project) = request.shared_project {
+        let unlock = if request.run_policy_grant.is_some() {
+            require_vault_unlocked(
+                context,
+                &request.profile.project_id,
+                "the policy's project vault",
+            )
+        } else {
+            Ok(())
+        };
+        if let Err(error) = unlock.and_then(|()| require_shared_vault_unlocked(context, project)) {
+            revoke_run_policy_grant(context, run_policy_grant.as_ref());
+            return Err(error);
+        }
+    }
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {

@@ -320,31 +320,30 @@ async fn stream_unix_status_events_with_cancel(
     sender: mpsc::Sender<StatusEvent>,
     cancel: &CancelToken,
 ) -> Result<(), AgentClientError> {
-    let mut stream = connect(socket_path).await?;
     let subscribe_id = new_request_id();
     let frame = encode_request(&subscribe_id, AgentMethod::SubscribeStatus, &())?;
-    stream
-        .write_all(&frame)
-        .await
-        .map_err(|error| AgentClientError::Protocol { reason: format!("write failed: {error}") })?;
+    let mut stream = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return Ok(()),
+        result = async {
+            let mut stream = connect(socket_path).await?;
+            stream.write_all(&frame).await.map_err(|error| AgentClientError::Protocol {
+                reason: format!("write failed: {error}"),
+            })?;
+            Ok::<_, AgentClientError>(stream)
+        } => result?,
+    };
     drop(frame);
-    stream
-        .flush()
-        .await
-        .map_err(|error| AgentClientError::Protocol { reason: format!("flush failed: {error}") })?;
     let result = read_status_stream(&mut stream, sender, cancel).await;
     if cancel.is_cancelled() {
-        // Best-effort `CancelSubscription` so the agent doesn't have to
-        // observe the close to free the subscriber. The cancellation
-        // path returns `Ok(())` regardless of whether the agent saw the
-        // envelope before the socket closed.
+        // Send the cancellation frame if the peer can take it. Dropping the
+        // socket also ends the subscription, even after a partial write.
         if let Ok(frame) = encode_request(
             &new_request_id(),
             AgentMethod::CancelSubscription,
             &serde_json::json!({ "subscription_id": subscribe_id }),
         ) {
-            let _ = stream.write_all(&frame).await;
-            let _ = stream.flush().await;
+            let _ = stream.try_write(&frame);
         }
         return Ok(());
     }

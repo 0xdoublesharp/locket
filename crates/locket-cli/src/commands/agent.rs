@@ -290,6 +290,7 @@ fn ensure_agent_running_with_launcher(
 ) -> Result<AgentStartupReport, CliError> {
     prepare_agent_log_dir(context)?;
 
+    #[cfg(not(unix))]
     let pid_path = agent_pid_path(context);
     let socket_path = agent_socket_path(context);
 
@@ -303,8 +304,16 @@ fn ensure_agent_running_with_launcher(
                 session_monitoring: session_monitoring_from_snapshot(&snapshot),
             });
         }
-        let _ignored = fs::remove_file(&pid_path);
-        let _ignored = fs::remove_file(&socket_path);
+        #[cfg(unix)]
+        return Err(typed_cli_error(
+            locket_core::LocketError::AgentUnavailable,
+            format!("agent (pid {pid}) did not answer its status probe"),
+        ));
+        #[cfg(not(unix))]
+        {
+            let _ignored = fs::remove_file(&pid_path);
+            let _ignored = fs::remove_file(&socket_path);
+        }
     }
 
     // If the pid file is missing or stale but the socket owner still
@@ -329,24 +338,15 @@ fn ensure_agent_running_with_launcher(
         });
     }
 
-    // Best-effort cleanup of stale pid/socket files. The daemon may have
-    // crashed and left them behind; bind_socket_listener will refuse if
-    // a live owner is still present.
-    let _ignored = fs::remove_file(&pid_path);
-    let _ignored = fs::remove_file(&socket_path);
+    // Only the Unix worker holding the endpoint lease can reap stale files.
+    #[cfg(not(unix))]
+    {
+        let _ignored = fs::remove_file(&pid_path);
+        let _ignored = fs::remove_file(&socket_path);
+    }
+    launcher.spawn(&socket_path, &agent_pid_path(context))?;
 
-    launcher.spawn(&socket_path, &pid_path)?;
-
-    // Poll for the endpoint so the caller's first
-    // `agent status`/connect attempt does not race the child.
-    wait_for_agent_endpoint(
-        launcher,
-        &socket_path,
-        AGENT_START_SOCKET_WAIT,
-        AGENT_START_POLL_INTERVAL,
-    );
-
-    let snapshot = launcher.status_snapshot(&socket_path).map_err(|error| {
+    let snapshot = wait_for_agent_endpoint(launcher, &socket_path).map_err(|error| {
         typed_cli_error(
             locket_core::LocketError::AgentUnavailable,
             format!("agent did not become reachable after on-demand startup: {error}"),
@@ -410,9 +410,17 @@ fn agent_status_command(context: &RuntimeContext, output: &mut impl Write) -> Re
             }
         }
         Err(_error) => {
-            // The pid file says the daemon is alive but we cannot reach
-            // it on the socket. Treat as stopped + stale and clean up
-            // the pid file so the next `agent start` is unblocked.
+            // A failed RPC is not evidence that a live listener has exited.
+            #[cfg(unix)]
+            if let Ok(Some(_lease)) = try_acquire_endpoint_lease(&socket_path)
+                && fs::symlink_metadata(&socket_path)
+                    .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+                && owned_agent_pid(&pid_path)
+                    .is_ok_and(|raw| raw.as_deref().and_then(parse_pid) == Some(pid))
+            {
+                let _ignored = fs::remove_file(&pid_path);
+            }
+            #[cfg(not(unix))]
             let _ignored = fs::remove_file(&pid_path);
             writeln!(output, "agent: stopped")?;
             writeln!(output, "running: no")?;
@@ -429,6 +437,7 @@ fn agent_status_command(context: &RuntimeContext, output: &mut impl Write) -> Re
     Ok(())
 }
 
+#[cfg(not(unix))]
 fn agent_stop_command(context: &RuntimeContext, output: &mut impl Write) -> Result<(), CliError> {
     let pid_path = agent_pid_path(context);
     let socket_path = agent_socket_path(context);
@@ -490,6 +499,54 @@ fn agent_stop_command(context: &RuntimeContext, output: &mut impl Write) -> Resu
     append_agent_log(context, "stop", "stopped", "daemon stopped")?;
     writeln!(output, "agent: stopped")?;
     writeln!(output, "running: no")?;
+    write_agent_paths(context, output)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn agent_stop_command(context: &RuntimeContext, output: &mut impl Write) -> Result<(), CliError> {
+    let socket = agent_socket_path(context);
+    let pid_file = agent_pid_path(context);
+    prepare_agent_log_dir(context)?;
+    let lease = try_acquire_endpoint_lease(&socket)?;
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let peer = runtime.block_on(inspect_unix_endpoint(&socket))?;
+    let mut removed_stale_pid = false;
+    let message = if let Some(peer) = peer {
+        let pid = owned_agent_pid(&pid_file)?.and_then(|value| parse_pid(&value));
+        let Some(pid) = pid.filter(|pid| Some(*pid) == peer.pid) else {
+            return Err(
+                io::Error::other("daemon PID file does not match its Unix socket peer").into()
+            );
+        };
+        send_sigterm(pid)?;
+        let deadline = Instant::now() + AGENT_STOP_WAIT;
+        while process_is_live(pid) && Instant::now() < deadline {
+            std::thread::sleep(AGENT_STOP_POLL_INTERVAL);
+        }
+        if process_is_live(pid) {
+            return Err(typed_cli_error(
+                locket_core::LocketError::AgentUnavailable,
+                format!(
+                    "agent (pid {pid}) did not exit within {} seconds",
+                    AGENT_STOP_WAIT.as_secs()
+                ),
+            ));
+        }
+        // The worker removes its own files. Another worker may already own
+        // the paths by the time this command observes the old process exit.
+        "daemon stopped"
+    } else {
+        let Some(_lease) = lease else {
+            return Err(io::Error::other("the daemon endpoint is changing").into());
+        };
+        removed_stale_pid = remove_stale_unix_endpoint(&socket, &pid_file)?;
+        if removed_stale_pid { "removed stale pid file" } else { "no daemon was running" }
+    };
+    append_agent_log(context, "stop", "stopped", message)?;
+    writeln!(output, "agent: stopped")?;
+    writeln!(output, "running: no")?;
+    writeln!(output, "removed_stale_pid: {}", if removed_stale_pid { "yes" } else { "no" })?;
     write_agent_paths(context, output)?;
     Ok(())
 }
@@ -571,22 +628,13 @@ fn spawn_agent_daemon(
 fn wait_for_agent_endpoint(
     launcher: &dyn AgentDaemonLauncher,
     endpoint: &Path,
-    timeout: StdDuration,
-    interval: StdDuration,
-) {
-    #[cfg(not(target_os = "windows"))]
-    let _ = launcher;
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        #[cfg(unix)]
-        if endpoint.exists() {
-            return;
+) -> Result<Value, io::Error> {
+    let deadline = Instant::now() + AGENT_START_SOCKET_WAIT;
+    loop {
+        match launcher.status_snapshot(endpoint) {
+            Err(_) if Instant::now() < deadline => std::thread::sleep(AGENT_START_POLL_INTERVAL),
+            result => return result,
         }
-        #[cfg(target_os = "windows")]
-        if launcher.status_snapshot(endpoint).is_ok() {
-            return;
-        }
-        std::thread::sleep(interval);
     }
 }
 
@@ -594,7 +642,11 @@ fn wait_for_agent_endpoint(
 /// dead PID is treated as stale and ignored (but is not deleted here —
 /// the caller decides when to remove it).
 fn read_running_pid(context: &RuntimeContext) -> Result<Option<u32>, CliError> {
-    let Some(raw) = read_agent_pid(context)? else {
+    #[cfg(unix)]
+    let raw = owned_agent_pid(&agent_pid_path(context))?;
+    #[cfg(not(unix))]
+    let raw = read_agent_pid(context)?;
+    let Some(raw) = raw else {
         return Ok(None);
     };
     let Some(pid) = parse_pid(&raw) else {
@@ -648,7 +700,8 @@ fn process_is_live(pid: u32) -> bool {
     let Some(rust_pid) = rustix::process::Pid::from_raw(raw) else {
         return false;
     };
-    rustix::process::test_kill_process(rust_pid).is_ok()
+    // EPERM also means a process exists. A foreign live PID is never stale.
+    !matches!(rustix::process::test_kill_process(rust_pid), Err(rustix::io::Errno::SRCH))
 }
 
 #[cfg(not(any(unix, target_os = "windows")))]
@@ -682,11 +735,6 @@ fn request_agent_shutdown_or_signal(socket_path: &Path, pid: u32) -> Result<(), 
     )
     .map(|_| ())
     .or_else(|_| terminate_windows_agent(pid))
-}
-
-#[cfg(unix)]
-fn request_agent_shutdown_or_signal(_socket_path: &Path, pid: u32) -> Result<(), CliError> {
-    send_sigterm(pid)
 }
 
 #[cfg(target_os = "windows")]
@@ -789,6 +837,9 @@ pub fn exchange_agent_request(
     let exchange = async move {
         #[cfg(unix)]
         let mut stream = tokio::net::UnixStream::connect(endpoint).await?;
+        #[cfg(unix)]
+        locket_agent::validate_peer_stream(&stream, locket_agent::current_process_uid(), 0)
+            .map_err(io::Error::other)?;
         #[cfg(windows)]
         let mut stream = locket_agent::connect_named_pipe_client(endpoint).await?;
         let frame =
@@ -833,6 +884,112 @@ pub fn request_status_snapshot(_socket_path: &Path) -> Result<Value, io::Error> 
     Err(io::Error::other("agent daemon is only supported on Unix targets"))
 }
 
+#[cfg(unix)]
+fn try_acquire_endpoint_lease(socket: &Path) -> io::Result<Option<fs::File>> {
+    use rustix::fs::{FlockOperation, Mode, OFlags, flock, open};
+    use std::os::unix::fs::MetadataExt as _;
+
+    // Keep the lock inode in place. Unlinking it would let a contender lock
+    // a new inode while a worker still holds the original one.
+    let mut path = socket.as_os_str().to_os_string();
+    path.push(".lock");
+    let file = fs::File::from(open(
+        Path::new(&path),
+        OFlags::CREATE | OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::RUSR | Mode::WUSR,
+    )?);
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.uid() != locket_agent::current_process_uid() {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "untrusted agent lease file"));
+    }
+    match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(Some(file)),
+        Err(rustix::io::Errno::WOULDBLOCK) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(unix)]
+fn owned_agent_path(path: &Path) -> io::Result<Option<fs::Metadata>> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.uid() == locket_agent::current_process_uid() => Ok(Some(metadata)),
+        Ok(_) => {
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "agent path has a foreign owner"))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn owned_agent_pid(path: &Path) -> io::Result<Option<String>> {
+    match owned_agent_path(path)? {
+        Some(metadata) if metadata.is_file() => match fs::read_to_string(path) {
+            Ok(pid) => Ok(Some(pid)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        },
+        Some(_) => {
+            Err(io::Error::new(io::ErrorKind::InvalidData, "agent PID path is not a regular file"))
+        }
+        None => Ok(None),
+    }
+}
+
+#[cfg(unix)]
+async fn inspect_unix_endpoint(
+    socket: &Path,
+) -> Result<Option<locket_agent::PeerIdentity>, CliError> {
+    use std::os::unix::fs::FileTypeExt as _;
+
+    let Some(metadata) = owned_agent_path(socket)? else { return Ok(None) };
+    if !metadata.file_type().is_socket() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "agent endpoint is not a Unix socket",
+        )
+        .into());
+    }
+    let connect = tokio::net::UnixStream::connect(socket);
+    match tokio::time::timeout(AGENT_START_SOCKET_WAIT, connect).await {
+        Ok(Ok(stream)) => {
+            locket_agent::validate_peer_stream(&stream, locket_agent::current_process_uid(), 0)
+                .map(Some)
+                .map_err(socket_error_to_cli)
+        }
+        Ok(Err(error))
+            if matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+            ) =>
+        {
+            Ok(None)
+        }
+        Ok(Err(error)) => Err(error.into()),
+        Err(error) => Err(io::Error::new(io::ErrorKind::TimedOut, error).into()),
+    }
+}
+
+// Callers hold the endpoint lease and have established that no listener is live.
+#[cfg(unix)]
+fn remove_stale_unix_endpoint(socket: &Path, pid_file: &Path) -> Result<bool, CliError> {
+    let pid = owned_agent_pid(pid_file)?;
+    if pid.as_deref().and_then(parse_pid).is_some_and(process_is_live) {
+        return Err(
+            io::Error::other("cannot clear agent files while the recorded PID is live").into()
+        );
+    }
+    if owned_agent_path(socket)?.is_some() {
+        fs::remove_file(socket)?;
+    }
+    if pid.is_some() {
+        fs::remove_file(pid_file)?;
+    }
+    Ok(pid.is_some())
+}
+
 /// Daemon entry point spawned by `agent_start_command`.
 ///
 /// Owns the Unix socket and `agent.pid` file for the duration of its
@@ -871,19 +1028,43 @@ fn run_internal_agent_worker(
     // before the handler registration would re-introduce a race against
     // any parallel test that emits SIGTERM, allowing the test process to
     // exit instead of the daemon.
+    if let Some(parent) = args.socket.parent().filter(|path| !path.as_os_str().is_empty())
+        && !parent.exists()
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
+    }
+    let in_use = || {
+        socket_error_to_cli(locket_agent::SocketServerError::AgentSocketInUse {
+            path: args.socket.clone(),
+        })
+    };
+    let _lease = try_acquire_endpoint_lease(&args.socket)?.ok_or_else(in_use)?;
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     runtime.block_on(async {
+        if inspect_unix_endpoint(&args.socket).await?.is_some() {
+            return Err(in_use());
+        }
+        remove_stale_unix_endpoint(&args.socket, &args.pid_file)?;
         let (listener, state) = bind_and_record(args, store_path)?;
         let sync_task = locket_agent::team_sync::spawn_team_sync_poll(state.clone());
         let expiry_task = state.spawn_unlock_expiry();
-        let result =
-            serve_until_signal(listener, state, &args.pid_file, args.require_session_monitoring)
-                .await
-                .map_err(CliError::Io);
+        let mut owns_pid_file = false;
+        let result = serve_until_signal(
+            &listener,
+            state,
+            &args.pid_file,
+            args.require_session_monitoring,
+            &mut owns_pid_file,
+        )
+        .await
+        .map_err(CliError::Io);
         sync_task.abort();
         expiry_task.abort();
+        if owns_pid_file {
+            let _ignored = fs::remove_file(&args.pid_file);
+        }
         let _ignored = fs::remove_file(&args.socket);
-        let _ignored = fs::remove_file(&args.pid_file);
         result
     })
 }
@@ -912,19 +1093,26 @@ fn bind_and_record(
 
 #[cfg(unix)]
 async fn serve_until_signal(
-    listener: tokio::net::UnixListener,
+    listener: &tokio::net::UnixListener,
     state: locket_agent::AgentSocketState,
     pid_file: &Path,
     require_session_monitoring: bool,
+    owns_pid_file: &mut bool,
 ) -> io::Result<()> {
     use locket_agent::{SessionLockSource, handle_connection};
+    use std::os::unix::fs::OpenOptionsExt as _;
     use tokio::signal::unix::{SignalKind, signal};
 
     let mut term = signal(SignalKind::terminate())?;
     let mut intr = signal(SignalKind::interrupt())?;
     let mut hup = signal(SignalKind::hangup())?;
     let mut observer = start_session_observer(&state, require_session_monitoring).await?;
-    write_pid_file(pid_file).map_err(|error| io::Error::other(error.to_string()))?;
+    if let Some(parent) = pid_file.parent().filter(|path| !path.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    let mut pid = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(pid_file)?;
+    *owns_pid_file = true;
+    writeln!(pid, "{}", std::process::id())?;
     let result: io::Result<()> = async {
     loop {
         tokio::select! {
@@ -1124,7 +1312,7 @@ pub fn run_internal_agent_serve(
     ))
 }
 
-#[cfg(any(unix, target_os = "windows"))]
+#[cfg(target_os = "windows")]
 fn write_pid_file(path: &Path) -> Result<(), CliError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -1454,6 +1642,53 @@ mod tests {
             }
         );
         assert_eq!(launcher.spawn_calls(), 1);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_status_probe_does_not_unlink_live_daemon_files()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        let directory = tempdir()?;
+        let context = temp_context(&directory);
+        let socket = agent_socket_path(&context);
+        let pid_file = agent_pid_path(&context);
+        let _listener = UnixListener::bind(&socket)?;
+        let owner = format!("{}\n", std::process::id());
+        fs::write(&pid_file, &owner)?;
+        let launcher = FakeLauncher::status_failing();
+
+        assert!(ensure_agent_running_with_launcher(&context, &launcher).is_err());
+        assert_eq!(launcher.spawn_calls(), 0);
+        assert_eq!(fs::read_to_string(&pid_file)?, owner);
+        let _connection = UnixStream::connect(&socket)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_preserves_a_live_socket_when_its_pid_file_is_stale()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        let directory = tempdir()?;
+        let context = temp_context(&directory);
+        let socket = agent_socket_path(&context);
+        let pid_file = agent_pid_path(&context);
+        let listener = UnixListener::bind(&socket)?;
+        let stale_pid = "999999999\n";
+        fs::write(&pid_file, stale_pid)?;
+
+        assert!(agent_stop_command(&context, &mut Vec::new()).is_err());
+        assert_eq!(fs::read_to_string(&pid_file)?, stale_pid);
+        let _connection = UnixStream::connect(&socket)?;
+
+        drop(listener);
+        agent_stop_command(&context, &mut Vec::new())?;
+        assert!(!pid_file.exists());
+        assert!(!socket.exists());
         Ok(())
     }
 

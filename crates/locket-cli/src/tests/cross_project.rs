@@ -260,6 +260,9 @@ default='wrong-fallback'
     assert!(!readiness.contains("wrong-vault"));
     assert_eq!(run(&inside, &["run", "check"])?.0, 0);
 
+    #[cfg(unix)]
+    assert_locked_shared_execution_is_refused(&inside)?;
+
     let store = crate::open_store(&inside)?;
     let metadata: String = store.connection().query_row(
         "SELECT metadata_json FROM audit_log WHERE action = 'RUN_POLICY' AND status = 'SUCCESS'",
@@ -276,6 +279,81 @@ default='wrong-fallback'
     for args in [&["env", "inspect", "--policy", "check"][..], &["run", "check"][..]] {
         assert!(run(&inside, args).is_err_and(|error| error.to_string().contains("ACL denied")));
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn assert_locked_shared_execution_is_refused(
+    context: &RuntimeContext,
+) -> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::net::UnixListener;
+
+    let directory = tempdir()?;
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))?;
+    let context =
+        RuntimeContext { agent_data_dir: Some(directory.path().into()), ..context.clone() };
+    let project_id = crate::require_project(&context)?.config.project_id.into_string();
+    let document = crate::read_policy_document(&context.cwd.join("locket.toml"))?;
+    let policy = document
+        .effective_command("check", &context.cwd, &context.cwd)
+        .ok_or("missing check policy")?;
+    let policy = locket_agent::CommandPolicySnapshot::from_policy(&project_id, &policy, 0);
+    let now = i128::from(crate::now_unix_nanos()?);
+    let listener = UnixListener::bind(crate::agent_socket_path(&context))?;
+    listener.set_nonblocking(true)?;
+    let server = std::thread::spawn(move || -> std::io::Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        runtime.block_on(async {
+            let listener = tokio::net::UnixListener::from_std(listener)?;
+            let state = locket_agent::AgentSocketState::locked("test");
+            state.command_policies.lock().await.push(policy);
+            state.unlock_cache.lock().await.insert(
+                project_id,
+                locket_agent::UnlockEntry::new(
+                    vec![7; 32],
+                    now,
+                    std::time::Duration::from_secs(60),
+                    locket_agent::UnlockMethod::OsKeychain,
+                ),
+            );
+            for _ in 0..2 {
+                let (stream, _) =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
+                        .await??;
+                let _ = locket_agent::handle_connection(stream, state.clone()).await;
+            }
+            Ok(())
+        })
+    });
+
+    let policy = run(&context, &["run", "check"]);
+    let exec = run(
+        &context,
+        &[
+            "exec",
+            "--project",
+            "@shared",
+            "--secret",
+            "GLOBAL_TOKEN",
+            "--",
+            super::test_shell(),
+            "-c",
+            "exit 0",
+        ],
+    );
+    let fixture_status = server.join().map_err(|_| "status fixture panicked")?;
+    for result in [policy, exec] {
+        let error = result.err().ok_or("a locked Global Vault must reject execution")?;
+        assert!(
+            matches!(
+                error.downcast_ref::<CliError>(),
+                Some(CliError::Typed { kind: LocketError::UnlockRequired, .. })
+            ),
+            "unexpected refusal: {error}"
+        );
+    }
+    fixture_status?;
     Ok(())
 }
 

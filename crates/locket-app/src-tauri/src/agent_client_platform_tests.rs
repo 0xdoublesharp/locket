@@ -432,6 +432,24 @@ async fn meaningful_change_resets_heartbeat_deadline() -> Result<(), Box<dyn std
 
 #[cfg(unix)]
 #[tokio::test]
+async fn cancelled_unix_subscription_does_not_attempt_to_connect()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let (sender, _receiver) = mpsc::channel(1);
+    let cancel = CancelToken::new();
+    cancel.cancel();
+
+    super::stream_status_events_with_cancel(
+        &directory.path().join("missing.sock"),
+        sender,
+        &cancel,
+    )
+    .await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn cancellation_releases_a_unix_status_reader_with_a_full_consumer_channel()
 -> Result<(), Box<dyn std::error::Error>> {
     use std::future::{Future as _, poll_fn};
