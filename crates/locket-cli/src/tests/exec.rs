@@ -304,6 +304,7 @@ env_mode = "strict"
 inherit_env = ["PATH"]
 "#.replace("/bin/sh", test_shell()).replace("/usr/bin/true", test_true())).as_bytes(),
         )?;
+    approve_test_policy(&context, "env_check")?;
 
     let mut inspect_output = Vec::new();
     run_with_context(
@@ -458,6 +459,7 @@ fn protected_run_fixture(
         std::fs::OpenOptions::new().append(true).open(directory.path().join("locket.toml"))?,
         "\n[commands.protected_run]\nargv = {argv}\nrequired_secrets = ['API_KEY']\nenv_mode = 'strict'",
     )?;
+    approve_test_policy(&context, "protected_run")?;
     Ok(context)
 }
 
@@ -476,6 +478,7 @@ fn denied_run_policy_grant_never_spawns_the_child() -> Result<(), Box<dyn std::e
         fs::OpenOptions::new().append(true).open(directory.path().join("locket.toml"))?,
         "\n[commands.canary]\nargv = {argv}\nenv_mode = 'strict'\ninherit_env = ['PATH']",
     )?;
+    approve_test_policy(&context, "canary")?;
     let denial = locket_agent::ErrorEnvelope::new(
         "run-authorize policy launch",
         "AccessDenied",
@@ -526,6 +529,7 @@ ttl = "30s"
             .replace("/usr/bin/true", test_true()))
             .as_bytes(),
         )?;
+    approve_test_policy(&context, "env_check")?;
 
     run_with_context(
         Cli::try_parse_from(["locket", "run", "env_check"])?,
@@ -622,6 +626,7 @@ env_mode = "minimal"
             )
             .as_bytes(),
         )?;
+    approve_test_policy(&context, "env_check")?;
 
     let mut output = Vec::new();
     run_with_context(Cli::try_parse_from(["locket", "run", "env_check"])?, &context, &mut output)?;
@@ -657,6 +662,7 @@ inherit_env = ["PATH"]
             .replace("/usr/bin/true", test_true()))
             .as_bytes(),
         )?;
+    approve_test_policy(&context, "fail_command")?;
 
     let mut output = Vec::new();
     let result = run_with_context(
@@ -1436,6 +1442,106 @@ fn init_docker_test_project(
     Ok(())
 }
 
+#[test]
+#[cfg(unix)]
+fn named_execution_requires_current_local_approval() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    init_docker_test_project(&context, "synthetic-key")?;
+    crate::set_secret_value(
+        &context,
+        &test_secret_write_args("EXTRA_KEY"),
+        "synthetic-extra-key",
+        "manual",
+        2_000,
+    )?;
+    let locked_context =
+        test_context_with_key_store(&directory, Arc::new(UnavailableMasterKeyStore));
+    let config = directory.path().join("locket.toml");
+    let source = std::fs::read_to_string(&config)?
+        + r#"
+[commands.check]
+argv = ["/bin/sh", "-c", "test -n \"$API_KEY\" && touch ran-approved"]
+required_secrets = ["API_KEY"]
+confirm = false
+[secrets.API_KEY]
+allow_commands = ["check"]
+"#;
+    std::fs::write(&config, &source)?;
+    let resolved = crate::require_project(&context)?;
+    let project_id = resolved.config.project_id.as_str();
+    let store = crate::open_store(&context)?;
+    let assert_unapproved = |case: &str| -> Result<(), Box<dyn std::error::Error>> {
+        let marker = if case == "argv" { "ran-changed" } else { "ran-approved" };
+        let script = format!("test -n \"$API_KEY\" && touch {marker}");
+        let invocations: [&[&str]; 4] = [
+            &["locket", "run", "check"],
+            &["locket", "run", "--", "/bin/sh", "-c", &script],
+            &["locket", "env", "docker", "--policy", "check", "--", "docker", "run", "fixture"],
+            &["locket", "compose", "run", "--policy", "check", "--", "docker", "compose", "up"],
+        ];
+        let before = store.get_command_policy_index(project_id, "check")?;
+        for invocation in invocations {
+            let error = run_with_context(
+                Cli::try_parse_from(invocation)?,
+                &locked_context,
+                &mut Vec::new(),
+            )
+            .err()
+            .ok_or_else(|| format!("{case}: {invocation:?} requires approval"))?;
+            assert_eq!(error.exit_code(), locket_core::LocketError::AccessDenied.exit_code());
+            assert!(error.to_string().contains("review locket.toml"), "{case}: {error}");
+            assert!(error.to_string().contains("locket policy refresh check"), "{case}: {error}");
+            assert_eq!(store.get_command_policy_index(project_id, "check")?, before);
+            assert!(!directory.path().join(marker).exists());
+        }
+        Ok(())
+    };
+    assert_unapproved("missing approval")?;
+    approve_test_policy(&context, "check")?;
+    for (case, before, after) in [
+        ("argv", "touch ran-approved", "touch ran-changed"),
+        ("added secret", "[\"API_KEY\"]", "[\"API_KEY\", \"EXTRA_KEY\"]"),
+        ("removed ACL", "[secrets.API_KEY]\nallow_commands = [\"check\"]", ""),
+        ("confirmation", "confirm = false", "confirm = true"),
+    ] {
+        let edited = source.replace(before, after);
+        assert_ne!(edited, source, "{case}");
+        std::fs::write(&config, edited)?;
+        assert_unapproved(case)?;
+    }
+    let edited = source.replace("[\"API_KEY\"]", "[\"API_KEY\", \"EXTRA_KEY\"]");
+    std::fs::write(&config, edited)?;
+    assert_error_contains(
+        run_with_context(
+            Cli::try_parse_from(["locket", "policy", "refresh", "check"])?,
+            &context,
+            &mut Vec::new(),
+        ),
+        "confirmation did not match policy name",
+    );
+    assert_unapproved("unconfirmed refresh")?;
+    approve_test_policy(&context, "check")?;
+    run_with_context(Cli::try_parse_from(["locket", "run", "check"])?, &context, &mut Vec::new())?;
+    assert!(directory.path().join("ran-approved").exists());
+    let docker = crate::prepare_docker_policy_execution(
+        &context,
+        "check",
+        &["docker", "run", "fixture"].map(str::to_owned),
+        docker_test_env(&directory),
+    )?;
+    let compose = crate::prepare_compose_policy_execution(
+        &context,
+        "check",
+        &["docker", "compose", "up"].map(str::to_owned),
+        docker_test_env(&directory),
+    )?;
+    for prepared in [docker, compose] {
+        assert_eq!(prepared.plan.injected_names, ["API_KEY", "EXTRA_KEY"]);
+    }
+    Ok(())
+}
+
 struct DockerNonInteractiveConfirmation;
 
 impl crate::ConfirmationReader for DockerNonInteractiveConfirmation {
@@ -1472,6 +1578,7 @@ env_mode = "strict"
 inherit_env = ["PATH", "DOCKER_CONFIG", "DOCKER_HOST"]
 "#,
         )?;
+    approve_test_policy(&context, "docker_app")?;
 
     let parsed = Cli::try_parse_from([
         "locket",
@@ -1549,6 +1656,7 @@ env_mode = "strict"
 inherit_env = ["PATH", "DOCKER_CONFIG", "DOCKER_HOST"]
 "#,
         )?;
+    approve_test_policy(&context, "compose_app")?;
 
     let parsed = Cli::try_parse_from([
         "locket",
@@ -1766,9 +1874,9 @@ inherit_env = ["PATH"]
             .replace("/usr/bin/true", test_true()))
             .as_bytes(),
         )?;
-
     let bad_context =
         test_context_with_key_store_and_confirmation(&directory, Arc::clone(&key_store), "wrong\n");
+    approve_test_policy(&bad_context, "deploy")?;
     let result = run_with_context(
         Cli::try_parse_from(["locket", "run", "deploy"])?,
         &bad_context,
@@ -1815,12 +1923,12 @@ inherit_env = ["PATH"]
             .replace("/usr/bin/true", test_true()))
             .as_bytes(),
         )?;
-
     let good_context = test_context_with_key_store_and_confirmation(
         &directory,
         Arc::clone(&key_store),
         "run deploy\n",
     );
+    approve_test_policy(&good_context, "deploy")?;
     let mut output = Vec::new();
     run_with_context(
         Cli::try_parse_from(["locket", "run", "deploy"])?,
@@ -1869,6 +1977,7 @@ inherit_env = ["PATH"]
             .replace("/usr/bin/true", test_true()))
             .as_bytes(),
         )?;
+    approve_test_policy(&context, "sensitive")?;
 
     let cases: [(&str, Arc<dyn LocalUserVerifier + Send + Sync>); 3] = [
         ("denied", Arc::new(MemoryLocalUserVerifier::denying())),
@@ -1924,6 +2033,7 @@ inherit_env = ["PATH"]
             .replace("/usr/bin/true", test_true()))
             .as_bytes(),
         )?;
+    approve_test_policy(&context, "sensitive")?;
 
     run_with_context(
         Cli::try_parse_from(["locket", "run", "sensitive"])?,
@@ -1970,6 +2080,7 @@ inherit_env = ["PATH"]
             .replace("/usr/bin/true", test_true()))
             .as_bytes(),
         )?;
+    approve_test_policy(&context, "unprotected")?;
 
     run_with_context(
         Cli::try_parse_from(["locket", "run", "unprotected"])?,
@@ -2018,6 +2129,7 @@ inherit_env = ["PATH"]
             )
             .as_bytes(),
         )?;
+    approve_test_policy(&context, "shell_check")?;
 
     run_with_context(
         Cli::try_parse_from(["locket", "run", "shell_check"])?,
@@ -2068,6 +2180,7 @@ inherit_env = ["PATH"]
             .replace("/usr/bin/true", test_true()))
             .as_bytes(),
         )?;
+    approve_test_policy(&context, "argv_check")?;
 
     run_with_context(
         Cli::try_parse_from(["locket", "run", "argv_check"])?,
@@ -2118,6 +2231,7 @@ inherit_env = ["PATH"]
             )
             .as_bytes(),
         )?;
+    approve_test_policy(&context, "shell_secret")?;
 
     run_with_context(
         Cli::try_parse_from(["locket", "run", "shell_secret"])?,
@@ -2195,6 +2309,7 @@ fn run_preserves_non_ascii_utf8_secret_bytes_through_injection()
             )
             .as_bytes(),
         )?;
+    approve_test_policy(&context, "check_unicode")?;
 
     run_with_context(
         Cli::try_parse_from(["locket", "run", "check_unicode"])?,
@@ -2252,6 +2367,8 @@ env_mode = "strict"
 inherit_env = ["PATH", "DOCKER_CONFIG", "DOCKER_HOST"]
 "#,
         )?;
+    approve_test_policy(&context, "docker_app")?;
+    approve_test_policy(&context, "compose_app")?;
 
     let parent_env = docker_test_env(&directory);
 
@@ -2377,6 +2494,8 @@ inherit_env = ["DOCKER_CONFIG"]
 allow_argv = [["docker", "run", "approved-image"], ["docker", "compose", "up", "approved-service"]]
 "#,
         )?;
+    approve_test_policy(&context, "docker_app")?;
+    approve_test_policy(&context, "compose_app")?;
 
     for (policy, approved, denied) in [
         (
@@ -2437,6 +2556,8 @@ env_mode = "strict"
 inherit_env = ["DOCKER_CONFIG", "DOCKER_CONTEXT", "DOCKER_HOST"]
 "#,
         )?;
+    approve_test_policy(&context, "docker_app")?;
+    approve_test_policy(&context, "compose_app")?;
     let config = directory.path().join("docker-config");
     let metadata_dir = config
         .join("contexts/meta")
@@ -2554,6 +2675,8 @@ fn docker_helpers_reject_routing_secrets_before_decryption()
     let unavailable = test_context_with_key_store(&directory, Arc::new(UnavailableMasterKeyStore));
     for name in names {
         for subcommand in ["run", "compose"] {
+            let policy = format!("{subcommand}_{name}");
+            approve_test_policy(&context, &policy)?;
             let prepare = if subcommand == "run" {
                 crate::prepare_docker_policy_execution
             } else {
@@ -2564,8 +2687,7 @@ fn docker_helpers_reject_routing_secrets_before_decryption()
                 "DOCKER_CONFIG".into(),
                 locket_exec::env_value(directory.path().join("docker-config").to_string_lossy()),
             )]);
-            let Err(error) = prepare(&unavailable, &format!("{subcommand}_{name}"), &argv, env)
-            else {
+            let Err(error) = prepare(&unavailable, &policy, &argv, env) else {
                 return Err(format!("routing secret {name} was accepted").into());
             };
             assert!(error.to_string().contains("cannot be injected"), "{name}: {error}");
@@ -2608,6 +2730,7 @@ fn docker_helpers_remote_allow_requires_exact_policy_confirmation()
             crate::prepare_compose_policy_execution
         };
         let policy = format!("{subcommand}_remote");
+        approve_test_policy(&context, &policy)?;
         let command = if subcommand == "run" { "app" } else { "up" };
         let argv = ["docker".into(), subcommand.into(), command.into()];
         for (variable, value) in [
@@ -2706,6 +2829,7 @@ fn docker_helpers_ignore_stripped_routing_environment_and_preserve_pass_through(
         } else {
             crate::prepare_compose_policy_execution
         };
+        approve_test_policy(&context, &format!("{subcommand}_local"))?;
         let mut argv = vec![
             "docker",
             subcommand,
@@ -2797,6 +2921,7 @@ fn generic_run_reuses_saved_exact_argv_and_policy_authorization()
     text.push_str(test_shell());
     text.push_str("\", \"-c\", \"test \\\"$API_KEY\\\" = fixture-value\"]\nrequired_secrets = [\"API_KEY\"]\n");
     std::fs::write(&config, text)?;
+    approve_test_policy(&context, "dev")?;
     run_with_context(
         Cli::try_parse_from([
             "locket",
@@ -2941,6 +3066,7 @@ required_secrets = ['SERVICE_KEY']
 inherit_env = ['PATH', 'DOCKER_CONFIG']
 ",
     )?;
+    approve_test_policy(&context, "container")?;
 
     assert!(Path::new(&fixture).join("docker").is_file());
     output.clear();

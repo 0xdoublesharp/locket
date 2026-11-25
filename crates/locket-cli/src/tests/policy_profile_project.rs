@@ -645,6 +645,7 @@ argv = ["echo", "lk://dev/DATABASE_URL"]
 override = "preserve"
 "#,
         )?;
+    approve_test_policy(&context, "uses_reference")?;
 
     let mut doctor_output = Vec::new();
     let result = run_with_context(

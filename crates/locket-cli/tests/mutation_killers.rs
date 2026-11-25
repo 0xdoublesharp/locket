@@ -31,8 +31,8 @@ mod unix_mutation_killers {
     -> Result<(), Box<dyn std::error::Error>> {
         let project = tempfile::tempdir()?;
         let project_path = project.path();
-        let store = initialize_project_store(project_path)?;
-        fs::write(project_path.join("locket.toml"), POLICY)?;
+        let mut store = initialize_project_store(project_path)?;
+        cache_policy(&mut store, project_path, POLICY)?;
         fs::write(project_path.join(".settings"), "PORT=synthetic-invalid-port\n")?;
         let _agent = start_agent(project_path)?;
         let output = command(project_path).args(["run", "serve"]).env("PORT", "9000").output()?;
@@ -53,7 +53,7 @@ mod unix_mutation_killers {
     -> Result<(), Box<dyn std::error::Error>> {
         let project = tempfile::tempdir()?;
         let root = project.path();
-        let store = initialize_project_store(root)?;
+        let mut store = initialize_project_store(root)?;
         let _agent = start_agent(root)?;
         let duplicate = "egress-fixture-value";
         for (value, sibling_value, argument) in [
@@ -76,7 +76,7 @@ external_env_sources = [{{ file = ".settings" }}]
 env_mode = "strict"
 "#,
             );
-            fs::write(root.join("locket.toml"), policy)?;
+            cache_policy(&mut store, root, &policy)?;
             fs::write(
                 root.join(".settings"),
                 format!("SERVICE_TOKEN={value}\nSIBLING_TOKEN={sibling_value}\n"),
@@ -95,7 +95,7 @@ env_mode = "strict"
             let stderr = denied_egress(root, invalid)?;
             assert!(stderr.contains("--egress-host requires SECRET_NAME=HOST_PATTERN"), "{stderr}");
         }
-        fs::write(root.join("locket.toml"), POLICY)?;
+        cache_policy(&mut store, root, POLICY)?;
         fs::write(root.join(".settings"), "")?;
         let stderr = denied_egress(root, "PORT=example.test")?;
         assert!(stderr.contains("--egress-host must name a secret injected by the run policy"));
@@ -314,6 +314,33 @@ require_agent = true
     }
 
     #[test]
+    fn run_revokes_the_grant_if_the_policy_changes_before_launch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let root = project.path();
+        let mut store = initialize_project_store(root)?;
+        cache_policy(&mut store, root, POLICY)?;
+        fs::write(root.join(".settings"), "PORT=9000\n")?;
+        fs::write(root.join(".fixture-grant-fault"), "source-changed")?;
+        let approved = store.get_command_policy_index(PROJECT, "serve")?;
+        let _fixture = start_fixture_agent(root)?;
+
+        let output = command(root).args(["run", "serve"]).output()?;
+        let stderr = String::from_utf8(output.stderr)?;
+        assert_eq!(
+            output.status.code(),
+            Some(i32::from(locket_core::LocketError::AccessDenied.exit_code())),
+            "{stderr}"
+        );
+        assert!(stderr.contains("locket policy refresh serve"), "{stderr}");
+        assert!(!String::from_utf8(output.stdout)?.contains("child-started"));
+        assert_eq!(fs::read_to_string(root.join(".fixture-last-revoke"))?, GRANT_ID);
+        assert_eq!(store.get_command_policy_index(PROJECT, "serve")?, approved);
+        assert_no_runtime_sessions(&store)?;
+        Ok(())
+    }
+
+    #[test]
     fn redaction_covers_a_preserved_short_value_and_provider_tokens()
     -> Result<(), Box<dyn std::error::Error>> {
         let project = tempfile::tempdir()?;
@@ -450,7 +477,7 @@ allow_commands = ["{allowed_command}"]
     -> Result<(), Box<dyn std::error::Error>> {
         let project = tempfile::tempdir()?;
         let root = project.path();
-        let store = initialize_project_store(root)?;
+        let mut store = initialize_project_store(root)?;
         let header = format!(
             r#"
 schema_version = 1
@@ -478,7 +505,7 @@ env_mode = "strict"
             ),
             ("shared_secrets=['SHARED_SETTING']", "locket set SHARED_SETTING --project @shared"),
         ] {
-            fs::write(root.join("locket.toml"), format!("{header}{fields}\n"))?;
+            cache_policy(&mut store, root, &format!("{header}{fields}\n"))?;
             let output = command(root).args(["setup", "status"]).output()?;
             let stdout = String::from_utf8(output.stdout)?;
             assert!(output.status.success(), "{stdout:?} {:?}", output.stderr);
@@ -500,7 +527,7 @@ env_mode = "strict"
     -> Result<(), Box<dyn std::error::Error>> {
         let project = tempfile::tempdir()?;
         let root = project.path();
-        let store = initialize_project_store(root)?;
+        let mut store = initialize_project_store(root)?;
         store.insert_project_if_absent(SHARED_PROJECT, "@shared", 1)?;
         store.insert_profile_if_absent("lk_prof_shared", SHARED_PROJECT, "default", false, 1)?;
         store.connection().execute(
@@ -522,7 +549,7 @@ argv = ["/bin/echo", "child-started"]
 shared_secrets = ["SHARED_SETTING"]
 "#,
         );
-        fs::write(root.join("locket.toml"), policy)?;
+        cache_policy(&mut store, root, &policy)?;
         let _fixture = start_fixture_agent(root)?;
         for (fault, denied_vault) in [
             ("shared-locked", "the Global Vault"),
@@ -696,7 +723,7 @@ env_mode = "strict"
         "[variables.SERVICE_TOKEN]\nclassification = \"public\"\ntype = \"integer\"\ndefault = \"8000\"",
         "",
     );
-        fs::write(root.join("locket.toml"), &file_policy)?;
+        cache_policy(&mut store, root, &file_policy)?;
         fs::write(root.join(".settings"), "SERVICE_TOKEN=\"unterminated\n")?;
         run_in_fixture_terminal(root, Path::new("."), &["run", "serve"], fixture_dialog)?;
 
@@ -705,7 +732,7 @@ env_mode = "strict"
         fs::set_permissions(&docker, fs::Permissions::from_mode(0o700))?;
         let compose_policy =
             file_policy.replace("[\"parent\", { file = \".settings\" }]", "[\"compose\"]");
-        fs::write(root.join("locket.toml"), &compose_policy)?;
+        cache_policy(&mut store, root, &compose_policy)?;
         run_in_fixture_terminal(root, Path::new("."), &["run", "serve"], fixture_dialog)?;
 
         let ide_policy = file_policy.replace("[\"parent\", { file = \".settings\" }]", "[\"ide\"]");
@@ -722,7 +749,7 @@ env_mode = "strict"
                    'manual', 0, 1, 'active', 1, 1, 2)",
             [PROJECT, PROFILE],
         )?;
-        fs::write(root.join("locket.toml"), &file_policy)?;
+        cache_policy(&mut store, root, &file_policy)?;
         run_in_fixture_terminal(root, Path::new("."), &["run", "serve"], fixture_dialog)?;
 
         let reasons = store
@@ -1005,6 +1032,11 @@ env_mode = "strict"
             "stale" => reply["expires_at_unix_nanos"] = json!(now.to_string()),
             "expiry" => reply["expires_at_unix_nanos"] = json!("invalid-timestamp"),
             "ttl" => reply["ttl_seconds"] = json!(3601),
+            "source-changed" => {
+                let path = Path::new("locket.toml");
+                let source = fs::read_to_string(path)?;
+                fs::write(path, source.replace("child-started", "different-fixture-command"))?;
+            }
             "" => {}
             _ => return Err("unknown fixture grant fault".into()),
         }

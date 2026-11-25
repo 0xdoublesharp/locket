@@ -2901,6 +2901,15 @@ pub(crate) fn load_effective_command_policy(
     cwd: &Path,
 ) -> Result<EffectiveCommandPolicy, CliError> {
     let policy_document = read_policy_document(&resolved.root.join(LOCKET_TOML))?;
+    effective_command_policy(&policy_document, resolved, policy_name, cwd)
+}
+
+fn effective_command_policy(
+    policy_document: &PolicyDocument,
+    resolved: &ResolvedProject,
+    policy_name: &str,
+    cwd: &Path,
+) -> Result<EffectiveCommandPolicy, CliError> {
     let mut policy = policy_document.commands.get(policy_name).cloned().ok_or_else(|| {
         policy_not_found_error(format!("command policy not found: {policy_name}"))
     })?;
@@ -2909,7 +2918,7 @@ pub(crate) fn load_effective_command_policy(
     if let Some(scope) = path_scope.as_ref() {
         apply_path_scope_to_policy(&mut policy, scope);
     }
-    enforce_secret_access_policies(&policy_document, &policy, &resolved.root, &canonical_cwd)?;
+    enforce_secret_access_policies(policy_document, &policy, &resolved.root, &canonical_cwd)?;
     Ok(EffectiveCommandPolicy {
         policy,
         path_scope_profile: path_scope.as_ref().and_then(|scope| scope.profile.clone()),
@@ -2917,7 +2926,19 @@ pub(crate) fn load_effective_command_policy(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn load_effective_command_policy_for_argv(
+    resolved: &ResolvedProject,
+    policy_name: impl Into<String>,
+    argv: Vec<String>,
+    cwd: &Path,
+) -> Result<EffectiveCommandPolicy, CliError> {
+    let document = read_policy_document(&resolved.root.join(LOCKET_TOML))?;
+    effective_command_policy_for_argv(&document, resolved, policy_name, argv, cwd)
+}
+
+fn effective_command_policy_for_argv(
+    policy_document: &PolicyDocument,
     resolved: &ResolvedProject,
     policy_name: impl Into<String>,
     argv: Vec<String>,
@@ -2941,13 +2962,12 @@ pub(crate) fn load_effective_command_policy_for_argv(
         require_agent: false,
         ttl: LocketDuration::from_secs(15 * 60),
     };
-    let policy_document = read_policy_document(&resolved.root.join(LOCKET_TOML))?;
     let canonical_cwd = cwd.canonicalize()?;
     let path_scope = policy_document.path_scope_for(&resolved.root, &canonical_cwd).cloned();
     if let Some(scope) = path_scope.as_ref() {
         apply_path_scope_to_policy(&mut policy, scope);
     }
-    enforce_secret_access_policies(&policy_document, &policy, &resolved.root, &canonical_cwd)?;
+    enforce_secret_access_policies(policy_document, &policy, &resolved.root, &canonical_cwd)?;
     Ok(EffectiveCommandPolicy {
         policy,
         path_scope_profile: path_scope.as_ref().and_then(|scope| scope.profile.clone()),

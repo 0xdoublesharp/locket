@@ -4,12 +4,15 @@
 //! gating, runtime-policy compatibility checks, and the canonical RUN audit
 //! payload for docker helpers.
 
+use std::io::Write;
 use std::path::Path;
+use std::process::ExitStatus;
 
 use locket_crypto::KeyPurpose;
 use locket_store::{AuditWrite, ProfileRecord, Store};
 use serde_json::{Value, json};
 
+use crate::commands::policy::{ApprovedPolicySource, require_approved_policy_source};
 use crate::runtime::RuntimeContext;
 use crate::runtime::error::{
     CliError, access_denied_error, invalid_reference_error, metadata_invalid_error,
@@ -21,8 +24,7 @@ use crate::support::secret_helpers::{
 };
 use crate::{EffectiveCommandPolicy, ResolvedProject};
 use crate::{
-    effective_policy_profile, ensure_trusted_project_root, load_effective_command_policy,
-    now_unix_nanos, open_store, require_project,
+    effective_command_policy, effective_policy_profile, now_unix_nanos, open_store, require_project,
 };
 
 use locket_core::{CommandPolicy, CommandSpec};
@@ -53,6 +55,19 @@ pub struct PreparedDockerPolicyExecution {
     pub plan: locket_docker::DockerInjectionPlan,
     /// Which docker helper this prepared execution targets.
     pub helper_kind: DockerHelperKind,
+    source: ApprovedPolicySource,
+}
+
+impl PreparedDockerPolicyExecution {
+    pub fn status(
+        &self,
+        context: &RuntimeContext,
+        output: &mut impl Write,
+    ) -> Result<ExitStatus, CliError> {
+        super::run::write_configuration_warnings(&self.source.document, &self.policy, output)?;
+        self.source.require_current(&self.store, &self.resolved, &self.policy.name)?;
+        Ok(self.execution.command().current_dir(&context.cwd).status()?)
+    }
 }
 
 pub fn prepare_docker_policy_execution(
@@ -93,15 +108,17 @@ fn prepare_docker_helper_policy_execution(
     helper_kind: DockerHelperKind,
 ) -> Result<PreparedDockerPolicyExecution, CliError> {
     let resolved = require_project(context)?;
-    let effective = load_effective_command_policy(&resolved, policy_name, &context.cwd)?;
+    let store = open_store(context)?;
+    let source = require_approved_policy_source(&store, &resolved, policy_name)?;
+    let effective =
+        effective_command_policy(&source.document, &resolved, policy_name, &context.cwd)?;
     let mut policy = effective.policy.clone();
     ensure_runtime_policy_supported(&policy)?;
     // Docker helpers accept pass-through arguments. The saved command cannot
     // stand in for the actual recipient when evaluating per-secret argv ACLs.
     policy.command = CommandSpec::Argv(argv.to_vec());
-    let document = crate::read_policy_document(&resolved.root.join(crate::LOCKET_TOML))?;
     crate::enforce_secret_access_policies(
-        &document,
+        &source.document,
         &policy,
         &resolved.root,
         &context.cwd.canonicalize()?,
@@ -111,7 +128,6 @@ fn prepare_docker_helper_policy_execution(
         policy.allowed_secrets.iter().map(locket_core::SecretName::as_str),
     )
     .map_err(docker_error)?;
-    let store = open_store(context)?;
     let (profile, _selections, locket_env) =
         resolve_policy_locket_env(context, &store, &resolved, &effective, &policy)?;
     let request = locket_exec::ExecutionRequest {
@@ -124,7 +140,7 @@ fn prepare_docker_helper_policy_execution(
         override_mode: policy.override_behavior,
     };
     let mut execution = super::prepare_vault_execution(&request)?;
-    super::run::finalize_configuration_environment(&resolved, &policy, &mut execution.env)?;
+    super::run::finalize_configuration_environment(&source.document, &policy, &mut execution.env)?;
     let endpoint = super::docker_context::resolve_endpoint(&execution.env, &context.cwd)?;
     let mut delivery_env = execution.env.clone();
     delivery_env
@@ -151,7 +167,6 @@ fn prepare_docker_helper_policy_execution(
         // redirect this prepared invocation to a different daemon.
         plan.argv.splice(1..1, ["--host".to_owned(), endpoint]);
     } else {
-        use std::io::Write as _;
         let expected = format!("remote {}", policy.name);
         writeln!(
             std::io::stderr(),
@@ -179,6 +194,7 @@ fn prepare_docker_helper_policy_execution(
         execution,
         plan,
         helper_kind,
+        source,
     })
 }
 
@@ -216,7 +232,6 @@ pub fn resolve_policy_locket_env(
             "shared_secrets are supported by locket run; Docker and Compose delivery require project secrets",
         ));
     }
-    ensure_trusted_project_root(store, resolved)?;
     let profile = effective_policy_profile(store, resolved, effective)?;
     let selections = policy_secret_selections(store, resolved, &profile, policy)?;
 

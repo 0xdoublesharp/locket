@@ -323,6 +323,18 @@ pub(super) fn context_with_recovery_code(context: &RuntimeContext, code: &str) -
     }
 }
 
+pub(crate) fn approve_test_policy(
+    context: &RuntimeContext,
+    name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_with_context(
+        Cli::try_parse_from(["locket", "policy", "refresh", name])?,
+        &context_with_confirmation(context, name),
+        &mut Vec::new(),
+    )?;
+    Ok(())
+}
+
 pub(super) fn test_secret_write_args(key: &str) -> super::SecretWriteArgs {
     super::SecretWriteArgs {
         target: crate::commands::secrets::set::WriteTargetArgs::default(),

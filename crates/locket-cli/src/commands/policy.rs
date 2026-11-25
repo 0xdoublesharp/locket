@@ -5,7 +5,7 @@ use locket_core::{
 };
 use locket_crypto::KeyPurpose;
 use locket_scan::EntropyRule;
-use locket_store::{AuditContext, AuditWrite};
+use locket_store::{AuditContext, AuditWrite, Store};
 use serde_json::json;
 use std::collections::BTreeSet;
 use std::fs;
@@ -52,7 +52,7 @@ pub enum PolicyCommand {
     Delete(PolicyDeleteArgs),
     /// Edit a command policy in the configured editor.
     Edit(PolicyEditArgs),
-    /// Review and approve the current policy source for agent reference access.
+    /// Review and approve the current policy source for execution.
     Refresh(PolicyEditArgs),
     /// Validate policy metadata in locket.toml.
     Doctor,
@@ -347,7 +347,7 @@ fn doctor(context: &RuntimeContext, output: &mut impl Write) -> Result<(), CliEr
     let validation = if document.commands.is_empty() {
         DoctorValidation::default()
     } else {
-        validate_policies_via_agent(context, &resolved, &document)
+        validate_policies_via_agent(context, &resolved, &document, &refreshes)
     };
 
     let header_status = if !refreshes.is_empty()
@@ -450,12 +450,14 @@ fn policy_indexes_needing_refresh(
     let store = open_store(context)?;
     let mut names = Vec::new();
     for name in parsed.commands.keys() {
+        let digest = locket_core::policy::policy_source_digest(source, name)?;
         if let Some(index) =
             store.get_command_policy_index(resolved.config.project_id.as_str(), name)?
-            && !policy_index_matches_source(&index, resolved, source, name)?
+            && policy_index_matches_source(&index, resolved, source, name, &digest)?
         {
-            names.push(name.clone());
+            continue;
         }
+        names.push(name.clone());
     }
     Ok(names)
 }
@@ -465,11 +467,11 @@ fn policy_index_matches_source(
     resolved: &ResolvedProject,
     source: &toml::Value,
     name: &str,
+    digest: &str,
 ) -> Result<bool, CliError> {
-    let digest = locket_core::policy::policy_source_digest(source, name)?;
     Ok(index.normalized_json.get("source_path") == Some(&json!(resolved.root.join(LOCKET_TOML)))
         && index.normalized_json.get("source_digest").and_then(serde_json::Value::as_str)
-            == Some(&digest)
+            == Some(digest)
         && index.policy_json == policy_json(source, name)?)
 }
 
@@ -522,6 +524,7 @@ fn validate_policies_via_agent(
     context: &RuntimeContext,
     resolved: &ResolvedProject,
     document: &PolicyDocument,
+    needs_approval: &[String],
 ) -> DoctorValidation {
     let mut validation = DoctorValidation::default();
 
@@ -552,8 +555,11 @@ fn validate_policies_via_agent(
         }
     };
 
-    let policies: Vec<&CommandPolicy> = document.commands.values().collect();
-
+    let policies: Vec<&CommandPolicy> = document
+        .commands
+        .values()
+        .filter(|policy| !needs_approval.contains(&policy.name))
+        .collect();
     for policy in &policies {
         let report =
             validate_one_policy(context, resolved, &profile, policy, &binding, &mut validation);
@@ -875,7 +881,7 @@ fn write_doctor_audit_if_available(
     Ok(())
 }
 
-fn read_locket_toml(path: &Path) -> Result<locket_platform::PolicyFileDocument, CliError> {
+pub fn read_locket_toml(path: &Path) -> Result<locket_platform::PolicyFileDocument, CliError> {
     locket_platform::PolicyFileDocument::read(path)
         .map_err(|error| metadata_invalid_error(error.to_string()))
 }
@@ -1345,47 +1351,72 @@ mod framing_tests {
     }
 }
 
-/// Saves an explicitly approved command using the shared durable policy writer.
-/// Refreshes derived reference permissions before an explicit local CLI run.
-pub fn refresh_command_policy_for_run(
-    context: &RuntimeContext,
-    resolved: &ResolvedProject,
-    name: &str,
-) -> Result<(), CliError> {
-    let document = read_locket_toml(&resolved.root.join(LOCKET_TOML))?;
-    let parsed = PolicyDocument::from_toml_value(&document)
-        .map_err(|error| metadata_invalid_error(error.to_string()))?;
-    let store = open_store(context)?;
-    crate::ensure_trusted_project_root(&store, resolved)?;
-    if let Some(index) =
-        store.get_command_policy_index(resolved.config.project_id.as_str(), name)?
-        && policy_index_matches_source(&index, resolved, &document, name)?
-    {
-        return Ok(());
-    }
-    write_policy_index_update_if_available(
-        context,
-        resolved.config.project_id.as_str(),
-        &document,
-        &parsed,
-        name,
-        "refresh",
-    )?;
-    pump_policies_to_agent(context, resolved.config.project_id.as_str(), &parsed);
-    Ok(())
+/// The approved policy document used to prepare one execution.
+#[derive(Debug)]
+pub struct ApprovedPolicySource {
+    pub document: PolicyDocument,
+    digest: String,
 }
 
+impl ApprovedPolicySource {
+    /// Check that the prepared execution still uses the current approved source.
+    pub fn require_current(
+        &self,
+        store: &Store,
+        resolved: &ResolvedProject,
+        name: &str,
+    ) -> Result<(), CliError> {
+        verify_policy_source(store, resolved, name, Some(&self.digest))?;
+        Ok(())
+    }
+}
+
+pub fn require_approved_policy_source(
+    store: &Store,
+    resolved: &ResolvedProject,
+    name: &str,
+) -> Result<ApprovedPolicySource, CliError> {
+    let (source, digest) = verify_policy_source(store, resolved, name, None)?;
+    let document = PolicyDocument::from_toml_value(&source)
+        .map_err(|error| invalid_policy_error(error.to_string()))?;
+    Ok(ApprovedPolicySource { document, digest })
+}
+
+fn verify_policy_source(
+    store: &Store,
+    resolved: &ResolvedProject,
+    name: &str,
+    expected_digest: Option<&str>,
+) -> Result<(locket_platform::PolicyFileDocument, String), CliError> {
+    crate::ensure_trusted_project_root(store, resolved)?;
+    let source = read_locket_toml(&resolved.root.join(LOCKET_TOML))?;
+    ensure_policy_exists(&source, name)?;
+    let project_id = resolved.config.project_id.as_str();
+    let digest = locket_core::policy::policy_source_digest(&source, name)?;
+    if source.get("project_id").and_then(toml::Value::as_str) == Some(project_id)
+        && source.get("default_profile").and_then(toml::Value::as_str)
+            == Some(resolved.config.default_profile.as_str())
+        && expected_digest.is_none_or(|expected| expected == digest)
+        && let Some(index) = store.get_command_policy_index(project_id, name)?
+        && policy_index_matches_source(&index, resolved, &source, name, &digest)?
+    {
+        return Ok((source, digest));
+    }
+    Err(crate::access_denied_error(format!(
+        "command policy {name} needs local approval of its current source; review locket.toml and run `locket policy refresh {name}`"
+    )))
+}
+
+/// Saves an explicitly approved command in the source reviewed before prompting.
 pub fn persist_command_policy(
     context: &RuntimeContext,
     resolved: &ResolvedProject,
     policy: &CommandPolicy,
+    mut document: locket_platform::PolicyFileDocument,
 ) -> Result<(), CliError> {
     validate_policy_name(&policy.name)?;
     let store = open_store(context)?;
     crate::ensure_trusted_project_root(&store, resolved)?;
-    let path = resolved.root.join(LOCKET_TOML);
-    let mut document = locket_platform::PolicyFileDocument::read(&path)
-        .map_err(|error| metadata_invalid_error(error.to_string()))?;
     commands_table_mut(&mut document)?
         .insert(policy.name.clone(), locket_core::policy::command_policy_value(policy));
     let parsed = document.save().map_err(|error| metadata_invalid_error(error.to_string()))?;

@@ -245,6 +245,7 @@ default='wrong-fallback'
         ),
     )?;
 
+    super::approve_test_policy(&inside, "check")?;
     let (_, missing) = run(&inside, &["env", "inspect", "--policy", "check"])?;
     assert!(missing.contains("configuration GLOBAL_TOKEN state=Missing source=none"));
     assert!(missing.contains("locket set GLOBAL_TOKEN --project @shared"));
@@ -276,6 +277,7 @@ default='wrong-fallback'
         .append(true)
         .open(file)?
         .write_all(b"\n[secrets.GLOBAL_TOKEN]\nallow_commands=['other']\n")?;
+    super::approve_test_policy(&inside, "check")?;
     for args in [&["env", "inspect", "--policy", "check"][..], &["run", "check"][..]] {
         assert!(run(&inside, args).is_err_and(|error| error.to_string().contains("ACL denied")));
     }

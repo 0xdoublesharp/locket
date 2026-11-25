@@ -33,6 +33,16 @@ impl IdeTestAgent {
             context.key_store.clone(),
             passphrase_store,
         );
+        // Tests that opt into real launch grants use the daemon's durable
+        // approval check, including after a restart with an empty policy cache.
+        let state = if context.agent_data_dir.is_some() {
+            state
+                .with_canonical_store_path(context.store_path.clone())
+                .with_user_verifier(context.user_verifier.clone())
+                .with_daemon_user_verification(true)
+        } else {
+            state
+        };
         let ide_registry = state.ide_env_sessions.clone();
         let shutdown = Arc::new(tokio::sync::Notify::new());
         let shutdown_signal = shutdown.clone();
@@ -155,7 +165,7 @@ fn agent_run_delivers_path_scoped_secret_from_cached_passphrase_unlock()
             "{source}\n[paths.'apps/api']\nrequired_secrets=['DATABASE_URL']\n[secrets.DATABASE_URL]\nallow_commands=['ide_run']\nallow_paths=['apps/api/**']\n"
         ),
     )?;
-    crate::commands::policy::refresh_command_policy_for_run(&context, &project, "ide_run")?;
+    approve_test_policy(&context, "ide_run")?;
     let master = context.key_store.load_master_key(project.config.project_id.as_str())?;
     context.passphrase_store.store_master_key(
         project.config.project_id.as_str(),
@@ -237,6 +247,7 @@ fn fixture(directory: &tempfile::TempDir) -> Result<RuntimeContext, Box<dyn std:
         .append(true)
         .open(directory.path().join("locket.toml"))?
         .write_all(b"external_env_sources = [\"ide\"]\n")?;
+    approve_test_policy(&context, "ide_run")?;
     tighten_directory(directory.path())?;
     Ok(context)
 }
@@ -390,6 +401,7 @@ fn require_agent_run_uses_bound_grants_and_reports_no_values()
         .replace("external_env_sources = [\"ide\"]", "require_agent = true")
         .replace("\"true\"", r#""test -n \"$DATABASE_URL\" && printf present > fixture-ran""#);
     fs::write(&source, text)?;
+    approve_test_policy(&context, "ide_run")?;
     context.agent_data_dir = Some(directory.path().to_path_buf());
 
     let agent = IdeTestAgent::start(&context)?;

@@ -200,6 +200,7 @@ fn configuration_contract_docker_and_compose_plans_include_only_authorized_defau
     let mut text = fs::read_to_string(&path)?;
     text.push_str("\n[commands.container]\nargv=['docker','run','synthetic-image']\nrequired_secrets=['PORT']\ninherit_env=['PORT']\n[variables.PORT]\nclassification='public'\ntype='integer'\ndefault='3001'\n[variables.UNAUTHORIZED]\nclassification='public'\ndefault='canary-not-in-container'\n");
     fs::write(path, text)?;
+    approve_test_policy(&context, "container")?;
     for compose in [false, true] {
         let argv = if compose {
             vec!["docker".into(), "compose".into(), "up".into()]
@@ -294,8 +295,9 @@ allow_commands=['allowed']
     assert!(crate::load_effective_command_policy(&resolved, "denied", &context.cwd).is_err());
     let allowed = crate::load_effective_command_policy(&resolved, "allowed", &context.cwd)?.policy;
     let mut child = locket_exec::EnvMap::new();
+    let document = crate::read_policy_document(&resolved.root.join("locket.toml"))?;
     crate::commands::exec::run::finalize_configuration_environment(
-        &resolved, &allowed, &mut child,
+        &document, &allowed, &mut child,
     )?;
     assert!(child.contains_key("PUBLIC_URL"));
     let mut output = Vec::new();

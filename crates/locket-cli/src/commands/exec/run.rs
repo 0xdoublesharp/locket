@@ -9,8 +9,8 @@ use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
 use std::str::FromStr;
 
 use locket_core::{
-    CommandPolicy, CommandSpec, ExternalEnvSource, LkReferenceUri, LocketError, SecretName,
-    SessionId,
+    CommandPolicy, CommandSpec, ExternalEnvSource, LkReferenceUri, LocketError, PolicyDocument,
+    SecretName, SessionId,
 };
 use locket_exec::{
     EgressEvent, EgressProxyBroker, EgressProxyConfig, EgressSecretBinding,
@@ -25,6 +25,9 @@ use zeroize::Zeroizing;
 
 use crate::commands::agent::{ensure_agent_running_for_execution, request_project_status_snapshot};
 use crate::commands::config::spec::{config_get_value, read_user_config};
+use crate::commands::policy::{
+    ApprovedPolicySource, read_locket_toml, require_approved_policy_source,
+};
 use crate::runtime::RuntimeContext;
 use crate::runtime::error::{
     CliError, child_exit_error, confirmation_failed_error, corrupt_db_error, exec_prepare_error,
@@ -36,9 +39,9 @@ use crate::support::secret_helpers::{
     PolicySecretSelection, decrypt_secret_version, policy_secret_selections,
 };
 use crate::{
-    ResolvedProject, RunArgs, effective_policy_profile, ensure_trusted_project_root,
-    load_effective_command_policy, load_effective_command_policy_for_argv, now_unix_nanos,
-    open_store, require_project, write_runtime_policy_audit_if_available,
+    EffectiveCommandPolicy, ResolvedProject, RunArgs, effective_command_policy,
+    effective_command_policy_for_argv, effective_policy_profile, ensure_trusted_project_root,
+    now_unix_nanos, open_store, require_project, write_runtime_policy_audit_if_available,
     write_runtime_policy_denial_audit_if_available,
 };
 use locket_core::dotenv::{DotenvOptions, parse_dotenv};
@@ -66,8 +69,10 @@ pub struct RuntimeExecutionRequest<'a> {
 /// Policy-grant data needed before spawning a runtime child.
 #[derive(Clone, Copy, Debug)]
 pub struct RunPolicyGrantRequest<'a> {
-    /// Trusted project configuration used to refresh the policy.
+    /// Trusted project configuration used to verify the approved policy.
     pub resolved: &'a ResolvedProject,
+    /// Source whose policy and access rules were used to prepare the child.
+    source: &'a ApprovedPolicySource,
     /// Live grant TTL from the command policy.
     pub ttl_seconds: u64,
 }
@@ -104,6 +109,11 @@ struct PreparedPolicyExecution {
     external_env_names: Vec<String>,
     protection_inputs: Option<ProtectionInputs>,
     prepared: locket_exec::PreparedExecution,
+}
+
+struct ApprovedRunPolicy {
+    source: ApprovedPolicySource,
+    effective: EffectiveCommandPolicy,
 }
 
 struct ProtectionInputs {
@@ -302,11 +312,11 @@ pub fn run_command_with_diagnostics(
     run_args: &RunArgs,
 ) -> Result<(), CliError> {
     let resolved = require_project(context)?;
-    let effective = resolve_run_policy(context, output, &resolved, run_args)?;
-    let policy = &effective.policy;
     let mut store = open_store(context)?;
     ensure_trusted_project_root(&store, &resolved)?;
-    let profile = effective_policy_profile(&store, &resolved, &effective)?;
+    let approved = resolve_run_policy(context, output, &mut store, &resolved, run_args)?;
+    let policy = &approved.effective.policy;
+    let profile = effective_policy_profile(&store, &resolved, &approved.effective)?;
     let insecure_argv = match argv_reference_access(&policy.command, run_args.allow_insecure_argv) {
         Ok(allowed) => allowed,
         Err(error) => {
@@ -337,7 +347,7 @@ pub fn run_command_with_diagnostics(
         &store,
         &resolved,
         &profile,
-        policy,
+        &approved,
         run_args.redact_output || !run_args.egress_host.is_empty(),
     ) {
         Ok(prepared) => prepared,
@@ -367,6 +377,7 @@ pub fn run_command_with_diagnostics(
             current_dir: Some(&context.cwd),
             run_policy_grant: Some(RunPolicyGrantRequest {
                 resolved: &resolved,
+                source: &approved.source,
                 ttl_seconds: policy.ttl.as_secs(),
             }),
             shared_project: shared_project(&prepared_policy.selections),
@@ -446,23 +457,32 @@ pub fn approve_project_command(
     resolved: &ResolvedProject,
     argv: Vec<String>,
 ) -> Result<(), CliError> {
-    resolve_run_policy(context, output, resolved, &RunArgs { argv, ..RunArgs::default() })?;
+    resolve_run_policy(
+        context,
+        output,
+        &mut open_store(context)?,
+        resolved,
+        &RunArgs { argv, ..RunArgs::default() },
+    )?;
     Ok(())
 }
 
 fn resolve_run_policy(
     context: &RuntimeContext,
     output: &mut impl Write,
+    store: &mut Store,
     resolved: &ResolvedProject,
     run_args: &RunArgs,
-) -> Result<crate::EffectiveCommandPolicy, CliError> {
+) -> Result<ApprovedRunPolicy, CliError> {
     let explicit_argv = run_args.policy.is_empty();
     if !explicit_argv && run_args.runner_args.is_empty() && run_args.argv.is_empty() {
-        return load_command_policy_or_audit_denial(context, resolved, &run_args.policy);
+        return load_command_policy_or_audit_denial(context, store, resolved, &run_args.policy);
     }
     let argv = requested_run_argv(run_args, &resolved.root)?;
     argv_reference_access(&CommandSpec::Argv(argv.clone()), run_args.allow_insecure_argv)?;
-    let document = crate::read_policy_document(&resolved.root.join(crate::LOCKET_TOML))?;
+    let source = read_locket_toml(&resolved.root.join(crate::LOCKET_TOML))?;
+    let document = PolicyDocument::from_toml_value(&source)
+        .map_err(|error| invalid_policy_error(error.to_string()))?;
     let matched = document
         .commands
         .get("dev")
@@ -474,7 +494,11 @@ fn resolve_run_policy(
                 .find(|policy| policy.command == CommandSpec::Argv(argv.clone()))
         });
     if let Some(policy) = matched {
-        return load_command_policy_or_audit_denial(context, resolved, &policy.name);
+        let approved = load_command_policy_or_audit_denial(context, store, resolved, &policy.name)?;
+        if approved.effective.policy.command != CommandSpec::Argv(argv) {
+            return Err(invalid_policy_error("command configuration changed; retry the command"));
+        }
+        return Ok(approved);
     }
     let policy_name = next_command_name(&document);
     // Match and persist authorization using the same resolved directory. In
@@ -482,12 +506,11 @@ fn resolve_run_policy(
     // caller's cwd spelling may omit.
     let canonical_cwd = context.cwd.canonicalize()?;
     let mut effective =
-        load_effective_command_policy_for_argv(resolved, policy_name, argv, &canonical_cwd)?;
-    let store = open_store(context)?;
-    ensure_trusted_project_root(&store, resolved)?;
-    let profile = effective_policy_profile(&store, resolved, &effective)?;
+        effective_command_policy_for_argv(&document, resolved, policy_name, argv, &canonical_cwd)?;
+    ensure_trusted_project_root(store, resolved)?;
+    let profile = effective_policy_profile(store, resolved, &effective)?;
     let names = crate::active_profile_secret_names(
-        &store,
+        store,
         resolved.config.project_id.as_str(),
         &profile.id,
     )?;
@@ -554,8 +577,8 @@ fn resolve_run_policy(
         base_policy.optional_secrets.retain(|name| !scoped.contains(name));
         base_policy.allowed_secrets.retain(|name| !scoped.contains(name));
     }
-    crate::commands::policy::persist_command_policy(context, resolved, &base_policy)?;
-    load_command_policy_or_audit_denial(context, resolved, &effective.policy.name)
+    crate::commands::policy::persist_command_policy(context, resolved, &base_policy, source)?;
+    load_command_policy_or_audit_denial(context, store, resolved, &effective.policy.name)
 }
 
 fn requested_run_argv(run_args: &RunArgs, project_root: &Path) -> Result<Vec<String>, CliError> {
@@ -783,9 +806,12 @@ fn prepare_policy_execution(
     store: &Store,
     resolved: &ResolvedProject,
     profile: &ProfileRecord,
-    policy: &CommandPolicy,
+    approved: &ApprovedRunPolicy,
     protect_output: bool,
 ) -> Result<PreparedPolicyExecution, CliError> {
+    let policy = &approved.effective.policy;
+    let document = &approved.source.document;
+    approved.source.require_current(store, resolved, &policy.name)?;
     let selections = policy_secret_selections(store, resolved, profile, policy)?;
     check_policy_secret_availability(store, &selections)?;
     ensure_agent_running_for_execution(context)?;
@@ -793,31 +819,16 @@ fn prepare_policy_execution(
     let parent_env = std::env::vars()
         .map(|(name, value)| (name, locket_exec::env_value(value)))
         .collect::<locket_exec::EnvMap>();
-
-    // The agent must be live before we resolve the IDE external-env
-    // source (it talks to the agent for both the session map and the
-    // per-name `ResolveReference`). Detect that need up front so the
-    // unlock + grant dance happens before external-env resolution
-    // rather than after.
-    let has_ide_source = policy_has_ide_source(policy);
-    let agent_required =
-        policy.require_agent || policy_command_has_lk_references(policy) || has_ide_source;
-    let agent_access = if agent_required {
-        Some(prepare_agent_policy_access(context, resolved, profile, policy, &selections)?)
-    } else {
-        None
-    };
-    let ide_ctx = agent_access.as_ref().filter(|_| has_ide_source).map(|access| {
-        IdeEnvSourceContext { context, resolved, profile, policy, agent_access: access }
-    });
-    let external_env = resolve_policy_external_env_with_compose_config_command(
-        policy,
+    let (agent_access, external_env) = prepare_policy_sources(
+        context,
+        store,
+        resolved,
+        profile,
+        approved,
+        &selections,
         &parent_env,
-        &resolved.root,
-        &ComposeConfigCommand::docker(),
-        ide_ctx.as_ref(),
     )?;
-    write_configuration_warnings(resolved, policy, output)?;
+    write_configuration_warnings(document, policy, output)?;
 
     let mut locket_env = policy_locket_env(
         context,
@@ -864,7 +875,7 @@ fn prepare_policy_execution(
         override_mode: policy.override_behavior,
     };
     let mut prepared = super::prepare_vault_execution(&request)?;
-    finalize_configuration_environment(resolved, policy, &mut prepared.env)?;
+    finalize_configuration_environment(document, policy, &mut prepared.env)?;
     let external_env_names = external_env.keys().map(ToOwned::to_owned).collect::<Vec<_>>();
     let secret_names = unique_secret_names(
         selections
@@ -891,6 +902,45 @@ fn prepare_policy_execution(
         protection_inputs,
         prepared,
     })
+}
+
+fn prepare_policy_sources(
+    context: &RuntimeContext,
+    store: &Store,
+    resolved: &ResolvedProject,
+    profile: &ProfileRecord,
+    approved: &ApprovedRunPolicy,
+    selections: &[PolicySecretSelection],
+    parent_env: &locket_exec::EnvMap,
+) -> Result<(Option<AgentPolicyAccess>, locket_exec::EnvMap), CliError> {
+    let policy = &approved.effective.policy;
+    // The IDE source needs a grant for its session map and reference lookups.
+    let has_ide_source = policy_has_ide_source(policy);
+    let agent_access =
+        if policy.require_agent || policy_command_has_lk_references(policy) || has_ide_source {
+            Some(prepare_agent_policy_access(
+                context,
+                store,
+                resolved,
+                profile,
+                policy,
+                &approved.source,
+                selections,
+            )?)
+        } else {
+            None
+        };
+    let ide_ctx = agent_access.as_ref().filter(|_| has_ide_source).map(|access| {
+        IdeEnvSourceContext { context, resolved, profile, policy, agent_access: access }
+    });
+    let external_env = resolve_policy_external_env_with_compose_config_command(
+        policy,
+        parent_env,
+        &resolved.root,
+        &ComposeConfigCommand::docker(),
+        ide_ctx.as_ref(),
+    )?;
+    Ok((agent_access, external_env))
 }
 
 fn check_policy_secret_availability(
@@ -1143,12 +1193,9 @@ pub(crate) fn prepare_agent_policy_access_for_tests(
     profile: &ProfileRecord,
     policy: &CommandPolicy,
 ) -> Result<AgentPolicyAccess, CliError> {
-    // Selections drive the "needs reference grant" decision; we always
-    // want a ResolveReference grant for IDE-source tests, so synthesize
-    // a placeholder selection list with one entry. Actual policy
-    // selections are not consulted during the grant request — the
-    // helper only checks `selected.is_some()` to decide.
-    prepare_agent_policy_access(context, resolved, profile, policy, &[])
+    let store = open_store(context)?;
+    let source = require_approved_policy_source(&store, resolved, &policy.name)?;
+    prepare_agent_policy_access(context, &store, resolved, profile, policy, &source, &[])
 }
 
 const COMPOSE_ROUTING_ENV: &[&str] = &[
@@ -1427,13 +1474,15 @@ fn policy_locket_env_via_agent(
 
 fn prepare_agent_policy_access(
     context: &RuntimeContext,
+    store: &Store,
     resolved: &ResolvedProject,
     profile: &ProfileRecord,
     policy: &CommandPolicy,
+    source: &ApprovedPolicySource,
     selections: &[PolicySecretSelection],
 ) -> Result<AgentPolicyAccess, CliError> {
     unlock_agent_for_policy(context, resolved, policy)?;
-    crate::commands::policy::refresh_command_policy_for_run(context, resolved, &policy.name)?;
+    source.require_current(store, resolved, &policy.name)?;
     let binding = agent_grant_binding()?.with_execution(&policy.name, context.cwd.canonicalize()?);
     let needs_reference_grant = policy_command_has_lk_references(policy)
         || selections.iter().any(|s| !s.shared && s.selected.is_some())
@@ -1889,11 +1938,11 @@ fn execute_runtime_child(
             return Err(error);
         }
     }
-    let mut child = match command.spawn() {
+    let mut child = match spawn_runtime_child(&mut command, request) {
         Ok(child) => child,
         Err(error) => {
             revoke_run_policy_grant(context, run_policy_grant.as_ref());
-            return Err(error.into());
+            return Err(error);
         }
     };
     drop(command);
@@ -1957,6 +2006,16 @@ fn execute_runtime_child(
     })
 }
 
+fn spawn_runtime_child(
+    command: &mut ProcessCommand,
+    request: &RuntimeExecutionRequest<'_>,
+) -> Result<std::process::Child, CliError> {
+    if let (Some(grant), Some(name)) = (request.run_policy_grant, request.policy_name) {
+        grant.source.require_current(request.store, grant.resolved, name)?;
+    }
+    Ok(command.spawn()?)
+}
+
 #[derive(serde::Deserialize)]
 struct RunPolicyGrantResponse {
     grant_id: String,
@@ -1976,6 +2035,7 @@ fn request_run_policy_grant(
     let ttl_seconds = grant.ttl_seconds;
     let policy_name =
         request.policy_name.ok_or_else(|| invalid_policy_error("run grant needs a policy"))?;
+    grant.source.require_current(request.store, grant.resolved, policy_name)?;
     let cwd = request.current_dir.unwrap_or(&context.cwd).canonicalize()?;
     let binding = agent_grant_binding()?.with_execution(policy_name, cwd);
     // Unit fixtures without an agent exercise local child behavior. Fixtures
@@ -1987,14 +2047,6 @@ fn request_run_policy_grant(
             metadata: RunPolicyGrantMetadata { ttl_seconds, binding },
         });
     }
-    if cfg!(not(test)) {
-        crate::commands::policy::refresh_command_policy_for_run(
-            context,
-            grant.resolved,
-            policy_name,
-        )?;
-    }
-
     let payload = locket_agent::RequestGrantPayload {
         project_id: grant.resolved.config.project_id.to_string(),
         profile_id: request.profile.id.clone(),
@@ -2079,24 +2131,34 @@ pub fn unique_secret_names<'a>(names: impl Iterator<Item = &'a str>) -> Vec<Stri
 /// bookkeeping never masks the original error.
 fn load_command_policy_or_audit_denial(
     context: &RuntimeContext,
+    store: &mut Store,
     resolved: &ResolvedProject,
     policy_name: &str,
-) -> Result<crate::EffectiveCommandPolicy, CliError> {
-    match load_effective_command_policy(resolved, policy_name, &context.cwd) {
+) -> Result<ApprovedRunPolicy, CliError> {
+    let load = || {
+        let source = require_approved_policy_source(store, resolved, policy_name)?;
+        let effective =
+            effective_command_policy(&source.document, resolved, policy_name, &context.cwd)?;
+        Ok(ApprovedRunPolicy { source, effective })
+    };
+    match load() {
         Ok(policy) => Ok(policy),
         Err(error) => {
-            if let Ok(mut store) = open_store(context) {
-                let profile = default_profile(&store, &resolved.config).ok();
-                let _ignored = write_runtime_policy_denial_audit_if_available(
-                    context,
-                    &mut store,
-                    resolved,
-                    profile.as_ref(),
-                    None,
-                    policy_name,
-                    "policy_not_found",
-                );
-            }
+            let reason = match error {
+                CliError::Typed { kind: LocketError::PolicyNotFound, .. } => "policy_not_found",
+                CliError::Typed { kind: LocketError::AccessDenied, .. } => "policy_unapproved",
+                _ => "policy_rejected",
+            };
+            let profile = default_profile(store, &resolved.config).ok();
+            let _ignored = write_runtime_policy_denial_audit_if_available(
+                context,
+                store,
+                resolved,
+                profile.as_ref(),
+                None,
+                policy_name,
+                reason,
+            );
             Err(error)
         }
     }
@@ -2132,6 +2194,7 @@ fn denial_failure_reason(error: &CliError) -> &'static str {
             LocketError::InvalidReference => "invalid_lk_reference",
             LocketError::AgentUnavailable => "agent_unavailable",
             LocketError::GrantRequired => "grant_required",
+            LocketError::AccessDenied => "access_denied",
             _ => "policy_rejected",
         },
         _ => "policy_rejected",
@@ -2140,11 +2203,10 @@ fn denial_failure_reason(error: &CliError) -> &'static str {
 
 /// Applies authorized public fallbacks, then checks only the final selected values.
 pub fn finalize_configuration_environment(
-    resolved: &ResolvedProject,
+    document: &PolicyDocument,
     policy: &CommandPolicy,
     env: &mut locket_exec::EnvMap,
 ) -> Result<(), CliError> {
-    let document = crate::read_policy_document(&resolved.root.join(crate::LOCKET_TOML))?;
     document.apply_variable_defaults(policy, env);
     locket_exec::restrict_child_search_path(env);
     let missing = policy
@@ -2178,11 +2240,10 @@ pub fn finalize_configuration_environment(
 }
 
 pub fn write_configuration_warnings(
-    resolved: &ResolvedProject,
+    document: &PolicyDocument,
     policy: &CommandPolicy,
     output: &mut impl Write,
 ) -> Result<(), CliError> {
-    let document = crate::read_policy_document(&resolved.root.join(crate::LOCKET_TOML))?;
     for row in document.variable_readiness(policy, &std::collections::BTreeMap::new(), false) {
         if let Some(warning) = row.warning {
             writeln!(output, "warning: {warning}")?;
@@ -2266,6 +2327,7 @@ mod approval_tests {
         let effective = super::resolve_run_policy(
             &context,
             &mut Vec::new(),
+            &mut crate::open_store(&context)?,
             &resolved,
             &crate::RunArgs {
                 policy: String::new(),
@@ -2273,7 +2335,8 @@ mod approval_tests {
                 argv: vec!["true".into()],
                 ..crate::RunArgs::default()
             },
-        )?;
+        )?
+        .effective;
         assert!(
             effective.policy.required_secrets.iter().any(|name| name.as_str() == "PACKAGE_ONLY")
         );
@@ -2357,6 +2420,7 @@ mod approval_tests {
         let effective = super::resolve_run_policy(
             &context,
             &mut Vec::new(),
+            &mut crate::open_store(&context)?,
             &resolved,
             &crate::RunArgs {
                 policy: String::new(),
@@ -2364,7 +2428,8 @@ mod approval_tests {
                 argv: vec!["/usr/bin/true".to_owned()],
                 ..crate::RunArgs::default()
             },
-        )?;
+        )?
+        .effective;
         assert!(effective.policy.confirm);
         Ok(())
     }
@@ -2386,10 +2451,12 @@ mod approval_tests {
         let mut text = std::fs::read_to_string(&path)?;
         text.push_str("\n[commands.dev]\nargv=[\"npm\",\"run\",\"dev\"]\nrequired_secrets=[\"API_KEY\"]\nconfirm=true\nrequire_user_verification=true\nenv_mode=\"strict\"\n");
         std::fs::write(path, text)?;
+        crate::tests::approve_test_policy(&context, "dev")?;
         let resolved = crate::require_project(&context)?;
         let effective = super::resolve_run_policy(
             &context,
             &mut Vec::new(),
+            &mut crate::open_store(&context)?,
             &resolved,
             &crate::RunArgs {
                 policy: "npm".to_owned(),
@@ -2397,7 +2464,8 @@ mod approval_tests {
                 argv: Vec::new(),
                 ..crate::RunArgs::default()
             },
-        )?;
+        )?
+        .effective;
         assert_eq!(effective.policy.name, "dev");
         assert!(effective.policy.confirm);
         assert!(effective.policy.require_user_verification);
@@ -2458,8 +2526,9 @@ default='must-not-inject'
             "API_URL=http://localhost:4000/external-canary\n",
         )?;
         let resolved = require_project(&context)?;
-        let store = open_store(&context)?;
-        let policy = load_effective_command_policy(&resolved, "check", &context.cwd)?.policy;
+        crate::tests::approve_test_policy(&context, "check")?;
+        let mut store = open_store(&context)?;
+        let policy = load_command_policy_or_audit_denial(&context, &mut store, &resolved, "check")?;
         let profile = default_profile(&store, &resolved.config)?;
         let mut output = Vec::new();
         let prepared = prepare_policy_execution(
@@ -2524,9 +2593,12 @@ default='must-not-inject'
         fs::write(path, text)?;
         fs::write(context.cwd.join(".synthetic-env"), "PORT=4000\n")?;
         let resolved = require_project(&context)?;
-        let store = open_store(&context)?;
+        crate::tests::approve_test_policy(&context, "keep_external")?;
+        crate::tests::approve_test_policy(&context, "use_vault")?;
+        let mut store = open_store(&context)?;
         let profile = default_profile(&store, &resolved.config)?;
-        let keep = load_effective_command_policy(&resolved, "keep_external", &context.cwd)?.policy;
+        let keep =
+            load_command_policy_or_audit_denial(&context, &mut store, &resolved, "keep_external")?;
         let prepared = prepare_policy_execution(
             &context,
             &mut Vec::new(),
@@ -2537,7 +2609,8 @@ default='must-not-inject'
             false,
         )?;
         assert_eq!(prepared.prepared.env["PORT"].as_str(), "4000");
-        let policy = load_effective_command_policy(&resolved, "use_vault", &context.cwd)?.policy;
+        let policy =
+            load_command_policy_or_audit_denial(&context, &mut store, &resolved, "use_vault")?;
         let result = prepare_policy_execution(
             &context,
             &mut Vec::new(),

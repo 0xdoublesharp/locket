@@ -155,6 +155,7 @@ required_secrets = ["MISSING_SECRET"]
             .replace("/usr/bin/true", test_true()))
             .as_bytes(),
         )?;
+    approve_test_policy(&context, "deploy")?;
 
     let result = run_with_context(
         Cli::try_parse_from(["locket", "run", "deploy"])?,
@@ -225,6 +226,7 @@ env_mode = "strict"
             .replace("/usr/bin/true", test_true()))
             .as_bytes(),
         )?;
+    approve_test_policy(&context, "deploy")?;
 
     let result = run_with_context(
         Cli::try_parse_from(["locket", "run", "deploy"])?,
@@ -285,6 +287,7 @@ env_mode = "strict"
             .replace("/usr/bin/true", test_true()))
             .as_bytes(),
         )?;
+    approve_test_policy(&context, "deploy")?;
 
     std::fs::set_permissions(
         directory.path(),
@@ -430,6 +433,7 @@ require_agent = true
             .replace("/usr/bin/true", test_true()))
             .as_bytes(),
         )?;
+    approve_test_policy(&context, "agent_only")?;
 
     let result = run_with_context(
         Cli::try_parse_from(["locket", "run", "agent_only"])?,
@@ -491,6 +495,7 @@ fn e2e_policy_run_require_agent_resolves_required_secret_via_agent()
         .append(true)
         .open(directory.path().join("locket.toml"))?
         .write_all(b"require_agent = true\n")?;
+    approve_test_policy(&context, "deploy")?;
 
     std::fs::set_permissions(
         directory.path(),
@@ -540,6 +545,7 @@ confirm = true
             .replace("/usr/bin/true", test_true()))
             .as_bytes(),
         )?;
+    approve_test_policy(&context, "sensitive")?;
 
     let result = run_with_context(
         Cli::try_parse_from(["locket", "run", "sensitive"])?,
@@ -583,6 +589,7 @@ confirm = true
             .replace("/usr/bin/true", test_true()))
             .as_bytes(),
         )?;
+    approve_test_policy(&context, "sensitive")?;
 
     let mut output = Vec::new();
     run_with_context(Cli::try_parse_from(["locket", "run", "sensitive"])?, &context, &mut output)?;
@@ -617,6 +624,7 @@ require_user_verification = true
             .replace("/usr/bin/true", test_true()))
             .as_bytes(),
         )?;
+    approve_test_policy(&context, "protected")?;
 
     let denying_context =
         context_with_user_verifier(&context, Arc::new(MemoryLocalUserVerifier::denying()));
@@ -671,6 +679,7 @@ env_mode = "strict"
             .replace("/usr/bin/true", test_true()))
             .as_bytes(),
         )?;
+    approve_test_policy(&context, "deploy")?;
 
     run_with_context(Cli::try_parse_from(["locket", "run", "deploy"])?, &context, &mut Vec::new())?;
 
@@ -718,6 +727,7 @@ required_secrets = ["DATABASE_URL"]
 env_mode = "merge"
 "#.replace("/bin/sh", test_shell()).replace("/usr/bin/true", test_true())).as_bytes(),
         )?;
+    approve_test_policy(&context, "merge_check")?;
 
     run_with_context(
         Cli::try_parse_from(["locket", "run", "merge_check"])?,
@@ -777,6 +787,7 @@ optional_secrets = ["API_KEY"]
 env_mode = "passthrough"
 "#.replace("/bin/sh", test_shell()).replace("/usr/bin/true", test_true())).as_bytes(),
         )?;
+    approve_test_policy(&context, "passthrough_check")?;
 
     run_with_context(
         Cli::try_parse_from(["locket", "run", "passthrough_check"])?,
@@ -942,6 +953,7 @@ required_secrets = ["APP_TOKEN", "OTHER_TOKEN"]
 external_env_sources = [{file = ".env.runtime"}]
 "#,
     )?;
+    approve_test_policy(&context, "dev")?;
     let mut output = Vec::new();
     let result =
         run_with_context(Cli::try_parse_from(["locket", "run", "dev"])?, &context, &mut output);

@@ -2,17 +2,18 @@
 
 use std::io::Write;
 
-use locket_core::CommandPolicy;
+use locket_core::{CommandPolicy, ExternalEnvSource};
 
 use super::docker::{prepare_docker_policy_execution, write_docker_policy_audit_if_available};
 use super::run::resolve_policy_external_env;
+use crate::commands::policy::require_approved_policy_source;
 use crate::runtime::RuntimeContext;
 use crate::runtime::error::{CliError, child_exit_error};
 use crate::support::secret_helpers::{PolicySecretSelection, policy_secret_selections};
 use crate::{
-    EnvCommand, EnvDockerArgs, EnvInspectArgs, command_type, effective_policy_profile,
-    ensure_trusted_project_root, external_env_source_label, load_effective_command_policy,
-    open_store, require_project,
+    EnvCommand, EnvDockerArgs, EnvInspectArgs, command_type, effective_command_policy,
+    effective_policy_profile, ensure_trusted_project_root, external_env_source_label, open_store,
+    require_project,
 };
 
 pub fn env_command(
@@ -33,10 +34,19 @@ pub fn env_inspect_command(
     args: &EnvInspectArgs,
 ) -> Result<(), CliError> {
     let resolved = require_project(context)?;
-    let effective = load_effective_command_policy(&resolved, &args.policy, &context.cwd)?;
-    let policy = &effective.policy;
     let store = open_store(context)?;
     ensure_trusted_project_root(&store, &resolved)?;
+    let mut document = crate::read_policy_document(&resolved.root.join(crate::LOCKET_TOML))?;
+    // Inspecting a Compose source invokes `docker compose config`.
+    if document
+        .commands
+        .get(&args.policy)
+        .is_some_and(|policy| policy.external_env_sources.contains(&ExternalEnvSource::Compose))
+    {
+        document = require_approved_policy_source(&store, &resolved, &args.policy)?.document;
+    }
+    let effective = effective_command_policy(&document, &resolved, &args.policy, &context.cwd)?;
+    let policy = &effective.policy;
     let profile = effective_policy_profile(&store, &resolved, &effective)?;
     let selections = policy_secret_selections(&store, &resolved, &profile, policy)?;
     let parent_env = std::env::vars()
@@ -65,7 +75,6 @@ pub fn env_inspect_command(
         )?;
     }
 
-    let document = crate::read_policy_document(&resolved.root.join(crate::LOCKET_TOML))?;
     let selected_sources =
         inspect_selected_sources(policy, &parent_env, &external_env, &selections)?;
     writeln!(output, "configuration_values_checked=false")?;
@@ -170,8 +179,7 @@ pub fn env_docker_command(
         .collect::<locket_exec::EnvMap>();
     let mut prepared =
         prepare_docker_policy_execution(context, &args.policy, &args.command, parent_env)?;
-    super::run::write_configuration_warnings(&prepared.resolved, &prepared.policy, output)?;
-    let status = prepared.execution.command().current_dir(&context.cwd).status()?;
+    let status = prepared.status(context, output)?;
     let audit_status = if status.success() { "SUCCESS" } else { "FAILED" };
     write_docker_policy_audit_if_available(context, &mut prepared, audit_status)?;
     if status.success() {

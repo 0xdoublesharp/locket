@@ -35,8 +35,7 @@ pub fn compose_run_command(
     )?;
     let mut prepared =
         prepare_compose_policy_execution(context, &args.policy, &compose_args, parent_env)?;
-    super::run::write_configuration_warnings(&prepared.resolved, &prepared.policy, output)?;
-    let status = prepared.execution.command().current_dir(&context.cwd).status()?;
+    let status = prepared.status(context, output)?;
     let audit_status = if status.success() { "SUCCESS" } else { "FAILED" };
     write_docker_policy_audit_if_available(context, &mut prepared, audit_status)?;
     if status.success() {
