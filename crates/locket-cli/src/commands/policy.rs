@@ -17,6 +17,7 @@ use crate::commands::config::spec::{
     config_get_value, read_user_config, validate_config_key, validate_stored_config_value,
 };
 use crate::commands::exec::run::agent_invoke;
+use crate::commands::project::detect::{DetectedCommand, detect_commands};
 use crate::commands::scan::scanner::{ScanPolicy, read_scan_policy};
 use crate::runtime::error::typed_cli_error;
 use crate::{
@@ -37,6 +38,12 @@ pub enum PolicyCommand {
     Apply,
     /// Add an argv command policy.
     Add(PolicyAddArgs),
+    /// Find runnable commands in project manifests.
+    Detect {
+        /// Emit JSON for agents and automation.
+        #[arg(long)]
+        json: bool,
+    },
     /// Append optional secret names to a policy.
     Allow(PolicySecretsArgs),
     /// Append required secret names to a policy.
@@ -89,6 +96,7 @@ pub fn command(
     match command {
         PolicyCommand::Apply => apply_editor_command(context, output),
         PolicyCommand::Add(args) => add(context, output, args),
+        PolicyCommand::Detect { json } => detect(context, output, json),
         PolicyCommand::Allow(args) => allow(context, output, args),
         PolicyCommand::Require(args) => require(context, output, args),
         PolicyCommand::Delete(args) => delete(context, output, args),
@@ -96,6 +104,57 @@ pub fn command(
         PolicyCommand::Refresh(args) => refresh(context, output, &args),
         PolicyCommand::Doctor => doctor(context, output),
     }
+}
+
+#[derive(serde::Serialize)]
+struct PolicyDetection {
+    #[serde(flatten)]
+    command: DetectedCommand,
+    command_preview: String,
+    already_configured: bool,
+}
+
+fn detect(
+    context: &RuntimeContext,
+    output: &mut impl Write,
+    json_output: bool,
+) -> Result<(), CliError> {
+    let cwd = context.cwd.canonicalize()?;
+    let config_root = cwd.ancestors().find(|root| root.join(LOCKET_TOML).is_file());
+    let document = config_root.map(|root| read_locket_toml(&root.join(LOCKET_TOML))).transpose()?;
+    let configured = document
+        .as_ref()
+        .and_then(|document| document.get("commands"))
+        .and_then(toml::Value::as_table);
+    let detected = detect_commands(config_root.unwrap_or(&cwd))?
+        .into_iter()
+        .map(|command| PolicyDetection {
+            command_preview: command.argv.join(" "),
+            already_configured: configured
+                .and_then(|commands| commands.get(command.name))
+                .is_some_and(toml::Value::is_table),
+            command,
+        })
+        .collect::<Vec<_>>();
+
+    if json_output {
+        serde_json::to_writer_pretty(&mut *output, &detected)?;
+        writeln!(output)?;
+    } else if detected.is_empty() {
+        writeln!(output, "No runnable commands detected.")?;
+    } else {
+        for row in detected {
+            writeln!(
+                output,
+                "{}: {} (source_file={}, already_configured={})",
+                row.command.name,
+                row.command_preview,
+                row.command.source_file,
+                row.already_configured
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn add(

@@ -2,6 +2,8 @@
 
 use std::io::{self, IsTerminal, Write};
 
+use super::detect::detect_development_argv;
+
 use crate::{
     CliError, LOCKET_TOML, RuntimeContext, SetupCommand, read_policy_document, resolve_project,
 };
@@ -62,7 +64,7 @@ fn setup_status(context: &RuntimeContext, output: &mut impl Write) -> Result<(),
         if names.is_empty() && resolved.root.join(".env").exists() {
             "locket import .env".to_owned()
         } else if policy_document.commands.is_empty() {
-            detected_project_argv(&resolved.root).ok().flatten().map_or_else(
+            detect_development_argv(&resolved.root).ok().flatten().map_or_else(
                 || "locket policy add dev -- <command>".to_owned(),
                 |argv| format!("locket run -- {}", argv.join(" ")),
             )
@@ -143,33 +145,6 @@ fn setup_share(output: &mut impl Write) -> Result<(), CliError> {
     Ok(())
 }
 
-fn detected_project_argv(root: &std::path::Path) -> Result<Option<Vec<String>>, CliError> {
-    let path = root.join("package.json");
-    if !path.exists() {
-        return Ok(None);
-    }
-    let document: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
-    let Some(scripts) = document.get("scripts").and_then(serde_json::Value::as_object) else {
-        return Ok(None);
-    };
-    let Some(script) = ["dev", "start", "develop", "serve"]
-        .into_iter()
-        .find(|script| scripts.contains_key(*script))
-    else {
-        return Ok(None);
-    };
-    let runner = if root.join("pnpm-lock.yaml").exists() {
-        "pnpm"
-    } else if root.join("yarn.lock").exists() {
-        "yarn"
-    } else if root.join("bun.lock").exists() || root.join("bun.lockb").exists() {
-        "bun"
-    } else {
-        "npm"
-    };
-    Ok(Some(vec![runner.to_owned(), "run".to_owned(), script.to_owned()]))
-}
-
 pub fn offer_interactive_setup(
     context: &RuntimeContext,
     output: &mut impl Write,
@@ -210,7 +185,7 @@ pub fn interactive_project_setup(
     }
     let document = read_policy_document(&resolved.root.join(LOCKET_TOML))?;
     if !document.commands.contains_key("dev")
-        && let Some(argv) = detected_project_argv(&resolved.root)?
+        && let Some(argv) = detect_development_argv(&resolved.root)?
     {
         writeln!(output, "Development script detected. Review its command access before saving.")?;
         match crate::commands::exec::run::approve_project_command(context, output, &resolved, argv)
@@ -237,7 +212,7 @@ mod tests {
         )?;
         std::fs::write(directory.path().join("pnpm-lock.yaml"), "lockfileVersion: '9.0'")?;
         assert_eq!(
-            super::detected_project_argv(directory.path())?,
+            super::detect_development_argv(directory.path())?,
             Some(vec!["pnpm".to_owned(), "run".to_owned(), "dev".to_owned()])
         );
         assert!(!directory.path().join("should-not-run").exists());

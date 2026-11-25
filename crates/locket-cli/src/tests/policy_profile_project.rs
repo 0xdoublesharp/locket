@@ -2,6 +2,112 @@
 use super::*;
 
 #[test]
+fn policy_detect_reports_metadata_across_manifests_without_initializing()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let root = directory.path();
+    let context = test_context(&directory);
+    std::fs::write(
+        root.join("package.json"),
+        r#"{
+      "scripts": {
+        "dev": "touch should-not-run", "start": "start", "build": "build", "test": "test",
+        "lint": "lint", "typecheck": "typecheck", "migrate": "migrate",
+        "db:migrate": "touch should-not-run", "ignored": "ignored"
+      }
+    }"#,
+    )?;
+    std::fs::write(root.join("pnpm-lock.yaml"), "")?;
+    std::fs::write(root.join("Cargo.toml"), "[[bin]]\nname='sample'\npath='bin.rs'\n")?;
+    std::fs::write(
+        root.join("Makefile"),
+        "dev: prepare\n\ttouch should-not-run\n# lint:\n\tlint:\n test:\nbuild:=variable\nrun::\n",
+    )?;
+    std::fs::write(root.join("pyproject.toml"), "[project]\nname='sample'\n")?;
+    std::fs::write(root.join("uv.lock"), "")?;
+
+    let mut output = Vec::new();
+    let cli = Cli::try_parse_from(["locket", "policy", "detect", "--json"])?;
+    run_with_context(cli, &context, &mut output)?;
+    let detected: Vec<serde_json::Value> = serde_json::from_slice(&output)?;
+    let expected = [
+        ("dev", vec!["pnpm", "run", "dev"], "package.json"),
+        ("start", vec!["pnpm", "run", "start"], "package.json"),
+        ("build", vec!["pnpm", "run", "build"], "package.json"),
+        ("test", vec!["pnpm", "run", "test"], "package.json"),
+        ("lint", vec!["pnpm", "run", "lint"], "package.json"),
+        ("typecheck", vec!["pnpm", "run", "typecheck"], "package.json"),
+        ("migrate", vec!["pnpm", "run", "migrate"], "package.json"),
+        ("db:migrate", vec!["pnpm", "run", "db:migrate"], "package.json"),
+        ("test", vec!["cargo", "test"], "Cargo.toml"),
+        ("run", vec!["cargo", "run"], "Cargo.toml"),
+        ("dev", vec!["make", "dev"], "Makefile"),
+        ("run", vec!["make", "run"], "Makefile"),
+        ("test", vec!["uv", "run", "pytest"], "pyproject.toml"),
+    ];
+    assert_eq!(detected.len(), expected.len());
+    for (name, argv, source_file) in expected {
+        assert!(detected.contains(&json!({
+            "name": name, "argv": argv, "command_preview": argv.join(" "),
+            "source_file": source_file, "already_configured": false,
+        })));
+    }
+    assert!(!root.join("should-not-run").exists());
+    assert!(!root.join("locket.toml").exists());
+    assert!(!context.store_path.exists());
+    assert!(!String::from_utf8(output)?.contains("should-not-run"));
+    Ok(())
+}
+
+#[test]
+fn policy_detect_uses_lockfile_runners_and_marks_existing_commands_from_subdirectories()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let root = directory.path();
+    let config = "schema_version=1\n[commands.dev]\nargv=['existing']\n";
+    std::fs::write(root.join("locket.toml"), config)?;
+    std::fs::write(root.join("package.json"), r#"{"scripts":{"dev":"run","test":false}}"#)?;
+    std::fs::write(root.join("Cargo.toml"), "[package]\nname='sample'\n")?;
+    std::fs::create_dir(root.join("src"))?;
+    std::fs::write(root.join("src/main.rs"), "")?;
+    std::fs::write(root.join("pyproject.toml"), "")?;
+    let mut context = test_context(&directory);
+    context.cwd = root.join("src");
+    for (lockfile, runner) in [
+        (None, "npm"),
+        (Some("yarn.lock"), "yarn"),
+        (Some("bun.lock"), "bun"),
+        (Some("bun.lockb"), "bun"),
+    ] {
+        if let Some(name) = lockfile {
+            std::fs::write(root.join(name), "")?;
+        }
+        let mut output = Vec::new();
+        run_with_context(
+            Cli::try_parse_from(["locket", "policy", "detect", "--json"])?,
+            &context,
+            &mut output,
+        )?;
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&output)?;
+        assert_eq!(rows.len(), 4);
+        assert!(
+            rows.iter().any(|row| row["argv"] == json!([runner, "run", "dev"])
+                && row["already_configured"] == true)
+        );
+        assert!(rows.iter().any(|row| row["argv"] == json!(["cargo", "run"])));
+        assert!(rows.iter().any(|row| row["argv"] == json!(["pytest"])));
+        if let Some(name) = lockfile {
+            std::fs::remove_file(root.join(name))?;
+        }
+    }
+    let mut output = Vec::new();
+    run_with_context(Cli::try_parse_from(["locket", "policy", "detect"])?, &context, &mut output)?;
+    assert!(String::from_utf8(output)?.contains("npm run dev"));
+    assert_eq!(std::fs::read_to_string(root.join("locket.toml"))?, config);
+    Ok(())
+}
+
+#[test]
 fn policy_doctor_reports_legacy_index_without_approving_it()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempdir()?;
