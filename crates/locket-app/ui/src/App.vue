@@ -2568,23 +2568,6 @@ onUnmounted(() => {
             </div>
           </div>
         </div>
-        <div class="shell__agent">
-          <span class="shell__vault" :data-unlocked="lockLabel === 'Unlocked'">
-            <AppIcon :name="lockLabel === 'Unlocked' ? 'unlock' : 'lock'" />
-            {{ lockLabel }}
-          </span>
-          <span
-            class="shell__connection"
-            :data-connected="agentOnline ? 'true' : 'false'"
-            role="status"
-            aria-label="Agent status"
-          >
-            {{ connectionLabel }}
-            <time v-if="agentOnline && lastSeenAt" :datetime="lastSeenAt" :title="lastSeenAt">
-              · {{ formatTime(lastSeenAt) }}
-            </time>
-          </span>
-        </div>
         <span
           v-if="
             agentOnline &&
@@ -2634,6 +2617,24 @@ onUnmounted(() => {
           </li>
         </ul>
       </nav>
+
+      <div class="shell__agent">
+        <span class="shell__vault" :data-unlocked="lockLabel === 'Unlocked'">
+          <AppIcon :name="lockLabel === 'Unlocked' ? 'unlock' : 'lock'" />
+          {{ lockLabel }}
+        </span>
+        <span
+          class="shell__connection"
+          :data-connected="agentOnline ? 'true' : 'false'"
+          role="status"
+          aria-label="Agent status"
+        >
+          {{ connectionLabel }}
+          <time v-if="agentOnline && lastSeenAt" :datetime="lastSeenAt" :title="lastSeenAt">
+            · {{ formatTime(lastSeenAt) }}
+          </time>
+        </span>
+      </div>
     </aside>
 
     <main class="shell__main">
@@ -3301,17 +3302,26 @@ html,
 .shell {
   display: grid;
   grid-template-columns: 182px minmax(0, 1fr);
-  min-height: 100vh;
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+  background: var(--bg-app);
 }
 
 .shell__nav {
   min-width: 0;
+  min-height: 0;
   background: color-mix(in srgb, var(--bg-surface), var(--bg-app) 40%);
   border-right: 1px solid var(--border-subtle);
-  padding: 1rem 0.75rem;
+  padding: 1rem 0.75rem 1.1rem;
   display: flex;
   flex-direction: column;
   gap: 0.9rem;
+}
+
+.shell__primary {
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .shell__masthead {
@@ -3495,10 +3505,12 @@ html,
 }
 
 .shell__agent {
+  margin-top: auto;
   display: flex;
   flex-direction: column;
   gap: 0.25rem;
-  padding: 0 0.25rem;
+  padding: 0.75rem 0.25rem 0.15rem;
+  border-top: 1px solid var(--border-subtle);
   font-size: 0.75rem;
 }
 
@@ -3594,7 +3606,11 @@ html,
   flex-direction: column;
   gap: 0.9rem;
   min-width: 0;
-  padding: 1rem clamp(0.85rem, 2vw, 1.75rem) 1.5rem;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  margin-bottom: 0.85rem;
+  padding: 1rem clamp(0.85rem, 2vw, 1.75rem) 2.5rem;
 }
 
 .shell__topbar {
@@ -3867,13 +3883,25 @@ html,
   .shell {
     grid-template-columns: minmax(0, 1fr);
     align-content: start;
+    height: auto;
+    min-height: 100vh;
+    overflow: visible;
   }
 
   .shell__nav {
-    gap: 0.2rem;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 0.2rem 0.35rem;
     padding: 0.35rem 0.7rem 0.25rem;
     border-right: 0;
     border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .shell__primary {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    overflow-y: visible;
   }
 
   .shell__masthead {
@@ -3938,6 +3966,10 @@ html,
   }
 
   .shell__agent {
+    grid-column: 2;
+    grid-row: 1;
+    margin-top: 0;
+    border-top: 0;
     flex-direction: row;
     align-items: center;
     gap: 0.45rem;
@@ -3964,7 +3996,9 @@ html,
 
   .shell__main {
     gap: 0.55rem;
-    padding: 0.5rem 0.75rem 1rem;
+    overflow-y: visible;
+    margin-bottom: 0;
+    padding: 0.5rem 0.75rem 2rem;
   }
 }
 
