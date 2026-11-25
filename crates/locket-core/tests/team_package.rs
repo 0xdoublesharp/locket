@@ -188,7 +188,9 @@ fn sealed_team_package_binds_recipient_and_checks_snapshot_shape()
 }
 
 #[test]
+#[cfg(not(miri))]
 fn verifier_rejects_oversized_statements_before_processing_signatures() {
+    // Allocating a >MAX_PACKAGE_BYTES buffer is prohibitively slow under Miri.
     use locket_core::team_package::MAX_PACKAGE_BYTES;
 
     let statement = fixture();

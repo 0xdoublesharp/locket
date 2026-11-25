@@ -4,9 +4,11 @@ use crate::key_wrap::{split_wrapped_dek_v1, wrap_dek_with_nonce_v1};
 use crate::{CryptoError, KEY_LEN, NONCE_LEN, TAG_LEN, canonical_field, unwrap_dek_v1};
 
 #[kani::proof]
-#[kani::unwind(24)]
+#[kani::unwind(12)]
 fn canonical_field_preserves_utf8_boundaries() {
-    let bytes: [u8; 8] = kani::any();
+    // Four bytes cover every 1–4 byte UTF-8 sequence and every split point
+    // without triggering stdlib's 8-byte SWAR UTF-8 validation path.
+    let bytes: [u8; 4] = kani::any();
     let split: usize = kani::any();
     kani::assume(split <= bytes.len());
     let (name, value) = bytes.split_at(split);

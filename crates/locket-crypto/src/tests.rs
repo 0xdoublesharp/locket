@@ -782,7 +782,10 @@ fn recovery_entry_open_fails_on_wrong_entry_id() -> Result<(), CryptoError> {
 }
 
 #[test]
+#[cfg(not(miri))]
 fn canonical_field_rejects_oversized_field_value() {
+    // Allocating a 4 GiB string is infeasible under Miri; field-length limits
+    // remain covered under Miri by `canonical_field_rejects_oversized_field_name`.
     let value = "v".repeat(usize::try_from(u32::MAX).unwrap_or(usize::MAX).saturating_add(1));
 
     // On 64-bit platforms the value will exceed u32::MAX; on 32-bit platforms
@@ -1074,6 +1077,7 @@ fn xchacha20_poly1305_ietf_vector_and_corruptions() -> Result<(), CryptoError> {
     assert_eq!(aead_encrypt(&key, &nonce, &plaintext, &aad)?, ciphertext);
     assert_eq!(*aead_decrypt(&key, &nonce, &ciphertext, &aad)?, plaintext);
 
+    #[cfg(not(miri))]
     for len in 0..ciphertext.len() {
         assert_eq!(
             aead_decrypt(&key, &nonce, &ciphertext[..len], &aad).err(),
@@ -1081,9 +1085,38 @@ fn xchacha20_poly1305_ietf_vector_and_corruptions() -> Result<(), CryptoError> {
             "truncated to {len} bytes"
         );
     }
+    #[cfg(miri)]
+    for len in [0, 1, TAG_LEN - 1, TAG_LEN, ciphertext.len() - 1] {
+        assert_eq!(
+            aead_decrypt(&key, &nonce, &ciphertext[..len], &aad).err(),
+            Some(CryptoError::DecryptionFailed),
+            "truncated to {len} bytes"
+        );
+    }
     let mut corrupted = ciphertext.clone();
+    #[cfg(not(miri))]
     for i in 0..ciphertext.len() {
         for bit in 0..8 {
+            let mask = 1 << bit;
+            corrupted[i] ^= mask;
+            assert_eq!(
+                aead_decrypt(&key, &nonce, &corrupted, &aad).err(),
+                Some(CryptoError::DecryptionFailed),
+                "bit {bit} of ciphertext byte {i}"
+            );
+            corrupted[i] ^= mask;
+        }
+    }
+    #[cfg(miri)]
+    for i in [
+        0,
+        1,
+        ciphertext.len() / 2,
+        ciphertext.len() - TAG_LEN - 1,
+        ciphertext.len() - TAG_LEN,
+        ciphertext.len() - 1,
+    ] {
+        for bit in [0_u8, 7] {
             let mask = 1 << bit;
             corrupted[i] ^= mask;
             assert_eq!(

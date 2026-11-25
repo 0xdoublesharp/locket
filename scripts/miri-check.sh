@@ -47,8 +47,13 @@ if [[ -n ${COMPUTE_JOBS:-} ]]; then
     export CARGO_BUILD_JOBS="$COMPUTE_JOBS"
     args+=(-j "$COMPUTE_JOBS")
 fi
+# Use portable Rust crypto backends so Miri works across both x86_64 and ARM64.
+export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--cfg=chacha20_backend=\"soft\" --cfg=poly1305_backend=\"soft\" --cfg=sha2_backend=\"soft\""
 cargo +nightly miri setup
-# Proptest's failure persistence needs filesystem access that Miri isolates.
+# Proptest's failure persistence needs filesystem access that Miri isolates,
+# and bounded case counts keep Miri runs practical while still exercising every
+# property under Undefined Behavior checks.
 PROPTEST_DISABLE_FAILURE_PERSISTENCE=1 \
-    MIRIFLAGS="${MIRIFLAGS:+$MIRIFLAGS }-Zmiri-env-forward=PROPTEST_DISABLE_FAILURE_PERSISTENCE" \
+    PROPTEST_CASES="${PROPTEST_CASES:-4}" \
+    MIRIFLAGS="${MIRIFLAGS:+$MIRIFLAGS }-Zmiri-env-forward=PROPTEST_DISABLE_FAILURE_PERSISTENCE -Zmiri-env-forward=PROPTEST_CASES" \
     cargo +nightly miri test "${args[@]}"

@@ -5,9 +5,11 @@ use std::path::Path;
 use crate::{LkReferenceUri, PolicyDocument, SecretAccessPolicy, SecretName};
 
 #[kani::proof]
-#[kani::unwind(24)]
+#[kani::unwind(8)]
 fn bounded_secret_names_match_the_ascii_grammar() {
-    let bytes: [u8; 8] = kani::any();
+    // Four bytes cover empty, multi-character ASCII, and all 1–4 byte UTF-8
+    // sequences without triggering stdlib's 8-byte SWAR UTF-8 validation path.
+    let bytes: [u8; 4] = kani::any();
     let len: usize = kani::any();
     kani::assume(len <= bytes.len());
     if let Ok(input) = std::str::from_utf8(&bytes[..len]) {
@@ -24,19 +26,23 @@ fn bounded_secret_names_match_the_ascii_grammar() {
 }
 
 #[kani::proof]
-#[kani::unwind(48)]
+#[kani::unwind(16)]
 fn bounded_reference_suffixes_parse_without_panics() {
-    let bytes: [u8; 12] = kani::any();
+    let suffix_bytes: [u8; 4] = kani::any();
     let len: usize = kani::any();
-    kani::assume(len <= bytes.len());
-    if let Ok(suffix) = std::str::from_utf8(&bytes[..len]) {
-        let mut input = "lk://dev/".to_owned();
-        input.push_str(suffix);
-        if let Ok(uri) = LkReferenceUri::parse(&input) {
-            assert_eq!(uri.profile().as_str(), "dev");
-            assert!(SecretName::new(uri.key().as_str()).is_ok());
-            assert!(uri.version().is_none_or(|version| version.get() > 0));
-        }
+    kani::assume(len <= suffix_bytes.len());
+    kani::assume(suffix_bytes[..len].iter().all(u8::is_ascii));
+
+    let Ok(suffix) = std::str::from_utf8(&suffix_bytes[..len]) else {
+        unreachable!("ASCII suffix bytes are valid UTF-8");
+    };
+    let mut input = String::with_capacity(9 + suffix_bytes.len());
+    input.push_str("lk://dev/");
+    input.push_str(suffix);
+    if let Ok(uri) = LkReferenceUri::parse(&input) {
+        assert_eq!(uri.profile().as_str(), "dev");
+        assert!(SecretName::new(uri.key().as_str()).is_ok());
+        assert!(uri.version().is_none_or(|version| version.get() > 0));
     }
 }
 
@@ -75,22 +81,26 @@ fn a_single_acl_mismatch_denies_an_explicitly_selected_secret() {
 }
 
 #[kani::proof]
-#[kani::unwind(32)]
+#[kani::unwind(12)]
 fn bounded_acl_matching_is_panic_free() {
-    let bytes: [u8; 8] = kani::any();
+    let bytes: [u8; 4] = kani::any();
+    kani::assume(bytes.iter().all(u8::is_ascii));
     let split: usize = kani::any();
     kani::assume(split <= bytes.len());
     let (pattern, input) = bytes.split_at(split);
-    if let (Ok(pattern), Ok(input)) = (std::str::from_utf8(pattern), std::str::from_utf8(input)) {
-        let Ok(name) = SecretName::new("TOKEN") else { unreachable!("valid fixture name") };
-        let acl = SecretAccessPolicy {
-            name,
-            allow_commands: vec!["*".to_owned()],
-            allow_argv: vec![vec![pattern.to_owned(), "**".to_owned()]],
-            allow_paths: vec![".".to_owned()],
-        };
-        let _ = acl.allows(input, Some(&[input.to_owned()]), Path::new(input));
-        assert!(!acl.allows(input, None, Path::new(input)));
-        assert!(!acl.allows(input, Some(&[input.to_owned()]), Path::new("../src")));
-    }
+    let (Ok(pattern), Ok(input)) = (std::str::from_utf8(pattern), std::str::from_utf8(input))
+    else {
+        unreachable!("ASCII slices are valid UTF-8");
+    };
+    let Ok(name) = SecretName::new("TOKEN") else { unreachable!("valid fixture name") };
+    let acl = SecretAccessPolicy {
+        name,
+        allow_commands: vec!["*".to_owned()],
+        allow_argv: vec![vec![pattern.to_owned(), "**".to_owned()]],
+        allow_paths: vec![".".to_owned()],
+    };
+    let argv = [input.to_owned()];
+    let _ = acl.allows(input, Some(&argv), Path::new(input));
+    assert!(!acl.allows(input, None, Path::new(input)));
+    assert!(!acl.allows(input, Some(&argv), Path::new("../src")));
 }

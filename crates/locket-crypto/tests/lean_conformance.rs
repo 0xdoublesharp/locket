@@ -12,14 +12,19 @@ use locket_crypto::{
 #[test]
 fn length_prefixes_distinguish_every_boundary_pair() -> Result<(), Box<dyn std::error::Error>> {
     // Includes equal delimiter-joined strings, embedded NULs, and different UTF-8 byte widths.
-    let parts = ["", "a", "b", "c", "a|b", "b|c", "|", "\0", "a\0", "\0b", "é", "🦀"];
+    // Under Miri, use a compact representative subset so the 4D Cartesian product stays fast.
+    let parts: &[&str] = if cfg!(miri) {
+        &["", "a|b", "\0", "é"]
+    } else {
+        &["", "a", "b", "c", "a|b", "b|c", "|", "\0", "a\0", "\0b", "é", "🦀"]
+    };
     let mut seen_fields = BTreeSet::new();
     let mut seen_aad = BTreeSet::new();
-    for name in parts {
-        for value in parts {
+    for &name in parts {
+        for &value in parts {
             assert!(seen_fields.insert(canonical_field(name, value)?), "{name:?}, {value:?}");
-            for secret_id in parts {
-                for secret_name in parts {
+            for &secret_id in parts {
+                for &secret_name in parts {
                     for version in [0, u32::MAX] {
                         let aad = SecretBlobAad::new(name, value, secret_id, secret_name, version);
                         assert!(seen_aad.insert(secret_blob_aad_v1(&aad)?), "{aad:?}");

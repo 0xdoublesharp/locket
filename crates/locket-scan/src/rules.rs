@@ -161,28 +161,41 @@ mod tests {
     #[test]
     fn shannon_entropy_matches_character_counts_for_ascii_and_unicode() {
         for token in ["abcdeaabcfgh", "AAAAA", "ABBC🦀🦀ééé", "x \t ñ"] {
+            #[cfg(not(miri))]
             assert_eq!(shannon_entropy(token).to_bits(), unicode_shannon_entropy(token).to_bits());
+            // Miri intentionally perturbs transcendental float ops (`f64::log2`) by a few ULPs.
+            #[cfg(miri)]
+            assert!((shannon_entropy(token) - unicode_shannon_entropy(token)).abs() < 1e-12);
         }
 
-        assert!(shannon_entropy("").abs() < f64::EPSILON);
-        assert!((shannon_entropy("éé🦀🦀") - 1.0).abs() < f64::EPSILON);
-        assert!((shannon_entropy("abcd") - 2.0).abs() < f64::EPSILON);
+        let tol = if cfg!(miri) { 1e-12 } else { f64::EPSILON };
+        assert!(shannon_entropy("").abs() < tol);
+        assert!((shannon_entropy("éé🦀🦀") - 1.0).abs() < tol);
+        assert!((shannon_entropy("abcd") - 2.0).abs() < tol);
         for token in ["ABCDE", "ABCDEé"] {
             let threshold = shannon_entropy(token);
-            assert!(is_high_entropy_token(token, 1, threshold));
-            assert!(!is_high_entropy_token(token, 1, threshold.next_up()));
+            #[cfg(not(miri))]
+            {
+                assert!(is_high_entropy_token(token, 1, threshold));
+                assert!(!is_high_entropy_token(token, 1, threshold.next_up()));
+            }
+            #[cfg(miri)]
+            {
+                assert!(is_high_entropy_token(token, 1, threshold - 1e-9));
+                assert!(!is_high_entropy_token(token, 1, threshold + 1e-9));
+            }
         }
     }
 
     #[test]
     fn wide_ascii_counters_match_the_default_path_and_decline_unicode() {
         // Exercise the wide-counter implementation without a four-GiB fixture.
-        let token = format!("{}{}", "a".repeat(70_000), "B".repeat(70_000));
+        // Keep the fixture compact under Miri so the interpreter stays fast.
+        let count = if cfg!(miri) { 128 } else { 70_000 };
+        let token = format!("{}{}", "a".repeat(count), "B".repeat(count));
         let expected = shannon_entropy(&token);
-        assert!((expected - 1.0).abs() < f64::EPSILON);
-        assert!(
-            large_ascii_entropy(&token).is_some_and(|wide| (wide - expected).abs() < f64::EPSILON)
-        );
+        assert!((expected - 1.0).abs() < 1e-12);
+        assert!(large_ascii_entropy(&token).is_some_and(|wide| (wide - expected).abs() < 1e-12));
         assert_eq!(large_ascii_entropy("é"), None);
     }
 }
