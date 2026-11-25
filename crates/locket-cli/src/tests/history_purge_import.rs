@@ -901,3 +901,286 @@ fn import_never_deletes_skipped_plaintext_values() -> Result<(), Box<dyn std::er
     assert!(String::from_utf8(output)?.contains("delete_env: kept"));
     Ok(())
 }
+
+fn run_env_json(
+    context: &RuntimeContext,
+    args: &[&str],
+    canaries: &[&str],
+) -> Result<(u8, serde_json::Value), Box<dyn std::error::Error>> {
+    let mut output = Vec::new();
+    let result = run_with_context(
+        Cli::try_parse_from(std::iter::once("locket").chain(args.iter().copied()))?,
+        context,
+        &mut output,
+    );
+    let output = String::from_utf8(output)?;
+    for canary in canaries {
+        assert!(!output.contains(canary));
+        assert!(!result.as_ref().is_err_and(|error| error.to_string().contains(canary)));
+    }
+    Ok((result?, serde_json::from_str(&output)?))
+}
+
+#[test]
+fn env_import_selects_shared_keys_outside_a_project() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context_with_confirmation(&directory, "delete .env");
+    let (_, shared) = run_env_json(&context, &["shared", "init", "--json"], &[])?;
+    let canaries =
+        ["provider-alpha-secret", "provider-beta-secret", "database-secret", "other-secret"];
+    let env_path = directory.path().join(".env");
+    std::fs::write(
+        &env_path,
+        format!(
+            "OPENAI_API_KEY={}\nANTHROPIC_API_KEY={}\nDATABASE_URL={}\nOTHER={}\n",
+            canaries[0], canaries[1], canaries[2], canaries[3]
+        ),
+    )?;
+    let (code, report) = run_env_json(
+        &context,
+        &[
+            "import",
+            ".env",
+            "--project",
+            "@shared",
+            "--only",
+            "OPENAI_API_KEY,ANTHROPIC_API_KEY",
+            "--only",
+            "DATABASE_URL",
+            "--exclude",
+            "DATABASE_URL",
+            "--keep",
+            "--json",
+        ],
+        &canaries,
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(report["project_id"], shared["project_id"]);
+    assert_eq!(report["project_name"], "@shared");
+    assert_eq!(report["profile"], "default");
+    assert_eq!(report["source"], "user-local");
+    assert_eq!(report["imported"], 2);
+    assert_eq!(
+        report["imported_names"],
+        serde_json::json!(["ANTHROPIC_API_KEY", "OPENAI_API_KEY"])
+    );
+    assert_eq!(report["filtered_out"], 2);
+    assert_eq!(report["filtered_out_names"], serde_json::json!(["DATABASE_URL", "OTHER"]));
+    assert_eq!(report["delete_env"], "kept");
+    assert_eq!(report["metadata_only"], true);
+    assert!(env_path.is_file());
+    for file in ["locket.toml", ".env.example", ".gitignore"] {
+        assert!(!directory.path().join(file).exists());
+    }
+
+    let project_id = shared["project_id"].as_str().ok_or("missing project id")?;
+    let store = locket_store::Store::open_read_only(&context.store_path)?;
+    let profile = store.get_profile_by_name(project_id, "default")?.ok_or("missing profile")?;
+    assert_eq!(
+        crate::active_profile_secret_names(&store, project_id, &profile.id)?,
+        BTreeSet::from(["ANTHROPIC_API_KEY".to_owned(), "OPENAI_API_KEY".to_owned()])
+    );
+    let audit_metadata: Vec<String> = store
+        .connection()
+        .prepare("SELECT metadata_json FROM audit_log WHERE action='IMPORT'")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    assert_eq!(audit_metadata.len(), 2);
+    assert!(audit_metadata.iter().all(|entry| canaries.iter().all(|value| !entry.contains(value))));
+    Ok(())
+}
+
+#[test]
+fn env_import_dry_run_keeps_vault_and_project_files_untouched()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--no-device", "--no-passkey"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    crate::set_secret_value(&context, &test_secret_write_args("EXISTS"), "old", "manual", 1000)?;
+    let canaries =
+        ["existing-plaintext-fixture", "new-plaintext-fixture", "excluded-plaintext-fixture"];
+    let env_text =
+        format!("EXISTS={}\nNEW={}\nEXCLUDE_ME={}\n", canaries[0], canaries[1], canaries[2]);
+    let env_path = directory.path().join(".env");
+    std::fs::write(&env_path, &env_text)?;
+    for file in [".env.example", ".gitignore"] {
+        std::fs::remove_file(directory.path().join(file))?;
+    }
+    let original_store = std::fs::read(&context.store_path)?;
+    let locked = RuntimeContext { key_store: Arc::new(UnavailableMasterKeyStore), ..context };
+    for overwrite in [false, true] {
+        let mut args = vec!["import", ".env", "--exclude", "EXCLUDE_ME", "--dry-run", "--json"];
+        if overwrite {
+            args.push("--overwrite");
+        }
+        let (code, report) = run_env_json(&locked, &args, &canaries)?;
+        assert_eq!(code, 0);
+        assert_eq!(report["dry_run"], true);
+        assert_eq!(report["imported"], 1);
+        assert_eq!(report["imported_names"], serde_json::json!(["NEW"]));
+        assert_eq!(report["skipped"], usize::from(!overwrite));
+        assert_eq!(report["overwritten"], usize::from(overwrite));
+        assert_eq!(report["filtered_out"], 1);
+        assert_eq!(report["filtered_out_names"], serde_json::json!(["EXCLUDE_ME"]));
+        assert_eq!(report["missing_in_profile"], serde_json::json!(["NEW"]));
+        assert_eq!(report["delete_env"], "kept");
+    }
+    let store_unchanged = std::fs::read(&locked.store_path)? == original_store;
+    assert!(store_unchanged, "dry run changed the vault database");
+    assert_eq!(std::fs::read_to_string(env_path)?, env_text);
+    for file in [".env.example", ".gitignore"] {
+        assert!(!directory.path().join(file).exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn env_keys_reports_strict_metadata_without_a_project() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    let canaries = ["first-value-fixture", "replacement-value-fixture", "expansion-fixture"];
+    std::fs::write(
+        directory.path().join(".env"),
+        format!("TOKEN={}\nTOKEN={}\nEXPANDED=${{{}}}\n", canaries[0], canaries[1], canaries[2]),
+    )?;
+    let args = ["env", "keys", ".env", "--json"];
+    let (code, report) = run_env_json(&context, &args, &canaries)?;
+    assert_eq!(code, 0);
+    assert_eq!(report["keys"], serde_json::json!(["TOKEN"]));
+    assert_eq!(report["warnings"][0]["line"], 2);
+    assert!(report["warnings"][0]["message"].is_string());
+    assert_eq!(report["invalid"], 1);
+    assert_eq!(report["metadata_only"], true);
+    let (_, literal) =
+        run_env_json(&context, &["env", "keys", ".env", "--literal", "--json"], &canaries)?;
+    assert_eq!(literal["keys"], serde_json::json!(["EXPANDED", "TOKEN"]));
+    assert_eq!(literal["invalid"], 0);
+    assert!(!context.store_path.exists());
+    Ok(())
+}
+
+#[test]
+fn env_scan_groups_keys_across_repos_and_ignores_templates()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    let root = directory.path();
+    let canaries = ["scan-one-fixture", "scan-two-fixture", "scan-three-fixture"];
+    std::fs::create_dir_all(root.join("one/.git"))?;
+    std::fs::create_dir_all(root.join("one/src"))?;
+    std::fs::create_dir_all(root.join("one/node_modules/package"))?;
+    std::fs::create_dir_all(root.join("two"))?;
+    std::fs::write(root.join("two/locket.toml"), "")?;
+    std::fs::write(
+        root.join("one/src/.env.production"),
+        format!(
+            "BOTH={}\nOPENAI_API_KEY={}\nSAME_ROOT={}\n",
+            canaries[0], canaries[0], canaries[0]
+        ),
+    )?;
+    std::fs::write(root.join("one/.env.local"), format!("SAME_ROOT={}\n", canaries[1]))?;
+    std::fs::write(root.join("two/.env.staging"), format!("BOTH={}\n", canaries[2]))?;
+    for path in
+        ["one/node_modules/package/.env", "two/.env.example", "two/.env.local.bak", "one/.git/.env"]
+    {
+        std::fs::write(root.join(path), "IGNORED=fixture\n")?;
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(root.join("two"), root.join("link"))?;
+
+    let (code, report) = run_env_json(&context, &["env", "scan", ".", "--json"], &canaries)?;
+    assert_eq!(code, 0);
+    assert_eq!(report["metadata_only"], true);
+    assert_eq!(report["total_files"], 3);
+    assert_eq!(report["total_keys"], 5);
+    let files = report["files"].as_array().ok_or("missing files")?;
+    assert_eq!(files[0]["suggested_profile"], "dev");
+    assert_eq!(files[0]["suggested_source"], "user-local");
+    assert_eq!(files[1]["suggested_profile"], "prod");
+    assert_eq!(files[1]["has_locket_config"], false);
+    assert_eq!(files[1]["project_root"], files[0]["project_root"]);
+    assert_eq!(files[2]["suggested_profile"], "staging");
+    assert_eq!(files[2]["has_locket_config"], true);
+    let candidates = report["shared_candidates"].as_array().ok_or("missing candidates")?;
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(candidates[0]["key"], "BOTH");
+    assert_eq!(candidates[0]["projects"].as_array().map(Vec::len), Some(2));
+    assert_eq!(candidates[0]["files"].as_array().map(Vec::len), Some(2));
+    assert_eq!(candidates[1]["key"], "OPENAI_API_KEY");
+    let (_, shallow) =
+        run_env_json(&context, &["env", "scan", "--depth", "2", "--json"], &canaries)?;
+    assert_eq!(shallow["total_files"], 2);
+    assert!(!context.store_path.exists());
+    Ok(())
+}
+
+#[test]
+fn env_keys_rejects_unsafe_inputs_without_a_project() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    let canary = "dotenv-unsafe-input-fixture";
+    let mut invalid_utf8 = format!("TOKEN={canary}").into_bytes();
+    invalid_utf8.push(0xff);
+    std::fs::write(directory.path().join(".env.invalid"), invalid_utf8)?;
+    std::fs::File::create(directory.path().join(".env.oversize"))?.set_len(1024 * 1024 + 1)?;
+    std::fs::create_dir(directory.path().join(".env.directory"))?;
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(".env.invalid", directory.path().join(".env.link"))?;
+    for (file, message) in [
+        (".env.invalid", "UTF-8"),
+        (".env.oversize", "1 MiB"),
+        (".env.directory", "regular file"),
+        #[cfg(unix)]
+        (".env.link", "regular file"),
+    ] {
+        let (code, report) = run_env_json(&context, &["env", "keys", file, "--json"], &[canary])?;
+        assert_ne!(code, 0);
+        assert!(report["error"]["message"].as_str().is_some_and(|error| error.contains(message)));
+    }
+    assert!(!context.store_path.exists());
+    Ok(())
+}
+
+#[test]
+fn env_import_refreshes_the_selected_folder_and_keeps_plaintext()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let outside = test_context_with_confirmation(&directory, "delete .env");
+    let project_root = directory.path().join("app");
+    std::fs::create_dir(&project_root)?;
+    let inside = RuntimeContext { cwd: project_root.clone(), ..outside.clone() };
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--no-device", "--no-passkey"])?,
+        &inside,
+        &mut Vec::new(),
+    )?;
+    let canary = "dotenv-folder-value-fixture";
+    let source = directory.path().join(".env");
+    std::fs::write(&source, format!("KEY={canary}\n"))?;
+    std::fs::remove_file(project_root.join(".gitignore"))?;
+    let mut output = Vec::new();
+    assert_eq!(
+        run_with_context(
+            Cli::try_parse_from(["locket", "import", ".env", "--project", "app", "--keep"])?,
+            &outside,
+            &mut output,
+        )?,
+        0
+    );
+    let output = String::from_utf8(output)?;
+    assert!(output.contains("delete_env: kept"));
+    assert!(!output.contains("delete_env_prompt"));
+    assert!(!output.contains(canary));
+    assert!(source.exists());
+    assert!(project_root.join(".gitignore").exists());
+    let example = std::fs::read_to_string(project_root.join(".env.example"))?;
+    assert!(example.contains("KEY=\n"));
+    assert!(!example.contains(canary));
+    assert!(!directory.path().join(".env.example").exists());
+    assert!(!directory.path().join(".gitignore").exists());
+    Ok(())
+}

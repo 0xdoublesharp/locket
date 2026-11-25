@@ -210,7 +210,7 @@ enum Command {
     /// Serve tools over stdio using MCP.
     Mcp,
     /// Import secrets from an env file.
-    Import(ImportArgs),
+    Import(ImportCommandArgs),
     /// Get secret metadata, reveal, or copy.
     Get(GetArgs),
     /// Reveal a secret value to stdout (alias for `get --reveal`).
@@ -232,7 +232,7 @@ enum Command {
     Env {
         /// Environment command.
         #[command(subcommand)]
-        command: EnvCommand,
+        command: EnvCommand<EnvFileCommand>,
     },
     /// Execute Docker Compose with scoped policy and path injection.
     Compose {
@@ -478,6 +478,40 @@ struct ImportArgs {
 }
 
 #[derive(Debug, Args)]
+struct ImportCommandArgs {
+    #[command(flatten)]
+    import: ImportArgs,
+    #[command(flatten)]
+    selection: ImportSelectionArgs,
+}
+
+#[derive(Debug, Default, Args)]
+#[allow(clippy::struct_excessive_bools)]
+struct ImportSelectionArgs {
+    /// Project id, name, @shared, or trusted root.
+    #[arg(long, value_name = "SELECTOR")]
+    project: Option<String>,
+    /// Include only these keys. Repeat or separate names with commas.
+    #[arg(long, value_name = "KEY")]
+    only: Vec<String>,
+    /// Exclude these keys. Repeat or separate names with commas.
+    #[arg(long, value_name = "KEY")]
+    exclude: Vec<String>,
+    /// Keep the plaintext input file without prompting.
+    #[arg(long)]
+    keep: bool,
+    /// Plan the import without unlocking or writing.
+    #[arg(long)]
+    dry_run: bool,
+    /// Emit a metadata-only JSON report and keep the input file.
+    #[arg(long)]
+    json: bool,
+    /// Confirm an overwrite in a dangerous profile by supplying its exact name.
+    #[arg(long, value_name = "PROFILE", requires = "overwrite")]
+    confirm_dangerous: Option<String>,
+}
+
+#[derive(Debug, Args)]
 #[allow(clippy::struct_excessive_bools)]
 struct GetArgs {
     /// Project id, name, or trusted root.
@@ -631,15 +665,52 @@ pub struct RunArgs {
     pub argv: Vec<String>,
 }
 
-/// Subcommands for `locket env`.
+/// Standalone dotenv discovery subcommands.
 #[derive(Debug, Subcommand)]
-pub enum EnvCommand {
+pub enum EnvFileCommand {
+    /// List the keys in a dotenv file without opening a vault.
+    Keys {
+        /// Dotenv file to inspect.
+        file: PathBuf,
+        /// Accept dollar expressions as literal values.
+        #[arg(long)]
+        literal: bool,
+        /// Emit a metadata-only JSON report.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Discover dotenv files and shared-key candidates in a workspace.
+    Scan {
+        /// Directory to scan. Defaults to the current directory.
+        path: Option<PathBuf>,
+        /// Maximum depth, counting the scan root as level zero.
+        #[arg(long, default_value_t = 5)]
+        depth: usize,
+        /// Accept dollar expressions as literal values.
+        #[arg(long)]
+        literal: bool,
+        /// Emit a metadata-only JSON report.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Empty extension for the policy-backed environment dispatcher.
+#[derive(Debug, Subcommand)]
+pub enum NoEnvFileCommand {}
+
+/// Subcommands for `locket env`. The CLI includes standalone file discovery.
+#[derive(Debug, Subcommand)]
+pub enum EnvCommand<Extra: Subcommand = NoEnvFileCommand> {
     /// Validate required-name coverage offline without reading values or the local vault.
     Validate(EnvValidateArgs),
     /// Show metadata-only policy environment decisions.
     Inspect(EnvInspectArgs),
     /// Execute docker run with policy-backed environment injection.
     Docker(EnvDockerArgs),
+    /// Inspect standalone dotenv files.
+    #[command(flatten)]
+    Files(Extra),
 }
 
 /// Arguments for offline, names-only contract validation.
@@ -1571,19 +1642,32 @@ fn main() -> ProcessExitCode {
     // hardening gaps separately.
     let _ = locket_platform::disable_core_dumps();
     let _ = locket_platform::lock_process_memory();
+
+    let mut output = io::stdout();
+    let cli = match Cli::parse().command {
+        Some(Command::Completion(args)) => {
+            return match completion_command(&mut output, args.shell) {
+                Ok(()) => ProcessExitCode::SUCCESS,
+                Err(error) => write_error_and_exit(&error),
+            };
+        }
+        Some(Command::Env { command: EnvCommand::Files(command) }) => {
+            // Standalone discovery does not need a local vault or a keyring.
+            let result = std::env::current_dir().map_err(CliError::from).and_then(|cwd| {
+                commands::secrets::import::env_file_command(&cwd, &mut output, command)
+            });
+            return match result {
+                Ok(code) => ProcessExitCode::from(code),
+                Err(error) => write_error_and_exit(&error),
+            };
+        }
+        command => Cli { command },
+    };
+
     // keyring-core 1.0 requires registering a credential store before any
     // Entry can resolve. A failure here surfaces later as the same error
     // from whichever command first touches the keychain.
     let _ = locket_platform::init_platform_keyring();
-
-    let cli = Cli::parse();
-    if let Some(Command::Completion(args)) = &cli.command {
-        let mut output = io::stdout();
-        return match completion_command(&mut output, args.shell) {
-            Ok(()) => ProcessExitCode::SUCCESS,
-            Err(error) => write_error_and_exit(&error),
-        };
-    }
 
     let context = match RuntimeContext::default() {
         Ok(context) => context,
@@ -1592,7 +1676,6 @@ fn main() -> ProcessExitCode {
         }
     };
 
-    let mut output = io::stdout();
     match run_with_context(cli, &context, &mut output) {
         Ok(code) => ProcessExitCode::from(code),
         Err(error) => write_error_and_exit(&error),
@@ -1653,7 +1736,14 @@ fn run_with_context(
         }
         Command::Parity(args) => return commands::parity::parity_command(context, output, &args),
         Command::Mcp => commands::mcp::serve(&mut io::stdin().lock(), output, context)?,
-        Command::Import(args) => secrets::import::import_command(context, output, &args)?,
+        Command::Import(args) => {
+            return secrets::import::import_selected_command(
+                context,
+                output,
+                &args.import,
+                &args.selection,
+            );
+        }
         Command::Get(args) => secrets::get::get_command(context, output, &args)?,
         Command::Reveal(args) => secrets::get::get_command(
             context,
@@ -1690,7 +1780,18 @@ fn run_with_context(
         Command::List(args) => secrets::lifecycle::list_command(context, output, &args)?,
         Command::Exec(args) => exec::exec::exec_command(context, output, &args)?,
         Command::Run(args) => exec::run::run_command(context, output, &args)?,
-        Command::Env { command } => exec::env::env_command(context, output, command)?,
+        Command::Env { command: EnvCommand::Files(command) } => {
+            return secrets::import::env_file_command(&context.cwd, output, command);
+        }
+        Command::Env { command: EnvCommand::Validate(args) } => {
+            exec::env::env_command(context, output, EnvCommand::Validate(args))?;
+        }
+        Command::Env { command: EnvCommand::Inspect(args) } => {
+            exec::env::env_command(context, output, EnvCommand::Inspect(args))?;
+        }
+        Command::Env { command: EnvCommand::Docker(args) } => {
+            exec::env::env_command(context, output, EnvCommand::Docker(args))?;
+        }
         Command::Compose { command } => exec::compose::compose_command(context, output, command)?,
         Command::Rotate(args) => secrets::lifecycle::rotate_command(context, output, &args)?,
         Command::Meta(args) | Command::Secret { command: SecretCommand::Meta(args) } => {
