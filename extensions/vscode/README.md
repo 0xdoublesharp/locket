@@ -19,8 +19,8 @@ Agent connections use the same defaults as the CLI: macOS Application Support, L
 
 ## Build
 
-Use Node.js 24 or newer for development and packaging. The extension still
-supports VS Code 1.80 and compiles against that host's API declarations.
+Use Node.js 24 or newer for development and packaging. The extension supports
+VS Code 1.80 and compiles against that host's API declarations.
 
 ```sh
 cd extensions/vscode
@@ -51,6 +51,6 @@ The package artifact and SHA-256 sidecar are written under
 
 ## Scope
 
-- `src/extension.ts` — extension activation and client lifecycle.
-- `src/agentClient.ts` — metadata-only agent socket protocol client.
+- `src/extension.ts`: Extension activation and client lifecycle.
+- `src/agentClient.ts`: Metadata-only agent socket protocol client.
 - The extension itself never writes audit rows directly.

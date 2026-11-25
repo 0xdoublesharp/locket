@@ -6,9 +6,9 @@ Locket is a Rust local-first secrets manager for developers who want encrypted l
 
 Scores reflect **shipped behavior** on a 0–2 scale:
 
-- **2** — Native, shipped, and core to the workflow
-- **1** — Partial, conditional, server-dependent, or requires manual/add-on steps
-- **0** — Not supported or intentionally out of scope
+- **2**: Native, shipped, and core to the workflow
+- **1**: Partial, conditional, server-dependent, or requires manual/add-on steps
+- **0**: Out of scope or unavailable
 
 | Capability | Locket (Rust) | Doppler | Infisical | 1Password CLI (`op`) | Bitwarden SM | dotenvx | SOPS | pass / gopass |
 | --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -30,10 +30,10 @@ Scores reflect **shipped behavior** on a 0–2 scale:
 1. **Offline & zero-server**: Doppler documents encrypted offline fallback snapshots and fallback-only mode ([Doppler fallback documentation](https://docs.doppler.com/docs/automatic-fallbacks)), Infisical and Bitwarden SM cache against a required server, and 1Password desktop supports offline viewing while `op` CLI relies on cloud/Connect or desktop integration. Locket, dotenvx, SOPS, and pass/gopass operate natively with no server.
 2. **Zero-knowledge**: Infisical offers end-to-end encryption, but server-side features such as dynamic secrets and managed rotation require server access to plaintext. Doppler decrypts secrets server-side.
 3. **AI-agent & known-value redaction**: Dotenvx documents runtime redaction of loaded values in `dotenvx run` ([Dotenvx official CLI documentation](https://github.com/dotenvx/dotenvx)). Locket pairs known-value scanning (`locket scan --require-known`), output redaction (`locket redact`, `locket ai-safe`), a streaming HTTP egress proxy, projection-first privacy mode, and a zero-knowledge MCP server (`locket mcp` with `locket_inspect_env_keys`, `locket_scan_env_files`, `locket_import_env`, and `locket_detect_commands`).
-4. **Desktop, IDE & shell**: Doppler, Infisical, and Bitwarden SM provide web consoles rather than a local native desktop companion; 1Password pairs a native desktop app with `op`. Locket ships a native Tauri v2 desktop companion (Global Vault, 1-click Keychain unlock, Day-2 CRUD, detected commands, MCP/agent setup, tray), a VS Code extension, and shell hooks.
-5. **Audit, rotation & recovery**: Hosted tools provide server-side audit logs and rotation rather than a local tamper-evident HMAC audit chain with external witness receipts, pinned `lk://...@vN` grace windows, and offline recovery envelopes.
+4. **Desktop, IDE & shell**: Doppler, Infisical, and Bitwarden SM provide web consoles, while 1Password pairs a native desktop app with `op`. Locket ships a native Tauri v2 desktop companion (Global Vault, 1-click Keychain unlock, Day-2 CRUD, detected commands, MCP/agent setup, and tray), a VS Code extension, and shell hooks.
+5. **Audit, rotation & recovery**: Hosted tools keep audit logs and rotation on their servers. Locket keeps a local tamper-evident HMAC audit chain with external witness receipts, pinned `lk://...@vN` grace windows, and offline recovery envelopes.
 6. **Team sync & RBAC**: Locket ships signed, device-encrypted shared-folder updates with personal overrides, collision holding, and fingerprint-verified onboarding, but currently supports a single pinned owner without owner handover, and live cloud-folder provider qualification remains open. Hosted platforms score 2 for multi-admin hosted RBAC.
-7. **Cloud CI/CD, SSO/SCIM & dynamic secrets**: Intentionally out of scope for Locket. Production and CI pipelines should use platform-native secret stores or hosted platforms like Doppler, Infisical, or HashiCorp Vault.
+7. **Cloud CI/CD, SSO/SCIM & dynamic secrets**: Out of scope for Locket. Production and CI pipelines should use platform-native secret stores or hosted platforms like Doppler, Infisical, or HashiCorp Vault.
 
 ## What sets the Rust version apart
 
@@ -64,7 +64,7 @@ Actual-value redaction is not unique either. Dotenvx documents redaction of load
 
 Locket's scanners and redaction are explicit tools for preparing files or output. They do not intercept arbitrary AI requests or make untrusted code safe. A process receiving a variable can disclose it.
 
-Do not market unfinished SSO, compliance programs, hosted tiers, owner handover, or future pricing as shipped features. Signed folder delivery is implemented; observed team usability and real provider qualification remain open. Vendor prices and plan limits change; check their primary pricing pages when evaluating a purchase rather than relying on an old matrix.
+Do not market unfinished SSO, compliance programs, hosted tiers, owner handover, or future pricing as shipped features. Signed folder delivery is implemented; observed team usability and real provider qualification remain open. Vendor prices and plan limits change, so check their primary pricing pages when evaluating a purchase.
 
 The remaining adoption test is practical: can an unfamiliar developer import and run their app without coaching, then help a teammate do the same without losing data or sharing extra values? The [team guide](team-updates.md) and [distribution checks](distribution-validation.md) describe the current workflows and acceptance boundaries.
 

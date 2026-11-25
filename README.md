@@ -40,55 +40,53 @@ Start with a personal Global Vault (`@shared`) in one click, or connect any repo
     <td><img src="docs/screenshots/secrets.png" alt="Locket Secrets view showing variable metadata, sources, and version status" /></td>
   </tr>
   <tr>
-    <td align="center"><sub><strong>First-run Welcome</strong> — Start with Global Vault (<code>@shared</code>) or connect a project folder</sub></td>
-    <td align="center"><sub><strong>Secrets</strong> — Metadata, source badges, grace windows, and gated copy/reveal</sub></td>
+    <td align="center"><sub><strong>First-run Welcome</strong>: Start with Global Vault (<code>@shared</code>) or connect a project folder</sub></td>
+    <td align="center"><sub><strong>Secrets</strong>: Metadata, source badges, grace windows, and gated copy/reveal</sub></td>
   </tr>
   <tr>
     <td><img src="docs/screenshots/commands.png" alt="Locket Commands view showing approved policies and configuration checks" /></td>
     <td><img src="docs/screenshots/activity.png" alt="Locket Activity view showing recorded runs and audit links" /></td>
   </tr>
   <tr>
-    <td align="center"><sub><strong>Commands</strong> — Approved command policies, detail pane, and readiness checks</sub></td>
-    <td align="center"><sub><strong>Activity</strong> — Recorded runs, audit chain verification, and terminal scan handoff</sub></td>
+    <td align="center"><sub><strong>Commands</strong>: Approved command policies, detail pane, and readiness checks</sub></td>
+    <td align="center"><sub><strong>Activity</strong>: Recorded runs, audit chain verification, and terminal scan handoff</sub></td>
   </tr>
 </table>
 
 ## Why Locket
 
-- 🔐 **Encrypted local vault** — your secrets, sealed at rest, unlocked only when you ask.
-- 🌐 **Global Vault (`@shared`) and MCP** — store personal API keys once and use them across projects, terminals, and AI tools via `locket mcp`.
-- 🎯 **Capability-scoped delivery** — `locket run`, `locket exec`, Docker, and Compose helpers inject secrets into one child process and nowhere else.
-- 📋 **Explicit command policies** — declare which secrets a command may receive, and Locket enforces it.
-- 🧭 **Project + profile workflows** — keep `dev`, `staging`, and per-machine secrets cleanly separated.
-- 🛠️ **Shell, editor, desktop, and tray integrations** — local status, approvals, metadata history, and `lk://` reference resolution.
-- 🔄 **Rotation, history, and diffs** — change values safely; compare profiles without revealing them.
-- 🧹 **Scanner, pre-commit, redaction, AI-safe tools** — keep secrets out of code, logs, and prompts before sharing context with local AI agents.
-- 🪪 **Recovery and device trust** — local verification, recovery rotation, and sealed export/import without a hosted service.
-- 👥 **Team updates** — signed encrypted shared-folder delivery, verified device onboarding, and personal overrides; no hosted service required.
-- 🧾 **Metadata-only audit and diagnostics** — report what happened, never the values.
-- 🚫 **No telemetry, no analytics** — only opt-in update checks or explicit sealed sync/export/import.
+- 🔐 **Encrypted local vault**: Your secrets stay sealed at rest and unlock only when you ask.
+- 🌐 **Global Vault (`@shared`) and MCP**: Store personal API keys once and use them across projects, terminals, and AI tools via `locket mcp`.
+- 🎯 **Capability-scoped delivery**: `locket run`, `locket exec`, Docker, and Compose helpers inject secrets into one child process.
+- 📋 **Explicit command policies**: Declare which secrets a command may receive, and Locket enforces the rule.
+- 🧭 **Project and profile workflows**: Keep `dev`, `staging`, and per-machine secrets cleanly separated.
+- 🛠️ **Shell, editor, desktop, and tray integrations**: Local status, approvals, metadata history, and `lk://` reference resolution.
+- 🔄 **Rotation, history, and diffs**: Rotate values safely and compare profiles without revealing plaintext.
+- 🧹 **Scanner, pre-commit, redaction, and AI-safe tools**: Keep secrets out of code, logs, and prompts before sharing context with local AI agents.
+- 🪪 **Recovery and device trust**: Local verification, recovery rotation, and sealed export/import without a hosted service.
+- 👥 **Team updates**: Signed encrypted shared-folder delivery, verified device onboarding, and personal overrides without a hosted service.
+- 🧾 **Metadata-only audit and diagnostics**: Report what happened without exposing secret values.
+- 🚫 **No telemetry or analytics**: Network access is limited to opt-in update checks or explicit sealed sync, export, and import.
 
 ## Project Files
 
 - `locket.toml` lives in the project and contains shareable configuration, policies, and metadata.
 - Monorepos can add `[paths."<relative/path>"]` env sets to make package-specific secret names available only when commands run from that subtree.
-- Secret values stay in the local encrypted vault, **not** in Git-tracked project files.
+- Secret values stay in the local encrypted vault, outside Git-tracked project files.
 - `.env.example` is maintained as a names-only contract for expected variables.
 - `.gitignore` is updated to keep plaintext local env files out of Git.
 
-> Locket is intentionally local-first. CI and production should use their platform-native secret stores; Locket is for local development workflows.
+> Locket targets local development workflows. Use platform-native secret stores for CI and production.
 
 ## Current Scope
 
-Locket targets local development. The desktop opens a personal Global Vault (`@shared`) without a project folder or connects project folders, unlocks the vault, imports env files, edits durable commands, and opens approved commands in a terminal. Imports and policy edits use the unlocked agent cache, including passphrase-only vaults. Native packages bundle a matching CLI; the editor version matches the app and CLI.
+The desktop app opens a personal Global Vault (`@shared`) or connects project folders, unlocks the vault, imports env files, edits durable commands, and opens approved commands in a terminal. Imports and policy edits use the unlocked agent cache, including passphrase-only vaults. Native packages bundle a matching CLI, and the editor extension version matches the app and CLI.
 
-Teams can [join a fresh machine and receive signed encrypted updates](docs/team-updates.md) through an existing shared folder. First join requires the owner's full fingerprint from a separate trusted channel. One owner publishes shared values, while personal overrides remain local. The unlocked agent publishes changed shared values and applies verified updates automatically. Status shows the last verified update; an offline or malicious folder provider can withhold newer files. Owner handover and real sync-provider/clean-OS acceptance remain separate qualification work.
+Teams can [join a fresh machine and receive signed encrypted updates](docs/team-updates.md) through an existing shared folder. First join requires verifying the owner's full fingerprint over a separate trusted channel. One owner publishes shared values while each developer keeps personal overrides locally. The unlocked agent publishes changed shared values and applies verified updates automatically. Status shows the last verified update; an offline or malicious folder provider can withhold newer files. Once a team owner is pinned, identity replacement is refused; authenticated owner handover and real sync-provider or clean-OS acceptance remain separate qualification work.
 
-Manual sealed export/import is also available. Sealed bundles encrypt for recipients but do **not** authenticate the issuer. Imported command proposals never grant local execution permission. Exports default to current shared values; personal overrides and history require explicit opt-in. Read [package validation](docs/distribution-validation.md) before preparing installers; unsigned local artifacts do not establish signing or notarization.
+Manual sealed export/import is also available. Sealed bundles encrypt for recipients but do **not** authenticate the issuer. Imported command proposals never grant local execution permission. Exports default to current shared values; personal overrides and history require explicit opt-in. Read [package validation](docs/distribution-validation.md) before preparing installers, because unsigned local artifacts do not establish signing or notarization.
 
-Once a team owner is pinned, identity replacement is refused; authenticated owner handover is not supported yet.
-
-Scanners and redaction help prepare output before sharing it. They do not isolate code or intercept an AI application's outbound requests. Programs receiving a variable can read and transmit it. Original `.env` files stay plaintext until you explicitly remove them; keep a verified recovery path before doing so.
+Scanners and redaction help prepare output before sharing it. They do not isolate code or intercept an AI application's outbound requests, and any program receiving a variable can read and transmit it. Original `.env` files remain plaintext until you explicitly remove them; keep a verified recovery path before deleting them.
 
 ## Install From Source
 
@@ -253,17 +251,17 @@ Keep each command's approved names in its existing `required_secrets` and
 can have defaults, which fill missing authorized names after existing sources
 and conflict rules. Types are checked before launch; errors show names, never
 values. Secret `VITE_` and `NEXT_PUBLIC_` names produce a browser exposure warning.
-The desktop's configuration panel shows missing names, setup guidance, source
-labels and unverified sources without showing values or default strings.
+The desktop configuration panel shows missing names, setup guidance, source
+labels, and unverified sources without showing values or default strings.
 
-For CI coverage without opening a vault, reading env values or starting scripts:
+For CI coverage without opening a vault, reading env values, or starting scripts:
 
 ```sh
 locket env validate --policy dev --provided-name DATABASE_URL --json
 ```
 
 The report is names-only and sets `values_checked` to `false`. Exit codes are 0
-for complete coverage, 1 for missing required names and 2 for invalid input or
+for complete coverage, 1 for missing required names, and 2 for invalid input or
 access rules. It does not verify a live credential. See the
 [contract specification](docs/specs/policy.md#variable-contracts) for all fields.
 
@@ -384,8 +382,8 @@ make slsa-provenance
 ```
 
 `make ci-local` is the default local quality gate. It uses `OFFLINE=1` by
-default, runs with `CARGO_JOBS=12`, and skips optional tools with explicit
-warnings instead of fetching network state.
+default, sizes `CARGO_JOBS` to the host's logical CPU count, and skips optional
+tools with explicit warnings instead of fetching network state.
 
 Additional quality gates are available through the `Makefile`:
 

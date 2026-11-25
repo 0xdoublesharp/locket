@@ -1,6 +1,6 @@
 # Share development variables with a team
 
-Locket encrypts a separate package for each approved device. A single owner publishes the team's shared values; each developer keeps personal overrides. Updates arrive through a folder your team already shares. The folder provider cannot read the package contents, but can see file sizes, counts and modification times, and can delay or delete files.
+Locket encrypts a separate package for each approved device. A single owner publishes the team's shared values; each developer keeps personal overrides. Updates arrive through a folder your team already shares. The folder provider cannot read the package contents, but can see file sizes, counts, and modification times, and can delay or delete files.
 
 ## Join a project
 
@@ -36,7 +36,7 @@ Use a fresh store if this machine already contains populated, unrelated profiles
 
 ## Receive updates
 
-The unlocked agent checks the locally configured folder periodically. The owner’s unlocked agent publishes changes automatically; `locket team publish` sends them immediately. Locked machines apply nothing. Local command approvals and `locket.toml` are never installed by a team package.
+The unlocked agent checks the locally configured folder periodically. The owner's unlocked agent publishes changes automatically; `locket team publish` sends them immediately. Locked machines apply nothing. Local command approvals and `locket.toml` are never installed by a team package.
 
 ```sh
 locket team sync status
@@ -54,13 +54,13 @@ Inspect held profiles without revealing their values:
 locket team sync pending
 ```
 
-For a new team profile blocked by a populated local profile with the same name, explicitly rename the local profile. Its ID, keys and history stay intact:
+For a new team profile blocked by a populated local profile with the same name, explicitly rename the local profile. Its ID, keys, and history stay intact:
 
 ```sh
 locket team sync rename-local-profile INCOMING_PROFILE_ID LOCAL_PROFILE_ID dev-personal
 ```
 
-Policies, `default_profile` and `lk://` references using the old name will refer to the incoming team profile after retry. Review those references before using it. Directory grants stay bound to the renamed local profile's ID. Locket does not rewrite command policies automatically.
+Policies, `default_profile`, and `lk://` references using the old name will refer to the incoming team profile after retry. Review those references before using it. Directory grants stay bound to the renamed local profile's ID. Locket does not rewrite command policies automatically.
 
 For a shared value blocked by a different local shared value with the same name, preserve the local value as a personal override:
 
@@ -85,6 +85,6 @@ Removing membership or folder access cannot erase values someone already receive
 
 ## Validation boundary
 
-Independent synthetic stores test package integrity, owner and recipient binding, atomic apply, ordering and replay rejection. Real iCloud, OneDrive, Dropbox, network shares, multi-person fingerprint comparisons and clean-machine installation need separate acceptance runs.
+Independent synthetic stores test package integrity, owner and recipient binding, atomic apply, ordering, and replay rejection. Real iCloud, OneDrive, Dropbox, network shares, multi-person fingerprint comparisons, and clean-machine installation need separate acceptance runs.
 
 Use the [team acceptance checklist](team-acceptance.md) for a synthetic two-device provider trial and an observed first run.
