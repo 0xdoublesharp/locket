@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 #[cfg(any(unix, target_os = "windows"))]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -251,7 +251,11 @@ fn prepare_parent_directory(parent: &Path) -> Result<(), SocketServerError> {
     let mut prefix = PathBuf::new();
     for component in parent.components() {
         prefix.push(component);
-        reject_socket_symlink(&prefix)?;
+        if prefix == parent {
+            reject_socket_symlink(&prefix)?;
+        } else {
+            reject_untrusted_ancestor_symlink(&prefix)?;
+        }
     }
     match std::fs::symlink_metadata(parent) {
         Ok(metadata) => {
@@ -287,6 +291,41 @@ fn reject_socket_symlink(path: &Path) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+#[cfg(unix)]
+fn reject_untrusted_ancestor_symlink(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            if is_root_system_symlink(path, &metadata) {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("agent socket path contains a symlink: {}", path.display()),
+                ))
+            }
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn is_root_system_symlink(path: &Path, metadata: &std::fs::Metadata) -> bool {
+    let is_os_compat_path = matches!(path.to_str(), Some("/tmp" | "/var" | "/etc" | "/var/run"));
+    if !is_os_compat_path || metadata.uid() != 0 {
+        return false;
+    }
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    std::fs::symlink_metadata(parent).is_ok_and(|parent_meta| {
+        !parent_meta.file_type().is_symlink()
+            && parent_meta.uid() == 0
+            && (parent_meta.permissions().mode() & 0o022) == 0
+    })
 }
 
 #[derive(serde::Serialize)]
