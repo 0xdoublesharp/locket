@@ -89,6 +89,14 @@ version() {
   node -e 'const fs=require("fs"); const t=fs.readFileSync(process.argv[1],"utf8"); const m=t.match(/\[workspace\.package\][\s\S]*?\nversion\s*=\s*"([^"]+)"/); if(!m) process.exit(1); process.stdout.write(m[1]);' "${repo_root}/Cargo.toml"
 }
 
+macos_target_arch() {
+  case "${CARGO_BUILD_TARGET:-}" in
+    x86_64-apple-darwin) echo "x86_64" ;;
+    aarch64-apple-darwin) echo "arm64" ;;
+    *) uname -m ;;
+  esac
+}
+
 build_tauri_bundle() {
   local bundles="$1"
   require_tool pnpm
@@ -128,10 +136,14 @@ build_tauri_bundle() {
     codesign --force --options runtime --timestamp --sign "${APPLE_DEVELOPER_ID_APPLICATION}" "${stage}/locket"
   fi
   node "${repo_root}/scripts/distribution.mjs" overlay "${stage}/locket${LOCKET_EXE_SUFFIX:-}" "${stage}/ui" "${stage}/tauri-bundle.json"
+  local tauri_target_args=()
+  if [[ -n "${CARGO_BUILD_TARGET:-}" ]]; then
+    tauri_target_args=(--target "${CARGO_BUILD_TARGET}")
+  fi
   if [[ "${unsigned}" == "1" ]]; then
-    (cd "${tauri_dir}" && APPLE_SIGNING_IDENTITY=- cargo tauri build --config "${stage}/tauri-bundle.json" --bundles "${bundles}")
+    (cd "${tauri_dir}" && APPLE_SIGNING_IDENTITY=- cargo tauri build ${tauri_target_args[@]+"${tauri_target_args[@]}"} --config "${stage}/tauri-bundle.json" --bundles "${bundles}")
   else
-    (cd "${tauri_dir}" && APPLE_SIGNING_IDENTITY="${APPLE_DEVELOPER_ID_APPLICATION:-}" cargo tauri build --runner "${repo_root}/scripts/package-cargo-auditable.sh" --config "${stage}/tauri-bundle.json" --bundles "${bundles}")
+    (cd "${tauri_dir}" && APPLE_SIGNING_IDENTITY="${APPLE_DEVELOPER_ID_APPLICATION:-}" cargo tauri build ${tauri_target_args[@]+"${tauri_target_args[@]}"} --runner "${repo_root}/scripts/package-cargo-auditable.sh" --config "${stage}/tauri-bundle.json" --bundles "${bundles}")
     cargo audit bin "${profile_root}/locket-desktop${LOCKET_EXE_SUFFIX:-}"
   fi
 }
@@ -171,20 +183,25 @@ macos_pkg() {
     echo "dry-run: would pkgbuild/productbuild/sign/notarize macOS pkg"
     return 0
   fi
-  local v component distribution pkg app_bundle
+  local v arch component distribution pkg app_bundle
+  local arch_check_args=()
   v="$(version)"
+  arch="$(macos_target_arch)"
+  if [[ -n "${CARGO_BUILD_TARGET:-}" ]]; then
+    arch_check_args=(--expected-arch "${arch}")
+  fi
   app_bundle="${profile_root}/bundle/macos/Locket.app"
-  python3 "${repo_root}/scripts/check-package-contents.py" --app "${app_bundle}" --version "${v}"
+  python3 "${repo_root}/scripts/check-package-contents.py" --app "${app_bundle}" --version "${v}" ${arch_check_args[@]+"${arch_check_args[@]}"}
   component="${out_root}/macos/locket-component.pkg"
   distribution="${out_root}/macos/distribution.xml"
-  pkg="${out_root}/macos/Locket-${v}-$(uname -m).pkg"
+  pkg="${out_root}/macos/Locket-${v}-${arch}.pkg"
   mkdir -p "${out_root}/macos"
   sed "s#__LOCKET_VERSION__#${v}#g" "${repo_root}/dist/installers/macos/distribution.xml" > "${distribution}"
   if [[ "${unsigned}" == "1" ]]; then
-    pkg="${out_root}/macos/Locket-${v}-$(uname -m)-unsigned.pkg"
+    pkg="${out_root}/macos/Locket-${v}-${arch}-unsigned.pkg"
     pkgbuild --component "${app_bundle}" --identifier app.locket.desktop.pkg --version "${v}" --install-location /Applications "${component}"
     productbuild --distribution "${distribution}" --package-path "${out_root}/macos" "${pkg}"
-    python3 "${repo_root}/scripts/check-package-contents.py" --pkg "${pkg}" --scratch-root "${stage}" --version "${v}"
+    python3 "${repo_root}/scripts/check-package-contents.py" --pkg "${pkg}" --scratch-root "${stage}" --version "${v}" ${arch_check_args[@]+"${arch_check_args[@]}"}
     echo "Unsigned macOS validation pkg: ${pkg}"
     return 0
   fi

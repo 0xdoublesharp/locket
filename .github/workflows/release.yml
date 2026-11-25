@@ -5,6 +5,12 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      publish_tag:
+        description: "Optional existing release tag (e.g. v0.2.0) to attach built executables to"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -217,3 +223,195 @@ jobs:
     uses: ./.github/workflows/package-validation.yml
     permissions:
       contents: read
+
+  build-macos-intel:
+    name: unsigned macOS Intel (x86_64) package
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish_tag != ''
+    runs-on: macos-26
+    env:
+      CARGO_BUILD_TARGET: x86_64-apple-darwin
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+      PYTHONDONTWRITEBYTECODE: "1"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Prepare disposable paths
+        run: |
+          mkdir -p "$RUNNER_TEMP/locket/tmp" "$RUNNER_TEMP/locket/cargo" "$RUNNER_TEMP/locket/build"
+          {
+            echo "TMPDIR=$RUNNER_TEMP/locket/tmp"
+            echo "CARGO_TARGET_DIR=$RUNNER_TEMP/locket/cargo"
+            echo "LOCKET_BUILD_ROOT=$RUNNER_TEMP/locket/build"
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '11.21.0'
+
+      - name: Restore macOS Intel build cache
+        id: intel-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ runner.temp }}/locket/cargo
+            ${{ runner.temp }}/locket/build/tools
+          key: unsigned-macos-x86_64-tauri-2.10.1-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+      - name: Install Rust x86_64 target and build tools
+        run: |
+          rustup show
+          rustup target add x86_64-apple-darwin
+          if [[ ! -x "$LOCKET_BUILD_ROOT/tools/bin/cargo-tauri" ]] || [[ "$("$LOCKET_BUILD_ROOT/tools/bin/cargo-tauri" --version)" != 'tauri-cli 2.10.1' ]]; then
+            cargo install tauri-cli --version 2.10.1 --locked --force --root "$LOCKET_BUILD_ROOT/tools"
+          fi
+          echo "$LOCKET_BUILD_ROOT/tools/bin" >> "$GITHUB_PATH"
+          pnpm --dir crates/locket-app/ui install --frozen-lockfile
+
+      - name: Build macOS Intel installer and standalone CLI archive
+        run: |
+          scripts/package-native-installers.sh --target macos-pkg --unsigned
+          version="$(node scripts/distribution.mjs versions)"
+          cli_out="$LOCKET_BUILD_ROOT/package/cli"
+          mkdir -p "$cli_out"
+          tar -C "$LOCKET_BUILD_ROOT/package/installers/stage" -czf "$cli_out/locket-${version}-x86_64-apple-darwin.tar.gz" locket
+
+      - name: Save macOS Intel build cache
+        if: success() && steps.intel-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ runner.temp }}/locket/cargo
+            ${{ runner.temp }}/locket/build/tools
+          key: unsigned-macos-x86_64-tauri-2.10.1-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: locket-unsigned-macos-x86_64-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/locket/build/package/installers/macos/*unsigned.pkg
+            ${{ runner.temp }}/locket/build/package/cli/*
+          if-no-files-found: error
+
+  publish-release:
+    name: publish GitHub Release assets
+    needs: [build, validate-packages, build-macos-intel]
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish_tag != ''
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: locket-unsigned-macos-26-${{ github.sha }}
+          path: staging/macos-arm64
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: locket-unsigned-macos-x86_64-${{ github.sha }}
+          path: staging/macos-x86_64
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: locket-unsigned-ubuntu-24.04-${{ github.sha }}
+          path: staging/linux-x86_64
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: locket-unsigned-windows-2025-${{ github.sha }}
+          path: staging/windows-x86_64
+
+      - name: Assemble release assets and SHA256SUMS
+        id: assemble
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_tag="${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || inputs.publish_tag }}"
+          if [[ "$release_tag" != v* ]]; then
+            echo "::error::Release tag must start with v, got: $release_tag"
+            exit 1
+          fi
+          mkdir -p release-assets
+          cp staging/macos-arm64/installers/macos/*-arm64-unsigned.pkg release-assets/
+          cp staging/macos-arm64/cli/locket-*-aarch64-apple-darwin.tar.gz release-assets/
+          cp staging/macos-x86_64/installers/macos/*-x86_64-unsigned.pkg release-assets/
+          cp staging/macos-x86_64/cli/locket-*-x86_64-apple-darwin.tar.gz release-assets/
+          cp staging/linux-x86_64/installers/linux/*.deb release-assets/
+          cp staging/linux-x86_64/cli/locket-*-x86_64-unknown-linux-gnu.tar.gz release-assets/
+          cp staging/linux-x86_64/vscode/*.vsix release-assets/
+          cp staging/windows-x86_64/installers/windows/*.msi release-assets/
+          cp staging/windows-x86_64/cli/locket-*-x86_64-pc-windows-msvc.zip release-assets/
+          (
+            cd release-assets
+            LC_ALL=C sha256sum -- * > SHA256SUMS.txt
+          )
+          ls -la release-assets
+          cat release-assets/SHA256SUMS.txt
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Attest downloadable release assets
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: release-assets/*
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.assemble.outputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed 's/^          //' > release-notes.md <<EOF
+          ## Locket ${RELEASE_TAG}
+
+          ### Downloads
+          - **macOS (Apple Silicon / arm64)**: \`Locket-*-arm64-unsigned.pkg\` (Desktop app + bundled CLI) or \`locket-*-aarch64-apple-darwin.tar.gz\` (standalone CLI)
+          - **macOS (Intel / x86_64)**: \`Locket-*-x86_64-unsigned.pkg\` (Desktop app + bundled CLI) or \`locket-*-x86_64-apple-darwin.tar.gz\` (standalone CLI)
+          - **Linux (x86_64)**: \`locket_*_x86_64.deb\` (Desktop app + bundled CLI) or \`locket-*-x86_64-unknown-linux-gnu.tar.gz\` (standalone CLI)
+          - **Windows (x86_64)**: \`Locket-*-AMD64.msi\` (Desktop app + bundled CLI) or \`locket-*-x86_64-pc-windows-msvc.zip\` (standalone CLI)
+          - **VS Code Extension**: \`locket-*.vsix\`
+          - **Checksums**: \`SHA256SUMS.txt\`
+
+          ### Verification
+          Every release asset is built on public GitHub Actions runners and attested with GitHub Build Provenance:
+
+          \`\`\`sh
+          sha256sum -c SHA256SUMS.txt --ignore-missing
+          gh attestation verify <downloaded-file> --repo ${GITHUB_REPOSITORY}
+          \`\`\`
+
+          > **Note on unsigned macOS builds**: These free community builds are ad-hoc signed rather than Apple Developer ID notarized. On macOS, right-click the \`.pkg\` and choose **Open** (or clear quarantine with \`xattr -d com.apple.quarantine <file>\`) after verifying the SHA-256 checksum and GitHub provenance attestation.
+          EOF
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-assets/* --clobber
+            gh release edit "$RELEASE_TAG" --notes-file release-notes.md
+          else
+            gh release create "$RELEASE_TAG" release-assets/* \
+              --title "Locket ${RELEASE_TAG}" \
+              --notes-file release-notes.md
+          fi

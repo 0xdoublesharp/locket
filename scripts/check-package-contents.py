@@ -3,6 +3,7 @@
 import argparse
 import json
 import pathlib
+import platform
 import plistlib
 import subprocess
 import tempfile
@@ -56,7 +57,13 @@ def inspect_vsix(filename, version):
         return f'{VSIX_PUBLISHER}.{VSIX_NAME}'
 
 
-def inspect_app(folder, version):
+def verify_macho_arch(binary, expected_arch):
+    output = subprocess.run(['/usr/bin/lipo', '-archs', str(binary)], check=True, capture_output=True, timeout=5).stdout.decode().split()
+    if expected_arch not in output:
+        raise ValueError(f'binary {binary.name} architecture mismatch: expected {expected_arch}, found {output}')
+
+
+def inspect_app(folder, version, expected_arch=None):
     root = pathlib.Path(folder)
     scan_tree(root)
     info = plistlib.loads((root / 'Contents/Info.plist').read_bytes())
@@ -72,9 +79,13 @@ def inspect_app(folder, version):
     cli = root / 'Contents/Resources/locket'
     if not desktop.is_file() or not cli.is_file() or cli.is_symlink():
         raise ValueError('app executable or bundled CLI missing')
-    output = subprocess.run([str(cli), '--version'], check=True, capture_output=True, timeout=5).stdout
-    if output.strip() != f'locket {version}'.encode():
-        raise ValueError('bundled CLI version mismatch')
+    if expected_arch and expected_arch != platform.machine():
+        verify_macho_arch(desktop, expected_arch)
+        verify_macho_arch(cli, expected_arch)
+    else:
+        output = subprocess.run([str(cli), '--version'], check=True, capture_output=True, timeout=5).stdout
+        if output.strip() != f'locket {version}'.encode():
+            raise ValueError('bundled CLI version mismatch')
     return 'app.locket.desktop'
 
 
@@ -100,11 +111,12 @@ def scan_tree(folder):
                     tail = block[-64:]
 
 
-def inspect_pkg(filename, version, scratch_root):
+def inspect_pkg(filename, version, scratch_root, expected_arch=None):
     """Expand with pkgutil, verify actual payload/receipt, then remove our files.
 
     This never invokes installer, package scripts, or the desktop application.
-    The bundled CLI is invoked with --version by the existing app content check.
+    The bundled CLI is invoked with --version by the existing app content check
+    unless inspecting a cross-architecture Mach-O bundle.
     """
     package = pathlib.Path(filename).resolve(strict=True)
     scratch = pathlib.Path(scratch_root).resolve(strict=True)
@@ -130,7 +142,7 @@ def inspect_pkg(filename, version, scratch_root):
         apps = [app for app in expanded.rglob('*.app') if app.is_dir()]
         if len(apps) != 1 or apps[0].name != 'Locket.app':
             raise ValueError('expected exactly one Locket.app in native package')
-        inspect_app(apps[0], version)
+        inspect_app(apps[0], version, expected_arch=expected_arch)
         return receipt.get('identifier')
 
 
@@ -141,15 +153,16 @@ def main():
     group.add_argument('--app')
     group.add_argument('--pkg')
     parser.add_argument('--scratch-root', help='existing disposable directory for native package expansion')
+    parser.add_argument('--expected-arch', help='expected Mach-O architecture (enables lipo check for cross-arch macOS builds)')
     parser.add_argument('--version', required=True)
     args = parser.parse_args()
     try:
         if args.pkg:
             if not args.scratch_root:
                 parser.error('--pkg requires --scratch-root for disposable expansion')
-            identity = inspect_pkg(args.pkg, args.version, args.scratch_root)
+            identity = inspect_pkg(args.pkg, args.version, args.scratch_root, expected_arch=args.expected_arch)
         else:
-            identity = inspect_vsix(args.vsix, args.version) if args.vsix else inspect_app(args.app, args.version)
+            identity = inspect_vsix(args.vsix, args.version) if args.vsix else inspect_app(args.app, args.version, expected_arch=args.expected_arch)
     except (ValueError, KeyError, OSError, ET.ParseError, plistlib.InvalidFileException, zipfile.BadZipFile, subprocess.SubprocessError) as error:
         parser.exit(1, f'package content check failed: {error}\n')
     print(f'Package contents verified: {identity} {args.version}')

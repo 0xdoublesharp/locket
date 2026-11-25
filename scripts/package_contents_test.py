@@ -122,5 +122,20 @@ class NativePackageContentsTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'outside'):
                 contents.inspect_app(app, '0.1.0')
 
+    def test_cross_arch_expected_arch_uses_macho_check(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory(dir=os.environ['TMPDIR']) as root:
+            app = self.native_app(root)
+            fake_lipo = mock.Mock(stdout=b'x86_64\n')
+            with mock.patch.object(contents.platform, 'machine', return_value='arm64'), \
+                 mock.patch.object(contents.subprocess, 'run', return_value=fake_lipo) as run_mock:
+                self.assertEqual(contents.inspect_app(app, '0.1.0', expected_arch='x86_64'), 'app.locket.desktop')
+                self.assertEqual(run_mock.call_count, 2)
+            bad_lipo = mock.Mock(stdout=b'arm64\n')
+            with mock.patch.object(contents.platform, 'machine', return_value='arm64'), \
+                 mock.patch.object(contents.subprocess, 'run', return_value=bad_lipo):
+                with self.assertRaisesRegex(ValueError, 'architecture mismatch'):
+                    contents.inspect_app(app, '0.1.0', expected_arch='x86_64')
+
 if __name__ == '__main__':
     unittest.main()

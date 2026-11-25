@@ -88,6 +88,18 @@ Manual sealed export/import is also available. Sealed bundles encrypt for recipi
 
 Scanners and redaction help prepare output before sharing it. They do not isolate code or intercept an AI application's outbound requests, and any program receiving a variable can read and transmit it. Original `.env` files remain plaintext until you explicitly remove them; keep a verified recovery path before deleting them.
 
+## Download
+
+Prebuilt executables and desktop installers are built automatically on public GitHub Actions runners and published on [GitHub Releases](https://github.com/0xdoublesharp/locket/releases):
+
+- **macOS (Apple Silicon)**: `Locket-<version>-arm64-unsigned.pkg` (Desktop app + bundled CLI) or `locket-<version>-aarch64-apple-darwin.tar.gz` (CLI)
+- **macOS (Intel)**: `Locket-<version>-x86_64-unsigned.pkg` (Desktop app + bundled CLI) or `locket-<version>-x86_64-apple-darwin.tar.gz` (CLI)
+- **Linux (x86_64)**: `locket_<version>_x86_64.deb` (Desktop app + bundled CLI) or `locket-<version>-x86_64-unknown-linux-gnu.tar.gz` (CLI)
+- **Windows (x86_64)**: `Locket-<version>-AMD64.msi` (Desktop app + bundled CLI) or `locket-<version>-x86_64-pc-windows-msvc.zip` (CLI)
+- **VS Code Extension**: `locket-<version>.vsix`
+
+Every release includes `SHA256SUMS.txt` and GitHub Build Provenance attestations (`gh attestation verify <file> --repo 0xdoublesharp/locket`). Free community macOS builds are ad-hoc signed rather than Apple notarized; after verifying the checksum and provenance attestation, right-click the `.pkg` and choose **Open** (or clear quarantine with `xattr -d com.apple.quarantine <file>`).
+
 ## Install From Source
 
 ```bash

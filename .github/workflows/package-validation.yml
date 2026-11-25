@@ -131,6 +131,23 @@ jobs:
           scripts/package-native-installers.sh --target host --unsigned
           scripts/package-vscode-extension.sh
           scripts/validate-packaged-os-canaries.sh --artifact-root "$LOCKET_BUILD_ROOT/package"
+          version="$(node scripts/distribution.mjs versions)"
+          cli_out="$LOCKET_BUILD_ROOT/package/cli"
+          mkdir -p "$cli_out"
+          case "$RUNNER_OS" in
+            macOS)
+              arch="$(uname -m)"
+              triple="aarch64-apple-darwin"
+              if [[ "$arch" == "x86_64" ]]; then triple="x86_64-apple-darwin"; fi
+              tar -C "$LOCKET_BUILD_ROOT/package/installers/stage" -czf "$cli_out/locket-${version}-${triple}.tar.gz" locket
+              ;;
+            Linux)
+              tar -C "$LOCKET_BUILD_ROOT/package/installers/stage" -czf "$cli_out/locket-${version}-x86_64-unknown-linux-gnu.tar.gz" locket
+              ;;
+            Windows)
+              python3 -c 'import pathlib, sys, zipfile; zf = zipfile.ZipFile(sys.argv[2], "w", compression=zipfile.ZIP_DEFLATED); zf.write(pathlib.Path(sys.argv[1]), "locket.exe"); zf.close()' "$LOCKET_BUILD_ROOT/package/installers/stage/locket.exe" "$cli_out/locket-${version}-x86_64-pc-windows-msvc.zip"
+              ;;
+          esac
       - name: Test Windows desktop IPC
         if: runner.os == 'Windows'
         run: |
@@ -163,6 +180,7 @@ jobs:
             ${{ runner.temp }}/locket/build/package/installers/macos/*unsigned.pkg
             ${{ runner.temp }}/locket/build/package/installers/windows/*.msi
             ${{ runner.temp }}/locket/build/package/installers/linux/*.deb
+            ${{ runner.temp }}/locket/build/package/cli/*
             ${{ runner.temp }}/locket/build/package/vscode/*.vsix
             ${{ runner.temp }}/locket/build/package/vscode/*.sha256
           if-no-files-found: ignore
