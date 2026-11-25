@@ -716,4 +716,28 @@ describe('desktop scan terminal handoff in the mounted app', () => {
       expect(app.state.scanError).toBeNull();
     },
   );
+
+  it('shows live agent version and No project instead of Unavailable before a project is opened', async () => {
+    overrides.set('desktop_list_projects', () => []);
+    overrides.set('agent_status', () => ({
+      lock_state: 'locked',
+      project_id: null,
+      profile_name: null,
+      live_grant_count: 0,
+      agent_version: '0.1.1',
+      unlock_ttl_seconds: 900,
+      running_session_count: 0,
+      scan_warning_count: 0,
+      recent_audit_status: 'unknown',
+      pinned_reference_warning_count: 0,
+    }));
+    const app = mountApp();
+    await settle();
+    await app.state.refresh();
+    await settle();
+    expect(findNode(app.root, (node) => node.text === 'No project')).toBeDefined();
+    expect(findNode(app.root, (node) => node.text === '0.1.1')).toBeDefined();
+    expect(findNode(app.root, (node) => node.text === 'Unavailable')).toBeUndefined();
+    app.unmount();
+  });
 });

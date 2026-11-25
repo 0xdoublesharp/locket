@@ -299,8 +299,11 @@ const lockLabel = computed<string>(() => {
     return 'Connecting…';
   }
   if (selectedProject.value && !status.value) return 'Unknown';
-  if (!connected.value || status.value === null) {
+  if (!connected.value || agentStatus.value === null) {
     return 'Unavailable';
+  }
+  if (status.value === null) {
+    return 'No project';
   }
   switch (status.value.lock_state) {
     case 'unlocked':
@@ -434,7 +437,7 @@ const settings = ref<SettingsState>({
   verification: null,
   dangerousProfile: null,
   dangerousProfileFlag: false,
-  agentVersion: status.value?.agent_version ?? 'unknown',
+  agentVersion: status.value?.agent_version ?? agentStatus.value?.agent_version ?? 'unknown',
 });
 
 watch(
@@ -481,7 +484,10 @@ function applyAgentConfig(config: AgentConfigSettings): void {
     verification: config.user_verification_required_for,
     dangerousProfile: config.dangerous_profile,
     dangerousProfileFlag: config.dangerous_profile?.dangerous ?? false,
-    agentVersion: status.value?.agent_version ?? settings.value.agentVersion,
+    agentVersion:
+      status.value?.agent_version ??
+      agentStatus.value?.agent_version ??
+      settings.value.agentVersion,
   };
 }
 
@@ -560,11 +566,11 @@ async function handleSettingsPatch(changes: WriteConfigChanges): Promise<void> {
 }
 
 watch(
-  status,
+  [status, agentStatus],
   () => {
     settings.value = {
       ...settings.value,
-      agentVersion: status.value?.agent_version ?? 'unknown',
+      agentVersion: status.value?.agent_version ?? agentStatus.value?.agent_version ?? 'unknown',
     };
   },
   { immediate: true },
@@ -1524,20 +1530,21 @@ const recentActivityRows = computed(() => {
   const failedCount = auditRows.value.filter(
     (row) => row.status === 'FAILED' || row.hmacOk === false,
   ).length;
+  const unloadedValue = projectConnected.value ? 'Unknown' : '—';
   return [
     {
       label: 'OK',
-      value: auditLastRefreshed.value ? okCount.toString() : 'Unknown',
+      value: auditLastRefreshed.value ? okCount.toString() : unloadedValue,
       tone: 'neutral',
     },
     {
       label: 'Denied',
-      value: auditLastRefreshed.value ? deniedCount.toString() : 'Unknown',
+      value: auditLastRefreshed.value ? deniedCount.toString() : unloadedValue,
       tone: deniedCount === 0 ? 'neutral' : 'warn',
     },
     {
       label: 'Failed',
-      value: auditLastRefreshed.value ? failedCount.toString() : 'Unknown',
+      value: auditLastRefreshed.value ? failedCount.toString() : unloadedValue,
       tone: failedCount === 0 ? 'neutral' : 'warn',
     },
     {
@@ -2296,7 +2303,9 @@ onUnmounted(() => {
                   class="companion-button"
                   :class="{
                     'companion-button--primary':
-                      !activeProjectFolder && (agentOnline || !shellAgentError),
+                      !activeProjectFolder &&
+                      Boolean(projectPath.trim()) &&
+                      (agentOnline || !shellAgentError),
                   }"
                   type="submit"
                   :disabled="desktopBusy || !desktopAvailable || !projectPath.trim()"

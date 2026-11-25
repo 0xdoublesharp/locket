@@ -72,6 +72,8 @@ const vaultTone = computed(() => {
       return 'locked';
     case 'Connecting…':
       return 'pending';
+    case 'No project':
+      return 'neutral';
     default:
       return 'error';
   }
@@ -147,19 +149,31 @@ const readiness = computed(() => ({
         <span class="dashboard__metric-label"
           >Variables <AppIcon name="chevron-down" class="dashboard__metric-arrow" :size="14"
         /></span>
-        <strong>{{ secretsLoaded ? secrets.length : 'Unknown' }}</strong>
+        <strong>{{ secretsLoaded ? secrets.length : projectConnected ? 'Unknown' : '—' }}</strong>
         <span class="dashboard__metric-meta">{{
-          secretsLoaded ? `${requiredVariables} required` : 'Not loaded'
+          secretsLoaded
+            ? `${requiredVariables} required`
+            : projectConnected
+              ? 'Not loaded'
+              : 'Open a project'
         }}</span>
       </button>
       <button type="button" class="dashboard__metric" @click="emit('navigate', 'execution')">
         <span class="dashboard__metric-label"
           >Recorded runs <AppIcon name="chevron-down" class="dashboard__metric-arrow" :size="14"
         /></span>
-        <strong>{{ sessionsLastRefreshed ? sessions.length : 'Unknown' }}</strong>
+        <strong>{{
+          sessionsLastRefreshed ? sessions.length : projectConnected ? 'Unknown' : '—'
+        }}</strong>
         <span
           :class="['dashboard__metric-meta', { 'dashboard__metric-meta--warn': failedRuns > 0 }]"
-          >{{ sessionsLastRefreshed ? `${failedRuns} failed/stale` : 'Not loaded' }}</span
+          >{{
+            sessionsLastRefreshed
+              ? `${failedRuns} failed/stale`
+              : projectConnected
+                ? 'Not loaded'
+                : 'Open a project'
+          }}</span
         >
       </button>
       <button type="button" class="dashboard__metric" @click="emit('navigate', 'audit')">
@@ -502,6 +516,10 @@ const readiness = computed(() => ({
 
 .dashboard__status--error {
   color: var(--danger);
+}
+
+.dashboard__status--neutral {
+  color: var(--text-secondary);
 }
 
 /* Configuration checks + project connection */

@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none">
+  <defs>
+    <linearGradient id="locket-gold" x1="512" y1="100" x2="512" y2="924" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#fae192" />
+      <stop offset="55%" stop-color="#f6d577" />
+      <stop offset="100%" stop-color="#e3b647" />
+    </linearGradient>
+    <linearGradient id="locket-sheen" x1="512" y1="100" x2="512" y2="924" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.45" />
+      <stop offset="30%" stop-color="#ffffff" stop-opacity="0.06" />
+      <stop offset="100%" stop-color="#1d1607" stop-opacity="0.16" />
+    </linearGradient>
+    <filter id="tile-shadow" x="40" y="60" width="944" height="944" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="20" stdDeviation="24" flood-color="#000000" flood-opacity="0.32" />
+    </filter>
+  </defs>
+  <g filter="url(#tile-shadow)">
+    <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#locket-gold)" />
+    <rect x="106" y="106" width="812" height="812" rx="179" stroke="url(#locket-sheen)" stroke-width="12" />
+  </g>
+  <g transform="translate(62 81) scale(37.5)" stroke="#1d1607" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="6.75" y="10.5" width="10.5" height="7.5" rx="2" />
+    <path d="M9 10.5V8a3 3 0 1 1 6 0v2.5M12 13.5v1.4" />
+  </g>
+</svg>
