@@ -197,6 +197,20 @@ fn longest_match_at_a_position_and_intersecting_suffixes_are_covered() -> io::Re
 }
 
 #[test]
+fn byte_writes_preserve_utf8_and_incomplete_prefixes_around_repeated_overlaps() -> io::Result<()> {
+    let cfg = StreamingRedactorConfig {
+        include_encoded_variants: false,
+        ..config(&[("FIRST", "秘密-abc"), ("SECOND", "abc-終わり")])
+    };
+    let input = "α秘密-ab!🙂秘密-abc-終わり🌿秘密-abc-終わり秘密-a";
+    let (output, stats) = redact(&input.as_bytes().chunks(1).collect::<Vec<_>>(), cfg)?;
+    assert_eq!(output, "α秘密-ab!🙂[REDACTED:locket]🌿[REDACTED:locket]秘密-a".as_bytes());
+    assert_eq!(stats.redaction_count, 2);
+    assert_eq!(stats.redacted_labels, ["FIRST".into(), "SECOND".into()].into());
+    Ok(())
+}
+
+#[test]
 fn recognizes_all_encodings_even_at_eof() -> io::Result<()> {
     let secret = "x?/\u{00ff}\"\r\n";
     let defined = [

@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
 use std::str::FromStr;
@@ -863,7 +863,7 @@ fn prepare_policy_execution(
         env_mode: policy.env_mode,
         override_mode: policy.override_behavior,
     };
-    let mut prepared = locket_exec::prepare_execution(&request).map_err(exec_prepare_error)?;
+    let mut prepared = super::prepare_vault_execution(&request)?;
     finalize_configuration_environment(resolved, policy, &mut prepared.env)?;
     let external_env_names = external_env.keys().map(ToOwned::to_owned).collect::<Vec<_>>();
     let secret_names = unique_secret_names(
@@ -1102,6 +1102,7 @@ pub(crate) fn resolve_external_env_ide_with_session_id(
             // the policy is the final authority.
             continue;
         }
+        super::ensure_vault_env_name(&name)?;
         let reference = format!("lk://{}/{}", ide.profile.name, name);
         let resolved = resolve_reference_via_agent(
             ide.context,
@@ -1175,16 +1176,25 @@ fn resolve_external_env_compose(
     project_root: &Path,
     policy: &CommandPolicy,
 ) -> Result<locket_exec::EnvMap, CliError> {
-    let compose_env = parent_env.iter().filter(|(name, _)| {
-        COMPOSE_ROUTING_ENV.contains(&name.as_str())
-            || policy.inherit_env.contains(name)
-            || policy.allowed_secrets.iter().any(|allowed| allowed.as_str() == name.as_str())
-    });
+    let mut compose_env = parent_env
+        .iter()
+        .filter(|(name, _)| {
+            COMPOSE_ROUTING_ENV.contains(&name.as_str())
+                || policy.inherit_env.contains(name)
+                || (!locket_exec::is_child_runtime_control(name)
+                    && policy
+                        .allowed_secrets
+                        .iter()
+                        .any(|allowed| allowed.as_str() == name.as_str()))
+        })
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    locket_exec::restrict_child_search_path(&mut compose_env);
     let output = ProcessCommand::new(compose_config_command.program)
         .args(compose_config_command.args)
         .current_dir(project_root)
         .env_clear()
-        .envs(compose_env.map(|(name, value)| (name, value.as_str())))
+        .envs(compose_env.iter().map(|(name, value)| (name, value.as_str())))
         .output()
         .map_err(|error| {
             external_source_unavailable_error(format!(
@@ -1273,7 +1283,9 @@ fn resolve_external_env_file(
 
     let allowed_names =
         policy.allowed_secrets.iter().map(|name| name.as_str().to_owned()).collect::<BTreeSet<_>>();
-    let contents = fs::read_to_string(&canonical_candidate)?;
+    let mut contents = Zeroizing::new(String::new());
+    crate::commands::secrets::import::open_scoped_file(&canonical_candidate)?
+        .read_to_string(&mut contents)?;
     let mut env = locket_exec::EnvMap::new();
     // External sources are data, never shell programs. Only a malformed
     // assignment to a name this command can receive affects its execution.
@@ -1587,6 +1599,11 @@ fn argv_reference_access(
     command: &CommandSpec,
     allow_insecure_argv: bool,
 ) -> Result<bool, CliError> {
+    if let CommandSpec::Argv(arguments) = command
+        && arguments.first().is_some_and(|program| program.contains("lk://"))
+    {
+        return Err(invalid_policy_error("a secret reference cannot select the executable"));
+    }
     let contains_reference = match command {
         CommandSpec::Argv(arguments) => arguments.iter().any(|arg| arg.contains("lk://")),
         CommandSpec::Shell(script) => script.contains("lk://"),
@@ -2129,6 +2146,7 @@ pub fn finalize_configuration_environment(
 ) -> Result<(), CliError> {
     let document = crate::read_policy_document(&resolved.root.join(crate::LOCKET_TOML))?;
     document.apply_variable_defaults(policy, env);
+    locket_exec::restrict_child_search_path(env);
     let missing = policy
         .required_secrets
         .iter()
@@ -2178,6 +2196,18 @@ mod approval_tests {
     use clap::Parser;
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn reference_opt_in_applies_to_arguments_only() -> Result<(), crate::CliError> {
+        use locket_core::CommandSpec;
+
+        let program = CommandSpec::Argv(vec!["lk://dev/TOOL".into(), "argument".into()]);
+        assert!(super::argv_reference_access(&program, true).is_err());
+        let argument = CommandSpec::Argv(vec!["tool".into(), "lk://dev/TOKEN".into()]);
+        assert!(super::argv_reference_access(&argument, true)?);
+        Ok(())
+    }
+
     struct Confirmations(Mutex<VecDeque<String>>);
     impl crate::ConfirmationReader for Confirmations {
         fn read_confirmation(&self, _prompt: &str) -> Result<String, crate::CliError> {

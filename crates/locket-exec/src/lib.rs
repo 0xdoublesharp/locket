@@ -4,6 +4,7 @@
 // alongside workspace versions. The sealed-bundle dependency owns that skew.
 #![allow(clippy::multiple_crate_versions)]
 
+use std::borrow::Cow;
 use std::process::Command;
 
 pub use locket_core::{
@@ -109,6 +110,9 @@ pub enum ExecError {
 
 /// Applies Locket environment policy and returns a spawn-ready plan.
 ///
+/// Broad inheritance omits loader and interpreter startup controls unless named
+/// in `inherit_env`. External sources are already authorized by the caller.
+///
 /// # Errors
 ///
 /// Returns [`ExecError::EmptyCommand`] when `request.argv` has no program.
@@ -119,8 +123,21 @@ pub fn prepare_execution(request: &ExecutionRequest) -> Result<PreparedExecution
         return Err(ExecError::EmptyCommand);
     };
     let inherit_env = request.inherit_env.iter().map(String::as_str).collect::<Vec<_>>();
-    let env = merge_environment(
-        &request.parent_env,
+    let parent_env = match request.env_mode {
+        EnvMode::Strict | EnvMode::Minimal => Cow::Borrowed(&request.parent_env),
+        EnvMode::Merge | EnvMode::Passthrough => Cow::Owned(
+            request
+                .parent_env
+                .iter()
+                .filter(|(name, _)| {
+                    !is_startup_control(name) || inherit_env.contains(&name.as_str())
+                })
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+        ),
+    };
+    let mut env = merge_environment(
+        &parent_env,
         DEFAULT_SAFE_ALLOWLIST,
         &inherit_env,
         &request.external_env,
@@ -128,8 +145,67 @@ pub fn prepare_execution(request: &ExecutionRequest) -> Result<PreparedExecution
         request.env_mode,
         request.override_mode,
     )?;
+    restrict_child_search_path(&mut env);
 
     Ok(PreparedExecution { program: program.clone(), args: args.to_vec(), env })
+}
+
+fn is_startup_control(name: &str) -> bool {
+    #[cfg(windows)]
+    let upper = name.to_ascii_uppercase();
+    #[cfg(windows)]
+    let name = upper.as_str();
+    name.starts_with("LD_")
+        || name.starts_with("DYLD_")
+        || name.starts_with("BASH_FUNC_")
+        || matches!(
+            name,
+            "BASH_ENV"
+                | "ENV"
+                | "IFS"
+                | "NODE_OPTIONS"
+                | "NODE_PATH"
+                | "PYTHONPATH"
+                | "PYTHONHOME"
+                | "PYTHONSTARTUP"
+                | "RUBYOPT"
+                | "RUBYLIB"
+                | "PERL5OPT"
+                | "PERL5LIB"
+                | "PERLLIB"
+                | "GCONV_PATH"
+        )
+}
+
+/// Identifies environment names that can change how the child loads or locates code.
+#[must_use]
+pub fn is_child_runtime_control(name: &str) -> bool {
+    #[cfg(windows)]
+    let is_path = name.eq_ignore_ascii_case("PATH");
+    #[cfg(not(windows))]
+    let is_path = name == "PATH";
+    is_path || is_startup_control(name)
+}
+
+/// Removes current-directory and other relative search entries from the child PATH.
+/// An emptied Unix PATH uses the standard system directories.
+pub fn restrict_child_search_path(env: &mut EnvMap) {
+    #[cfg(not(windows))]
+    let paths = env.get_mut("PATH").into_iter();
+    #[cfg(windows)]
+    let paths = env
+        .iter_mut()
+        .filter_map(|(name, value)| name.eq_ignore_ascii_case("PATH").then_some(value));
+    for path in paths {
+        let absolute = std::env::split_paths(path.as_str()).filter(|entry| entry.is_absolute());
+        // The entries were split from an existing PATH, so they can be joined again.
+        if let Ok(joined) = std::env::join_paths(absolute) {
+            let joined = joined.into_string().unwrap_or_default();
+            #[cfg(unix)]
+            let joined = if joined.is_empty() { "/usr/bin:/bin".to_owned() } else { joined };
+            *path = env_value(joined);
+        }
+    }
 }
 
 /// Selects parent environment values that a policy explicitly allows through an
@@ -224,6 +300,47 @@ mod tests {
 
         assert_eq!(prepared.env.get("NODE_ENV").map(|value| value.as_str()), Some("development"));
         assert!(!prepared.env.contains_key("SECRET"));
+        Ok(())
+    }
+
+    #[test]
+    fn broad_inheritance_omits_ambient_startup_controls() -> Result<(), ExecError> {
+        let mut request = ExecutionRequest::strict(vec!["tool".to_owned()]);
+        request.parent_env = env(&[
+            ("LD_PRELOAD", "loader-placeholder"),
+            ("LD_AUDIT", "loader-placeholder"),
+            ("LD_LIBRARY_PATH", "loader-placeholder"),
+            ("DYLD_INSERT_LIBRARIES", "loader-placeholder"),
+            ("DYLD_LIBRARY_PATH", "loader-placeholder"),
+            ("DYLD_FRAMEWORK_PATH", "loader-placeholder"),
+            ("BASH_ENV", "shell-placeholder"),
+            ("ENV", "shell-placeholder"),
+            ("IFS", "shell-placeholder"),
+            ("NODE_OPTIONS", "runtime-placeholder"),
+            ("PYTHONPATH", "runtime-placeholder"),
+            ("PYTHONSTARTUP", "runtime-placeholder"),
+            ("RUBYOPT", "runtime-placeholder"),
+            ("PERL5OPT", "runtime-placeholder"),
+            ("GCONV_PATH", "runtime-placeholder"),
+            ("NODE_ENV", "development"),
+        ]);
+        request.locket_env = env(&[("APP_TOKEN", "fixture")]);
+        request.inherit_env = vec!["PYTHONPATH".into()];
+        request.external_env = env(&[("NODE_OPTIONS", "policy-placeholder")]);
+
+        for mode in [EnvMode::Merge, EnvMode::Passthrough] {
+            request.env_mode = mode;
+            let child = prepare_execution(&request)?;
+            assert_eq!(
+                child.env,
+                env(&[
+                    ("APP_TOKEN", "fixture"),
+                    ("NODE_ENV", "development"),
+                    ("NODE_OPTIONS", "policy-placeholder"),
+                    ("PYTHONPATH", "runtime-placeholder"),
+                ])
+            );
+        }
         Ok(())
     }
 

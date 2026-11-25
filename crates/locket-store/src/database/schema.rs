@@ -11,10 +11,16 @@ pub const SCHEMA_VERSION: u32 = 1;
 
 const BUSY_TIMEOUT_MS: u64 = 5_000;
 
-pub fn configure_connection(connection: &Connection) -> Result<(), rusqlite::Error> {
+pub fn configure_connection(
+    connection: &Connection,
+    writable: bool,
+) -> Result<(), rusqlite::Error> {
     connection.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))?;
-    connection.pragma_update(None, "foreign_keys", "ON")?;
-    connection.pragma_update(None, "journal_mode", "WAL")?;
+    connection.pragma_update(None, "secure_delete", "ON")?;
+    if writable {
+        connection.pragma_update(None, "foreign_keys", "ON")?;
+        connection.pragma_update(None, "journal_mode", "WAL")?;
+    }
     Ok(())
 }
 

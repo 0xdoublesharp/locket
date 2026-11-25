@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 
 mod access;
 mod atomic;
@@ -66,30 +66,35 @@ pub struct Store {
 impl Store {
     /// Opens a `SQLite` store at `path` and configures connection-level safety pragmas.
     ///
-    /// The connection enables foreign key enforcement, requests WAL journaling where
-    /// `SQLite` supports it, and configures a 5000 ms busy timeout.
+    /// The connection enables foreign key enforcement and secure deletion, requests
+    /// WAL journaling where `SQLite` supports it, and sets a 5000 ms busy timeout.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError::Sqlite`] when `SQLite` cannot open or configure the store.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let connection = Connection::open(path)?;
-        schema::configure_connection(&connection)?;
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        schema::configure_connection(&connection, true)?;
         Ok(Self { connection })
     }
 
     /// Opens an existing `SQLite` database without schema or journal-mode writes.
     ///
-    /// Only a 5000 ms busy timeout is configured. This never creates a missing
-    /// database or runs migrations; database writes are denied by the open flags.
+    /// Sets the busy timeout and secure deletion connection settings. This never
+    /// creates a missing database or runs migrations, and the open flags deny writes.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError::Sqlite`] when the existing database cannot be opened.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let connection =
-            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        connection.busy_timeout(std::time::Duration::from_millis(5_000))?;
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        schema::configure_connection(&connection, false)?;
         Ok(Self { connection })
     }
 

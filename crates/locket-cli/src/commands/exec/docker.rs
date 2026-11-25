@@ -12,8 +12,8 @@ use serde_json::{Value, json};
 
 use crate::runtime::RuntimeContext;
 use crate::runtime::error::{
-    CliError, access_denied_error, exec_prepare_error, invalid_reference_error,
-    metadata_invalid_error, unimplemented_in_build_error,
+    CliError, access_denied_error, invalid_reference_error, metadata_invalid_error,
+    unimplemented_in_build_error,
 };
 use crate::runtime::key_access::load_project_key;
 use crate::support::secret_helpers::{
@@ -123,7 +123,7 @@ fn prepare_docker_helper_policy_execution(
         env_mode: policy.env_mode,
         override_mode: policy.override_behavior,
     };
-    let mut execution = locket_exec::prepare_execution(&request).map_err(exec_prepare_error)?;
+    let mut execution = super::prepare_vault_execution(&request)?;
     super::run::finalize_configuration_environment(&resolved, &policy, &mut execution.env)?;
     let endpoint = super::docker_context::resolve_endpoint(&execution.env, &context.cwd)?;
     let mut delivery_env = execution.env.clone();

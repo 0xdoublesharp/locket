@@ -18,9 +18,9 @@ use crate::commands::discovery::{SHARED_PROJECT_PREFIX, select_project, trusted_
 use crate::runtime::RuntimeContext;
 use crate::runtime::dangerous_profile::ensure_dangerous_profile_consent;
 use crate::runtime::error::{
-    CliError, child_exit_error, confirmation_failed_error, exec_prepare_error,
-    invalid_policy_error, invalid_reference_error, profile_not_found_error,
-    project_root_untrusted_error, secret_not_found_error,
+    CliError, child_exit_error, confirmation_failed_error, invalid_policy_error,
+    invalid_reference_error, profile_not_found_error, project_root_untrusted_error,
+    secret_not_found_error,
 };
 use crate::runtime::key_access::load_project_key;
 use crate::support::secret_helpers::{
@@ -98,7 +98,7 @@ pub fn exec_command(
         env_mode: locket_exec::EnvMode::Strict,
         override_mode: locket_exec::EnvOverrideMode::Locket,
     };
-    let prepared = locket_exec::prepare_execution(&request).map_err(exec_prepare_error)?;
+    let prepared = super::prepare_vault_execution(&request)?;
     for document in &documents {
         validate_exec_configuration(document, &secret_names, &prepared.env, output)?;
     }

@@ -7,6 +7,21 @@ use crate::{SCHEMA_VERSION, Store, StoreError};
 use super::{insert_project_profile, insert_project_profile_secret, open_initialized_store};
 
 #[test]
+fn enables_secure_delete_on_each_vault_connection() -> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let path = directory.path().join("vault.sqlite3");
+    let mut vault = Store::open(&path)?;
+    vault.initialize_schema()?;
+
+    for connection in [vault, Store::open(&path)?, Store::open_read_only(&path)?] {
+        let secure_delete: i64 =
+            connection.connection().pragma_query_value(None, "secure_delete", |row| row.get(0))?;
+        assert_eq!(secure_delete, 1);
+    }
+    Ok(())
+}
+
+#[test]
 fn creates_schema_and_records_migration() -> Result<(), Box<dyn Error>> {
     let test_store = open_initialized_store()?;
     let connection = test_store.store.connection();
