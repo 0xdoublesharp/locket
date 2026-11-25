@@ -174,7 +174,7 @@ impl InputDirectory {
             let mut handles = Vec::new();
             let ancestors: Vec<_> = path.ancestors().collect();
             for ancestor in ancestors.into_iter().rev() {
-                let handle = open_windows_entry(ancestor, true)?;
+                let handle = open_windows_entry(ancestor)?;
                 if !windows_entry_is_plain(&handle)? || !handle.metadata()?.is_dir() {
                     return Err(io::Error::new(io::ErrorKind::InvalidInput, "expected directory"));
                 }
@@ -238,7 +238,7 @@ impl InputDirectory {
         }
         #[cfg(windows)]
         {
-            let file = open_windows_entry(&self.path.join(name), false)?;
+            let file = open_windows_entry(&self.path.join(name))?;
             if windows_entry_is_plain(&file)? {
                 Ok(file)
             } else {
@@ -304,17 +304,15 @@ impl InputDirectory {
 }
 
 #[cfg(windows)]
-fn open_windows_entry(path: &Path, directory: bool) -> io::Result<File> {
+fn open_windows_entry(path: &Path) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     const FILE_SHARE_READ_WRITE: u32 = 0x0000_0003;
-    let flags =
-        FILE_FLAG_OPEN_REPARSE_POINT | if directory { FILE_FLAG_BACKUP_SEMANTICS } else { 0 };
     std::fs::OpenOptions::new()
         .read(true)
         .share_mode(FILE_SHARE_READ_WRITE)
-        .custom_flags(flags)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
 }
 

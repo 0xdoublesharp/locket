@@ -512,7 +512,8 @@ fn outside_workspace_shared_discovery_storage_generation_and_parity() -> Result<
     assert_eq!(projects[0]["name"], "@shared");
     assert_eq!(projects[1]["name"], "PrivateApp");
     assert_eq!(projects[1]["profiles"][1]["dangerous"], true);
-    assert_eq!(projects[1]["trusted_roots"][0], root.canonicalize()?.to_string_lossy().as_ref());
+    let reported_root = projects[1]["trusted_roots"][0].as_str().ok_or("missing trusted root")?;
+    assert_eq!(std::path::Path::new(reported_root).canonicalize()?, root.canonicalize()?);
 
     let args = ["set", "PRIVATE_TOKEN", "--project", "work", "--profile", "prod", "--json"];
     let (code, denied) = json_run(&outside, &args)?;

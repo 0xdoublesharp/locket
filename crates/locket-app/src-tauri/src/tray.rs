@@ -823,6 +823,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     #[test]
+    #[cfg(unix)]
     fn tray_starts_with_disconnected_icon_and_metadata_only_menu() -> tauri::Result<()> {
         let app = tauri::test::mock_builder()
             .build(tauri::test::mock_context(tauri::test::noop_assets()))?;

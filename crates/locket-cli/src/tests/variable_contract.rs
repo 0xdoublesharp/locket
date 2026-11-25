@@ -375,7 +375,8 @@ setup_hint = 'Choose an app mode'
         );
         fs::write(&path, document)?;
         let report = run(&scoped, &["locket", "env", "inspect", "--policy", "dev"])?;
-        assert!(report.contains("path_scope=apps/api"));
+        let scope_line = format!("path_scope={}", Path::new("apps").join("api").display());
+        assert!(report.contains(&scope_line));
         assert!(report.contains("path_scope_profile=staging"));
         assert!(report.contains("Public display mode"));
         assert!(report.contains("Choose an app mode"));
