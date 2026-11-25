@@ -783,8 +783,7 @@ export function createMockRuntime(params: URLSearchParams) {
       case 'agent_rotate_secret':
         requireDangerousConfirmation(request);
         return saveSecret(request as unknown as SetSecretRequest, true);
-      case 'agent_reveal':
-      case 'agent_copy': {
+      case 'agent_reveal': {
         requireUnlocked();
         requireDangerousConfirmation(request);
         const row = projectSecrets

@@ -44,7 +44,6 @@ agent_lock
 agent_unlock
 agent_set_active_profile
 agent_reveal
-agent_copy
 agent_scan
 agent_resolve
 agent_prepare_exec

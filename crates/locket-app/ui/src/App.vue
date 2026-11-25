@@ -1015,8 +1015,11 @@ function submitDangerousConfirmation(): void {
   if (dangerousProfileMatches.value) dangerousConfirmDialog.value?.close('confirm');
 }
 
-async function confirmDangerousAction(action: string): Promise<string | false | undefined> {
-  if (!settings.value.dangerousProfileFlag) return false;
+async function confirmDangerousAction(
+  action: string,
+  force = false,
+): Promise<string | false | undefined> {
+  if (!force && !settings.value.dangerousProfileFlag) return false;
   const dialog = dangerousConfirmDialog.value;
   if (!dialog || dangerousProfileName.value) return;
   const generation = selectionGeneration.value;

@@ -554,29 +554,6 @@ async fn agent_reveal(
     .await
 }
 
-/// Tauri command exposing the agent's `Copy` RPC to the webview.
-#[tauri::command]
-async fn agent_copy(
-    request: DesktopValueAccess<locket_agent::CopyRequest>,
-) -> Result<locket_agent::CopyResponse, AgentClientError> {
-    let DesktopValueAccess { request, confirm_dangerous_profile } = request;
-    let store = resolve_path(request.store_path.clone(), default_store_path)?;
-    let project =
-        request.project_id.clone().map(Ok).unwrap_or_else(desktop_actions::selected_project_id)?;
-    let mut request = request;
-    request.store_path = Some(store.clone());
-    request.project_id = Some(project.clone());
-    desktop_actions::invoke_granted(
-        locket_agent::AgentMethod::Copy,
-        locket_agent::GrantAction::Copy,
-        value_access_payload(&request, confirm_dangerous_profile)?,
-        &store,
-        &project,
-        &request.profile_id,
-    )
-    .await
-}
-
 /// Tauri command exposing the agent's `ScanKnownValues` RPC.
 #[tauri::command]
 async fn agent_scan(
@@ -1176,7 +1153,6 @@ fn register_commands<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R
         agent_unlock,
         agent_set_active_profile,
         agent_reveal,
-        agent_copy,
         agent_scan,
         agent_resolve,
         agent_prepare_exec,

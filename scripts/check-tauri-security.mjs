@@ -94,6 +94,8 @@ function checkCapabilities() {
     }
   }
   assert(desktopFound, 'Missing capabilities/desktop.json');
+  const commandsToml = readFileSync(join(desktop, 'permissions/desktop-commands.toml'), 'utf8');
+  assert(!/"agent_copy"/.test(commandsToml), 'desktop-commands.toml must not allow plaintext-returning agent_copy');
   return identifiers;
 }
 

@@ -74,7 +74,7 @@ describe('trayActionAgentCommand', () => {
       ['run-policy', 'agent_list_policies'],
       ['start-scan', 'agent_scan'],
       ['reveal-secret', 'agent_reveal'],
-      ['copy-secret', 'agent_copy'],
+      ['copy-secret', 'agent_copy_secret'],
     ];
     for (const [action, expected] of cases) {
       expect(trayActionAgentCommand(action)).toBe(expected);

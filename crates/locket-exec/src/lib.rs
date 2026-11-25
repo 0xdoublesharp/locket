@@ -168,11 +168,21 @@ fn is_startup_control(name: &str) -> bool {
                 | "PYTHONPATH"
                 | "PYTHONHOME"
                 | "PYTHONSTARTUP"
+                | "PYTHONUSERBASE"
                 | "RUBYOPT"
                 | "RUBYLIB"
                 | "PERL5OPT"
                 | "PERL5LIB"
                 | "PERLLIB"
+                | "PERL5DB"
+                | "JAVA_TOOL_OPTIONS"
+                | "_JAVA_OPTIONS"
+                | "JDK_JAVA_OPTIONS"
+                | "DOTNET_STARTUP_HOOKS"
+                | "CORECLR_PROFILER"
+                | "CORECLR_PROFILER_PATH"
+                | "COR_PROFILER"
+                | "COR_PROFILER_PATH"
                 | "GCONV_PATH"
         )
 }
@@ -322,6 +332,13 @@ mod tests {
             ("PYTHONSTARTUP", "runtime-placeholder"),
             ("RUBYOPT", "runtime-placeholder"),
             ("PERL5OPT", "runtime-placeholder"),
+            ("PERL5DB", "runtime-placeholder"),
+            ("PYTHONUSERBASE", "runtime-placeholder"),
+            ("JAVA_TOOL_OPTIONS", "jvm-placeholder"),
+            ("_JAVA_OPTIONS", "jvm-placeholder"),
+            ("JDK_JAVA_OPTIONS", "jvm-placeholder"),
+            ("DOTNET_STARTUP_HOOKS", "dotnet-placeholder"),
+            ("CORECLR_PROFILER", "dotnet-placeholder"),
             ("GCONV_PATH", "runtime-placeholder"),
             ("NODE_ENV", "development"),
         ]);

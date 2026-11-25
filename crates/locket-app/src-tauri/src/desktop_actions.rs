@@ -1947,6 +1947,14 @@ async fn team_sync_request(
         let folder = request.folder.ok_or_else(|| super::AgentClientError::Protocol {
             reason: "Choose a shared folder first.".into(),
         })?;
+        if request.allow_dangerous
+            && !matches_profile_confirmation(
+                request.confirm_dangerous_profile.as_deref(),
+                &context.profile_name,
+            )
+        {
+            return Err(confirmation_required());
+        }
         payload["folder"] = serde_json::json!(folder);
         payload["allow_dangerous"] = serde_json::json!(request.allow_dangerous);
     }

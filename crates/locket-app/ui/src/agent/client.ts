@@ -31,8 +31,6 @@ import type {
   AgentStatus,
   AgentStatusEvent,
   BackupActionResponse,
-  CopyRequest,
-  CopyResponse,
   ExportBundleRequest,
   ImportBundleRequest,
   ListDeviceMembersRequest,
@@ -234,10 +232,6 @@ async function callTyped<T>(
 
 export async function reveal(request: RevealRequest): Promise<AgentResult<RevealResponse>> {
   return callTyped<RevealResponse>('agent_reveal', { request });
-}
-
-export async function copy(request: CopyRequest): Promise<AgentResult<CopyResponse>> {
-  return callTyped<CopyResponse>('agent_copy', { request });
 }
 
 export async function lockVault(): Promise<AgentResult<void>> {

@@ -724,6 +724,7 @@ impl AgentSocketState {
             live_grant_count: u32::try_from(grant_count).unwrap_or(u32::MAX),
             agent_version: self.agent_version.clone(),
             session_monitoring: self.session_monitoring.lock().await.clone(),
+            core_dump_hardening: Some(locket_platform::core_dump_hardening_state().to_string()),
             unlock_ttl_seconds: summary.max_remaining_seconds,
             running_session_count: u32::try_from(running_session_count).unwrap_or(u32::MAX),
             scan_warning_count: metrics.scan_warning_count,

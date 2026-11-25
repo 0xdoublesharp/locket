@@ -15,7 +15,7 @@ import { joinCommand, syncMessage, type TeamSyncStatus } from '../team/sync';
 const props = defineProps<{
   projectId?: string;
   privacyMode?: boolean;
-  confirmDangerous?: (action: string) => Promise<string | false | undefined>;
+  confirmDangerous?: (action: string, force?: boolean) => Promise<string | false | undefined>;
 }>();
 const status = ref<TeamSyncStatus | null>(null);
 const busy = ref(false);
@@ -75,9 +75,11 @@ async function perform(kind: 'status' | 'now' | 'configure') {
     const approved =
       kind === 'status' || !props.confirmDangerous
         ? false
-        : await props.confirmDangerous(
-            kind === 'now' ? 'Sync team updates' : 'Configure team sync',
-          );
+        : kind === 'configure' && allowDangerous.value
+          ? await props.confirmDangerous('Configure team sync', true)
+          : await props.confirmDangerous(
+              kind === 'now' ? 'Sync team updates' : 'Configure team sync',
+            );
     if (approved === undefined || token !== generation || project !== props.projectId) return;
     const request = {
       project_id: project,

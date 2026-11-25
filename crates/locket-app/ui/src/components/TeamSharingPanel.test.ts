@@ -129,7 +129,7 @@ it('configures delivery after confirmation and copies the verified owner join co
   await click(button(root, 'Save folder and consent'));
   expect(invoke).toHaveBeenCalledTimes(1);
   await click(button(root, 'Save folder and consent'));
-  expect(confirmDangerous).toHaveBeenCalledWith('Configure team sync');
+  expect(confirmDangerous).toHaveBeenCalledWith('Configure team sync', true);
   expect(invoke).toHaveBeenLastCalledWith('desktop_team_sync_configure', {
     request: {
       project_id: 'project-a',

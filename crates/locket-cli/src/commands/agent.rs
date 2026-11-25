@@ -376,6 +376,13 @@ fn session_monitoring_from_snapshot(snapshot: &Value) -> Option<String> {
     snapshot.get("session_monitoring").and_then(Value::as_str).map(str::to_owned)
 }
 
+pub fn probe_agent_core_dump_hardening(context: &RuntimeContext) -> Option<String> {
+    let _pid = read_running_pid(context).ok()??;
+    let socket_path = agent_socket_path(context);
+    let snapshot = request_status_snapshot(&socket_path).ok()?;
+    snapshot.get("core_dump_hardening").and_then(Value::as_str).map(ToOwned::to_owned)
+}
+
 fn agent_status_command(context: &RuntimeContext, output: &mut impl Write) -> Result<(), CliError> {
     let pid_path = agent_pid_path(context);
     let socket_path = agent_socket_path(context);

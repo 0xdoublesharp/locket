@@ -339,7 +339,7 @@ fn exercise_desktop_ipc(home: &Path) {
         "unavailable"
     );
     assert_eq!(
-        ipc.request("agent_copy", json!({"secret_name":"TOKEN","profile_id":PROFILE})),
+        ipc.request("agent_copy_secret", json!({"secret_name":"TOKEN","profile_id":PROFILE})),
         Err(
             json!({"kind":"protocol","reason":"Open a trusted project before requesting secret access."})
         ),
@@ -490,7 +490,6 @@ fn malformed_requests(ipc: &Ipc) {
         "agent_unlock",
         "agent_set_active_profile",
         "agent_reveal",
-        "agent_copy",
         "agent_scan",
         "agent_resolve",
         "agent_prepare_exec",
@@ -1161,19 +1160,9 @@ fn wire_granted_actions(ipc: &Ipc, vault: &Vault, socket: &Path, policy: Value) 
             "agent_reveal",
             AgentMethod::Reveal,
             "Reveal",
-            access.clone(),
-            json!({"store_path":vault.store,"secret_name":"TOKEN","profile_id":PROFILE}),
-            json!({"value":TOKEN,"ttl_seconds":23}),
-            true,
-            PROFILE,
-        ),
-        (
-            "agent_copy",
-            AgentMethod::Copy,
-            "Copy",
             access,
             json!({"store_path":vault.store,"secret_name":"TOKEN","profile_id":PROFILE}),
-            json!({"value":TOKEN,"ttl_seconds":31}),
+            json!({"value":TOKEN,"ttl_seconds":23}),
             true,
             PROFILE,
         ),
@@ -1241,10 +1230,11 @@ fn wire_granted_actions(ipc: &Ipc, vault: &Vault, socket: &Path, policy: Value) 
             "TeamSync",
             json!({
                 "project_id":vault.id,"folder":vault.root.join("shared"),"allow_dangerous":true,
+                "confirm_dangerous_profile":"dev",
             }),
             json!({"folder":vault.root.join("shared"),"allow_dangerous":true}),
             json!({"state":"configured"}),
-            false,
+            true,
             PROFILE,
         ),
         (
@@ -1354,7 +1344,6 @@ fn dangerous_actions_require_typed_name(ipc: &Ipc, vault: &Vault) {
     set["value"] = json!(TOKEN);
     for (command, request) in [
         ("agent_reveal", access.clone()),
-        ("agent_copy", access.clone()),
         ("agent_copy_secret", access),
         ("agent_set_secret", set.clone()),
         ("agent_rotate_secret", set),
@@ -1365,6 +1354,12 @@ fn dangerous_actions_require_typed_name(ipc: &Ipc, vault: &Vault) {
             }),
         ),
         ("desktop_team_sync_now", json!({"project_id":vault.id})),
+        (
+            "desktop_team_sync_configure",
+            json!({
+                "project_id":vault.id,"folder":vault.root.join("shared"),"allow_dangerous":true,
+            }),
+        ),
         (
             "agent_export_bundle",
             json!({
@@ -1395,6 +1390,20 @@ fn dangerous_actions_require_typed_name(ipc: &Ipc, vault: &Vault) {
         }
     }
     vault.dangerous(false);
+    // Even with a safe active profile, enabling automatic dangerous-profile sync
+    // requires exact typed confirmation in native code.
+    for confirmation in [None, Some(""), Some("DEV")] {
+        let mut request = json!({
+            "project_id":vault.id,
+            "folder":vault.root.join("shared"),
+            "allow_dangerous":true,
+        });
+        if let Some(typed) = confirmation {
+            request["confirm_dangerous_profile"] = json!(typed);
+        }
+        let error = ipc.rejected("desktop_team_sync_configure", request, "ConfirmationFailed");
+        assert_eq!(error["message"], "Type the exact active profile name to confirm this action.");
+    }
 }
 
 fn clipboard_uses_agent_ttl(ipc: &Ipc, vault: &Vault, socket: &Path) {

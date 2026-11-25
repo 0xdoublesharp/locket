@@ -433,7 +433,7 @@ fn collect_diagnostics(
     checks.push(check_agent_placeholder(context));
     checks.push(check_agent_socket_path_matches_spec(context));
     checks.push(check_degraded_audit_log_perms(context));
-    checks.push(check_hardening());
+    checks.push(check_hardening(context));
     checks.push(check_degraded_audit_log(context));
     for check in SKIPPED_LOCKED_CHECKS {
         checks.push(DiagnosticCheck::skip(check, "locked-safe metadata-only invocation"));
@@ -945,16 +945,23 @@ fn check_degraded_audit_log_perms(context: &RuntimeContext) -> DiagnosticCheck {
     }
 }
 
-fn check_hardening() -> DiagnosticCheck {
+fn check_hardening(context: &RuntimeContext) -> DiagnosticCheck {
     let core_dumps = locket_platform::core_dump_hardening_state();
+    let daemon_core_dumps = crate::commands::agent::probe_agent_core_dump_hardening(context);
     let memory_lock = locket_platform::memory_lock_hardening_state();
-    let detail = format!("core_dumps={core_dumps} memory_lock={memory_lock}");
+    let detail = daemon_core_dumps.as_deref().map_or_else(
+        || format!("core_dumps={core_dumps} memory_lock={memory_lock}"),
+        |daemon| {
+            format!("core_dumps={core_dumps} daemon_core_dumps={daemon} memory_lock={memory_lock}")
+        },
+    );
     let core_active = matches!(
         core_dumps,
         locket_platform::CoreDumpHardening::Active | locket_platform::CoreDumpHardening::Suppressed
     );
+    let daemon_degraded = daemon_core_dumps.as_deref() == Some("degraded");
     let memory_active = matches!(memory_lock, locket_platform::MemoryLockHardening::Active);
-    if core_active && memory_active {
+    if core_active && !daemon_degraded && memory_active {
         DiagnosticCheck::pass("hardening", detail)
     } else {
         DiagnosticCheck::warn("hardening", detail)

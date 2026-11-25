@@ -1919,7 +1919,15 @@ fn run_with_context(
         }
         Command::InternalAgentServe(args) => {
             #[cfg(all(target_os = "macos", not(debug_assertions), not(test)))]
-            let _ = locket_platform::disable_debugger_attach();
+            if !matches!(
+                locket_platform::disable_debugger_attach(),
+                locket_platform::CoreDumpHardening::Active
+            ) {
+                let _ = append_agent_log(
+                    context,
+                    "warning: macOS PT_DENY_ATTACH debugger denial failed",
+                );
+            }
             agent::run_internal_agent_serve(&args, &context.store_path)?;
         }
         Command::InternalClipboardClear(args) => {

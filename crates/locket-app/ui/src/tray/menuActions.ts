@@ -52,7 +52,7 @@ export type TrayAgentCommand =
   | 'agent_list_policies'
   | 'agent_scan'
   | 'agent_reveal'
-  | 'agent_copy';
+  | 'agent_copy_secret';
 
 /**
  * Vault + secret-selection state pushed into the Rust tray module via
@@ -171,7 +171,7 @@ export function trayActionAgentCommand(action: TrayMenuAction): TrayAgentCommand
     case 'reveal-secret':
       return 'agent_reveal';
     case 'copy-secret':
-      return 'agent_copy';
+      return 'agent_copy_secret';
     case 'open-app':
       return null;
     default:
