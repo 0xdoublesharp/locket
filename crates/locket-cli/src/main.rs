@@ -1925,7 +1925,9 @@ fn run_with_context(
             ) {
                 let _ = append_agent_log(
                     context,
-                    "warning: macOS PT_DENY_ATTACH debugger denial failed",
+                    "hardening",
+                    "warning",
+                    "macOS PT_DENY_ATTACH debugger denial failed",
                 );
             }
             agent::run_internal_agent_serve(&args, &context.store_path)?;
