@@ -5,3 +5,7 @@ import LocketProofs.EnvIsolation
 import LocketProofs.StreamingRedaction
 import LocketProofs.EgressPolicy
 import LocketProofs.AuditWitness
+import LocketProofs.CryptoDomainSeparation
+import LocketProofs.PathScopeAndContract
+import LocketProofs.DotenvMetadataNonInterference
+import LocketProofs.PrivacyModeNonInterference

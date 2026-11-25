@@ -67,7 +67,7 @@ check_model() {
         die "$model failed"
     fi
     local counts
-    counts=$(awk '/states generated, .*distinct states found, 0 states left on queue/ {
+    counts=$(awk '/^[0-9]+ states generated, .*distinct states found, 0 states left on queue/ {
         print $1 " generated, " $4 " distinct"
     }' "$log")
     if [[ -z "$counts" ]] || ! grep -Fq 'No error has been found' "$log"; then
@@ -87,6 +87,10 @@ check_model AutomationClientAuth
 check_model SecretLifecycleAuditChain
 check_model EgressProxyAndRedaction
 check_model TeamSyncAndAuditWitness
+check_model BackupAndRecoveryLifecycle
+check_model SharedVaultIsolation
+check_model AgentDaemonLifecycle
+check_model McpAndDesktopBoundary
 
 # Build the exact sources in a Scratch copy so Lake's artifacts stay off Data.
 lean_project="$work/formal/lean"
@@ -97,4 +101,4 @@ printf 'Building Lean proofs\n'
     cd -- "$lean_project"
     lake --no-cache --wfail build
 )
-printf 'Formal checks passed for all six TLC models and all Lean modules.\n'
+printf 'Formal checks passed for all ten TLC models and all eleven Lean modules.\n'
