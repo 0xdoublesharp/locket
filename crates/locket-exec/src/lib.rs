@@ -254,9 +254,10 @@ mod tests {
 
     #[test]
     fn minimal_mode_inherits_safe_allowlist() -> Result<(), ExecError> {
+        let bin_dir = if cfg!(windows) { r"C:\bin" } else { "/bin" };
         let mut request = ExecutionRequest::strict(vec!["tool".to_owned()]);
         request.parent_env = env(&[
-            ("PATH", "/bin"),
+            ("PATH", bin_dir),
             ("HOME", "/home/dev"),
             ("USER", "dev"),
             ("SHELL", "/bin/zsh"),
@@ -274,7 +275,7 @@ mod tests {
 
         let prepared = prepare_execution(&request)?;
 
-        assert_eq!(prepared.env.get("PATH").map(|value| value.as_str()), Some("/bin"));
+        assert_eq!(prepared.env.get("PATH").map(|value| value.as_str()), Some(bin_dir));
         assert_eq!(prepared.env.get("HOME").map(|value| value.as_str()), Some("/home/dev"));
         assert_eq!(prepared.env.get("USER").map(|value| value.as_str()), Some("dev"));
         assert_eq!(prepared.env.get("SHELL").map(|value| value.as_str()), Some("/bin/zsh"));
@@ -358,14 +359,15 @@ mod tests {
 
     #[test]
     fn default_override_mode_prefers_locket_values() -> Result<(), ExecError> {
+        let external_bin = if cfg!(windows) { r"C:\external\bin" } else { "/external/bin" };
         let mut request = ExecutionRequest::strict(vec!["tool".to_owned()]);
-        request.external_env = env(&[("DATABASE_URL", "external"), ("PATH", "/external/bin")]);
+        request.external_env = env(&[("DATABASE_URL", "external"), ("PATH", external_bin)]);
         request.locket_env = env(&[("DATABASE_URL", "locket")]);
 
         let prepared = prepare_execution(&request)?;
 
         assert_eq!(prepared.env.get("DATABASE_URL").map(|value| value.as_str()), Some("locket"));
-        assert_eq!(prepared.env.get("PATH").map(|value| value.as_str()), Some("/external/bin"));
+        assert_eq!(prepared.env.get("PATH").map(|value| value.as_str()), Some(external_bin));
         Ok(())
     }
 
