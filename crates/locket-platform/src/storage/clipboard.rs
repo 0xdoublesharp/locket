@@ -2,6 +2,7 @@
 
 #![allow(unsafe_code)]
 
+use std::ffi::CStr;
 use std::sync::Mutex;
 
 use objc2::msg_send;
@@ -25,23 +26,42 @@ const SECRET_MARKERS: [&str; 3] = [
 // Serialize this process's pasteboard writes and compare-and-clear operations.
 static PASTEBOARD_ACCESS: Mutex<()> = Mutex::new(());
 
-fn pasteboard_class() -> Result<&'static AnyClass, PlatformError> {
-    AnyClass::get(c"NSPasteboard").ok_or(PlatformError::PasteboardUnavailable)
-}
+struct Pasteboard(&'static CStr);
 
-fn with_general_pasteboard<T>(
-    operation: impl FnOnce(&AnyObject) -> Result<T, PlatformError>,
-) -> Result<T, PlatformError> {
-    let _guard = PASTEBOARD_ACCESS.lock().map_err(|_| PlatformError::MemoryPoisoned)?;
-    autoreleasepool(|_| {
-        let class = pasteboard_class()?;
-        // SAFETY: AppKit's +generalPasteboard returns an autoreleased NSPasteboard.
-        // Retained keeps it alive for the duration of the operation.
+const GENERAL_PASTEBOARD: Pasteboard = Pasteboard(c"NSPasteboard");
+
+impl Pasteboard {
+    fn open(&self) -> Result<Retained<AnyObject>, PlatformError> {
+        let class = AnyClass::get(self.0).ok_or(PlatformError::PasteboardUnavailable)?;
+        // SAFETY: the class implements +generalPasteboard. Retained keeps its
+        // returned object alive for the operation.
         let pasteboard: Option<Retained<AnyObject>> =
             unsafe { msg_send![class, generalPasteboard] };
-        let pasteboard = pasteboard.ok_or(PlatformError::PasteboardUnavailable)?;
-        operation(&pasteboard)
-    })
+        pasteboard.ok_or(PlatformError::PasteboardUnavailable)
+    }
+
+    fn access<T>(
+        &self,
+        operation: impl FnOnce(&AnyObject) -> Result<T, PlatformError>,
+    ) -> Result<T, PlatformError> {
+        let _guard = PASTEBOARD_ACCESS.lock().map_err(|_| PlatformError::MemoryPoisoned)?;
+        autoreleasepool(|_| {
+            let pasteboard = self.open()?;
+            operation(&pasteboard)
+        })
+    }
+
+    fn write_concealed_secret(&self, text: &str) -> Result<i64, PlatformError> {
+        self.access(|board| write_text(board, text, true))
+    }
+
+    fn clear_if_unchanged(&self, expected: i64) -> Result<bool, PlatformError> {
+        self.access(|board| Ok(clear_pasteboard_if_unchanged(board, expected)))
+    }
+
+    fn write_plain_text(&self, text: &str) -> Result<(), PlatformError> {
+        self.access(|board| write_text(board, text, false).map(|_| ()))
+    }
 }
 
 fn set_data(pasteboard: &AnyObject, kind: &str, data: &NSData) -> Result<(), PlatformError> {
@@ -97,7 +117,7 @@ fn write_text(pasteboard: &AnyObject, text: &str, concealed: bool) -> Result<i64
 /// Returns an error if the pasteboard is unavailable, a write is rejected, or
 /// the pasteboard changed ownership during the write.
 pub fn write_concealed_secret(secret: &str) -> Result<i64, PlatformError> {
-    with_general_pasteboard(|pasteboard| write_text(pasteboard, secret, true))
+    GENERAL_PASTEBOARD.write_concealed_secret(secret)
 }
 
 /// Clears the general pasteboard if the supplied change count still matches.
@@ -106,9 +126,7 @@ pub fn write_concealed_secret(secret: &str) -> Result<i64, PlatformError> {
 ///
 /// Returns an error if the pasteboard is unavailable.
 pub fn clear_if_unchanged(expected_change_count: i64) -> Result<bool, PlatformError> {
-    with_general_pasteboard(|pasteboard| {
-        Ok(clear_pasteboard_if_unchanged(pasteboard, expected_change_count))
-    })
+    GENERAL_PASTEBOARD.clear_if_unchanged(expected_change_count)
 }
 
 /// Writes ordinary text to the general pasteboard.
@@ -117,44 +135,9 @@ pub fn clear_if_unchanged(expected_change_count: i64) -> Result<bool, PlatformEr
 ///
 /// Returns an error if the pasteboard is unavailable or the write fails.
 pub fn write_plain_text(text: &str) -> Result<(), PlatformError> {
-    with_general_pasteboard(|pasteboard| write_text(pasteboard, text, false).map(|_| ()))
+    GENERAL_PASTEBOARD.write_plain_text(text)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    #[ignore = "requires a macOS user session with access to the pasteboard service"]
-    fn concealed_write_tags_utf8_and_expiry_tracks_ownership() -> Result<(), PlatformError> {
-        autoreleasepool(|_| {
-            let class = pasteboard_class()?;
-            // SAFETY: +pasteboardWithUniqueName returns an autoreleased NSPasteboard.
-            let pasteboard: Option<Retained<AnyObject>> =
-                unsafe { msg_send![class, pasteboardWithUniqueName] };
-            let pasteboard = pasteboard.ok_or(PlatformError::PasteboardUnavailable)?;
-            let check = || {
-                let written = write_text(&pasteboard, "secret 🗝", true)?;
-                for (kind, expected) in SECRET_MARKERS
-                    .map(|kind| (kind, &[][..]))
-                    .into_iter()
-                    .chain([(TEXT_TYPE, "secret 🗝".as_bytes())])
-                {
-                    let kind = NSString::from_str(kind);
-                    // SAFETY: -dataForType: takes an NSString and returns nullable NSData.
-                    let data: Option<Retained<NSData>> =
-                        unsafe { msg_send![&*pasteboard, dataForType: &*kind] };
-                    assert_eq!(data.map(|data| data.to_vec()).as_deref(), Some(expected));
-                }
-                let replacement = write_text(&pasteboard, "secret 🗝", false)?;
-                assert!(!clear_pasteboard_if_unchanged(&pasteboard, written));
-                assert!(clear_pasteboard_if_unchanged(&pasteboard, replacement));
-                Ok(())
-            };
-            let result = check();
-            // SAFETY: -releaseGlobally unregisters this uniquely named NSPasteboard.
-            let _: () = unsafe { msg_send![&*pasteboard, releaseGlobally] };
-            result
-        })
-    }
-}
+#[path = "clipboard_tests.rs"]
+mod tests;

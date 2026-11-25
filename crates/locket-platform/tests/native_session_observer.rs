@@ -3,7 +3,7 @@
 
 #[cfg(target_os = "macos")]
 fn main() -> std::io::Result<()> {
-    locket_platform::run_with_native_session_loop(|| {
+    locket_platform::run_with_native_session_loop(|| -> std::io::Result<()> {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         runtime.block_on(async {
             // Startup waits for a private, unique distributed notification
@@ -16,7 +16,14 @@ fn main() -> std::io::Result<()> {
             drop(observer);
             Ok(())
         })
-    })?
+    })??;
+
+    let failed: std::io::Result<()> = locket_platform::run_with_native_session_loop(|| {
+        std::panic::resume_unwind(Box::new("test daemon worker failure"));
+    });
+    assert!(matches!(failed, Err(error) if error.to_string() == "daemon worker panicked"));
+    assert_eq!(locket_platform::run_with_native_session_loop(|| 42)?, 42);
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]

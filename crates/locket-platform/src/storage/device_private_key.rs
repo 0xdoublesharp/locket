@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -21,8 +22,8 @@ use zeroize::Zeroizing;
 
 use crate::error::PlatformError;
 use crate::fs_helpers::{
-    decode_bytes, decode_nonce, encode_bytes, secure_directory, validate_path_component,
-    write_user_only_file,
+    decode_bytes, decode_nonce, encode_bytes, open_regular_file, secure_directory,
+    validate_path_component, write_user_only_file,
 };
 use crate::master_key::MasterKeyStore;
 
@@ -190,21 +191,17 @@ impl LocalDevicePrivateKeyStorage for WrappedLocalFileDevicePrivateKeyStorage {
 
     fn load(&self, device_id: &str) -> Result<Zeroizing<PrivateKeyBytes>, PlatformError> {
         let path = self.envelope_path(device_id)?;
-        let metadata = match fs::metadata(&path) {
-            Ok(metadata) => metadata,
+        let mut file = match open_regular_file(&path) {
+            Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(PlatformError::DevicePrivateKeyNotFound);
             }
             Err(error) => return Err(error.into()),
         };
-        check_envelope_permissions(&metadata)?;
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(PlatformError::DevicePrivateKeyNotFound);
-            }
-            Err(error) => return Err(error.into()),
-        };
+        // Check and read the same regular file even if the directory entry is replaced.
+        check_envelope_permissions(&file.metadata()?)?;
+        let mut text = String::new();
+        file.read_to_string(&mut text)?;
         let envelope: DevicePrivateKeyEnvelope = toml::from_str(&text).map_err(|error| {
             PlatformError::DevicePrivateKeyIntegrityFailure(format!(
                 "device private-key envelope is malformed: {error}"

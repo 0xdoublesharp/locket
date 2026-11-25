@@ -106,6 +106,11 @@ fn process_start_time_for_pid(pid: u32) -> Result<String, PlatformError> {
         .args(["-o", "lstart=", "-p", &pid.to_string()])
         .output()
         .map_err(PlatformError::Io)?;
+    parse_macos_ps_output(output)
+}
+
+#[cfg(target_os = "macos")]
+fn parse_macos_ps_output(output: std::process::Output) -> Result<String, PlatformError> {
     if !output.status.success() {
         return Err(PlatformError::ProcessStartTimeUnavailable);
     }
@@ -371,3 +376,7 @@ mod windows_process_impl {
 fn process_start_time_for_pid(_pid: u32) -> Result<String, PlatformError> {
     Err(PlatformError::ProcessStartTimeUnavailable)
 }
+
+#[cfg(all(target_os = "macos", test))]
+#[path = "process_macos_tests.rs"]
+mod macos_tests;

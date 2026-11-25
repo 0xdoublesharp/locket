@@ -334,3 +334,7 @@ pub fn ensure_secret_file_ignores(root: &Path) -> std::io::Result<()> {
     std::fs::File::open(root)?.sync_all()?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "policy_file_tests.rs"]
+mod ignore_tests;

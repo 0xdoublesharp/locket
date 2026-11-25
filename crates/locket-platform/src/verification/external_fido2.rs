@@ -39,6 +39,14 @@ pub(super) fn register(
     validate_rp(relying_party_id)?;
     let mut terminal = terminal()?;
     let tools = Tools::discover()?;
+    register_with_tools(&tools, relying_party_id, || terminal.prompt())
+}
+
+fn register_with_tools(
+    tools: &Tools,
+    relying_party_id: &str,
+    prompt: impl FnOnce() -> Result<(), PlatformError>,
+) -> Result<PasskeyRegistration, PlatformError> {
     let device = tools.device()?;
     let challenge = random_bytes()?;
     let user_handle = random_bytes()?;
@@ -49,14 +57,14 @@ pub(super) fn register(
     );
     // pin=true (1.17+) requests PIN verification directly. -v here would
     // require built-in biometric UV and exclude ordinary PIN-only keys.
-    terminal.prompt()?;
+    prompt()?;
     let result = run(
         &tools.cred,
         &["-M", "-h", "-t", "pin=true", "--", &device, "es256"],
         input.as_bytes(),
         CEREMONY_TIMEOUT,
     )?;
-    verify_registration(&tools, &result.stdout, &challenge, relying_party_id, user_handle)
+    verify_registration(tools, &result.stdout, &challenge, relying_party_id, user_handle)
 }
 
 pub(super) fn evaluate(
@@ -73,6 +81,15 @@ pub(super) fn evaluate(
     }
     let mut terminal = terminal()?;
     let tools = Tools::discover()?;
+    evaluate_with_tools(&tools, credential, salt, || terminal.prompt())
+}
+
+fn evaluate_with_tools(
+    tools: &Tools,
+    credential: PasskeyAssertionContext<'_>,
+    salt: &[u8],
+    prompt: impl FnOnce() -> Result<(), PlatformError>,
+) -> Result<Zeroizing<[u8; 32]>, PlatformError> {
     let device = tools.device()?;
     let challenge = random_bytes()?;
     // WebAuthn PRF maps its input to CTAP hmac-secret with this domain
@@ -85,14 +102,14 @@ pub(super) fn evaluate(
         BASE64.encode(credential.credential_id),
         BASE64.encode(&ctap_salt),
     );
-    terminal.prompt()?;
+    prompt()?;
     let result = run(
         &tools.assert,
         &["-G", "-h", "-p", "-v", "--", &device],
         input.as_bytes(),
         CEREMONY_TIMEOUT,
     )?;
-    verify_assertion(&tools, &result.stdout, credential, &challenge)
+    verify_assertion(tools, &result.stdout, credential, &challenge)
 }
 
 fn prf_salt(input: &[u8]) -> [u8; 32] {
@@ -173,18 +190,31 @@ struct Tools {
 
 impl Tools {
     fn discover() -> Result<Self, PlatformError> {
-        for directory in ["/usr/bin", "/opt/homebrew/bin", "/usr/local/bin"] {
-            if let Ok(tools) = Self::in_directory(Path::new(directory)) {
+        Self::discover_in(
+            ["/usr/bin", "/opt/homebrew/bin", "/usr/local/bin"].map(Path::new),
+            trusted_executable,
+        )
+    }
+
+    fn discover_in<'a>(
+        directories: impl IntoIterator<Item = &'a Path>,
+        resolve: impl Fn(&Path) -> Result<PathBuf, PlatformError>,
+    ) -> Result<Self, PlatformError> {
+        for directory in directories {
+            if let Ok(tools) = Self::in_directory(directory, &resolve) {
                 return Ok(tools);
             }
         }
         Err(PlatformError::PasskeyUnsupported)
     }
 
-    fn in_directory(directory: &Path) -> Result<Self, PlatformError> {
-        let token = trusted_executable(&directory.join("fido2-token"))?;
-        let cred = trusted_executable(&directory.join("fido2-cred"))?;
-        let assert = trusted_executable(&directory.join("fido2-assert"))?;
+    fn in_directory(
+        directory: &Path,
+        resolve: impl Fn(&Path) -> Result<PathBuf, PlatformError>,
+    ) -> Result<Self, PlatformError> {
+        let token = resolve(&directory.join("fido2-token"))?;
+        let cred = resolve(&directory.join("fido2-cred"))?;
+        let assert = resolve(&directory.join("fido2-assert"))?;
         if token.parent() != cred.parent() || token.parent() != assert.parent() {
             return Err(PlatformError::PasskeyUnsupported);
         }

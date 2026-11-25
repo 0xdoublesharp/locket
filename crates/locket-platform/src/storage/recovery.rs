@@ -390,3 +390,7 @@ fn write_recovery_atomically(recovery_dir: &Path, data: &[u8]) -> Result<(), Pla
     secure_directory(recovery_dir)?;
     write_user_only_file(&recovery_dir.join("envelope.bin"), data)
 }
+
+#[cfg(test)]
+#[path = "recovery_tests.rs"]
+mod tests;

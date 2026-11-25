@@ -116,6 +116,8 @@ fn memory_store_replaces_existing_project_key() -> Result<(), PlatformError> {
     let replacement = [7; KEY_LEN];
 
     store.store_master_key(PROJECT_ID, &MASTER_KEY)?;
+    store.store_master_key(PROJECT_ID, &replacement)?;
+    assert_eq!(*store.load_master_key(PROJECT_ID)?, replacement);
     store.store_master_key("lk_proj_other", &replacement)?;
 
     assert!(matches!(store.load_master_key(PROJECT_ID), Err(PlatformError::MasterKeyNotFound)));
@@ -793,5 +795,234 @@ fn recovery_atomic_container_rejects_truncation_lengths_and_mismatched_metadata(
     assert!(crate::decode_recovery_state(&mismatched).is_err());
     assert!(crate::decode_recovery_state(&encoded).is_ok());
     assert!(crate::decode_recovery_state(&envelope.serialize()?).is_err());
+    Ok(())
+}
+
+#[test]
+fn wrapped_device_key_rejects_envelope_field_corruption() -> Result<(), PlatformError> {
+    use std::fs;
+    let directory = tempfile::tempdir()?;
+    let store = populated_master_key_store(MASTER_KEY)?;
+    let storage = WrappedLocalFileDevicePrivateKeyStorage::new(directory.path(), PROJECT_ID, store);
+    storage.store(DEVICE_ID_A, &PRIVATE_KEY_A)?;
+    let path = storage.envelope_path(DEVICE_ID_A)?;
+    let canonical = fs::read_to_string(&path)?;
+    let assert_rejected = |text: &str, expected: &str| -> Result<(), PlatformError> {
+        fs::write(&path, text)?;
+        assert!(matches!(
+            storage.load(DEVICE_ID_A),
+            Err(PlatformError::DevicePrivateKeyIntegrityFailure(message))
+                if message.contains(expected)
+        ));
+        Ok(())
+    };
+    assert_rejected("not valid TOML [", "malformed")?;
+
+    for (field, value, expected) in [
+        ("version", toml::Value::Integer(2), "unsupported device private-key envelope version"),
+        (
+            "algorithm",
+            toml::Value::String("unknown".into()),
+            "unsupported device private-key envelope algorithm",
+        ),
+        ("project_id", toml::Value::String("another_project".into()), "project_id mismatch"),
+        ("device_id", toml::Value::String("another_device".into()), "device_id mismatch"),
+        ("nonce", toml::Value::String("!".repeat(32)), "nonce is invalid"),
+        ("wrapped_private_key", toml::Value::String("!".into()), "ciphertext is invalid"),
+        (
+            "wrapped_private_key",
+            toml::Value::String("AA".into()),
+            "ciphertext has unexpected length",
+        ),
+    ] {
+        let mut envelope: toml::Table = toml::from_str(&canonical)?;
+        assert!(envelope.insert(field.into(), value).is_some());
+        assert_rejected(&toml::to_string(&envelope)?, expected)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn signing_key_storage_is_separate_and_signing_domain_is_authenticated() -> Result<(), PlatformError>
+{
+    use std::fs;
+    let directory = tempfile::tempdir()?;
+    let store = populated_master_key_store(MASTER_KEY)?;
+    let sealing = WrappedLocalFileDevicePrivateKeyStorage::new(directory.path(), PROJECT_ID, store);
+    let signing = sealing.clone().for_signing();
+    sealing.store(DEVICE_ID_A, &PRIVATE_KEY_A)?;
+    signing.store(DEVICE_ID_A, &PRIVATE_KEY_B)?;
+    assert_eq!(*sealing.load(DEVICE_ID_A)?, PRIVATE_KEY_A);
+    assert_eq!(*signing.load(DEVICE_ID_A)?, PRIVATE_KEY_B);
+    let sealing_path = sealing.envelope_path(DEVICE_ID_A)?;
+    let signing_path = signing.envelope_path(DEVICE_ID_A)?;
+
+    fs::copy(signing_path, sealing_path)?;
+    assert!(matches!(
+        sealing.load(DEVICE_ID_A),
+        Err(PlatformError::DevicePrivateKeyIntegrityFailure(message)) if message.contains("authentication")
+    ));
+    assert!(matches!(signing.envelope_path("../outside"), Err(PlatformError::InvalidProjectId)));
+    assert!(matches!(signing.envelope_path(""), Err(PlatformError::InvalidProjectId)));
+    let debug = format!("{signing:?}");
+    assert!(debug.contains(PROJECT_ID));
+    assert!(!debug.contains("master_key_store"));
+    Ok(())
+}
+
+#[test]
+fn device_key_storage_filters_unrelated_files_and_propagates_io_errors() -> Result<(), PlatformError>
+{
+    use std::fs;
+    let directory = tempfile::tempdir()?;
+    let store = populated_master_key_store(MASTER_KEY)?;
+    let storage = WrappedLocalFileDevicePrivateKeyStorage::new(directory.path(), PROJECT_ID, store);
+    storage.store(DEVICE_ID_A, &PRIVATE_KEY_A)?;
+    let envelope = storage.envelope_path(DEVICE_ID_A)?;
+    let devices = envelope.parent().ok_or(PlatformError::InvalidProjectId)?;
+    fs::write(devices.join("notes"), b"unrelated")?;
+    fs::write(devices.join("invalid device.priv"), b"unrelated")?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        fs::write(devices.join(std::ffi::OsStr::from_bytes(b"bad-\xff.priv")), b"unrelated")?;
+    }
+    assert_eq!(storage.list()?, [DEVICE_ID_A]);
+
+    fs::remove_file(&envelope)?;
+    crate::secure_directory(&envelope)?;
+    assert!(matches!(storage.load(DEVICE_ID_A), Err(PlatformError::Io(_))));
+    assert!(matches!(storage.delete(DEVICE_ID_A), Err(PlatformError::Io(_))));
+    fs::remove_dir_all(devices)?;
+    fs::write(devices, b"not a device directory")?;
+    assert!(matches!(storage.list(), Err(PlatformError::Io(_))));
+    #[cfg(unix)]
+    assert!(matches!(storage.load(DEVICE_ID_A), Err(PlatformError::Io(_))));
+    Ok(())
+}
+
+#[test]
+fn default_verifier_rejects_a_blank_prompt_before_platform_authentication() {
+    let request = LocalUserVerificationRequest::new("unlock", " \t");
+    assert!(matches!(
+        crate::default_local_user_verifier().verify_user(&request),
+        Err(PlatformError::LocalUserVerificationFailed
+            | PlatformError::LocalUserVerificationUnavailable)
+    ));
+}
+
+#[test]
+fn mock_passkey_registrars_expose_capability_and_missing_enrollment() -> Result<(), PlatformError> {
+    assert!(!UnavailablePlatformPasskeyRegistrar.supports_registration());
+    let unsupported = MemoryPlatformPasskeyRegistrar::unsupported();
+    let failed = MemoryPlatformPasskeyRegistrar::auth_failed();
+    assert!(!unsupported.supports_registration());
+    assert!(failed.supports_registration());
+
+    let id = [1, 2, 3];
+    let context = PasskeyAssertionContext {
+        credential_id: &id,
+        relying_party_id: "locket.localhost",
+        public_key: &[],
+    };
+    assert!(matches!(
+        unsupported.evaluate_prf(context, &[0; 32]),
+        Err(PlatformError::PasskeyUnsupported)
+    ));
+    assert!(matches!(
+        failed.evaluate_prf(context, &[0; 32]),
+        Err(PlatformError::PasskeyAuthFailed)
+    ));
+    let known = MemoryPlatformPasskeyRegistrar::with_known_credential([9; 32], id.to_vec());
+    assert_eq!(*known.evaluate_prf(context, &[0; 32])?, [9; 32]);
+    let other = MemoryPlatformPasskeyRegistrar::with_known_credential([41; 32], vec![4, 5]);
+    assert_eq!(format!("{known:?}"), format!("{other:?}"));
+    assert_eq!(format!("{known:?}"), "MemoryPlatformPasskeyRegistrar { .. }");
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn opens_only_regular_files_without_following_symlinks_or_waiting_on_fifos()
+-> Result<(), PlatformError> {
+    use std::fs;
+    use std::io::Read;
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir()?;
+    let file = directory.path().join("regular");
+    let link = directory.path().join("link");
+    let fifo = directory.path().join("fifo");
+    fs::write(&file, b"regular contents")?;
+    symlink(&file, &link)?;
+    assert!(std::process::Command::new("/usr/bin/mkfifo").arg(&fifo).status()?.success());
+
+    let mut contents = Vec::new();
+    crate::fs_helpers::open_regular_file(&file)?.read_to_end(&mut contents)?;
+    assert_eq!(contents, b"regular contents");
+    assert!(crate::fs_helpers::open_regular_file(&link).is_err());
+    let (opened, result) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _sent = opened.send(crate::fs_helpers::open_regular_file(&fifo));
+    });
+    let result =
+        result.recv_timeout(std::time::Duration::from_secs(2)).map_err(std::io::Error::other)?;
+    assert_eq!(result.err().map(|error| error.kind()), Some(std::io::ErrorKind::InvalidInput));
+    assert!(crate::fs_helpers::open_regular_file(directory.path()).is_err());
+    Ok(())
+}
+
+#[test]
+fn memory_store_debug_reveals_neither_keys_nor_identifiers() -> Result<(), PlatformError> {
+    let master = MemoryMasterKeyStore::default();
+    let device = MemoryDevicePrivateKeyStorage::default();
+    let automation = crate::MemoryAutomationClientKeyStore::default();
+    master.store_master_key(PROJECT_ID, &MASTER_KEY)?;
+    device.store(DEVICE_ID_A, &PRIVATE_KEY_A)?;
+    crate::AutomationClientKeyStore::store_client_key(
+        &automation,
+        "lk_private_client",
+        &MASTER_KEY,
+    )?;
+
+    assert_eq!(format!("{master:?}"), "MemoryMasterKeyStore { .. }");
+    assert_eq!(format!("{device:?}"), "MemoryDevicePrivateKeyStorage { .. }");
+    assert_eq!(format!("{automation:?}"), "MemoryAutomationClientKeyStore { .. }");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn passphrase_fallback_reports_storage_errors_for_a_directory_at_the_envelope_path()
+-> Result<(), PlatformError> {
+    let temp = tempfile::tempdir()?;
+    let store = PassphraseFallbackMasterKeyStore::new(temp.path());
+    std::fs::create_dir(temp.path().join(format!("{PROJECT_ID}.toml")))?;
+    assert!(matches!(store.load_master_key(PROJECT_ID, b"fixture"), Err(PlatformError::Io(_))));
+    assert!(matches!(store.delete_master_key(PROJECT_ID), Err(PlatformError::Io(_))));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn device_key_load_rejects_a_symlink_even_to_a_valid_envelope() -> Result<(), PlatformError> {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir()?;
+    let store = populated_master_key_store(MASTER_KEY)?;
+    let storage = WrappedLocalFileDevicePrivateKeyStorage::new(directory.path(), PROJECT_ID, store);
+    storage.store(DEVICE_ID_A, &PRIVATE_KEY_A)?;
+    assert_eq!(*storage.load(DEVICE_ID_A)?, PRIVATE_KEY_A);
+    let path = storage.envelope_path(DEVICE_ID_A)?;
+    let referent = directory.path().join("original-envelope");
+    fs::rename(&path, &referent)?;
+    symlink(&referent, &path)?;
+
+    assert!(matches!(
+        storage.load(DEVICE_ID_A),
+        Err(PlatformError::Io(error))
+            if error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error())
+    ));
     Ok(())
 }

@@ -242,6 +242,14 @@ pub(super) async fn start(failed: FailureCallback) -> io::Result<SessionObserver
                 "macOS native notifications require the daemon's main run-loop driver",
             )
         })?;
+    start_with_driver(driver, failed, Duration::from_secs(3)).await
+}
+
+async fn start_with_driver(
+    driver: Arc<DispatchHandle>,
+    failed: FailureCallback,
+    probe_timeout: Duration,
+) -> io::Result<SessionObserver> {
     let id = NEXT_OBSERVER.fetch_add(1, Ordering::Relaxed);
     let acknowledgement = Arc::new(SleepAcknowledgement::default());
     let guard = ObserverGuard { id, driver, acknowledgement: Arc::clone(&acknowledgement) };
@@ -250,7 +258,7 @@ pub(super) async fn start(failed: FailureCallback) -> io::Result<SessionObserver
     guard.driver.send(MainTask::Start { id, sender, acknowledgement, failed, ready })?;
     // The private probe exercises the same real OS delivery path as screen
     // locks. Never claim native coverage merely because registration returned.
-    tokio::time::timeout(Duration::from_secs(3), started)
+    tokio::time::timeout(probe_timeout, started)
         .await
         .map_err(|_| {
             io::Error::new(
@@ -668,3 +676,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "macos_tests.rs"]
+mod callback_tests;

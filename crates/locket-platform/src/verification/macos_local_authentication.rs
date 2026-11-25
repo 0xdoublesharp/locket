@@ -34,12 +34,11 @@
 //     for the duration of the call out of caution.
 //   * The reply block is sendable: it only captures an
 //     `mpsc::Sender<EvaluateOutcome>`, which is `Send`. The block converts
-//     the borrowed `*mut NSError` into an owned `Option<String>` before
+//     the borrowed `*mut NSError` into an owned `String` before
 //     handing the result back, so no Objective-C pointer escapes the
 //     block.
-//   * The test-only `LOCKET_TEST_LOCAL_AUTH` short-circuit is evaluated
-//     before any FFI call, so unit and integration tests never enter
-//     the `unsafe` block.
+//   * The thread-local test override can short-circuit evaluation before
+//     creating an LAContext or prompting the user.
 // ---------------------------------------------------------------------------
 
 #![allow(unsafe_code)]
@@ -47,6 +46,9 @@
 use std::sync::mpsc;
 use std::time::Duration;
 
+use block2::RcBlock;
+use objc2::runtime::Bool;
+use objc2_foundation::NSError;
 use thiserror::Error;
 
 /// Maximum time we will block waiting for a Touch ID/passcode prompt to
@@ -55,10 +57,10 @@ use thiserror::Error;
 /// deadlock the caller indefinitely.
 const EVALUATE_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Environment variable consulted by tests so they can drive the wrapper
-/// deterministically without invoking Apple's framework.
 #[cfg(test)]
-const TEST_OVERRIDE_ENV: &str = "LOCKET_TEST_LOCAL_AUTH";
+thread_local! {
+    static TEST_OVERRIDE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
 
 /// Errors returned by [`evaluate_local_user`].
 #[derive(Debug, Error)]
@@ -87,14 +89,14 @@ pub enum LocalAuthError {
 /// Test-only override applied before any FFI call.
 #[cfg(test)]
 fn test_override() -> Option<Result<bool, LocalAuthError>> {
-    let value = std::env::var(TEST_OVERRIDE_ENV).ok()?;
-    Some(match value.as_str() {
+    let value = TEST_OVERRIDE.get()?;
+    Some(match value {
         "allow" => Ok(true),
         "deny" => Ok(false),
         "unavailable" => Err(LocalAuthError::Unavailable("test override".to_owned())),
         "timeout" => Err(LocalAuthError::Timeout),
         other => Err(LocalAuthError::Framework(format!(
-            "unrecognized {TEST_OVERRIDE_ENV} override: {other}"
+            "unrecognized local authentication override: {other}"
         ))),
     })
 }
@@ -141,10 +143,8 @@ fn evaluate_local_user_via_framework(_reason: &str) -> Result<bool, LocalAuthErr
 
 #[cfg(target_os = "macos")]
 fn evaluate_local_user_via_framework(reason: &str) -> Result<bool, LocalAuthError> {
-    use block2::RcBlock;
     use objc2::rc::Retained;
-    use objc2::runtime::Bool;
-    use objc2_foundation::{NSError, NSString};
+    use objc2_foundation::NSString;
     use objc2_local_authentication::{LAContext, LAPolicy};
 
     // SAFETY: `LAContext::new` allocates and retains a fresh Objective-C
@@ -155,28 +155,7 @@ fn evaluate_local_user_via_framework(reason: &str) -> Result<bool, LocalAuthErro
 
     let (tx, rx) = mpsc::channel::<EvaluateOutcome>();
 
-    // The block captures only the `Sender`, which is `Send`. The closure
-    // converts the borrowed `*mut NSError` into an owned `Option<String>`
-    // before forwarding the outcome, so no Objective-C pointer leaves the
-    // block.
-    let reply = RcBlock::new(move |success: Bool, error: *mut NSError| {
-        let outcome = if success.as_bool() {
-            EvaluateOutcome::Allowed
-        } else if error.is_null() {
-            EvaluateOutcome::Rejected("user rejected local user verification".to_owned())
-        } else {
-            // SAFETY: When `success` is `NO`, LocalAuthentication passes a
-            // valid, autoreleased `NSError *` to the block. We immediately
-            // copy the localized description into an owned `String`; the
-            // pointer is not retained beyond this scope.
-            let message = unsafe { describe_ns_error(error) };
-            EvaluateOutcome::Rejected(message)
-        };
-
-        // The send may fail if the receiver was dropped (timeout). That
-        // is fine — we simply discard the reply.
-        let _ = tx.send(outcome);
-    });
+    let reply = evaluation_reply(tx);
 
     // SAFETY: The framework requires that:
     //   * `policy` is one of the documented `LAPolicy` constants;
@@ -194,14 +173,47 @@ fn evaluate_local_user_via_framework(reason: &str) -> Result<bool, LocalAuthErro
         );
     }
 
-    match rx.recv_timeout(EVALUATE_TIMEOUT) {
+    await_evaluation(&rx, EVALUATE_TIMEOUT, || {
+        // SAFETY: the context remains retained and invalidation is thread-safe.
+        unsafe { context.invalidate() };
+    })
+}
+
+fn evaluation_reply(tx: mpsc::Sender<EvaluateOutcome>) -> RcBlock<dyn Fn(Bool, *mut NSError)> {
+    // The block captures only the `Sender`, which is `Send`. The closure
+    // converts the borrowed `*mut NSError` into an owned `String`
+    // before forwarding the outcome, so no Objective-C pointer leaves the
+    // block.
+    RcBlock::new(move |success: Bool, error: *mut NSError| {
+        let outcome = if success.as_bool() {
+            EvaluateOutcome::Allowed
+        } else if error.is_null() {
+            EvaluateOutcome::Rejected("user rejected local user verification".to_owned())
+        } else {
+            // SAFETY: When `success` is `NO`, LocalAuthentication passes a
+            // valid, autoreleased `NSError *` to the block. We immediately
+            // copy the localized description into an owned `String`; the
+            // pointer is not retained beyond this scope.
+            let message = unsafe { describe_ns_error(error) };
+            EvaluateOutcome::Rejected(message)
+        };
+
+        // The send may fail if the receiver was dropped (timeout). That
+        // is fine — we simply discard the reply.
+        let _ = tx.send(outcome);
+    })
+}
+
+fn await_evaluation(
+    rx: &mpsc::Receiver<EvaluateOutcome>,
+    timeout: Duration,
+    invalidate: impl FnOnce(),
+) -> Result<bool, LocalAuthError> {
+    match rx.recv_timeout(timeout) {
         Ok(EvaluateOutcome::Allowed) => Ok(true),
         Ok(EvaluateOutcome::Rejected(msg)) => Err(LocalAuthError::Rejected(msg)),
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            // SAFETY: `invalidate` is documented as safe to call any time
-            // the context is alive. We hold a `Retained` reference, so it
-            // is alive here.
-            unsafe { context.invalidate() };
+            invalidate();
             Err(LocalAuthError::Timeout)
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => Err(LocalAuthError::Framework(
@@ -226,43 +238,18 @@ unsafe fn describe_ns_error(error: *mut objc2_foundation::NSError) -> String {
     error_ref.localizedDescription().to_string()
 }
 
-/// Serializes tests that mutate the shared `LOCKET_TEST_LOCAL_AUTH`
-/// environment variable so they cannot race across the test binary.
-///
-/// Lives in this module rather than in callers so that the entire
-/// `unsafe { env::set_var(..) }` mechanic stays inside the single
-/// authorized `unsafe` module. Callers in sibling modules
-/// (`macos_user_verifier.rs`) drive their tests through
-/// [`with_test_override`].
+/// Supplies a fake result on this test thread without touching the process environment.
 #[cfg(test)]
-#[allow(clippy::redundant_pub_crate, clippy::expect_used)]
-pub(crate) fn with_test_override<F: FnOnce()>(value: Option<&str>, f: F) {
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    let _guard = ENV_LOCK.lock().expect("env lock poisoned");
-    let previous = std::env::var(TEST_OVERRIDE_ENV).ok();
-    if let Some(v) = value {
-        // SAFETY: the lock above gives us exclusive access for the
-        // duration of the test. `set_var` is safe when no other thread
-        // is reading the environment concurrently, which is the case
-        // here.
-        unsafe { std::env::set_var(TEST_OVERRIDE_ENV, v) };
-    } else {
-        // SAFETY: see above.
-        unsafe { std::env::remove_var(TEST_OVERRIDE_ENV) };
+pub(super) fn with_test_override(value: Option<&'static str>, f: impl FnOnce()) {
+    struct Restore(Option<&'static str>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_OVERRIDE.set(self.0);
+        }
     }
 
+    let _restore = Restore(TEST_OVERRIDE.replace(value));
     f();
-
-    if let Some(prev) = previous {
-        // SAFETY: see above.
-        unsafe { std::env::set_var(TEST_OVERRIDE_ENV, prev) };
-    } else {
-        // SAFETY: see above.
-        unsafe { std::env::remove_var(TEST_OVERRIDE_ENV) };
-    }
 }
 
 #[cfg(test)]
@@ -317,3 +304,7 @@ mod tests {
         });
     }
 }
+
+#[cfg(test)]
+#[path = "macos_local_authentication_tests.rs"]
+mod framework_tests;

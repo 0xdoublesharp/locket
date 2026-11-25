@@ -130,11 +130,16 @@ pub enum MemoryPlatformPasskeyOutcome {
 ///
 /// Stores at most one credential id and its associated PRF output so tests
 /// can round-trip register -> `evaluate_prf` flows.
-#[derive(Debug)]
 pub struct MemoryPlatformPasskeyRegistrar {
     outcome: MemoryPlatformPasskeyOutcome,
     prf_output: [u8; 32],
     credential_id: Mutex<Option<Vec<u8>>>,
+}
+
+impl std::fmt::Debug for MemoryPlatformPasskeyRegistrar {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("MemoryPlatformPasskeyRegistrar").finish_non_exhaustive()
+    }
 }
 
 impl MemoryPlatformPasskeyRegistrar {

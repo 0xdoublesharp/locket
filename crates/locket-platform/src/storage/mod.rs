@@ -15,3 +15,6 @@ pub mod windows_directory;
 
 #[cfg(windows)]
 mod windows_file_identity;
+
+#[cfg(test)]
+mod keyring_tests;
