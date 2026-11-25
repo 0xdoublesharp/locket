@@ -1,0 +1,156 @@
+name: formal and memory checks
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: formal-and-memory-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_BUILD_JOBS: "2"
+
+jobs:
+  miri:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install nightly Miri and Rust sources
+        run: rustup toolchain install nightly --profile minimal --component miri,rust-src
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-formal-${{ runner.os }}-miri-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+      - name: Fetch locked dependencies
+        run: cargo +nightly fetch --locked
+
+      - name: Prepare the Miri sysroot before going offline
+        run: |
+          export MIRI_SYSROOT="$RUNNER_TEMP/miri-sysroot"
+          cargo +nightly miri setup
+          printf 'MIRI_SYSROOT=%s\n' "$MIRI_SYSROOT" >> "$GITHUB_ENV"
+
+      - name: Run Miri
+        run: OFFLINE=1 STRICT=1 scripts/miri-check.sh
+
+  kani:
+    runs-on: ubuntu-24.04
+    env:
+      KANI_VERSION: 0.68.0
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install the workspace Rust toolchain
+        run: rustup show
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-formal-${{ runner.os }}-kani-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+      - name: Cache Kani
+        id: kani-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.kani
+            ~/.cargo/bin/kani
+            ~/.cargo/bin/cargo-kani
+          key: kani-${{ runner.os }}-${{ runner.arch }}-${{ env.KANI_VERSION }}
+
+      - name: Install Kani
+        if: steps.kani-cache.outputs.cache-hit != 'true'
+        run: cargo install --locked kani-verifier --version "$KANI_VERSION"
+
+      - name: Set up Kani
+        if: steps.kani-cache.outputs.cache-hit != 'true'
+        run: cargo kani setup
+
+      - name: Install the compiler for cached Kani
+        if: steps.kani-cache.outputs.cache-hit == 'true'
+        run: rustup toolchain install "$(cat "$HOME/.kani/kani-$KANI_VERSION/rust-toolchain-version")" --profile minimal
+
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+
+      - name: Run Kani
+        run: OFFLINE=1 STRICT=1 scripts/kani-check.sh
+
+  formal:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install TLA+ tools
+        run: |
+          jar="$RUNNER_TEMP/tla2tools.jar"
+          curl --fail --silent --show-error --location --retry 3 \
+            --output "$jar" https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+          printf '%s  %s\n' fdffef247f563ef6edbfd44958d2a82db79e7564e07cb673262d896353fa6713 "$jar" | sha256sum --check
+          printf 'TLA2TOOLS_JAR=%s\n' "$jar" >> "$GITHUB_ENV"
+
+      - name: Install elan and the pinned Lean toolchain
+        working-directory: formal/lean
+        run: |
+          archive="$RUNNER_TEMP/elan.tar.gz"
+          curl --fail --silent --show-error --location --retry 3 \
+            --output "$archive" https://github.com/leanprover/elan/releases/download/v4.4.0/elan-x86_64-unknown-linux-gnu.tar.gz
+          printf '%s  %s\n' 0e8250aa2be86c7af929ade68db617af9edc8b9ccf6eaf5ece228250d0d032e2 "$archive" | sha256sum --check
+          tar -xzf "$archive" -C "$RUNNER_TEMP" elan-init
+          "$RUNNER_TEMP/elan-init" -y --default-toolchain none --no-modify-path
+          "$HOME/.elan/bin/lake" --version
+          printf '%s\n' "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Install the workspace Rust toolchain
+        run: rustup show
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-formal-${{ runner.os }}-trace-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+
+      - name: Check TLC models and Lean proofs
+        run: scripts/formal-check.sh
+
+      - name: Check live Rust and CLI traces against TLC
+        run: scripts/formal-trace-check.sh
+
+      - name: Scan Linux heap after vault lock
+        run: cargo test -p locket-agent --test security_ipc_and_memory --locked --offline

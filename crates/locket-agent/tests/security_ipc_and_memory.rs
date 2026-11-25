@@ -1,4 +1,4 @@
-//! Verify socket isolation and the lifetime of live vault access through framed IPC.
+//! Verify socket isolation, live vault access, and post-lock plaintext retention.
 #![allow(unused_crate_dependencies, clippy::multiple_crate_versions)]
 
 #[cfg(unix)]
@@ -193,7 +193,11 @@ mod unix {
             Ok(())
         }
 
-        fn seed_vault(path: &Path, key_store: &MemoryMasterKeyStore) -> Result<(), Box<dyn Error>> {
+        fn seed_vault(
+            path: &Path,
+            key_store: &MemoryMasterKeyStore,
+            canary: &str,
+        ) -> Result<(), Box<dyn Error>> {
             let master = generate_key()?;
             let audit_key = generate_key()?;
             let secret_key = generate_key()?;
@@ -213,9 +217,6 @@ mod unix {
                 &secret_key,
             )?;
 
-            // Keep the plaintext fixture in this helper. The scan request carries no plaintext.
-            let random = generate_key()?;
-            let canary = Zeroizing::new(BASE64URL_NOPAD.encode(random.as_ref()));
             let name = "CANARY_TOKEN";
             let value_aad =
                 secret_blob_aad_v1(&SecretBlobAad::new(PROJECT, PROFILE, SECRET, name, 1))?;
@@ -226,8 +227,8 @@ mod unix {
                 1,
                 KeyWrapPurpose::SecretDek,
             ))?;
-            let encrypted = encrypt_secret_value_v1(&secret_key, &canary, &value_aad, &wrap_aad)?;
-            let fingerprint = secret_fingerprint_v1(&fingerprint_key, &canary)?;
+            let encrypted = encrypt_secret_value_v1(&secret_key, canary, &value_aad, &wrap_aad)?;
+            let fingerprint = secret_fingerprint_v1(&fingerprint_key, canary)?;
             store.create_active_secret(
                 &SecretRecord {
                     id: SECRET.into(),
@@ -280,7 +281,11 @@ mod unix {
             let directory = tempfile::tempdir()?;
             let path = directory.path().join("vault.db");
             let keys = Arc::new(MemoryMasterKeyStore::default());
-            seed_vault(&path, &keys)?;
+            {
+                let random = generate_key()?;
+                let canary = Zeroizing::new(BASE64URL_NOPAD.encode(random.as_ref()));
+                seed_vault(&path, &keys, &canary)?;
+            }
             let alias = directory.path().join("vault-link.db");
             symlink(&path, &alias)?;
             assert!(Store::open(&alias).is_err());
@@ -360,6 +365,191 @@ mod unix {
             drop(client);
             assert_eq!(server.await?, ConnectionOutcome::PeerClosed);
             Ok(())
+        }
+
+        #[cfg(target_os = "linux")]
+        mod heap {
+            use super::{
+                AgentMethod, AgentSocketState, Arc, ConnectionOutcome, Error, GrantBinding,
+                MasterKeyStore, MemoryMasterKeyStore, PROFILE, PROJECT,
+                PassphraseFallbackMasterKeyStore, UnixStream, Zeroizing, current_process_uid,
+                handle_connection, json, rpc, seed_vault, success,
+            };
+            use std::fs::File;
+            use std::hint::black_box;
+            use std::io::{Read, Write};
+            use std::os::unix::fs::FileExt;
+            use std::process::Command;
+
+            const CHILD: &str = "LOCKET_TEST_POST_LOCK_HEAP_CHILD";
+            const CHILD_PASSED: &str = "completed post-lock heap scan and positive control";
+            const CANARY_LEN: usize = 48;
+            const CANARY_XOR: u8 = 0xa7;
+            static MASKED_CANARY: [u8; CANARY_LEN] = [
+                0xd6, 0xe1, 0xe4, 0xf8, 0xf5, 0xe6, 0xe9, 0xc6, 0xf3, 0xd3, 0x9e, 0xd0, 0xe2, 0xd2,
+                0xd2, 0xf7, 0xc4, 0xf6, 0x92, 0xc4, 0xf2, 0xf8, 0xe2, 0xf8, 0xdf, 0xc5, 0xe0, 0xfe,
+                0xf7, 0xd7, 0xc4, 0x95, 0xc4, 0x9f, 0xf2, 0xf0, 0xe1, 0xf4, 0xf6, 0xf1, 0xf3, 0xc6,
+                0xeb, 0xdd, 0xfd, 0xe0, 0xed, 0xf3,
+            ];
+
+            fn canary() -> Zeroizing<Vec<u8>> {
+                let mut bytes = Zeroizing::new(vec![0; CANARY_LEN]);
+                // Keep the plaintext out of compiler-generated constants and stack arrays.
+                for (byte, masked) in bytes.iter_mut().zip(black_box(&MASKED_CANARY)) {
+                    *byte = masked ^ CANARY_XOR;
+                }
+                bytes
+            }
+
+            #[test]
+            fn lock_leaves_no_plaintext_canary_in_heap() -> Result<(), Box<dyn Error>> {
+                if std::env::var_os(CHILD).is_none() {
+                    let (_, module) =
+                        module_path!().split_once("::").ok_or("missing test module")?;
+                    let test = format!("{module}::lock_leaves_no_plaintext_canary_in_heap");
+                    let output = Command::new(std::env::current_exe()?)
+                        .env(CHILD, "1")
+                        .args(["--exact", &test, "--nocapture", "--test-threads=1"])
+                        .output()?;
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    assert!(
+                        output.status.success() && stdout.contains(CHILD_PASSED),
+                        "heap scan child exited with {}\n{stdout}\n{}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    return Ok(());
+                }
+
+                // Allocate scanner storage before decrypting so it cannot recycle a freed
+                // plaintext allocation when the scan begins.
+                let mut maps = String::with_capacity(64 * 1024);
+                let mut buffer = Zeroizing::new(vec![0; 64 * 1024]);
+                let directory = tempfile::tempdir()?;
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(exercise_vault(directory.path()))?;
+                assert!(
+                    !contains_canary(&mut maps, &mut buffer)?,
+                    "plaintext canary survived vault lock in private anonymous memory"
+                );
+
+                // Check detector sensitivity after the real scan to avoid contaminating it.
+                let live = canary();
+                assert!(
+                    contains_canary(&mut maps, &mut buffer)?,
+                    "heap scanner missed a live plaintext allocation"
+                );
+                black_box(&live);
+                writeln!(std::io::stdout().lock(), "{CHILD_PASSED}")?;
+                Ok(())
+            }
+
+            async fn exercise_vault(directory: &std::path::Path) -> Result<(), Box<dyn Error>> {
+                let path = directory.join("vault.db");
+                let keys = Arc::new(MemoryMasterKeyStore::default());
+                seed_vault(&path, &keys, std::str::from_utf8(&canary())?)?;
+                let state = AgentSocketState::with_stores(
+                    "heap-fixture",
+                    current_process_uid(),
+                    keys.clone(),
+                    Arc::new(PassphraseFallbackMasterKeyStore::new(directory.join("fallback"))),
+                )
+                .with_canonical_store_path(path.clone());
+                let (mut client, server) = UnixStream::pair()?;
+                let server = tokio::spawn(handle_connection(server, state));
+                success(
+                    rpc(
+                        &mut client,
+                        AgentMethod::Unlock,
+                        json!({"project_id": PROJECT, "ttl_seconds": 60}),
+                    )
+                    .await?,
+                )?;
+                keys.delete_master_key(PROJECT)?;
+
+                let process = locket_platform::current_process_binding()?;
+                let binding = GrantBinding::new(process.pid, process.process_start_time);
+                let grant = success(
+                    rpc(
+                        &mut client,
+                        AgentMethod::RequestGrant,
+                        json!({
+                            "project_id": PROJECT, "profile_id": PROFILE,
+                            "action": "ScanKnownValues", "ttl_seconds": 30, "binding": binding,
+                        }),
+                    )
+                    .await?,
+                )?;
+                // Read the stored plaintext through the agent's known-value decryption path
+                // without embedding it in IPC buffers or returning it to the caller.
+                let scan = success(
+                    rpc(
+                        &mut client,
+                        AgentMethod::ScanKnownValues,
+                        json!({
+                            "project_id": PROJECT, "profile_id": PROFILE, "store_path": path,
+                            "grant_id": grant["grant_id"], "binding": binding, "require_known": true,
+                        }),
+                    )
+                    .await?,
+                )?;
+                assert_eq!(scan, json!({"findings": [], "locked": false}));
+                let project = json!({"project_id": PROJECT});
+                success(rpc(&mut client, AgentMethod::Lock, project.clone()).await?)?;
+                let status = success(rpc(&mut client, AgentMethod::Status, project).await?)?;
+                assert_eq!(status["lock_state"], "locked");
+                assert_eq!(status["live_grant_count"], 0);
+                drop(client);
+                assert_eq!(server.await?, ConnectionOutcome::PeerClosed);
+                Ok(())
+            }
+
+            fn contains_canary(
+                maps: &mut String,
+                buffer: &mut [u8],
+            ) -> Result<bool, Box<dyn Error>> {
+                maps.clear();
+                File::open("/proc/self/maps")?.read_to_string(maps)?;
+                let memory = File::open("/proc/self/mem")?;
+                let mask = black_box(&MASKED_CANARY);
+                let capacity = u64::try_from(buffer.len())?;
+                let overlap = u64::try_from(CANARY_LEN - 1)?;
+                for line in maps.lines() {
+                    let mut fields = line.split_ascii_whitespace();
+                    let range = fields.next().ok_or("missing process memory range")?;
+                    if fields.next() != Some("rw-p") {
+                        continue;
+                    }
+                    // Skip offset, device, and inode to read the optional mapping name.
+                    if let Some(name) = fields.nth(3)
+                        && name != "[heap]"
+                        && !name.starts_with("[anon:")
+                    {
+                        continue;
+                    }
+                    let (start, end) = range.split_once('-').ok_or("invalid memory range")?;
+                    let mut offset = u64::from_str_radix(start, 16)?;
+                    let end = u64::from_str_radix(end, 16)?;
+                    while end - offset > overlap {
+                        let size = capacity.min(end - offset);
+                        let bytes = &mut buffer[..usize::try_from(size)?];
+                        memory.read_exact_at(bytes, offset)?;
+                        if bytes.windows(CANARY_LEN).any(|candidate| {
+                            candidate
+                                .iter()
+                                .zip(mask)
+                                .all(|(byte, masked)| byte ^ CANARY_XOR == *masked)
+                        }) {
+                            return Ok(true);
+                        }
+                        // Check windows that cross a read boundary in the same mapping.
+                        offset += size - overlap;
+                    }
+                }
+                Ok(false)
+            }
         }
     }
 }

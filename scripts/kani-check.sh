@@ -9,12 +9,14 @@ fi
 
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 scratch=/Volumes/Scratch
-if ! mount | awk -v path="$scratch" '$2 == "on" && $3 == path { found = 1 } END { exit !found }'; then
+if mount | awk -v path="$scratch" '$2 == "on" && $3 == path { found = 1 } END { exit !found }'; then
+    export TMPDIR="$scratch/locket/tmp"
+elif [[ ${CI:-} == true ]] || [[ $(uname -s) == Linux && -n ${RUNNER_TEMP:-${TMPDIR:-}} ]]; then
+    export TMPDIR="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/locket-check"
+else
     printf 'kani-check: %s is not mounted\n' "$scratch" >&2
     exit 1
 fi
-export TMPDIR="$scratch/locket/t"
-export CARGO_NET_OFFLINE=true
 mkdir -p -- "$TMPDIR"
 work=$(mktemp -d "$TMPDIR/kani.XXXXXXXX")
 trap 'rm -rf -- "$work"' EXIT
@@ -24,8 +26,17 @@ trap 'exit 143' TERM
 cd -- "$root"
 # Kani's Cargo invocations inherit offline mode. Check the resolved lockfile
 # first because cargo kani does not forward Cargo's --locked flag.
-cargo metadata --offline --locked --format-version 1 >/dev/null
+if [[ ${OFFLINE:-1} == 0 ]]; then
+    export CARGO_NET_OFFLINE=false
+else
+    export CARGO_NET_OFFLINE=true
+fi
+cargo metadata --locked --format-version 1 >/dev/null
 if [[ -n ${COMPUTE_JOBS:-} ]]; then
     export CARGO_BUILD_JOBS="$COMPUTE_JOBS"
 fi
-cargo kani -p locket-crypto -p locket-core --lib --target-dir "$work" -j "${COMPUTE_JOBS:-2}"
+# Kani cannot verify the inline assembly used for CPU feature detection or
+# all of the accelerated crypto intrinsics. Check the portable Rust backends.
+export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--cfg=chacha20_backend=\"soft\" --cfg=poly1305_backend=\"soft\""
+cargo kani -p locket-crypto -p locket-core --lib --target-dir "$work" \
+    --output-format terse -j "${COMPUTE_JOBS:-2}"

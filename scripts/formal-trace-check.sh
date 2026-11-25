@@ -8,18 +8,19 @@ die() {
 
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 scratch=/Volumes/Scratch
-if [[ ! -d "$scratch" ]] ||
-    ! mount | awk -v path="$scratch" '$2 == "on" && $3 == path { found = 1 } END { exit !found }'; then
+if mount | awk -v path="$scratch" '$2 == "on" && $3 == path { found = 1 } END { exit !found }'; then
+    check_tmp="$scratch/locket/tmp"
+elif [[ ${CI:-} == true ]] || [[ $(uname -s) == Linux && -n ${RUNNER_TEMP:-${TMPDIR:-}} ]]; then
+    check_tmp="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/locket-check"
+else
     die "$scratch is not mounted"
 fi
-scratch_tmp="$scratch/locket/tmp"
-mkdir -p -- "$scratch_tmp"
-work=$(mktemp -d "$scratch_tmp/formal-trace-check.XXXXXXXX")
+mkdir -p -- "$check_tmp"
+work=$(mktemp -d "$check_tmp/formal-trace-check.XXXXXXXX")
 trap 'rm -rf -- "$work"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-export TMPDIR="$scratch/locket/t"
-mkdir -p -- "$TMPDIR"
+export TMPDIR="$check_tmp"
 
 jar=${TLA2TOOLS_JAR:-"$HOME/.local/share/tla2tools/tla2tools.jar"}
 [[ -f "$jar" && -r "$jar" ]] || die "TLA+ tools jar unavailable at $jar"
@@ -48,7 +49,8 @@ for line in sys.stdin:
 ' <"$work/cli-build.jsonl")
 [[ -x "$cli" ]] || die "Cargo did not report an executable Locket CLI"
 
-LOCKET_TLA_CLI="$cli" LOCKET_TLA_TRACE_DIR="$work/traces" cargo "${cargo_args[@]}"
+LOCKET_TLA_CLI="$cli" LOCKET_TLA_TRACE_DIR="$work/traces" LOCKET_TLA_TMPDIR="$check_tmp" \
+    cargo "${cargo_args[@]}"
 
 run_tlc() (
     local dir=$1 model=$2

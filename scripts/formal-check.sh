@@ -8,10 +8,15 @@ die() {
 
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 scratch=/Volumes/Scratch
-[[ -d "$scratch" ]] || die "$scratch is unavailable"
-scratch_tmp="$scratch/locket/tmp"
-mkdir -p -- "$scratch_tmp"
-work=$(mktemp -d "$scratch_tmp/formal-check.XXXXXXXX")
+if mount | awk -v path="$scratch" '$2 == "on" && $3 == path { found = 1 } END { exit !found }'; then
+    check_tmp="$scratch/locket/tmp"
+elif [[ ${CI:-} == true ]] || [[ $(uname -s) == Linux && -n ${RUNNER_TEMP:-${TMPDIR:-}} ]]; then
+    check_tmp="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/locket-check"
+else
+    die "$scratch is not mounted"
+fi
+mkdir -p -- "$check_tmp"
+work=$(mktemp -d "$check_tmp/formal-check.XXXXXXXX")
 trap 'rm -rf -- "$work"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -92,7 +97,7 @@ check_model SharedVaultIsolation
 check_model AgentDaemonLifecycle
 check_model McpAndDesktopBoundary
 
-# Build the exact sources in a Scratch copy so Lake's artifacts stay off Data.
+# Build the exact sources in the temporary directory to keep Lake's artifacts out of the checkout.
 lean_project="$work/formal/lean"
 mkdir -p -- "$lean_project"
 cp -R -- "$root/formal/lean/"{lean-toolchain,lakefile.toml,LocketProofs.lean,LocketProofs} "$lean_project/"

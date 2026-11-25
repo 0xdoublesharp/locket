@@ -1535,7 +1535,9 @@ mod cli_traces {
     fn tempdir() -> tempfile::TempDir {
         // Cargo wrappers may choose long temporary paths. Keep Unix socket
         // addresses within sockaddr_un and give the daemon a private parent.
-        let dir = tempfile::tempdir_in("/Volumes/Scratch/locket/t").unwrap();
+        let root =
+            std::env::var_os("LOCKET_TLA_TMPDIR").map_or_else(std::env::temp_dir, PathBuf::from);
+        let dir = tempfile::tempdir_in(root).unwrap();
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
         dir
     }
