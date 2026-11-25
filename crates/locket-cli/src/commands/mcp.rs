@@ -14,8 +14,9 @@ use zeroize::Zeroizing;
 
 use crate::commands::discovery::{
     discover_rows, error_json, project_rows, read_metadata_store, require_metadata_store,
-    select_project, trusted_project_configs,
+    select_project, trusted_project_config, trusted_project_configs,
 };
+use crate::commands::project::detect::detect_policy_commands;
 use crate::commands::secrets::generate::{GenerateFormat, generate_value};
 use crate::commands::secrets::import::{
     EnvImportOptions, import_env_to_target, inspect_env_file_keys, scan_workspace_env_files,
@@ -24,7 +25,7 @@ use crate::commands::secrets::set::{
     SecretWriteKeys, WriteRequest, WriteTarget, confirm_write, select_target,
     validate_write_metadata, write_value,
 };
-use crate::runtime::error::access_denied_error;
+use crate::runtime::error::{access_denied_error, typed_cli_error};
 use crate::{
     CliError, RuntimeContext, SecretMetadataFlags, SecretSourceArg, load_project_key,
     metadata_invalid_error, now_unix_nanos, open_store, secret_deleted_error,
@@ -34,6 +35,8 @@ use crate::{
 const MAX_INPUT_BYTES: u64 = 1_048_576;
 const DEFAULT_ENV_SCAN_DEPTH: i64 = 5;
 const MAX_ENV_SCAN_DEPTH: i64 = 10;
+const ENV_PATH_SCOPE: &str =
+    "dotenv path must be inside the working directory or a trusted project root";
 
 pub fn serve(
     input: &mut impl BufRead,
@@ -248,6 +251,13 @@ struct ScanEnvArgs {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct DetectCommandsArgs {
+    path: Option<PathBuf>,
+    project: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)] // Independent MCP options.
 struct ImportEnvArgs {
     project: String,
@@ -299,23 +309,62 @@ fn call_tool(context: &RuntimeContext, name: &str, mut args: Value) -> Result<Va
         }
         "locket_inspect_env_keys" => inspect_env(context, &args_as::<InspectEnvArgs>(args)?),
         "locket_scan_env_files" => scan_env(context, &args_as::<ScanEnvArgs>(args)?),
+        "locket_detect_commands" => detect_commands(context, args_as(args)?),
         "locket_import_env" => import_env(context, args_as::<ImportEnvArgs>(args)?),
         _ => Err(metadata_invalid_error("unknown MCP tool")),
     }
 }
 
 fn inspect_env(context: &RuntimeContext, args: &InspectEnvArgs) -> Result<Value, CliError> {
-    let path = canonical_env_path(context, &args.path, EnvPathKind::File)?;
-    require_workspace_env_path(context, &path, None)?;
+    let path = canonical_input_path(context, &args.path, InputPathKind::EnvFile)?;
+    require_workspace_path(context, &path, None, ENV_PATH_SCOPE)?;
     inspect_env_file_keys(&path, args.literal)
 }
 
 fn scan_env(context: &RuntimeContext, args: &ScanEnvArgs) -> Result<Value, CliError> {
     let path = args.path.as_deref().unwrap_or_else(|| Path::new("."));
-    let root = canonical_env_path(context, path, EnvPathKind::Directory)?;
-    require_workspace_env_path(context, &root, None)?;
+    let root = canonical_input_path(
+        context,
+        path,
+        InputPathKind::Directory("dotenv scan root must be a directory"),
+    )?;
+    require_workspace_path(context, &root, None, ENV_PATH_SCOPE)?;
     let max_depth = args.max_depth.unwrap_or(DEFAULT_ENV_SCAN_DEPTH).clamp(1, MAX_ENV_SCAN_DEPTH);
     scan_workspace_env_files(&root, usize::try_from(max_depth).unwrap_or(5), args.literal)
+}
+
+fn detect_commands(context: &RuntimeContext, args: DetectCommandsArgs) -> Result<Value, CliError> {
+    let root = if let Some(selector) = args.project {
+        if args.path.is_some() {
+            return Err(metadata_invalid_error("supply either path or project"));
+        }
+        let store = require_metadata_store(context)?;
+        let project = select_project(&store, &context.cwd, &selector)?;
+        trusted_project_config(&store, &project.id)?
+            .ok_or_else(|| {
+                typed_cli_error(
+                    LocketError::ProjectRootUntrusted,
+                    "project has no trusted workspace root",
+                )
+            })?
+            .root
+    } else {
+        let path = args.path.as_deref().unwrap_or_else(|| Path::new("."));
+        let root = canonical_input_path(
+            context,
+            path,
+            InputPathKind::Directory("command detection root must be a directory"),
+        )?;
+        require_workspace_path(
+            context,
+            &root,
+            None,
+            "command detection path must be inside the working directory or a trusted project root",
+        )?;
+        root
+    };
+    let commands = detect_policy_commands(&root, false)?;
+    Ok(json!({"root": root.display().to_string(), "commands": commands, "metadata_only": true}))
 }
 
 fn import_env(context: &RuntimeContext, args: ImportEnvArgs) -> Result<Value, CliError> {
@@ -324,9 +373,9 @@ fn import_env(context: &RuntimeContext, args: ImportEnvArgs) -> Result<Value, Cl
     let mut store =
         if args.dry_run { require_metadata_store(context)? } else { open_store(context)? };
     let target = select_target(context, &store, Some(&args.project), args.profile.as_deref())?;
-    let path = canonical_env_path(context, &args.path, EnvPathKind::File)?;
+    let path = canonical_input_path(context, &args.path, InputPathKind::EnvFile)?;
     if target.project.id.starts_with("lk_proj_shared_") {
-        require_workspace_env_path(context, &path, Some(&store))?;
+        require_workspace_path(context, &path, Some(&store), ENV_PATH_SCOPE)?;
     } else if !path_in_project_roots(&store, &target.project.id, &path)? {
         return Err(access_denied_error(
             "dotenv file must be inside a trusted target project root",
@@ -347,35 +396,36 @@ fn import_env(context: &RuntimeContext, args: ImportEnvArgs) -> Result<Value, Cl
 }
 
 #[derive(Clone, Copy)]
-enum EnvPathKind {
-    File,
-    Directory,
+enum InputPathKind {
+    EnvFile,
+    Directory(&'static str),
 }
 
-fn canonical_env_path(
+fn canonical_input_path(
     context: &RuntimeContext,
     path: &Path,
-    kind: EnvPathKind,
+    kind: InputPathKind,
 ) -> Result<PathBuf, CliError> {
     // Strip trailing separators and dots so they cannot hide a final symlink.
     let path = context.cwd.join(path).components().collect::<PathBuf>();
     let metadata = fs::symlink_metadata(&path)?;
     match kind {
-        EnvPathKind::File if !metadata.is_file() => {
+        InputPathKind::EnvFile if !metadata.is_file() => {
             return Err(metadata_invalid_error("dotenv input must be a regular file"));
         }
-        EnvPathKind::Directory if !metadata.is_dir() => {
-            return Err(metadata_invalid_error("dotenv scan root must be a directory"));
+        InputPathKind::Directory(message) if !metadata.is_dir() => {
+            return Err(metadata_invalid_error(message));
         }
         _ => {}
     }
     Ok(path.canonicalize()?)
 }
 
-fn require_workspace_env_path(
+fn require_workspace_path(
     context: &RuntimeContext,
     canonical: &Path,
     store: Option<&Store>,
+    outside_scope_message: &str,
 ) -> Result<(), CliError> {
     if context.cwd.canonicalize().is_ok_and(|cwd| canonical.starts_with(cwd)) {
         return Ok(());
@@ -388,9 +438,7 @@ fn require_workspace_env_path(
             }
         }
     }
-    Err(access_denied_error(
-        "dotenv path must be inside the working directory or a trusted project root",
-    ))
+    Err(access_denied_error(outside_scope_message))
 }
 
 fn path_in_project_roots(
@@ -625,6 +673,21 @@ fn tool(name: &str, description: &str, properties: &Value, required: &[&str]) ->
     })
 }
 
+fn detect_commands_tool() -> Value {
+    let mut definition = tool(
+        "locket_detect_commands",
+        "Detect runnable commands from manifests and return metadata only. Defaults to the working directory.",
+        &json!({
+            "path": {"type": "string", "description": "Directory within the working directory or a trusted project root."},
+            "project": {"type": "string", "description": "Project ID, name, or trusted root."},
+        }),
+        &[],
+    );
+    definition["inputSchema"]["additionalProperties"] = json!(false);
+    definition["inputSchema"]["not"] = json!({"required": ["path", "project"]});
+    definition
+}
+
 fn tools() -> Vec<Value> {
     let string = json!({"type": "string"});
     let boolean = json!({"type": "boolean"});
@@ -670,6 +733,7 @@ fn tools() -> Vec<Value> {
             }),
             &[],
         ),
+        detect_commands_tool(),
         tool(
             "locket_import_env",
             "Import dotenv keys into an encrypted vault and return metadata. Use dry_run to preview changes. Confirm overwrites in dangerous profiles with confirm_dangerous.",

@@ -109,7 +109,7 @@ pub fn trusted_project_configs(
             continue;
         }
         let config_path = path.join(LOCKET_TOML);
-        if !config_path.is_file() {
+        if !fs::symlink_metadata(&config_path).is_ok_and(|metadata| metadata.is_file()) {
             continue;
         }
         let config = read_project_config(&config_path)
@@ -283,6 +283,17 @@ pub fn shared_command(
 
 pub const SHARED_PROJECT_PREFIX: &str = "lk_proj_shared_";
 pub const GLOBAL_VAULT: &str = "@shared";
+
+pub fn global_vault_project(store: &Store) -> Result<Option<ProjectRecord>, CliError> {
+    match store.resolve_project_selector(GLOBAL_VAULT)? {
+        ProjectSelectorResolution::Found(project)
+            if project.name == GLOBAL_VAULT && project.id.starts_with(SHARED_PROJECT_PREFIX) =>
+        {
+            Ok(Some(project))
+        }
+        _ => Ok(None),
+    }
+}
 
 fn shared_init(context: &RuntimeContext, name: &str) -> Result<Value, CliError> {
     if name.is_empty() || name.trim() != name || name.chars().any(char::is_control) {

@@ -150,9 +150,30 @@ pub(crate) fn next_secret_version(current_version: u32) -> Result<u32, CliError>
     name = "locket",
     version,
     about = "Encrypted local secrets with command and path-scoped delivery",
-    after_help = "Project files keep policy in locket.toml and values in the encrypted local vault.\n\
-                  Monorepos can add [paths.\"relative/path\"] env sets; the deepest matching\n\
-                  scope extends the selected [commands.<policy>] entry when run from that subtree."
+    after_help = r#"Quick Start
+  locket shared init     Create the shared local vault.
+  locket init            Set up Locket in a project.
+  locket status --json   See project, vault, and agent status from any directory.
+  locket policy detect   Find commands to turn into policies.
+
+Start & Vaults
+  shared init, init, status --json, unlock, lock, setup
+
+Secrets
+  list, set, import, env keys, env scan, generate, discover, get, rotate, rm
+
+Commands & Execution
+  run, exec, policy detect, policy add, env inspect, compose
+
+AI Agents & Safety
+  mcp, scan, redact, context, ai-safe, audit
+
+Environments, Team & Recovery
+  profile, use, team, device, export, recover, agent, doctor
+
+Project files keep policy in locket.toml and values in the encrypted local vault.
+Monorepos can add [paths."relative/path"] env sets; the deepest matching
+scope extends the selected [commands.<policy>] entry when run from that subtree."#
 )]
 struct Cli {
     #[command(subcommand)]
@@ -162,11 +183,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Show metadata-only status.
-    Status {
-        /// Scan project files for plaintext secrets.
-        #[arg(long)]
-        scan: bool,
-    },
+    Status(StatusArgs),
     /// Initialize a Locket project from a template.
     New(NewArgs),
     /// Show metadata-only onboarding checklist.
@@ -390,6 +407,16 @@ pub(crate) struct InternalClipboardClearArgs {
     /// Seconds to wait before checking and clearing the clipboard.
     #[arg(long)]
     ttl_seconds: u64,
+}
+
+#[derive(Debug, Default, Args)]
+struct StatusArgs {
+    /// Scan project files for plaintext secrets.
+    #[arg(long)]
+    scan: bool,
+    /// Print metadata as JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1709,7 +1736,7 @@ fn run_with_context(
         team, trust, vault,
     };
 
-    let command = cli.command.unwrap_or(Command::Status { scan: false });
+    let command = cli.command.unwrap_or_else(|| Command::Status(StatusArgs::default()));
 
     // The master-key cache is scoped to a single CLI invocation. In
     // production each invocation gets a fresh `RuntimeContext`; tests
@@ -1719,7 +1746,15 @@ fn run_with_context(
     context.master_key_cache.clear();
 
     match command {
-        Command::Status { scan } => project::status::status_with_scan(context, output, scan)?,
+        Command::Status(args) => {
+            if args.json {
+                return commands::discovery::write_json_result(
+                    output,
+                    project::status::status_json(context, args.scan),
+                );
+            }
+            project::status::status_with_scan(context, output, args.scan)?;
+        }
         Command::New(args) => new_command(context, output, &args)?,
         Command::Bootstrap => project::bootstrap::bootstrap_command(context, output)?,
         Command::Setup { command } => project::setup::setup_command(context, output, command)?,

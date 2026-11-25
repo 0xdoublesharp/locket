@@ -235,6 +235,26 @@ fn help_mentions_path_scoped_env_sets() {
 }
 
 #[test]
+fn help_groups_workflows_and_shows_quick_start() {
+    let help = Cli::command().render_long_help().to_string();
+    for heading in [
+        "Start & Vaults",
+        "Secrets",
+        "Commands & Execution",
+        "AI Agents & Safety",
+        "Environments, Team & Recovery",
+    ] {
+        assert!(help.lines().any(|line| line.trim() == heading), "missing {heading}");
+    }
+    let mut lines = help.lines().skip_while(|line| line.trim() != "Quick Start").skip(1);
+    for command in
+        ["locket shared init", "locket init", "locket status --json", "locket policy detect"]
+    {
+        assert!(lines.next().is_some_and(|line| line.trim().starts_with(command)), "{help}");
+    }
+}
+
+#[test]
 #[allow(clippy::expect_used)]
 fn execution_help_mentions_path_scope_merge_points() {
     let mut command = Cli::command();

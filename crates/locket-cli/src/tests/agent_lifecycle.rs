@@ -76,6 +76,51 @@ fn read_status_snapshot(
 
 #[cfg(unix)]
 #[test]
+fn status_json_reports_a_running_agent_and_project_lock_state()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempdir()?;
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))?;
+    let project_dir = directory.path().join("project");
+    fs::create_dir(&project_dir)?;
+    let outside = test_context(&directory);
+    let inside = RuntimeContext { cwd: project_dir, ..outside.clone() };
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--no-device", "--no-passkey"])?,
+        &inside,
+        &mut Vec::new(),
+    )?;
+    let socket_path = crate::agent_socket_path(&outside);
+    let serve_thread = serve_status_requests(socket_path.clone(), 2);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !socket_path.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(socket_path.exists(), "test agent did not bind socket within deadline");
+
+    for (context, has_config) in [(&outside, false), (&inside, true)] {
+        let mut output = Vec::new();
+        let code = run_with_context(
+            Cli::try_parse_from(["locket", "status", "--json"])?,
+            context,
+            &mut output,
+        )?;
+        assert_eq!(code, 0);
+        let status: serde_json::Value = serde_json::from_slice(&output)?;
+        assert_eq!(status["has_locket_config"], has_config);
+        assert_eq!(status["agent_running"], true);
+        assert_eq!(
+            status.get("vault_unlocked"),
+            has_config.then_some(&serde_json::Value::Bool(false))
+        );
+    }
+    serve_thread.join().map_err(|_| "serve thread panicked")??;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn agent_start_preserves_live_socket_without_pid_file()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use std::os::unix::fs::PermissionsExt;

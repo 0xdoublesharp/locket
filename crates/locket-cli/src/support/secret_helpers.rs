@@ -16,7 +16,7 @@ use locket_store::{AuditWrite, ProfileRecord, SecretRecord, Store};
 use serde_json::{Value, json};
 
 use crate::commands::config::spec::{config_get_value, read_user_config};
-use crate::commands::discovery::{GLOBAL_VAULT, SHARED_PROJECT_PREFIX};
+use crate::commands::discovery::{GLOBAL_VAULT, global_vault_project};
 use crate::runtime::RuntimeContext;
 #[cfg(test)]
 use crate::runtime::error::secret_version_expired_error;
@@ -491,14 +491,9 @@ pub fn policy_secret_selections(
 }
 
 fn shared_secrets_by_name(store: &Store) -> Result<BTreeMap<String, Vec<SecretRecord>>, CliError> {
-    let locket_store::ProjectSelectorResolution::Found(project) =
-        store.resolve_project_selector(GLOBAL_VAULT)?
-    else {
+    let Some(project) = global_vault_project(store)? else {
         return Ok(BTreeMap::new());
     };
-    if project.name != GLOBAL_VAULT || !project.id.starts_with(SHARED_PROJECT_PREFIX) {
-        return Ok(BTreeMap::new());
-    }
     let Some(profile) = store.get_profile_by_name(&project.id, "default")? else {
         return Ok(BTreeMap::new());
     };

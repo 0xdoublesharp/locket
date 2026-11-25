@@ -4,13 +4,90 @@ use std::io::Write;
 use std::path::Path;
 
 use locket_store::ProfileRecord;
+use serde_json::{Value, json};
 
+use crate::commands::agent::{request_project_status_snapshot, request_status_snapshot};
 use crate::commands::config::spec::read_user_config;
+use crate::commands::discovery::{global_vault_project, read_metadata_store};
 use crate::commands::scan::scanner;
 use crate::{
-    CliError, EXAMPLE_FILE, LOCKET_TOML, ResolvedProject, RuntimeContext, config_bool_value,
-    open_store, privacy_alias, resolve_project, root_hash,
+    CliError, EXAMPLE_FILE, LOCKET_TOML, ResolvedProject, RuntimeContext, active_secrets_by_name,
+    agent_socket_path, config_bool_value, invalid_policy_error, open_store, privacy_alias,
+    read_policy_document, resolve_project, root_hash,
 };
+
+pub fn status_json(context: &RuntimeContext, scan: bool) -> Result<Value, CliError> {
+    let resolved = resolve_project(&context.cwd)?;
+    let store = read_metadata_store(context)?;
+    let redact_names = status_privacy_redact_names_enabled(context)?;
+    let shared_project_id = match &store {
+        Some(store) => global_vault_project(store)?
+            .map(|project| status_project_id_label(&project.id, redact_names)),
+        None => None,
+    };
+    let socket = agent_socket_path(context);
+    let Some(resolved) = resolved else {
+        return Ok(json!({
+            "has_locket_config": false,
+            "project_id": null,
+            "project_name": null,
+            "profile": null,
+            "has_shared_vault": shared_project_id.is_some(),
+            "shared_project_id": shared_project_id,
+            "agent_running": request_status_snapshot(&socket).is_ok(),
+            "secret_count": 0,
+            "policy_names": [],
+            "metadata_only": true,
+        }));
+    };
+
+    let project_id = resolved.config.project_id.as_str();
+    let snapshot = request_project_status_snapshot(&socket, project_id).ok();
+    let project_snapshot = matching_project_snapshot(snapshot.as_ref(), project_id);
+    let vault_unlocked = match project_snapshot.and_then(|snapshot| snapshot["lock_state"].as_str())
+    {
+        Some("locked") => Some(false),
+        Some("unlocked") => Some(true),
+        _ => None,
+    };
+    let profile_name = project_snapshot
+        .and_then(|snapshot| snapshot["profile_name"].as_str())
+        .unwrap_or(resolved.config.default_profile.as_str());
+    let (profile, secret_count) = match &store {
+        Some(store) => {
+            let profile = store.get_profile_by_name(project_id, profile_name)?;
+            let count = match &profile {
+                Some(profile) => active_secrets_by_name(store, project_id, &profile.id)?.len(),
+                None => 0,
+            };
+            (profile, count)
+        }
+        None => (None, 0),
+    };
+    let policy_names = read_policy_document(&resolved.root.join(LOCKET_TOML))
+        .map_err(|_| invalid_policy_error("could not read project policy metadata"))?
+        .commands
+        .into_keys()
+        .map(|name| if redact_names { privacy_alias("policy", &name) } else { name })
+        .collect::<Vec<_>>();
+    let mut status = json!({
+        "has_locket_config": true,
+        "project_id": status_project_id_label(project_id, redact_names),
+        "project_name": status_project_label(&resolved, redact_names),
+        "profile": status_profile_label(profile.as_ref(), profile_name, redact_names),
+        "has_shared_vault": shared_project_id.is_some(),
+        "shared_project_id": shared_project_id,
+        "agent_running": snapshot.is_some(),
+        "vault_unlocked": vault_unlocked,
+        "secret_count": secret_count,
+        "policy_names": policy_names,
+        "metadata_only": true,
+    });
+    if scan {
+        status["scan_warnings"] = json!(status_scan_warning_count(&resolved.root)?);
+    }
+    Ok(status)
+}
 
 pub fn status_with_scan(
     context: &RuntimeContext,
@@ -40,15 +117,9 @@ pub fn status_with_scan(
     );
     let running_sessions =
         store.list_incomplete_runtime_sessions(resolved.config.project_id.as_str())?.len();
-    let snapshot = crate::commands::agent::request_project_status_snapshot(
-        &crate::agent_socket_path(context),
-        resolved.config.project_id.as_str(),
-    )
-    .ok();
-    let project_snapshot = snapshot.as_ref().filter(|snapshot| {
-        snapshot.get("project_id").and_then(serde_json::Value::as_str)
-            == Some(resolved.config.project_id.as_str())
-    });
+    let project_id = resolved.config.project_id.as_str();
+    let snapshot = request_project_status_snapshot(&agent_socket_path(context), project_id).ok();
+    let project_snapshot = matching_project_snapshot(snapshot.as_ref(), project_id);
     let active_name = project_snapshot
         .and_then(|snapshot| snapshot.get("profile_name"))
         .and_then(serde_json::Value::as_str);
@@ -112,6 +183,14 @@ pub fn status_with_scan(
     writeln!(output, "metadata_only: yes")?;
     writeln!(output, "next_action: {next_action}")?;
     Ok(())
+}
+
+fn matching_project_snapshot<'a>(
+    snapshot: Option<&'a Value>,
+    project_id: &str,
+) -> Option<&'a Value> {
+    snapshot
+        .filter(|snapshot| snapshot.get("project_id").and_then(Value::as_str) == Some(project_id))
 }
 
 fn write_secret_expiry_summary(
