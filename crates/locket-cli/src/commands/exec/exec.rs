@@ -2,27 +2,32 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
+use std::path::Path;
 
+use locket_core::{PolicyDocument, SecretName};
 use locket_crypto::KeyPurpose;
-use locket_store::{AuditWrite, ProfileRecord};
+use locket_store::{AuditWrite, ProfileRecord, Store};
 use serde_json::json;
 
 use super::run::{
     RuntimeExecutionRequest, execute_prepared_with_runtime_session, unique_secret_names,
 };
 use crate::commands::agent::ensure_agent_running_for_execution;
+use crate::commands::discovery::{SHARED_PROJECT_PREFIX, select_project, trusted_project_configs};
 use crate::runtime::RuntimeContext;
+use crate::runtime::dangerous_profile::ensure_dangerous_profile_consent;
 use crate::runtime::error::{
     CliError, child_exit_error, confirmation_failed_error, exec_prepare_error,
-    invalid_reference_error,
+    invalid_policy_error, invalid_reference_error, profile_not_found_error,
+    project_root_untrusted_error, secret_not_found_error,
 };
-use crate::runtime::key_access::{default_profile, load_project_key};
+use crate::runtime::key_access::load_project_key;
 use crate::support::secret_helpers::{
-    decrypt_current_secret, resolve_active_secret, summarize_names,
+    decrypt_secret_version, select_highest_precedence_secret, summarize_names,
 };
 use crate::{
-    ExecArgs, ResolvedProject, active_profile_secret_names, now_unix_nanos, open_store,
-    require_project,
+    ExecArgs, ResolvedProject, active_secrets_by_name, ensure_trusted_project_root, now_unix_nanos,
+    open_store, require_project,
 };
 
 pub fn exec_command(
@@ -34,25 +39,24 @@ pub fn exec_command(
         return Err(invalid_reference_error("exec requires --all or at least one --secret"));
     }
 
-    let resolved_project = require_project(context)?;
+    let implicit = args.project.is_none().then(|| require_project(context)).transpose()?;
     let store = open_store(context)?;
-    let profile = default_profile(&store, &resolved_project.config)?;
-
-    let secret_names = if args.all {
-        let mut names = active_profile_secret_names(
-            &store,
-            resolved_project.config.project_id.as_str(),
-            &profile.id,
-        )?
-        .into_iter()
-        .collect::<Vec<_>>();
-        names.sort();
-        names
-    } else {
-        args.secrets.clone()
-    };
-
-    enforce_exec_access(context, &resolved_project, &secret_names, &args.command)?;
+    let cwd = context.cwd.canonicalize()?;
+    let (project_id, configs) =
+        resolve_exec_target(&store, &cwd, implicit, args.project.as_deref())?;
+    let default_profile =
+        configs.first().map_or("default", |config| config.config.default_profile.as_str());
+    let profile_name = args.profile.as_deref().unwrap_or(default_profile);
+    let profile = store.get_profile_by_name(&project_id, profile_name)?.ok_or_else(|| {
+        profile_not_found_error("target profile not found; pass --profile to select a profile")
+    })?;
+    if args.project.is_some() || args.profile.is_some() {
+        ensure_dangerous_profile_consent(&profile, args.use_dangerous)?;
+    }
+    let mut active = active_secrets_by_name(&store, &project_id, &profile.id)?;
+    let secret_names =
+        if args.all { active.keys().cloned().collect::<Vec<_>>() } else { args.secrets.clone() };
+    let documents = load_exec_configurations(&configs, &cwd, &secret_names, &args.command)?;
 
     if args.all && !args.force {
         confirm_exec_all_scope(context, output, &profile, &args.command, &secret_names)?;
@@ -60,22 +64,25 @@ pub fn exec_command(
 
     ensure_agent_running_for_execution(context)?;
 
-    let mut resolved_secrets = Vec::with_capacity(args.secrets.len());
     let mut locket_env = locket_exec::EnvMap::new();
-    let mut injected_names = Vec::with_capacity(secret_names.len());
     let mut injected_sources = BTreeMap::new();
-    for key in &secret_names {
-        let resolved = resolve_active_secret(context, key)?;
-        let value = decrypt_current_secret(context, &resolved)?;
-        injected_names.push(resolved.secret.name.clone());
-        injected_sources.insert(resolved.secret.name.clone(), resolved.secret.source.clone());
-        locket_env.insert(resolved.secret.name.clone(), value);
-        resolved_secrets.push(resolved);
+    for name in unique_secret_names(secret_names.iter().map(String::as_str)) {
+        let secret = active
+            .remove(&name)
+            .and_then(select_highest_precedence_secret)
+            .ok_or_else(|| secret_not_found_error(format!("secret not found: {name}")))?;
+        let value = decrypt_secret_version(
+            context,
+            &store,
+            &project_id,
+            &profile.id,
+            &secret,
+            secret.current_version,
+        )?;
+        injected_sources.insert(name.clone(), secret.source);
+        locket_env.insert(name, value);
     }
-    injected_names.sort();
-    injected_names.dedup();
-    let unique_names = unique_secret_names(injected_names.iter().map(String::as_str));
-    let first_secret = resolved_secrets.first();
+    let injected_names = injected_sources.keys().cloned().collect::<Vec<_>>();
 
     let argv_program = args.command.first().cloned().unwrap_or_default();
     let arg_count = args.command.len();
@@ -91,19 +98,19 @@ pub fn exec_command(
         override_mode: locket_exec::EnvOverrideMode::Locket,
     };
     let prepared = locket_exec::prepare_execution(&request).map_err(exec_prepare_error)?;
-    validate_exec_configuration(&resolved_project, &secret_names, &prepared.env, output)?;
-    let _ = first_secret;
-    let status = if unique_names.is_empty() {
+    for document in &documents {
+        validate_exec_configuration(document, &secret_names, &prepared.env, output)?;
+    }
+    let status = if injected_names.is_empty() {
         prepared.command().status()?
     } else {
         execute_prepared_with_runtime_session(
             context,
             &RuntimeExecutionRequest {
                 store: &store,
-                resolved: &resolved_project,
                 profile: &profile,
                 policy_name: None,
-                secret_names: &unique_names,
+                secret_names: &injected_names,
                 prepared: &prepared,
                 current_dir: Some(&context.cwd),
                 run_policy_grant: None,
@@ -115,7 +122,7 @@ pub fn exec_command(
 
     write_exec_audit_if_available(
         context,
-        &resolved_project,
+        configs.is_empty(),
         &profile,
         &argv_program,
         arg_count,
@@ -133,51 +140,110 @@ pub fn exec_command(
     Err(child_exit_error(status))
 }
 
-fn enforce_exec_access(
-    context: &RuntimeContext,
-    resolved: &ResolvedProject,
+fn resolve_exec_target(
+    store: &Store,
+    cwd: &Path,
+    implicit: Option<ResolvedProject>,
+    selector: Option<&str>,
+) -> Result<(String, Vec<ResolvedProject>), CliError> {
+    if let Some(project) = implicit {
+        ensure_trusted_project_root(store, &project)?;
+        return Ok((project.config.project_id.to_string(), vec![project]));
+    }
+
+    let selector = selector.ok_or_else(crate::project_not_found_error)?;
+    let project = select_project(store, cwd, selector)?;
+    let mut configs = trusted_project_configs(store, &project.id)?;
+    if configs.is_empty() {
+        if project.id.starts_with(SHARED_PROJECT_PREFIX)
+            && store.list_project_roots(&project.id)?.is_empty()
+        {
+            return Ok((project.id, configs));
+        }
+        return Err(project_root_untrusted_error());
+    }
+    if let Some(index) = configs
+        .iter()
+        .enumerate()
+        .filter(|(_, config)| cwd.starts_with(&config.root))
+        .max_by_key(|(_, config)| config.root.components().count())
+        .map(|(index, _)| index)
+    {
+        let config = configs.swap_remove(index);
+        configs = vec![config];
+    }
+    Ok((project.id, configs))
+}
+
+fn load_exec_configurations(
+    configs: &[ResolvedProject],
+    cwd: &Path,
     secret_names: &[String],
     command: &[String],
-) -> Result<(), CliError> {
-    // Explicit selection does not bypass the project's restrictions. Evaluate
-    // every requested name before decrypting anything or starting the child.
-    let document = crate::read_policy_document(&resolved.root.join(crate::LOCKET_TOML))?;
-    let cwd = context.cwd.canonicalize()?;
-    let relative = cwd.strip_prefix(&resolved.root).map_err(|_| {
-        crate::runtime::error::invalid_policy_error("exec directory is outside the project")
-    })?;
-    let relative =
-        if relative.as_os_str().is_empty() { std::path::Path::new(".") } else { relative };
+) -> Result<Vec<PolicyDocument>, CliError> {
     let names = secret_names
         .iter()
-        .map(|name| locket_core::SecretName::new(name.clone()))
+        .map(|name| SecretName::new(name.clone()))
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| crate::runtime::error::invalid_policy_error("invalid selected secret name"))?;
-    let denied = document.denied_secrets("exec", Some(command), relative, &names);
+        .map_err(|_| invalid_policy_error("invalid selected secret name"))?;
+    configs
+        .iter()
+        .map(|config| {
+            let document = crate::read_policy_document(&config.root.join(crate::LOCKET_TOML))?;
+            let relative = cwd
+                .strip_prefix(&config.root)
+                .ok()
+                .map(|path| if path.as_os_str().is_empty() { Path::new(".") } else { path });
+            enforce_exec_access(&document, relative, &names, command)?;
+            Ok(document)
+        })
+        .collect()
+}
+
+fn enforce_exec_access(
+    document: &PolicyDocument,
+    relative_cwd: Option<&Path>,
+    secret_names: &[SecretName],
+    command: &[String],
+) -> Result<(), CliError> {
+    // Outside the project, an execution cannot satisfy a project-relative path rule.
+    let denied = secret_names
+        .iter()
+        .filter(|name| {
+            document.secret_access.get(name.as_str()).is_some_and(|acl| {
+                (relative_cwd.is_none() && !acl.allow_paths.is_empty())
+                    || !acl.allows(
+                        "exec",
+                        Some(command),
+                        relative_cwd.unwrap_or_else(|| Path::new(".")),
+                    )
+            })
+        })
+        .map(SecretName::as_str)
+        .collect::<Vec<_>>();
     if !denied.is_empty() {
-        return Err(crate::runtime::error::invalid_policy_error(format!(
+        return Err(invalid_policy_error(format!(
             "secret ACL denied command exec for: {}",
-            denied.into_iter().map(locket_core::SecretName::as_str).collect::<Vec<_>>().join(",")
+            denied.join(", ")
         )));
     }
     Ok(())
 }
 
 fn validate_exec_configuration(
-    resolved: &ResolvedProject,
+    document: &PolicyDocument,
     secret_names: &[String],
     env: &locket_exec::EnvMap,
     output: &mut impl Write,
 ) -> Result<(), CliError> {
     // Ad-hoc exec selects existing vault names explicitly. Contracts validate these
     // values but do not authorize additional names or apply saved-command defaults.
-    let document = crate::read_policy_document(&resolved.root.join(crate::LOCKET_TOML))?;
     for name in secret_names {
         let contract = document.variables.get(name);
         if let (Some(contract), Some(value)) = (contract, env.get(name)) {
             contract
                 .validate_value(value)
-                .map_err(|error| crate::runtime::error::invalid_policy_error(error.to_string()))?;
+                .map_err(|error| invalid_policy_error(error.to_string()))?;
         }
         let classification = contract
             .map_or(locket_core::VariableClassification::Secret, |contract| {
@@ -220,7 +286,7 @@ fn join_or_none(names: &[String]) -> String {
 #[allow(clippy::too_many_arguments)]
 fn write_exec_audit_if_available(
     context: &RuntimeContext,
-    resolved: &ResolvedProject,
+    rootless: bool,
     profile: &ProfileRecord,
     argv_program: &str,
     arg_count: usize,
@@ -231,11 +297,11 @@ fn write_exec_audit_if_available(
     status: &str,
 ) -> Result<(), CliError> {
     let mut store = open_store(context)?;
-    if store.get_project(resolved.config.project_id.as_str())?.is_none() {
+    let project_id = &profile.project_id;
+    if rootless && store.get_key_by_scope(project_id, None, KeyPurpose::Audit.as_str())?.is_none() {
         return Ok(());
     }
-    let audit_key =
-        load_project_key(context, &store, resolved.config.project_id.as_str(), KeyPurpose::Audit)?;
+    let audit_key = load_project_key(context, &store, project_id, KeyPurpose::Audit)?;
     let metadata = json!({
         "schema_version": 1,
         "action": "EXEC",
@@ -250,7 +316,7 @@ fn write_exec_audit_if_available(
         "exit_code": exit_code,
     });
     let audit = AuditWrite {
-        project_id: resolved.config.project_id.as_str(),
+        project_id,
         profile_id: Some(&profile.id),
         action: "EXEC",
         status,

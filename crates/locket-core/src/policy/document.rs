@@ -133,6 +133,20 @@ impl PolicyDocument {
 
         let commands = parse_commands(root)?;
         let path_scopes = parse_path_scopes(root)?;
+        let scoped_secrets = path_scopes
+            .values()
+            .flat_map(|scope| &scope.allowed_secrets)
+            .collect::<std::collections::BTreeSet<_>>();
+        for policy in commands.values() {
+            if let Some(shared) =
+                policy.shared_secrets.iter().find(|name| scoped_secrets.contains(name))
+            {
+                return Err(PolicyParseError::SharedAndProjectSecret {
+                    command: policy.name.clone(),
+                    name: shared.to_string(),
+                });
+            }
+        }
         let secret_access = parse_secret_access(root)?;
 
         let variables = super::variable_contract::parse_variables(root.get("variables"))?;

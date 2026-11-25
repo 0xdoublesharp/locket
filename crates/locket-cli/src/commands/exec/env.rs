@@ -90,24 +90,25 @@ pub fn env_inspect_command(
         } else {
             selection.sources.join(",")
         };
-        let selected = selection.selected.as_ref().map_or("none", |secret| secret.source.as_str());
+        let selected = selection.selected_source().unwrap_or("none");
         let conflicts = inspect_conflicts(selection, &parent_env, &external_env, policy);
-        let decision =
-            if selection.selected.is_none() && !external_env.contains_key(&selection.name) {
-                if selected_sources.contains_key(&selection.name) {
-                    "inherit"
-                } else if document
-                    .variables
-                    .get(&selection.name)
-                    .is_some_and(|contract| contract.default.is_some())
-                {
-                    "public-default"
-                } else {
-                    inspect_decision(selection, &parent_env, &external_env, policy)
-                }
+        let decision = if selection.shared && selection.selected.is_none() {
+            "missing-required"
+        } else if selection.selected.is_none() && !external_env.contains_key(&selection.name) {
+            if selected_sources.contains_key(&selection.name) {
+                "inherit"
+            } else if document
+                .variables
+                .get(&selection.name)
+                .is_some_and(|contract| contract.default.is_some())
+            {
+                "public-default"
             } else {
                 inspect_decision(selection, &parent_env, &external_env, policy)
-            };
+            }
+        } else {
+            inspect_decision(selection, &parent_env, &external_env, policy)
+        };
         writeln!(
             output,
             "secret {} kind={} sources={} selected={} conflicts={} decision={}",
@@ -146,11 +147,14 @@ fn inspect_selected_sources(
     selected_sources
         .extend(external_env.keys().map(|name| (name.clone(), "external-source".into())));
     for selection in selections {
-        if let Some(selected) = &selection.selected
+        if selection.shared && selection.selected.is_none() {
+            selected_sources.remove(&selection.name);
+        }
+        if let Some(source) = selection.selected_source()
             && (!selected_sources.contains_key(&selection.name)
                 || policy.override_behavior != locket_core::EnvOverrideMode::Preserve)
         {
-            selected_sources.insert(selection.name.clone(), selected.source.as_str().into());
+            selected_sources.insert(selection.name.clone(), source.into());
         }
     }
     Ok(selected_sources)

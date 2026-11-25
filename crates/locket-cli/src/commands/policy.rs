@@ -263,6 +263,13 @@ fn refresh(
         "allowed_secret_names: {}",
         policy.allowed_secrets.iter().map(ToString::to_string).collect::<Vec<_>>().join(" ")
     )?;
+    if !policy.shared_secrets.is_empty() {
+        writeln!(
+            output,
+            "shared_secret_names: {}",
+            policy.shared_secrets.iter().map(ToString::to_string).collect::<Vec<_>>().join(" ")
+        )?;
+    }
     writeln!(
         output,
         "path_scopes: {}",
@@ -1142,6 +1149,7 @@ fn normalized_policy_json(policy: &CommandPolicy) -> serde_json::Value {
         "allowed_secrets": secret_name_strings(&policy.allowed_secrets),
         "required_secrets": secret_name_strings(&policy.required_secrets),
         "optional_secrets": secret_name_strings(&policy.optional_secrets),
+        "shared_secrets": secret_name_strings(&policy.shared_secrets),
         "inherit_env": policy.inherit_env,
         "env_mode": policy.env_mode.as_str(),
         "override": policy.override_behavior.as_str(),

@@ -19,6 +19,7 @@ const NAME_FIELD: &str = "name";
 const SECRETS_FIELD: &str = "secrets";
 const REQUIRED_SECRETS_FIELD: &str = "required_secrets";
 const OPTIONAL_SECRETS_FIELD: &str = "optional_secrets";
+const SHARED_SECRETS_FIELD: &str = "shared_secrets";
 
 /// Command representation that controls shell expansion behavior.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -37,12 +38,14 @@ pub struct CommandPolicy {
     pub name: String,
     /// Command form to execute.
     pub command: CommandSpec,
-    /// Normalized union of required and optional secret names.
+    /// Normalized union of required and optional project secret names.
     pub allowed_secrets: Vec<SecretName>,
     /// Secret names that must be present before execution.
     pub required_secrets: Vec<SecretName>,
     /// Secret names that may be injected only when present.
     pub optional_secrets: Vec<SecretName>,
+    /// Required names sourced from the local `@shared` vault.
+    pub shared_secrets: Vec<SecretName>,
     /// Parent environment names explicitly inherited in addition to base mode.
     pub inherit_env: Vec<String>,
     /// Base child environment policy.
@@ -139,6 +142,16 @@ impl CommandPolicy {
         )?;
         let allowed_secrets =
             normalize_allowed_secrets(name, &required_secrets, &optional_secrets)?;
+        let shared_secrets =
+            parse_secret_list(name, SHARED_SECRETS_FIELD, raw.shared_secrets.unwrap_or_default())?;
+        if let Some(shared) =
+            shared_secrets.iter().find(|secret| allowed_secrets.binary_search(secret).is_ok())
+        {
+            return Err(PolicyParseError::SharedAndProjectSecret {
+                command: name.to_owned(),
+                name: shared.to_string(),
+            });
+        }
 
         let env_mode = parse_env_mode(name, raw.env_mode)?;
         let override_source = if raw.override_behavior.is_some() {
@@ -157,6 +170,7 @@ impl CommandPolicy {
             allowed_secrets,
             required_secrets,
             optional_secrets,
+            shared_secrets,
             inherit_env: raw.inherit_env.unwrap_or_default(),
             env_mode,
             override_behavior,
@@ -178,6 +192,7 @@ struct RawCommandPolicy {
     shell: Option<String>,
     required_secrets: Option<Vec<String>>,
     optional_secrets: Option<Vec<String>>,
+    shared_secrets: Option<Vec<String>>,
     inherit_env: Option<Vec<String>>,
     env_mode: Option<String>,
     #[serde(rename = "override")]

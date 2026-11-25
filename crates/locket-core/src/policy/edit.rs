@@ -88,6 +88,12 @@ pub fn command_policy_value(policy: &CommandPolicy) -> toml::Value {
         "optional_secrets".into(),
         strings(policy.optional_secrets.iter().map(crate::SecretName::as_str)),
     );
+    if !policy.shared_secrets.is_empty() {
+        table.insert(
+            "shared_secrets".into(),
+            strings(policy.shared_secrets.iter().map(crate::SecretName::as_str)),
+        );
+    }
     table.insert("inherit_env".into(), strings(policy.inherit_env.iter().map(String::as_str)));
     table.insert("env_mode".into(), toml::Value::String(policy.env_mode.as_str().into()));
     table.insert("override".into(), toml::Value::String(policy.override_behavior.as_str().into()));
@@ -145,6 +151,51 @@ fn strings<'a>(values: impl IntoIterator<Item = &'a str>) -> toml::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_secrets_round_trip_and_change_source_digest() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let source =
+            "schema_version=1\n[commands.dev]\nargv=['true']\nrequired_secrets=['LOCAL']\n";
+        let mut desired: toml::Value = toml::from_str(source)?;
+        let original = policy_source_digest(&desired, "dev")?;
+        desired["commands"]["dev"]
+            .as_table_mut()
+            .ok_or("command table")?
+            .insert("shared_secrets".into(), strings(["GLOBAL_TOKEN"]));
+        assert_ne!(policy_source_digest(&desired, "dev")?, original);
+        let parsed = PolicyDocument::from_toml_value(&desired)?;
+        desired["commands"]["dev"] = command_policy_value(&parsed.commands["dev"]);
+        let rendered = render_policy_document(source, &desired)?;
+        let round_trip = PolicyDocument::from_toml_str(&rendered)?;
+        assert_eq!(round_trip.commands["dev"].shared_secrets[0].as_str(), "GLOBAL_TOKEN");
+        let rendered: toml::Value = toml::from_str(&rendered)?;
+        let digest = policy_source_digest(&rendered, "dev")?;
+        let mut changed = rendered;
+        changed["commands"]["dev"]["shared_secrets"] = strings(["OTHER_TOKEN"]);
+        assert_ne!(policy_source_digest(&changed, "dev")?, digest);
+        Ok(())
+    }
+
+    #[test]
+    fn shared_secrets_cannot_overlap_project_secrets() {
+        for field in ["required_secrets", "optional_secrets"] {
+            let input = format!(
+                "schema_version=1\n[commands.dev]\nargv=['true']\n{field}=['TOKEN']\nshared_secrets=['TOKEN']"
+            );
+            let error = PolicyDocument::from_toml_str(&input).err();
+            assert!(error.is_some_and(|error| error.to_string().contains("both")));
+        }
+    }
+
+    #[test]
+    fn shared_secrets_cannot_overlap_path_scoped_project_secrets() {
+        let input = "schema_version=1\n[commands.dev]\nargv=['true']\nshared_secrets=['TOKEN']\n[paths.api]\nrequired_secrets=['TOKEN']";
+        assert!(matches!(
+            PolicyDocument::from_toml_str(input),
+            Err(PolicyParseError::SharedAndProjectSecret { .. })
+        ));
+    }
 
     #[test]
     fn source_digest_changes_only_for_relevant_authorization_rules()

@@ -16,6 +16,7 @@ use locket_store::{AuditWrite, ProfileRecord, SecretRecord, Store};
 use serde_json::{Value, json};
 
 use crate::commands::config::spec::{config_get_value, read_user_config};
+use crate::commands::discovery::{GLOBAL_VAULT, SHARED_PROJECT_PREFIX};
 use crate::runtime::RuntimeContext;
 #[cfg(test)]
 use crate::runtime::error::secret_version_expired_error;
@@ -43,6 +44,17 @@ pub struct PolicySecretSelection {
     pub required: bool,
     pub sources: Vec<String>,
     pub selected: Option<SecretRecord>,
+    pub shared: bool,
+}
+
+impl PolicySecretSelection {
+    pub fn selected_source(&self) -> Option<&str> {
+        self.selected.as_ref().map(
+            |secret| {
+                if self.shared { GLOBAL_VAULT } else { secret.source.as_str() }
+            },
+        )
+    }
 }
 
 pub struct ValueAccessTarget {
@@ -163,21 +175,6 @@ pub fn decrypt_secret_version(
         aad_schema_version: blob.aad_schema_version,
     };
     Ok(decrypt_secret_value_v1(&profile_secret_key, &encrypted, &value_aad, &wrap_aad)?)
-}
-
-pub fn decrypt_current_secret(
-    context: &RuntimeContext,
-    resolved: &ResolvedSecret,
-) -> Result<zeroize::Zeroizing<String>, CliError> {
-    let store = open_store(context)?;
-    decrypt_secret_version(
-        context,
-        &store,
-        resolved.project.config.project_id.as_str(),
-        &resolved.profile.id,
-        &resolved.secret,
-        resolved.secret.current_version,
-    )
 }
 
 pub fn resolve_active_secret(
@@ -479,7 +476,34 @@ pub fn policy_secret_selections(
     for name in &policy.optional_secrets {
         selections.push(policy_secret_selection(name.as_str(), false, &active_by_name));
     }
+    if !policy.shared_secrets.is_empty() {
+        let shared_by_name = shared_secrets_by_name(store)?;
+        for name in &policy.shared_secrets {
+            let mut selection = policy_secret_selection(name.as_str(), true, &shared_by_name);
+            selection.shared = true;
+            if selection.selected.is_some() {
+                selection.sources = vec![GLOBAL_VAULT.to_owned()];
+            }
+            selections.push(selection);
+        }
+    }
     Ok(selections)
+}
+
+fn shared_secrets_by_name(store: &Store) -> Result<BTreeMap<String, Vec<SecretRecord>>, CliError> {
+    let locket_store::ProjectSelectorResolution::Found(project) =
+        store.resolve_project_selector(GLOBAL_VAULT)?
+    else {
+        return Ok(BTreeMap::new());
+    };
+    if project.name != GLOBAL_VAULT || !project.id.starts_with(SHARED_PROJECT_PREFIX) {
+        return Ok(BTreeMap::new());
+    }
+    let Some(profile) = store.get_profile_by_name(&project.id, "default")? else {
+        return Ok(BTreeMap::new());
+    };
+    crate::runtime::dangerous_profile::ensure_dangerous_profile_consent(&profile, false)?;
+    active_secrets_by_name(store, &project.id, &profile.id)
 }
 
 pub fn policy_secret_selection(
@@ -490,7 +514,7 @@ pub fn policy_secret_selection(
     let secrets = active_by_name.get(name).cloned().unwrap_or_default();
     let sources = sources_by_precedence(secrets.iter().map(|secret| secret.source.clone()));
     let selected = select_highest_precedence_secret(secrets);
-    PolicySecretSelection { name: name.to_owned(), required, sources, selected }
+    PolicySecretSelection { name: name.to_owned(), required, sources, selected, shared: false }
 }
 
 pub fn select_highest_precedence_secret(

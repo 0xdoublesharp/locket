@@ -91,7 +91,9 @@ fn setup_status(context: &RuntimeContext, output: &mut impl Write) -> Result<(),
                     )?;
                     return Ok(());
                 };
-                if let Some(name) = availability.missing.first() {
+                if let Some(name) = availability.missing_shared.first() {
+                    format!("locket set {name} --project @shared")
+                } else if let Some(name) = availability.missing.first() {
                     format!("locket set {name}")
                 } else if !availability.unknown.is_empty() {
                     format!("locket env inspect {}", policy.name)

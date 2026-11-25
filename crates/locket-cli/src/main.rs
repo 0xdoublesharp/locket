@@ -610,6 +610,15 @@ struct ListArgs {
 /// Arguments for the `locket exec` command.
 #[derive(Debug, Args)]
 pub struct ExecArgs {
+    /// Select a registered project by ID, name, or root, including `@shared`.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Select a profile in the target project.
+    #[arg(long)]
+    pub profile: Option<String>,
+    /// Confirm use of a dangerous profile with an explicit target or profile.
+    #[arg(long)]
+    pub use_dangerous: bool,
     /// Secret name to inject. May be repeated.
     #[arg(long = "secret")]
     pub secrets: Vec<String>,
@@ -2883,6 +2892,7 @@ pub(crate) fn load_effective_command_policy_for_argv(
         allowed_secrets: Vec::new(),
         required_secrets: Vec::new(),
         optional_secrets: Vec::new(),
+        shared_secrets: Vec::new(),
         inherit_env: Vec::new(),
         env_mode: EnvMode::Minimal,
         override_behavior: EnvOverrideMode::Locket,
@@ -2939,6 +2949,7 @@ fn enforce_secret_access_policies(
     let denied = document
         .denied_secrets(&policy.name, argv, relative_cwd, &policy.allowed_secrets)
         .into_iter()
+        .chain(document.denied_secrets(&policy.name, argv, relative_cwd, &policy.shared_secrets))
         .map(locket_core::SecretName::as_str)
         .collect::<Vec<_>>();
     if denied.is_empty() {
@@ -3024,11 +3035,19 @@ pub(crate) fn write_runtime_policy_audit_if_available(
     let external_sources =
         policy.external_env_sources.iter().map(external_env_source_label).collect::<Vec<_>>();
     let secrets = policy_secret_audit_entries(selections);
-    let allowed_secret_names_raw =
-        policy.allowed_secrets.iter().map(locket_core::SecretName::as_str).collect::<Vec<_>>();
+    let allowed_secret_names_raw = policy
+        .allowed_secrets
+        .iter()
+        .chain(&policy.shared_secrets)
+        .map(locket_core::SecretName::as_str)
+        .collect::<Vec<_>>();
     let allowed_secret_names = summarize_names(&allowed_secret_names_raw);
-    let required_secret_names_raw =
-        policy.required_secrets.iter().map(locket_core::SecretName::as_str).collect::<Vec<_>>();
+    let required_secret_names_raw = policy
+        .required_secrets
+        .iter()
+        .chain(&policy.shared_secrets)
+        .map(locket_core::SecretName::as_str)
+        .collect::<Vec<_>>();
     let required_secret_names = summarize_names(&required_secret_names_raw);
     let user_verification_metadata = json!({
         "required": policy.require_user_verification,
@@ -3181,7 +3200,7 @@ fn policy_secret_audit_entries(selections: &[PolicySecretSelection]) -> Vec<Valu
             entry.insert("required".to_owned(), json!(selection.required));
             entry.insert("sources".to_owned(), json!(selection.sources));
             if let Some(secret) = &selection.selected {
-                entry.insert("selected_source".to_owned(), json!(secret.source));
+                entry.insert("selected_source".to_owned(), json!(selection.selected_source()));
                 entry.insert("selected_version".to_owned(), json!(secret.current_version));
             }
             Value::Object(entry)

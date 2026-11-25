@@ -127,12 +127,17 @@ fn collect_bootstrap_report(
                 });
             if let Ok(availability) = availability {
                 missing_variables.extend(availability.missing);
+                missing_variables.extend(availability.missing_shared);
                 unverified_variables.extend(availability.unknown);
             } else {
                 // Readiness is diagnostic: missing local profiles/files are
                 // repair actions, never a reason to lose the whole report.
-                unverified_variables
-                    .extend(base.required_secrets.iter().map(|name| name.as_str().to_owned()));
+                unverified_variables.extend(
+                    base.required_secrets
+                        .iter()
+                        .chain(&base.shared_secrets)
+                        .map(|name| name.as_str().to_owned()),
+                );
                 unverified_commands.push(name.clone());
             }
         }

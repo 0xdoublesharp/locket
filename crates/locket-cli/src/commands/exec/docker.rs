@@ -211,6 +211,11 @@ pub fn resolve_policy_locket_env(
     effective: &EffectiveCommandPolicy,
     policy: &CommandPolicy,
 ) -> Result<(ProfileRecord, Vec<PolicySecretSelection>, locket_exec::EnvMap), CliError> {
+    if !policy.shared_secrets.is_empty() {
+        return Err(crate::runtime::error::invalid_policy_error(
+            "shared_secrets are supported by locket run; Docker and Compose delivery require project secrets",
+        ));
+    }
     ensure_trusted_project_root(store, resolved)?;
     let profile = effective_policy_profile(store, resolved, effective)?;
     let selections = policy_secret_selections(store, resolved, &profile, policy)?;

@@ -182,15 +182,19 @@ impl PolicyDocument {
         policy
             .allowed_secrets
             .iter()
+            .chain(&policy.shared_secrets)
             .map(|name| {
                 let key = name.as_str();
                 let contract = self.variables.get(key);
                 let classification =
                     contract.map_or(VariableClassification::Secret, |item| item.classification);
-                let required = policy.required_secrets.contains(name);
+                let shared = policy.shared_secrets.contains(name);
+                let required = shared || policy.required_secrets.contains(name);
                 let selected_source = sources.get(key).cloned().or_else(|| {
                     contract
-                        .filter(|item| item.classification == VariableClassification::Public)
+                        .filter(|item| {
+                            !shared && item.classification == VariableClassification::Public
+                        })
                         .and_then(|item| item.default.as_ref())
                         .map(|_| "public-default".into())
                 });
@@ -212,8 +216,13 @@ impl PolicyDocument {
                     selected_source,
                     description: contract.and_then(|item| item.description.clone()),
                     setup_hint: contract.and_then(|item| item.setup_hint.clone()),
-                    next_action: (state == VariableReadinessState::Missing)
-                        .then(|| format!("locket set {key}")),
+                    next_action: (state == VariableReadinessState::Missing).then(|| {
+                        if shared {
+                            format!("locket set {key} --project @shared")
+                        } else {
+                            format!("locket set {key}")
+                        }
+                    }),
                     warning,
                 }
             })
@@ -244,7 +253,7 @@ impl PolicyDocument {
         policy: &CommandPolicy,
         env: &crate::EnvMap,
     ) -> Result<(), PolicyParseError> {
-        for name in &policy.allowed_secrets {
+        for name in policy.allowed_secrets.iter().chain(&policy.shared_secrets) {
             if let (Some(contract), Some(value)) =
                 (self.variables.get(name.as_str()), env.get(name.as_str()))
             {

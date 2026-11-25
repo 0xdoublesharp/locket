@@ -47,8 +47,6 @@ use locket_core::dotenv::{DotenvOptions, parse_dotenv};
 pub struct RuntimeExecutionRequest<'a> {
     /// The opened backing store used to track the runtime session.
     pub store: &'a Store,
-    /// Project resolved for the active working directory.
-    pub resolved: &'a ResolvedProject,
     /// Profile whose secrets are being injected.
     pub profile: &'a ProfileRecord,
     /// Optional policy name when the execution is policy-driven.
@@ -60,12 +58,14 @@ pub struct RuntimeExecutionRequest<'a> {
     /// Optional working directory to apply when spawning.
     pub current_dir: Option<&'a Path>,
     /// Optional live grant request for policy-driven `locket run`.
-    pub run_policy_grant: Option<RunPolicyGrantRequest>,
+    pub run_policy_grant: Option<RunPolicyGrantRequest<'a>>,
 }
 
 /// Policy-grant data needed before spawning a runtime child.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RunPolicyGrantRequest {
+#[derive(Clone, Copy, Debug)]
+pub struct RunPolicyGrantRequest<'a> {
+    /// Trusted project configuration used to refresh the policy.
+    pub resolved: &'a ResolvedProject,
     /// Live grant TTL from the command policy.
     pub ttl_seconds: u64,
 }
@@ -358,13 +358,15 @@ pub fn run_command_with_diagnostics(
         context,
         &RuntimeExecutionRequest {
             store: &store,
-            resolved: &resolved,
             profile: &profile,
             policy_name: Some(&policy.name),
             secret_names: &prepared_policy.secret_names,
             prepared: &prepared_policy.prepared,
             current_dir: Some(&context.cwd),
-            run_policy_grant: Some(RunPolicyGrantRequest { ttl_seconds: policy.ttl.as_secs() }),
+            run_policy_grant: Some(RunPolicyGrantRequest {
+                resolved: &resolved,
+                ttl_seconds: policy.ttl.as_secs(),
+            }),
         },
         protection,
     )?;
@@ -691,6 +693,7 @@ pub(crate) fn runner_policy_name_for_tests(runner: &str, args: &[String]) -> Str
 /// Names whose availability can be checked without running external commands.
 pub struct RequiredVariableAvailability {
     pub missing: Vec<String>,
+    pub missing_shared: Vec<String>,
     pub unknown: Vec<String>,
 }
 
@@ -749,9 +752,15 @@ pub fn required_variable_availability(
     )
     .map_err(|_| invalid_policy_error("environment resolution failed"))?;
     external_names.extend(inherited.into_keys());
-    let mut result = RequiredVariableAvailability { missing: Vec::new(), unknown: Vec::new() };
+    let mut result = RequiredVariableAvailability {
+        missing: Vec::new(),
+        missing_shared: Vec::new(),
+        unknown: Vec::new(),
+    };
     for selection in selections {
-        if selection.required
+        if selection.shared && selection.selected.is_none() {
+            result.missing_shared.push(selection.name);
+        } else if selection.required
             && selection.selected.is_none()
             && !external_names.contains(&selection.name)
         {
@@ -775,9 +784,7 @@ fn prepare_policy_execution(
     protect_output: bool,
 ) -> Result<PreparedPolicyExecution, CliError> {
     let selections = policy_secret_selections(store, resolved, profile, policy)?;
-    for secret in selections.iter().filter_map(|selection| selection.selected.as_ref()) {
-        crate::commands::secrets::expiry::check_secret_expiry(store, &secret.id)?;
-    }
+    check_policy_secret_availability(store, &selections)?;
     ensure_agent_running_for_execution(context)?;
     let parent_env = std::env::vars()
         .map(|(name, value)| (name, locket_exec::env_value(value)))
@@ -808,11 +815,21 @@ fn prepare_policy_execution(
     )?;
     write_configuration_warnings(resolved, policy, output)?;
 
-    let locket_env = if let Some(agent_access) = agent_access.as_ref() {
-        policy_locket_env_via_agent(context, resolved, profile, policy, &selections, agent_access)?
-    } else {
-        policy_locket_env(context, store, resolved, profile, &selections)?
-    };
+    let mut locket_env = policy_locket_env(
+        context,
+        store,
+        selections.iter().filter(|selection| selection.shared || agent_access.is_none()),
+    )?;
+    if let Some(agent_access) = agent_access.as_ref() {
+        locket_env.extend(policy_locket_env_via_agent(
+            context,
+            resolved,
+            profile,
+            policy,
+            &selections,
+            agent_access,
+        )?);
+    }
     warn_implicit_locket_override_conflicts(
         output,
         policy,
@@ -849,12 +866,7 @@ fn prepare_policy_execution(
         selections
             .iter()
             .filter_map(|selection| selection.selected.as_ref().map(|secret| secret.name.as_str()))
-            .chain(external_env_names.iter().map(String::as_str)),
-    );
-    let secret_names = unique_secret_names(
-        secret_names
-            .iter()
-            .map(String::as_str)
+            .chain(external_env_names.iter().map(String::as_str))
             .chain(reference_secret_names.iter().map(String::as_str))
             .chain(
                 policy
@@ -875,6 +887,27 @@ fn prepare_policy_execution(
         protection_inputs,
         prepared,
     })
+}
+
+fn check_policy_secret_availability(
+    store: &Store,
+    selections: &[PolicySecretSelection],
+) -> Result<(), CliError> {
+    let missing_shared = selections
+        .iter()
+        .filter(|selection| selection.shared && selection.selected.is_none())
+        .map(|selection| selection.name.as_str())
+        .collect::<Vec<_>>();
+    if !missing_shared.is_empty() {
+        return Err(invalid_policy_error(format!(
+            "required secret(s) missing from @shared: {}",
+            missing_shared.join(", ")
+        )));
+    }
+    for secret in selections.iter().filter_map(|selection| selection.selected.as_ref()) {
+        crate::commands::secrets::expiry::check_secret_expiry(store, &secret.id)?;
+    }
+    Ok(())
 }
 
 pub fn resolve_policy_external_env(
@@ -1271,22 +1304,19 @@ fn compose_env_value_as_string(value: &serde_json::Value) -> Option<String> {
     }
 }
 
-fn policy_locket_env(
+fn policy_locket_env<'a>(
     context: &RuntimeContext,
     store: &Store,
-    resolved: &ResolvedProject,
-    profile: &ProfileRecord,
-    selections: &[PolicySecretSelection],
+    selections: impl Iterator<Item = &'a PolicySecretSelection>,
 ) -> Result<locket_exec::EnvMap, CliError> {
     let mut locket_env = locket_exec::EnvMap::new();
     for selection in selections {
         if let Some(secret) = &selection.selected {
-            crate::commands::secrets::expiry::check_secret_expiry(store, &secret.id)?;
             let value = decrypt_secret_version(
                 context,
                 store,
-                resolved.config.project_id.as_str(),
-                &profile.id,
+                &secret.project_id,
+                &secret.profile_id,
                 secret,
                 secret.current_version,
             )?;
@@ -1306,7 +1336,7 @@ fn policy_locket_env_via_agent(
 ) -> Result<locket_exec::EnvMap, CliError> {
     let mut locket_env = locket_exec::EnvMap::new();
     for selection in selections {
-        if selection.selected.is_some() {
+        if !selection.shared && selection.selected.is_some() {
             let reference = format!("lk://{}/{}", profile.name, selection.name);
             let response = resolve_reference_via_agent(
                 context,
@@ -1333,7 +1363,7 @@ fn prepare_agent_policy_access(
     crate::commands::policy::refresh_command_policy_for_run(context, resolved, &policy.name)?;
     let binding = agent_grant_binding()?.with_execution(&policy.name, context.cwd.canonicalize()?);
     let needs_reference_grant = policy_command_has_lk_references(policy)
-        || selections.iter().any(|s| s.selected.is_some())
+        || selections.iter().any(|s| !s.shared && s.selected.is_some())
         || policy_has_ide_source(policy);
     let resolve_grant_id = if needs_reference_grant {
         Some(
@@ -1764,7 +1794,7 @@ fn execute_runtime_child(
     }
     let run_policy_grant = request
         .run_policy_grant
-        .map(|grant| request_run_policy_grant(context, request, grant.ttl_seconds))
+        .map(|grant| request_run_policy_grant(context, request, grant))
         .transpose()?;
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -1777,7 +1807,7 @@ fn execute_runtime_child(
     let process_id = child.id();
     let session = RuntimeSessionRecord {
         id: session_id,
-        project_id: request.resolved.config.project_id.to_string(),
+        project_id: request.profile.project_id.clone(),
         profile_id: request.profile.id.clone(),
         policy_name: request.policy_name.map(ToOwned::to_owned),
         process_id,
@@ -1848,8 +1878,9 @@ struct RunPolicyGrantResponse {
 fn request_run_policy_grant(
     context: &RuntimeContext,
     request: &RuntimeExecutionRequest<'_>,
-    ttl_seconds: u64,
+    grant: RunPolicyGrantRequest<'_>,
 ) -> Result<RunPolicyGrant, CliError> {
+    let ttl_seconds = grant.ttl_seconds;
     let policy_name =
         request.policy_name.ok_or_else(|| invalid_policy_error("run grant needs a policy"))?;
     let cwd = request.current_dir.unwrap_or(&context.cwd).canonicalize()?;
@@ -1863,15 +1894,16 @@ fn request_run_policy_grant(
             metadata: RunPolicyGrantMetadata { ttl_seconds, binding },
         });
     }
-    #[cfg(not(test))]
-    crate::commands::policy::refresh_command_policy_for_run(
-        context,
-        request.resolved,
-        policy_name,
-    )?;
+    if cfg!(not(test)) {
+        crate::commands::policy::refresh_command_policy_for_run(
+            context,
+            grant.resolved,
+            policy_name,
+        )?;
+    }
 
     let payload = locket_agent::RequestGrantPayload {
-        project_id: request.resolved.config.project_id.to_string(),
+        project_id: grant.resolved.config.project_id.to_string(),
         profile_id: request.profile.id.clone(),
         policy_name: Some(policy_name.to_owned()),
         action: locket_agent::GrantAction::RunPolicy,

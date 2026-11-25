@@ -281,6 +281,9 @@ pub fn shared_command(
     Ok(0)
 }
 
+pub const SHARED_PROJECT_PREFIX: &str = "lk_proj_shared_";
+pub const GLOBAL_VAULT: &str = "@shared";
+
 fn shared_init(context: &RuntimeContext, name: &str) -> Result<Value, CliError> {
     if name.is_empty() || name.trim() != name || name.chars().any(char::is_control) {
         return Err(metadata_invalid_error("invalid shared project name"));
@@ -290,7 +293,7 @@ fn shared_init(context: &RuntimeContext, name: &str) -> Result<Value, CliError> 
     let transaction =
         Transaction::new_unchecked(store.connection(), TransactionBehavior::Immediate)
             .map_err(StoreError::from)?;
-    let prefix = "lk_proj_shared_";
+    let prefix = SHARED_PROJECT_PREFIX;
     match store.resolve_project_selector(name)? {
         ProjectSelectorResolution::Found(project)
             if project.id.starts_with(prefix) && project.name == name =>

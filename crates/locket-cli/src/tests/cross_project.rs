@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs;
-use std::io::Cursor;
+use std::io::{Cursor, Write};
 use std::sync::{Arc, Mutex};
 
 use clap::Parser;
@@ -63,6 +63,160 @@ fn json_run(context: &RuntimeContext, args: &[&str]) -> Result<(u8, Value), Box<
 
 fn init(context: &RuntimeContext, name: &str) -> Result<(), Box<dyn Error>> {
     run(context, &["init", "--name", name, "--profile", "dev", "--no-device", "--no-passkey"])?;
+    Ok(())
+}
+
+#[test]
+fn exec_injects_shared_secret_from_outside_a_project() -> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let context = RuntimeContext {
+        key_store: Arc::new(ProjectKeys::default()),
+        ..test_context_with_secret_value(&directory, CANARY)
+    };
+    run(&context, &["shared", "init"])?;
+    run(&context, &["set", "GLOBAL_TOKEN", "--project", "@shared"])?;
+    assert!(!directory.path().join("locket.toml").exists());
+    let (code, output) = run(
+        &context,
+        &[
+            "exec",
+            "--project",
+            "@shared",
+            "--profile",
+            "default",
+            "--secret",
+            "GLOBAL_TOKEN",
+            "--",
+            super::test_shell(),
+            "-c",
+            &format!("test \"$GLOBAL_TOKEN\" = '{CANARY}'"),
+        ],
+    )?;
+    assert_eq!(code, 0);
+    assert!(!output.contains(CANARY));
+    let store = crate::open_store(&context)?;
+    let (project_id, metadata): (String, String) = store.connection().query_row(
+        "SELECT project_id, metadata_json FROM audit_log WHERE action = 'EXEC'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert!(project_id.starts_with("lk_proj_shared_"));
+    assert!(metadata.contains("GLOBAL_TOKEN"));
+    assert!(!metadata.contains(CANARY));
+    Ok(())
+}
+
+#[test]
+fn explicit_exec_uses_the_selected_profile_and_enforces_project_acls_from_outside()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let outside = test_context_with_secret_value(&directory, CANARY);
+    let root = outside.cwd.join("work");
+    fs::create_dir(&root)?;
+    let inside = RuntimeContext { cwd: root.clone(), ..outside.clone() };
+    init(&inside, "PrivateApp")?;
+    run(&inside, &["profile", "create", "ci"])?;
+    run(&outside, &["set", "TOKEN", "--project", "PrivateApp", "--profile", "ci"])?;
+    let command = format!("test \"$TOKEN\" = '{CANARY}' && test ! -e locket.toml");
+    let args = [
+        "exec",
+        "--project",
+        "PrivateApp",
+        "--profile",
+        "ci",
+        "--secret",
+        "TOKEN",
+        "--",
+        super::test_shell(),
+        "-c",
+        &command,
+    ];
+    assert_eq!(run(&outside, &args)?.0, 0);
+    fs::OpenOptions::new()
+        .append(true)
+        .open(root.join("locket.toml"))?
+        .write_all(b"\n[secrets.TOKEN]\nallow_paths=['**']\n")?;
+    assert!(run(&outside, &args).is_err_and(|error| error.to_string().contains("ACL denied")));
+    Ok(())
+}
+
+#[test]
+fn run_and_inspect_resolve_required_shared_secrets_from_the_global_vault()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let outside = RuntimeContext {
+        key_store: Arc::new(ProjectKeys::default()),
+        ..test_context_with_secret_value(&directory, CANARY)
+    };
+    let root = outside.cwd.join("work");
+    fs::create_dir(&root)?;
+    let inside = RuntimeContext { cwd: root.clone(), ..outside.clone() };
+    init(&inside, "PrivateApp")?;
+    crate::set_secret_value(
+        &inside,
+        &super::test_secret_write_args("LOCAL_TOKEN"),
+        "project-fixture",
+        "manual",
+        1000,
+    )?;
+    crate::set_secret_value(
+        &inside,
+        &super::test_secret_write_args("GLOBAL_TOKEN"),
+        "wrong-vault",
+        "manual",
+        2000,
+    )?;
+    let file = root.join("locket.toml");
+    let initial = fs::read_to_string(&file)?;
+    let script =
+        format!("test \"$GLOBAL_TOKEN\" = '{CANARY}' && test \"$LOCAL_TOKEN\" = 'project-fixture'");
+    let argv = toml::Value::try_from(vec![super::test_shell(), "-c", &script])?;
+    fs::write(
+        &file,
+        format!(
+            "{initial}
+[commands.check]
+argv={argv}
+required_secrets=['LOCAL_TOKEN']
+shared_secrets=['GLOBAL_TOKEN']
+[variables.GLOBAL_TOKEN]
+classification='public'
+default='wrong-fallback'
+"
+        ),
+    )?;
+
+    let (_, missing) = run(&inside, &["env", "inspect", "--policy", "check"])?;
+    assert!(missing.contains("configuration GLOBAL_TOKEN state=Missing source=none"));
+    assert!(missing.contains("locket set GLOBAL_TOKEN --project @shared"));
+    let error = run(&inside, &["run", "check"]).err().ok_or("expected missing shared secret")?;
+    assert!(error.to_string().contains("missing from @shared: GLOBAL_TOKEN"));
+    assert!(!error.to_string().contains("wrong-vault"));
+
+    run(&outside, &["shared", "init"])?;
+    run(&outside, &["set", "GLOBAL_TOKEN", "--project", "@shared"])?;
+    let (_, readiness) = run(&inside, &["env", "inspect", "--policy", "check"])?;
+    assert!(readiness.contains("configuration GLOBAL_TOKEN state=Ready source=@shared"));
+    assert!(!readiness.contains(CANARY));
+    assert!(!readiness.contains("wrong-vault"));
+    assert_eq!(run(&inside, &["run", "check"])?.0, 0);
+
+    let store = crate::open_store(&inside)?;
+    let metadata: String = store.connection().query_row(
+        "SELECT metadata_json FROM audit_log WHERE action = 'RUN_POLICY' AND status = 'SUCCESS'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert!(metadata.contains(r#""selected_source":"@shared""#));
+    assert!(!metadata.contains(CANARY));
+
+    fs::OpenOptions::new()
+        .append(true)
+        .open(file)?
+        .write_all(b"\n[secrets.GLOBAL_TOKEN]\nallow_commands=['other']\n")?;
+    for args in [&["env", "inspect", "--policy", "check"][..], &["run", "check"][..]] {
+        assert!(run(&inside, args).is_err_and(|error| error.to_string().contains("ACL denied")));
+    }
     Ok(())
 }
 

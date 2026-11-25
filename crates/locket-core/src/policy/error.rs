@@ -112,6 +112,14 @@ pub enum PolicyParseError {
         /// Conflicting secret name.
         name: String,
     },
+    /// A command requests the same name from both vaults.
+    #[error("command {command} secret {name} cannot be both a shared and a project secret")]
+    SharedAndProjectSecret {
+        /// Command policy name.
+        command: String,
+        /// Conflicting secret name.
+        name: String,
+    },
     /// `env_mode` was not a supported string.
     #[error("command {command} has invalid env_mode {value}")]
     InvalidEnvMode {
