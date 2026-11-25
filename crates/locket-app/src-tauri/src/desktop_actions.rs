@@ -829,7 +829,7 @@ fn posix_terminal_command(cli: &Path, root: &Path, args: &[&str]) -> Vec<std::ff
     posix_terminal_command_for(LocketInstance::current(), cli, root, args)
 }
 
-#[cfg(any(target_os = "linux", all(test, unix)))]
+#[cfg(any(target_os = "linux", test))]
 fn posix_terminal_command_for(
     instance: LocketInstance,
     cli: &Path,

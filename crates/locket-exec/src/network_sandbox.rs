@@ -27,6 +27,7 @@ pub enum NetworkContainmentSupport {
 
 /// Returns the available network containment backend or the reason it is unavailable.
 #[must_use]
+#[allow(clippy::missing_const_for_fn)]
 pub fn network_containment_support() -> NetworkContainmentSupport {
     #[cfg(target_os = "macos")]
     if std::path::Path::new(SANDBOX_EXEC).is_file() {
