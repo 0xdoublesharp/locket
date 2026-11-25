@@ -147,7 +147,7 @@ const readiness = computed(() => ({
     <section class="dashboard__metrics" aria-label="Project summary">
       <button type="button" class="dashboard__metric" @click="emit('navigate', 'secrets')">
         <span class="dashboard__metric-label"
-          >Variables <AppIcon name="chevron-down" class="dashboard__metric-arrow" :size="14"
+          >Secrets <AppIcon name="chevron-down" class="dashboard__metric-arrow" :size="14"
         /></span>
         <strong>{{ secretsLoaded ? secrets.length : projectConnected ? 'Unknown' : '—' }}</strong>
         <span class="dashboard__metric-meta">{{

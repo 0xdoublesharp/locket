@@ -3,6 +3,8 @@ import { computed, nextTick, ref } from 'vue';
 
 import AppIcon from '../components/AppIcon.vue';
 import AgentUnavailableBanner from '../components/AgentUnavailableBanner.vue';
+import { desktopActionsAvailable, desktopCopyTextPlain } from '../agent/client';
+import { dotenvMigrationPrompt } from '../agent/agentPrompts';
 import type { AgentClientError } from '../agent/types';
 import { formatTime } from '../utils/formatTime';
 import CopyReference from '../components/CopyReference.vue';
@@ -25,6 +27,7 @@ interface Props {
   privacyMode: boolean;
   loading: boolean;
   metadataLoaded: boolean;
+  isShared?: boolean;
   actionGuidance?: string | null;
   lastRefreshedAt?: string;
 }
@@ -33,7 +36,7 @@ const props = defineProps<Props>();
 
 const emit = defineEmits<{
   (e: 'select', row: SecretRowMeta): void;
-  (e: 'refresh' | 'add' | 'retry' | 'start'): void;
+  (e: 'refresh' | 'add' | 'retry' | 'start' | 'openAgentSetup'): void;
   (e: 'copyValue' | 'revealValue', row: SecretRowMeta): void;
 }>();
 
@@ -112,6 +115,17 @@ const isFilteredEmpty = computed<boolean>(
   () => !props.loading && props.rows.length > 0 && filteredRows.value.length === 0,
 );
 
+const desktop = desktopActionsAvailable();
+const migrationMessage = ref('');
+
+async function copyMigrationPrompt(): Promise<void> {
+  migrationMessage.value = '';
+  const result = await desktopCopyTextPlain(dotenvMigrationPrompt({ isShared: props.isShared }));
+  migrationMessage.value = result.ok
+    ? 'Copied AI migration prompt.'
+    : 'Could not copy AI migration prompt.';
+}
+
 function displayName(row: SecretRowMeta): string {
   if (props.privacyMode) {
     return row.alias ?? row.name;
@@ -166,9 +180,9 @@ function graceDetails(row: SecretRowMeta): string {
     <header class="variables__header">
       <h2 id="secret-metadata-list-heading">
         <template v-if="metadataLoaded && !loadError">
-          {{ rows.length }} {{ rows.length === 1 ? 'variable' : 'variables' }} · {{ profileLabel }}
+          {{ rows.length }} {{ rows.length === 1 ? 'secret' : 'secrets' }} · {{ profileLabel }}
         </template>
-        <template v-else>Variables · {{ profileLabel }}</template>
+        <template v-else>Secrets · {{ profileLabel }}</template>
       </h2>
       <div class="variables__actions">
         <span v-if="lastRefreshedAt && !loadError" class="variables__updated">
@@ -180,8 +194,8 @@ function graceDetails(row: SecretRowMeta): string {
         <button
           class="companion-button icon-label"
           type="button"
-          aria-label="Refresh variables"
-          title="Refresh variables"
+          aria-label="Refresh secrets"
+          title="Refresh secrets"
           :disabled="loading || !connected"
           @click="emit('refresh')"
         >
@@ -189,6 +203,7 @@ function graceDetails(row: SecretRowMeta): string {
           <span class="variables__refresh-label">Refresh</span>
         </button>
         <button
+          v-if="!isEmpty || loadError || actionGuidance"
           class="companion-button icon-label"
           :class="{ 'companion-button--primary': connected }"
           type="button"
@@ -196,7 +211,7 @@ function graceDetails(row: SecretRowMeta): string {
           @click="emit('add')"
         >
           <AppIcon name="plus" />
-          Add variable
+          Add secret
         </button>
       </div>
     </header>
@@ -204,15 +219,49 @@ function graceDetails(row: SecretRowMeta): string {
     <AgentUnavailableBanner
       v-if="loadError"
       :error="loadError"
-      heading="Can't load variables"
+      heading="Can't load secrets"
       :retrying="loading"
       :can-start="canStart"
       :starting="starting"
       @retry="emit('retry')"
       @start="emit('start')"
     />
-    <p v-else-if="loading" class="variables__empty" role="status">Loading variable metadata…</p>
+    <p v-else-if="loading" class="variables__empty" role="status">Loading secret metadata…</p>
     <p v-else-if="actionGuidance" class="variables__empty" role="status">{{ actionGuidance }}</p>
+
+    <section
+      v-else-if="isEmpty"
+      class="variables__empty variables__onboarding"
+      aria-labelledby="variables-onboarding-heading"
+    >
+      <h3 id="variables-onboarding-heading">No secrets yet</h3>
+      <p>Add a secret or ask your AI agent to migrate existing <code>.env</code> files.</p>
+      <div class="variables__onboarding-actions">
+        <button
+          class="companion-button companion-button--primary icon-label"
+          type="button"
+          :disabled="!connected"
+          @click="emit('add')"
+        >
+          <AppIcon name="plus" />
+          Add a secret
+        </button>
+        <button
+          class="companion-button icon-label"
+          type="button"
+          :disabled="!desktop"
+          @click="copyMigrationPrompt"
+        >
+          <AppIcon name="copy" />
+          Copy AI migration prompt
+        </button>
+        <button class="companion-button icon-label" type="button" @click="emit('openAgentSetup')">
+          <AppIcon name="terminal" />
+          AI agent &amp; MCP setup
+        </button>
+      </div>
+      <p class="variables__migration-status" role="status">{{ migrationMessage }}</p>
+    </section>
 
     <template v-else>
       <div class="variables__toolbar">
@@ -221,10 +270,10 @@ function graceDetails(row: SecretRowMeta): string {
           <input
             v-model="searchQuery"
             type="search"
-            aria-label="Search variable metadata"
+            aria-label="Search secrets"
             autocomplete="off"
             spellcheck="false"
-            placeholder="Search variables"
+            placeholder="Search secrets"
           />
         </label>
         <button
@@ -274,14 +323,8 @@ function graceDetails(row: SecretRowMeta): string {
         </div>
       </div>
 
-      <p v-if="isEmpty" class="variables__empty">
-        No variables in this environment yet. You can add one here or run
-        <code>locket set &lt;KEY&gt;</code> or <code>locket import &lt;file.env&gt;</code>.
-      </p>
-      <p v-else-if="isFilteredEmpty" class="variables__empty" role="status">
-        No matching variables.
-      </p>
-      <ul v-else class="variables__list" aria-label="Variable metadata">
+      <p v-if="isFilteredEmpty" class="variables__empty" role="status">No matching secrets.</p>
+      <ul v-else class="variables__list" aria-label="Secret metadata">
         <li
           v-for="row in filteredRows"
           :key="row.id"
@@ -366,7 +409,7 @@ function graceDetails(row: SecretRowMeta): string {
               v-if="canAccessValues"
               class="variables__sensitive"
               role="group"
-              aria-label="Variable value"
+              aria-label="Secret value"
             >
               <button
                 class="companion-button icon-label"
@@ -405,7 +448,7 @@ function graceDetails(row: SecretRowMeta): string {
             aria-labelledby="variable-inspector-title"
           >
             <header class="variable-inspector__header">
-              <h3 id="variable-inspector-title">Variable details</h3>
+              <h3 id="variable-inspector-title">Secret details</h3>
               <button
                 class="companion-button icon-label"
                 type="button"
@@ -570,6 +613,26 @@ function graceDetails(row: SecretRowMeta): string {
   background: var(--bg-surface);
   color: var(--text-secondary);
   font-size: 0.875rem;
+}
+.variables__onboarding {
+  display: grid;
+  gap: 0.65rem;
+}
+.variables__onboarding h3,
+.variables__onboarding p {
+  margin: 0;
+}
+.variables__onboarding h3 {
+  color: var(--text-primary);
+  font-size: 0.95rem;
+}
+.variables__onboarding-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+.variables__migration-status:empty {
+  position: absolute;
 }
 .variables__list {
   margin: 0;

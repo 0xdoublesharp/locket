@@ -47,6 +47,7 @@ import {
   recoveryRotate,
   desktopActionsAvailable,
   desktopCopyTextPlain,
+  desktopMcpConfigSnippet,
   desktopPickDirectory,
   previewParams,
   desktopListProjects,
@@ -69,6 +70,7 @@ import {
   verifyAudit,
   verifyBundle,
 } from './agent/client';
+import { dotenvMigrationPrompt, mcpClientSnippets } from './agent/agentPrompts';
 import type { SetSecretRequest, SetSecretResponse } from './agent/client';
 import type { PolicyFormMode } from './policy/form';
 import { rememberTarget, type ProfileSwitchState } from './profile/switcher';
@@ -187,6 +189,19 @@ watch(desktopNotice, (message) => {
 const unlockOpen = ref(false);
 const unlockBusy = ref(false);
 const unlockError = ref<string | null>(null);
+const unlockWithPassphrase = ref(false);
+const unlockRequests = createRequestLifetime();
+watch(
+  selectionGeneration,
+  () => {
+    unlockRequests.invalidate();
+    unlockBusy.value = false;
+    unlockOpen.value = false;
+    unlockError.value = null;
+    unlockWithPassphrase.value = false;
+  },
+  { flush: 'sync' },
+);
 const envPath = ref('.env');
 const importOverwrite = ref(false);
 const importConfirmation = ref('');
@@ -270,7 +285,7 @@ const secondaryItems = computed<Array<{ key: ViewKey; label: string }>>(() => {
       { key: 'secrets', label: 'Secrets' },
       { key: 'secret-editor', label: 'Add or import' },
       { key: 'discover', label: 'Discover' },
-      ...(selectedSecret.value ? [{ key: 'versions' as const, label: 'Variable history' }] : []),
+      ...(selectedSecret.value ? [{ key: 'versions' as const, label: 'Secret history' }] : []),
     ];
   if (['execution', 'audit', 'scan'].includes(currentView.value))
     return [
@@ -680,6 +695,21 @@ const selectedReference = computed(() =>
 const copyNotice = ref<string | null>(null);
 const copyRequests = createRequestLifetime();
 
+async function paletteMcpJson(): Promise<string> {
+  const snippet = await desktopMcpConfigSnippet();
+  if (snippet.ok && typeof snippet.value?.json === 'string') return snippet.value.json;
+  return mcpClientSnippets('locket', ['mcp']).json;
+}
+
+async function copyPaletteText(text: string | Promise<string>, label: string): Promise<void> {
+  const isCurrent = metadataClipboardRequests.begin();
+  const value = await text;
+  if (!isCurrent()) return;
+  const result = await desktopCopyTextPlain(value);
+  if (!isCurrent()) return;
+  paletteMessage.value = result.ok ? `Copied ${label}.` : `Could not copy ${label}.`;
+}
+
 type RunnablePaletteAction = PaletteAction & { run: () => void | Promise<void> };
 const paletteActions = computed<RunnablePaletteAction[]>(() => {
   const redact = settings.value.privacyRedactNames;
@@ -711,13 +741,36 @@ const paletteActions = computed<RunnablePaletteAction[]>(() => {
     });
   }
   actions.push({
-    id: 'add-variable',
+    id: 'add-secret',
     group: 'Quick actions',
     icon: 'plus',
     badge: 'Action',
-    label: 'Add variable',
+    label: 'Add secret',
     run: addVariable,
   });
+  if (desktopAvailable) {
+    actions.push(
+      {
+        id: 'copy-agent-prompt',
+        group: 'Quick actions',
+        icon: 'copy',
+        label: 'Copy AI agent .env migration prompt',
+        keywords: 'dotenv import claude codex',
+        run: () =>
+          copyPaletteText(
+            dotenvMigrationPrompt({ isShared: selectedIsShared.value }),
+            'AI migration prompt',
+          ),
+      },
+      {
+        id: 'copy-mcp-json',
+        group: 'Quick actions',
+        icon: 'copy',
+        label: 'Copy MCP config JSON',
+        run: () => copyPaletteText(paletteMcpJson(), 'MCP JSON'),
+      },
+    );
+  }
   actions.push({
     id: 'project:shared',
     group: 'Projects',
@@ -727,7 +780,7 @@ const paletteActions = computed<RunnablePaletteAction[]>(() => {
     detail: 'Personal secrets across projects and MCP',
     keywords: 'shared global vault personal',
     run: async () => {
-      if (await openSharedVault()) selectView('secrets');
+      if (await openSharedVault({ autoUnlock: !hasSharedVault.value })) selectView('secrets');
     },
   });
   knownFolderProjects.value.forEach((project, index) => {
@@ -748,10 +801,10 @@ const paletteActions = computed<RunnablePaletteAction[]>(() => {
   secretRows.value.forEach((row, index) => {
     const name = secretLabel(row, redact);
     actions.push({
-      id: `variable:${index}`,
-      group: 'Variables',
+      id: `secret:${index}`,
+      group: 'Secrets',
       icon: 'key',
-      badge: 'Variable',
+      badge: 'Secret',
       label: name,
       run: () => selectSecret(row),
     });
@@ -759,7 +812,7 @@ const paletteActions = computed<RunnablePaletteAction[]>(() => {
     if (reference) {
       actions.push({
         id: `reference:${index}`,
-        group: 'Variables',
+        group: 'Secrets',
         icon: 'link',
         badge: 'Reference',
         label: `Copy ${reference}`,
@@ -795,7 +848,7 @@ watch(
 async function openDiscoveredProject(row: DiscoveredSecretWire): Promise<void> {
   const known = knownProjects.value.find((project) => project.project_id === row.project_id);
   if (known?.is_shared) {
-    if (await openSharedVault(known.project_id)) selectView('secrets');
+    if (await openSharedVault({ projectId: known.project_id })) selectView('secrets');
     return;
   }
   const root =
@@ -1041,7 +1094,9 @@ async function handleCopySelectedSecret(): Promise<void> {
 }
 
 async function triggerVerify(): Promise<void> {
+  const generation = selectionGeneration.value;
   await refresh();
+  if (generation !== selectionGeneration.value) return;
   await Promise.all([
     refreshSecrets(),
     refreshVersions(),
@@ -1050,7 +1105,7 @@ async function triggerVerify(): Promise<void> {
     refreshPolicies(),
     refreshAuditLog(),
   ]);
-  await verifyAuditChain();
+  if (generation === selectionGeneration.value) await verifyAuditChain();
 }
 
 function nowUnixNanos(): number {
@@ -1573,10 +1628,15 @@ async function refreshAuditLog(): Promise<void> {
 
 async function verifyAuditChain(): Promise<void> {
   const request = auditRequest.value;
+  const generation = selectionGeneration.value;
   auditChainOk.value = null;
   if (request === null) return;
   const result = await verifyAudit({ project_id: request.project_id });
-  if (auditRequest.value?.project_id !== request.project_id) return;
+  if (
+    generation !== selectionGeneration.value ||
+    auditRequest.value?.project_id !== request.project_id
+  )
+    return;
   if (!result.ok) {
     auditChainOk.value = null;
     auditError.value = actionError(result.error);
@@ -1793,7 +1853,7 @@ async function refreshProjectConnections(): Promise<void> {
       : initialProjectSelection(result.value, selectedProject.value);
     if (!selectedProject.value && initial) {
       if (initial.is_shared) {
-        await openSharedVault(initial.project_id);
+        await openSharedVault({ projectId: initial.project_id });
       } else {
         await connectProject(false, initial.root);
       }
@@ -1802,7 +1862,10 @@ async function refreshProjectConnections(): Promise<void> {
     desktopError.value = actionError(result.error);
 }
 
-async function openSharedVault(projectId?: string): Promise<boolean> {
+async function openSharedVault({
+  projectId,
+  autoUnlock = false,
+}: { projectId?: string; autoUnlock?: boolean } = {}): Promise<boolean> {
   if (desktopBusy.value) return false;
   selectionGeneration.value++;
   profileSwitchInProgress.value = false;
@@ -1814,20 +1877,25 @@ async function openSharedVault(projectId?: string): Promise<boolean> {
   desktopError.value = null;
   desktopNotice.value = null;
   const result = await desktopOpenSharedVault(projectId ? { project_id: projectId } : undefined);
-  if (result.ok) {
-    const showPreviewUnlock = !selectedProject.value && previewParams?.get('modal') === 'unlock';
-    selectedProject.value = result.value;
-    selectedSecret.value = null;
-    unlockOpen.value = showPreviewUnlock;
-    projectPath.value = '';
-    if (currentView.value === 'dashboard' || currentView.value === 'profiles') {
-      currentView.value = 'secrets';
-    }
-    await refreshProjectConnections();
-    await refresh();
-  } else desktopError.value = actionError(result.error);
+  if (!result.ok) {
+    desktopError.value = actionError(result.error);
+    desktopBusy.value = false;
+    return false;
+  }
+  const showPreviewUnlock = !selectedProject.value && previewParams?.get('modal') === 'unlock';
+  selectedProject.value = result.value;
+  const generation = selectionGeneration.value;
+  selectedSecret.value = null;
+  unlockOpen.value = showPreviewUnlock;
+  projectPath.value = '';
+  if (autoUnlock || currentView.value === 'dashboard' || currentView.value === 'profiles') {
+    currentView.value = 'secrets';
+  }
+  await refreshProjectConnections();
+  await refresh();
   desktopBusy.value = false;
-  return result.ok;
+  if (autoUnlock) await unlockAfterOpening(generation);
+  return generation === selectionGeneration.value;
 }
 
 async function inspectAndConnectPath(rawPath = projectPath.value): Promise<void> {
@@ -1915,26 +1983,43 @@ async function connectProject(initialize = false, path = projectPath.value): Pro
   const result = initialize
     ? await desktopInitializeProject({ path: path.trim() })
     : await desktopOpenProject({ path: path.trim() });
-  if (result.ok) {
-    const showPreviewUnlock = !selectedProject.value && previewParams?.get('modal') === 'unlock';
-    selectedProject.value = result.value;
-    selectedSecret.value = null;
-    unlockOpen.value = showPreviewUnlock;
-    projectPath.value = result.value.root;
-    manualConnectOpen.value = false;
-    if (
-      wasUnconnected &&
+  if (!result.ok) {
+    desktopError.value = actionError(result.error);
+    desktopBusy.value = false;
+    return false;
+  }
+  const showPreviewUnlock = !selectedProject.value && previewParams?.get('modal') === 'unlock';
+  selectedProject.value = result.value;
+  const generation = selectionGeneration.value;
+  selectedSecret.value = null;
+  unlockOpen.value = showPreviewUnlock;
+  projectPath.value = result.value.root;
+  manualConnectOpen.value = false;
+  if (
+    initialize ||
+    (wasUnconnected &&
       currentView.value === 'dashboard' &&
-      (!previewParams || previewParams.get('state') === 'welcome')
-    ) {
-      currentView.value = 'secrets';
-    }
-    await refreshProjectConnections();
-    await refresh();
-  } else desktopError.value = actionError(result.error);
+      (!previewParams || previewParams.get('state') === 'welcome'))
+  ) {
+    currentView.value = 'secrets';
+  }
+  await refreshProjectConnections();
+  await refresh();
   desktopBusy.value = false;
-  return result.ok;
+  if (initialize) await unlockAfterOpening(generation);
+  return generation === selectionGeneration.value;
 }
+
+async function unlockAfterOpening(generation: number): Promise<void> {
+  if (
+    generation === selectionGeneration.value &&
+    agentOnline.value &&
+    lockLabel.value === 'Locked'
+  ) {
+    await handleUnlock({ kind: 'os-keychain' }, 'silent');
+  }
+}
+
 async function retryVariables(): Promise<void> {
   if (error.value) await refresh();
   if (!error.value) await refreshSecrets();
@@ -1955,34 +2040,45 @@ async function startAgent(): Promise<void> {
   }
   desktopBusy.value = false;
 }
-function openUnlock(): void {
+function openUnlock(preferPassphrase = false): void {
   unlockError.value = null;
   if (!projectConnected.value) {
     currentView.value = 'dashboard';
     desktopError.value = 'Connect a project before unlocking.';
     return;
   }
+  unlockWithPassphrase.value = preferPassphrase;
   unlockOpen.value = true;
 }
-async function handleUnlock(source: UnlockRequest['source']): Promise<void> {
+async function handleUnlock(
+  source: UnlockRequest['source'],
+  onError: 'show' | 'open-modal' | 'silent' = 'show',
+): Promise<void> {
   const projectId = selectedProject.value?.project_id ?? status.value?.project_id;
-  if (!projectId || unlockBusy.value) return;
+  if (!projectId || unlockBusy.value || desktopBusy.value) return;
+  const isCurrent = unlockRequests.begin();
   unlockBusy.value = true;
   unlockError.value = null;
   const profileId = selectedProject.value?.profile_id;
-  const result = await unlockVault({
-    project_id: projectId,
-    ttl_seconds: unlockTtl(settings.value.unlockTtlSeconds),
-    source,
-    ...(profileId ? { audit: { profile_id: profileId } } : {}),
-  });
-  if (source.kind === 'passphrase') source.passphrase = '';
-  if (result.ok) {
-    unlockOpen.value = false;
-    await refresh();
-    await triggerVerify();
-  } else unlockError.value = actionError(result.error);
-  unlockBusy.value = false;
+  try {
+    const result = await unlockVault({
+      project_id: projectId,
+      ttl_seconds: unlockTtl(settings.value.unlockTtlSeconds),
+      source,
+      ...(profileId ? { audit: { profile_id: profileId } } : {}),
+    });
+    if (source.kind === 'passphrase') source.passphrase = '';
+    if (!isCurrent()) return;
+    if (result.ok) {
+      unlockOpen.value = false;
+      await triggerVerify();
+    } else if (onError !== 'silent') {
+      if (onError === 'open-modal') openUnlock();
+      unlockError.value = actionError(result.error);
+    }
+  } finally {
+    if (isCurrent()) unlockBusy.value = false;
+  }
 }
 async function importEnv(): Promise<void> {
   const projectId = selectedProject.value?.project_id ?? status.value?.project_id;
@@ -2083,6 +2179,7 @@ onBeforeUnmount(() => {
   copyRequests.dispose();
   settingsRequests.dispose();
   scanRequests.dispose();
+  unlockRequests.dispose();
   scanLaunching.value = false;
   scanError.value = null;
   scanNotice.value = null;
@@ -2144,7 +2241,7 @@ onUnmounted(() => {
                 class="shell__switcher-item"
                 :aria-current="selectedIsShared ? 'true' : undefined"
                 :disabled="desktopBusy || !desktopAvailable"
-                @click="openSharedVault()"
+                @click="openSharedVault({ autoUnlock: !hasSharedVault })"
               >
                 <AppIcon name="key" :size="14" />
                 <span class="shell__switcher-text">
@@ -2350,18 +2447,28 @@ onUnmounted(() => {
           <AppIcon name="lock" :size="16" />
           <span>
             <strong>{{ switcherLabel }} is locked.</strong>
-            Unlock with your keychain or passphrase to view and edit secrets.
+            Unlock to view and edit secrets.
           </span>
         </div>
-        <button
-          type="button"
-          class="companion-button companion-button--primary icon-label"
-          :disabled="!desktopAvailable || unlockBusy"
-          @click="openUnlock"
-        >
-          <AppIcon name="unlock" />
-          Unlock
-        </button>
+        <div class="shell__unlock-actions">
+          <button
+            type="button"
+            class="companion-button companion-button--primary icon-label"
+            :disabled="!desktopAvailable || desktopBusy || unlockBusy"
+            @click="handleUnlock({ kind: 'os-keychain' }, 'open-modal')"
+          >
+            <AppIcon name="unlock" />
+            Unlock with keychain
+          </button>
+          <button
+            type="button"
+            class="companion-button"
+            :disabled="!desktopAvailable || desktopBusy || unlockBusy"
+            @click="openUnlock(true)"
+          >
+            Use passphrase
+          </button>
+        </div>
       </div>
       <section
         v-if="currentView === 'secret-editor'"
@@ -2419,7 +2526,7 @@ onUnmounted(() => {
               (settings.dangerousProfileFlag && importConfirmation !== activeContext?.profile_name)
             "
           >
-            {{ desktopBusy ? 'Importing…' : 'Import variables' }}
+            {{ desktopBusy ? 'Importing…' : 'Import secrets' }}
           </button>
         </form>
       </section>
@@ -2507,7 +2614,7 @@ onUnmounted(() => {
             pendingInitFolder = null;
           }
         "
-        @open-shared="openSharedVault()"
+        @open-shared="openSharedVault({ autoUnlock: true })"
         @pick-folder="handleWelcomePickFolder"
         @connect-path="inspectAndConnectPath()"
         @confirm-init="confirmInitializeFolder"
@@ -2515,7 +2622,7 @@ onUnmounted(() => {
         @open-known="
           (project) =>
             project.is_shared
-              ? openSharedVault(project.project_id)
+              ? openSharedVault({ projectId: project.project_id, autoUnlock: true })
               : connectProject(false, project.root)
         "
         @start-agent="startAgent"
@@ -2664,6 +2771,7 @@ onUnmounted(() => {
         :copy-verification="settings.verification?.copy"
         :last-refreshed-at="secretsLastRefreshed"
         :metadata-loaded="secretAccess.enabled"
+        :is-shared="selectedIsShared"
         :action-guidance="secretAccess.guidance"
         @select="selectSecret"
         @copy-value="handleListCopy"
@@ -2672,6 +2780,7 @@ onUnmounted(() => {
         @retry="retryVariables"
         @start="startAgent"
         @add="addVariable"
+        @open-agent-setup="selectView('settings')"
       />
 
       <DiscoverSecrets
@@ -2707,7 +2816,7 @@ onUnmounted(() => {
         <div
           v-if="selectedSecret && secretAccess.enabled"
           class="shell__toolbar"
-          aria-label="Variable actions"
+          aria-label="Secret actions"
         >
           <CopyReference :reference="selectedReference" />
           <button type="button" @click="handleCopySelectedSecret">Copy value</button>
@@ -2891,6 +3000,7 @@ onUnmounted(() => {
       :project-label="projectLabel"
       :busy="unlockBusy"
       :error-message="unlockError"
+      :prefer-passphrase="unlockWithPassphrase"
       @submit="handleUnlock"
       @dismiss="unlockOpen = false"
     />
@@ -3087,6 +3197,7 @@ html,
   gap: 0.55rem;
   font-size: 0.85rem;
   color: var(--text-secondary);
+  overflow-wrap: anywhere;
 }
 
 .shell__unlock-copy strong {
@@ -3096,6 +3207,12 @@ html,
 
 .shell__unlock-copy .app-icon {
   color: var(--accent);
+}
+
+.shell__unlock-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
 }
 
 .shell__context span:not(.shell__context-dot) {
@@ -3583,6 +3700,10 @@ html,
 }
 
 @media (max-width: 639px) {
+  .shell__unlock-actions .companion-button {
+    padding-inline: 0.5rem;
+  }
+
   .shell__masthead {
     position: relative;
   }

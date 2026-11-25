@@ -13,9 +13,9 @@ it('uses safe navigation for empty-query Enter and runs Lock vault when searched
     actions: [
       { id: 'vault', label: 'Lock vault', group: 'Actions' },
       { id: 'project', label: 'Project', group: 'Views' },
-      { id: 'add-variable', label: 'Add variable', group: 'Quick actions' },
+      { id: 'add-secret', label: 'Add secret', group: 'Quick actions' },
       { id: 'workspace', label: 'Workspace', group: 'Projects' },
-      { id: 'database', label: 'DATABASE_URL', group: 'Variables' },
+      { id: 'database', label: 'DATABASE_URL', group: 'Secrets' },
     ],
   });
   try {
@@ -26,7 +26,7 @@ it('uses safe navigation for empty-query Enter and runs Lock vault when searched
       options?.children
         .filter((node) => node.props.role === 'group')
         .map((node) => node.children[0]?.text),
-    ).toEqual(['Views', 'Quick actions', 'Projects', 'Variables', 'Actions']);
+    ).toEqual(['Views', 'Quick actions', 'Projects', 'Secrets', 'Actions']);
     const onKey = dialog!.props.onKeydown as (event: Partial<KeyboardEvent>) => void;
     const enter = {
       key: 'Enter',
@@ -60,8 +60,8 @@ it('filters actions, selects by arrow keys, executes with Enter, and closes with
     onExecute,
     actions: [
       { id: 'settings', label: 'Settings', group: 'Views', badge: 'View' },
-      { id: 'jump', label: 'DATABASE_URL', group: 'Variables', badge: 'Variable' },
-      { id: 'copy', label: 'Copy lk://dev/DATABASE_URL', group: 'Variables', badge: 'Reference' },
+      { id: 'jump', label: 'DATABASE_URL', group: 'Secrets', badge: 'Secret' },
+      { id: 'copy', label: 'Copy lk://dev/DATABASE_URL', group: 'Secrets', badge: 'Reference' },
     ],
   });
   try {
@@ -76,11 +76,11 @@ it('filters actions, selects by arrow keys, executes with Enter, and closes with
     const dialog = findNode(view.root, (node) => node.tag === 'dialog');
     const onKey = dialog!.props.onKeydown as (event: Partial<KeyboardEvent>) => void;
     const preventDefault = vi.fn();
-    view.state.query = 'database variable';
+    view.state.query = 'database secret';
     await settle();
     expect(findNode(view.root, (node) => node.text === 'Settings')).toBeUndefined();
-    expect(findNode(view.root, (node) => node.props.id === 'palette-group-Variables')?.text).toBe(
-      'Variables',
+    expect(findNode(view.root, (node) => node.props.id === 'palette-group-Secrets')?.text).toBe(
+      'Secrets',
     );
     const input = view.state.searchInput as unknown as EventTarget;
     onKey({ key: 'ArrowDown', preventDefault, target: input });

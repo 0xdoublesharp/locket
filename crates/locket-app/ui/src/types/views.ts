@@ -161,7 +161,7 @@ export type AppIconName =
   | 'x'
   | 'more';
 
-export type PaletteGroup = 'Actions' | 'Views' | 'Projects' | 'Variables' | 'Quick actions';
+export type PaletteGroup = 'Actions' | 'Views' | 'Projects' | 'Secrets' | 'Quick actions';
 
 export interface PaletteAction {
   group?: PaletteGroup;

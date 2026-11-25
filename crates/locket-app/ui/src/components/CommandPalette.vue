@@ -18,7 +18,7 @@ const dialog = ref<HTMLDialogElement | null>(null);
 const searchInput = ref<HTMLInputElement | null>(null);
 const query = ref('');
 const selectedIndex = ref<number | null>(null);
-const groupOrder: PaletteGroup[] = ['Views', 'Quick actions', 'Projects', 'Variables', 'Actions'];
+const groupOrder: PaletteGroup[] = ['Views', 'Quick actions', 'Projects', 'Secrets', 'Actions'];
 const groupId = (group: PaletteGroup) => `palette-group-${group.replaceAll(' ', '-')}`;
 const groupedResults = computed(() => {
   const terms = query.value.trim().toLocaleLowerCase().split(/\s+/);
@@ -161,7 +161,7 @@ function onKeys(event: KeyboardEvent): void {
         :aria-activedescendant="
           results.length && activeIndex >= 0 ? `palette-result-${activeIndex}` : undefined
         "
-        placeholder="Search projects, views, or variables"
+        placeholder="Search projects, views, or secrets"
         autocomplete="off"
         spellcheck="false"
       />

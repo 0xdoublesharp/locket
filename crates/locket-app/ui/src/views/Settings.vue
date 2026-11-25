@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import AppIcon from '../components/AppIcon.vue';
-import { computed, onMounted, ref, watch } from 'vue';
+import { computed, onMounted, ref, shallowRef, watch } from 'vue';
 
 import {
   desktopActionsAvailable,
@@ -9,6 +9,7 @@ import {
   desktopMcpConfigSnippet,
   desktopSetLaunchAtLogin,
 } from '../agent/client';
+import { dotenvMigrationPrompt, mcpClientSnippets } from '../agent/agentPrompts';
 import { configuredDurationSeconds, unlockTtl } from '../dashboard/health';
 import type { WriteConfigChanges } from '../agent/types';
 import type { SettingsState } from '../types/views';
@@ -67,11 +68,23 @@ const desktop = desktopActionsAvailable();
 const launchAtLogin = ref<boolean | null>(null);
 const launchBusy = ref(false);
 const launchMessage = ref('');
-const mcpJson = ref(
-  JSON.stringify({ mcpServers: { locket: { command: 'locket', args: ['mcp'] } } }, null, 2),
-);
+const mcpClients = [
+  { id: 'json', label: 'MCP JSON', copyLabel: 'Copy JSON', statusLabel: 'MCP JSON' },
+  {
+    id: 'claude',
+    label: 'Claude Code',
+    copyLabel: 'Copy command',
+    statusLabel: 'Claude Code command',
+  },
+  { id: 'codex', label: 'Codex CLI', copyLabel: 'Copy command', statusLabel: 'Codex CLI command' },
+] as const;
+type McpClient = (typeof mcpClients)[number];
+
+const activeMcpClient = shallowRef<McpClient>(mcpClients[0]);
+const mcpConfigPending = ref(desktop);
+const mcpSnippets = ref(mcpClientSnippets('locket', ['mcp']));
 const mcpTokens = computed(() => {
-  const parts = mcpJson.value.split(/("(?:[^"\\]|\\.)*"|[[\]{},:])/u);
+  const parts = mcpSnippets.value.json.split(/("(?:[^"\\]|\\.)*"|[[\]{},:])/u);
   return parts.map((text, index) => {
     if (index % 2 === 0) return { text, kind: 'plain' };
     if (!text.startsWith('"')) return { text, kind: 'punctuation' };
@@ -80,16 +93,21 @@ const mcpTokens = computed(() => {
   });
 });
 const mcpMessage = ref('');
+const agentPromptMessage = ref('');
 
-onMounted(async () => {
+onMounted(() => {
   if (!desktop) return;
-  const [login, snippet] = await Promise.all([
-    desktopGetLaunchAtLogin(),
-    desktopMcpConfigSnippet(),
-  ]);
-  if (login.ok) launchAtLogin.value = login.value;
-  else launchMessage.value = 'Launch at login is unavailable.';
-  if (snippet.ok && typeof snippet.value?.json === 'string') mcpJson.value = snippet.value.json;
+  void desktopGetLaunchAtLogin().then((login) => {
+    if (login.ok) launchAtLogin.value = login.value;
+    else launchMessage.value = 'Launch at login is unavailable.';
+  });
+  void desktopMcpConfigSnippet().then((snippet) => {
+    if (snippet.ok && typeof snippet.value?.json === 'string') {
+      const { command, args, json } = snippet.value;
+      mcpSnippets.value = { ...mcpClientSnippets(command, args), json };
+    }
+    mcpConfigPending.value = false;
+  });
 });
 
 async function toggleLaunch(event: Event): Promise<void> {
@@ -108,9 +126,51 @@ async function toggleLaunch(event: Event): Promise<void> {
   launchBusy.value = false;
 }
 
+function selectMcpClient(client: McpClient): void {
+  activeMcpClient.value = client;
+  mcpMessage.value = '';
+}
+
+function moveMcpTab(event: KeyboardEvent, index: number): void {
+  const count = mcpClients.length;
+  let next: number;
+  switch (event.key) {
+    case 'ArrowLeft':
+      next = (index + count - 1) % count;
+      break;
+    case 'ArrowRight':
+      next = (index + 1) % count;
+      break;
+    case 'Home':
+      next = 0;
+      break;
+    case 'End':
+      next = count - 1;
+      break;
+    default:
+      return;
+  }
+  event.preventDefault();
+  const client = mcpClients[next]!;
+  selectMcpClient(client);
+  const tablist = event.currentTarget as HTMLElement;
+  tablist.querySelector<HTMLButtonElement>(`#settings-mcp-tab-${client.id}`)?.focus();
+}
+
 async function copyMcp(): Promise<void> {
-  const result = await desktopCopyTextPlain(mcpJson.value);
-  mcpMessage.value = result.ok ? 'Copied MCP JSON.' : 'Could not copy MCP JSON.';
+  const client = activeMcpClient.value;
+  mcpMessage.value = '';
+  const result = await desktopCopyTextPlain(mcpSnippets.value[client.id]);
+  if (client !== activeMcpClient.value) return;
+  mcpMessage.value = result.ok
+    ? `Copied ${client.statusLabel}.`
+    : `Could not copy ${client.statusLabel}.`;
+}
+
+async function copyAgentPrompt(): Promise<void> {
+  agentPromptMessage.value = '';
+  const result = await desktopCopyTextPlain(dotenvMigrationPrompt());
+  agentPromptMessage.value = result.ok ? 'Copied agent prompt.' : 'Could not copy agent prompt.';
 }
 </script>
 
@@ -237,7 +297,7 @@ async function copyMcp(): Promise<void> {
             />
             <span>Redact names with local aliases</span>
           </label>
-          <p>Uses aliases in project, variable, and activity views and the menu bar.</p>
+          <p>Uses aliases in project, secret, and activity views and the menu bar.</p>
         </section>
         <section class="settings__card" aria-labelledby="settings-companion">
           <h3 id="settings-companion"><AppIcon name="laptop" /> macOS companion</h3>
@@ -259,20 +319,74 @@ async function copyMcp(): Promise<void> {
             <button
               class="icon-label"
               type="button"
-              aria-label="Copy MCP JSON"
-              :disabled="!desktop"
+              :aria-label="`Copy ${activeMcpClient.statusLabel}`"
+              :disabled="!desktop || mcpConfigPending"
               @click="copyMcp"
             >
               <AppIcon name="copy" />
-              Copy
+              {{ activeMcpClient.copyLabel }}
             </button>
           </header>
-          <p>
+          <p v-if="activeMcpClient.id === 'json'">
             Paste this JSON into your MCP client settings. Locket MCP never exposes plaintext
             reveals.
           </p>
-          <pre><code><span v-for="(token, index) in mcpTokens" :key="index" :data-syntax="token.kind">{{ token.text }}</span></code></pre>
-          <p v-if="mcpMessage" role="status">{{ mcpMessage }}</p>
+          <p v-else>
+            Run this command in your terminal to add Locket to {{ activeMcpClient.label }}.
+          </p>
+          <div
+            class="settings__mcp-tabs"
+            role="tablist"
+            aria-label="MCP client"
+            @keydown="moveMcpTab($event, mcpClients.indexOf(activeMcpClient))"
+          >
+            <button
+              v-for="client in mcpClients"
+              :id="`settings-mcp-tab-${client.id}`"
+              :key="client.id"
+              class="settings__mcp-tab"
+              type="button"
+              role="tab"
+              aria-controls="settings-mcp-snippet"
+              :aria-selected="client.id === activeMcpClient.id"
+              :tabindex="client.id === activeMcpClient.id ? 0 : -1"
+              @click="selectMcpClient(client)"
+            >
+              {{ client.label }}
+            </button>
+          </div>
+          <div
+            id="settings-mcp-snippet"
+            class="settings__mcp-panel"
+            role="tabpanel"
+            :aria-labelledby="`settings-mcp-tab-${activeMcpClient.id}`"
+          >
+            <pre
+              v-if="activeMcpClient.id === 'json'"
+              tabindex="0"
+            ><code><span v-for="(token, index) in mcpTokens" :key="index" :data-syntax="token.kind">{{ token.text }}</span></code></pre>
+            <pre v-else tabindex="0"><code>{{ mcpSnippets[activeMcpClient.id] }}</code></pre>
+          </div>
+          <p class="settings__copy-status" role="status">{{ mcpMessage }}</p>
+          <section class="settings__migration" aria-labelledby="settings-env-migration">
+            <h4 id="settings-env-migration">Port <code>.env</code> files with an AI agent</h4>
+            <p>
+              Copy a zero-secret prompt so your agent scans key names and imports
+              <code>.env</code> files without ever reading secret values.
+            </p>
+            <div class="settings__actions">
+              <button
+                class="icon-label"
+                type="button"
+                :disabled="!desktop"
+                @click="copyAgentPrompt"
+              >
+                <AppIcon name="copy" />
+                Copy agent prompt
+              </button>
+              <p class="settings__copy-status" role="status">{{ agentPromptMessage }}</p>
+            </div>
+          </section>
         </section>
       </div>
     </div>
@@ -304,6 +418,7 @@ async function copyMcp(): Promise<void> {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 0.5rem;
 }
 
@@ -335,6 +450,7 @@ async function copyMcp(): Promise<void> {
 
 .settings__card {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 0.75rem;
   min-width: 0;
   padding: 1rem;
@@ -400,6 +516,10 @@ async function copyMcp(): Promise<void> {
   color: var(--accent);
 }
 
+.settings__card-header button {
+  font-size: 0.8125rem;
+}
+
 .settings__warning {
   padding: 0.2rem 0.45rem;
   border-radius: var(--radius-sm);
@@ -430,7 +550,7 @@ async function copyMcp(): Promise<void> {
 
 .settings pre {
   padding: 0.75rem;
-  overflow: auto;
+  overflow-x: auto;
   background: var(--bg-subtle);
   border-radius: var(--radius-sm);
   font: 0.8125rem/1.5 var(--font-mono);
@@ -443,6 +563,55 @@ async function copyMcp(): Promise<void> {
 }
 .settings [data-syntax='punctuation'] {
   color: var(--text-muted);
+}
+
+.settings__mcp-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  padding: 0.25rem;
+  border-radius: var(--radius-sm);
+  background: var(--bg-subtle);
+}
+
+.settings .settings__mcp-tab {
+  flex: 1 1 auto;
+  min-width: 0;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+}
+
+.settings .settings__mcp-tab:hover,
+.settings .settings__mcp-tab[aria-selected='true'] {
+  color: var(--text-primary);
+}
+
+.settings__mcp-panel {
+  min-width: 0;
+}
+
+.settings .settings__mcp-tab[aria-selected='true'] {
+  border-color: var(--border-subtle);
+  background: var(--bg-surface);
+  font-weight: 650;
+}
+
+.settings__migration {
+  display: grid;
+  gap: 0.5rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.settings__migration h4 {
+  margin: 0;
+  font-size: 0.875rem;
+}
+
+.settings__copy-status:empty {
+  position: absolute;
 }
 
 @media (max-width: 767px) {

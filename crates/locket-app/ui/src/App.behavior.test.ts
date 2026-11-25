@@ -2,7 +2,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { invoke, type InvokeArgs } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import App from './App.vue';
-import type { AgentStatus, DesktopProjectContext, RevealResponse } from './agent/types';
+import type {
+  AgentStatus,
+  DesktopProjectContext,
+  RevealResponse,
+  SecretWireRow,
+} from './agent/types';
 import type { SecretRowMeta } from './types/views';
 import type RevealModal from './components/RevealModal.vue';
 import { deferred, findNode, mountComponent, settle } from './test/renderer';
@@ -85,7 +90,8 @@ async function nativeInvoke(command: string, args?: InvokeArgs): Promise<unknown
     case 'desktop_open_shared_vault':
       nativeSelection = shared;
       return nativeSelection;
-    case 'desktop_open_project': {
+    case 'desktop_open_project':
+    case 'desktop_initialize_project': {
       const path = (args as { request: { path: string } }).request.path;
       nativeSelection = path === b.root ? b : a;
       return nativeSelection;
@@ -121,6 +127,14 @@ async function nativeInvoke(command: string, args?: InvokeArgs): Promise<unknown
       return {
         rows: [],
         chain_status: { locked: false, hmac_ok: null, first_break_sequence: null },
+      };
+    case 'agent_verify_audit':
+      return {
+        locked: false,
+        hmac_ok: true,
+        first_break_sequence: null,
+        first_break_reason: null,
+        rows_verified: 0,
       };
     case 'agent_reveal':
       return revealed();
@@ -181,6 +195,179 @@ function plaintext(app: ReturnType<typeof mountApp>): string | undefined {
   return findNode(app.root, (node) => node.props['data-testid'] === 'reveal-value')?.text;
 }
 
+describe('vault unlock in the mounted app', () => {
+  type MountedApp = ReturnType<typeof mountApp>;
+
+  const button = (app: MountedApp, label: string) =>
+    findNode(
+      app.root,
+      (node) =>
+        node.tag === 'button' && !!findNode(node, (content) => content.text.trim() === label),
+    );
+  const click = (app: MountedApp, label: string) => {
+    const action = button(app, label);
+    expect(action).toBeDefined();
+    expect(action?.props.disabled).toBeFalsy();
+    (action?.props.onClick as () => void)();
+  };
+  const unlockBar = (app: MountedApp) =>
+    findNode(app.root, (node) => node.props['aria-label'] === 'Vault actions');
+  const unlockDialog = (app: MountedApp) =>
+    findNode(app.root, (node) => node.props['aria-labelledby'] === 'unlock-title');
+  const keychainDenied = () => {
+    throw {
+      kind: 'rejected',
+      code: 'KeychainDenied',
+      display_reason: 'Keychain access was denied.',
+    };
+  };
+  const allowKeychainUnlock = () => {
+    lockState = 'unlocked';
+  };
+  const expectKeychainRequest = (target: DesktopProjectContext) =>
+    expect(invoke).toHaveBeenCalledWith('agent_unlock', {
+      request: {
+        project_id: target.project_id,
+        ttl_seconds: 900,
+        source: { kind: 'os-keychain' },
+        audit: { profile_id: target.profile_id },
+      },
+    });
+
+  describe.each([
+    { label: 'Create Global Vault (@shared)', target: shared },
+    { label: 'Open Global Vault (@shared)', target: shared },
+    { label: 'Initialize & open', target: a },
+  ])('$label', ({ label, target }) => {
+    it.each(['success', 'failure'] as const)(
+      'tries the keychain after status refresh and handles %s',
+      async (outcome) => {
+        lockState = 'locked';
+        if (label.startsWith('Open')) overrides.set('desktop_list_projects', () => [a, shared]);
+        overrides.set('agent_unlock', outcome === 'success' ? allowKeychainUnlock : keychainDenied);
+        const app = mountApp();
+        await settle();
+        if (target === a) {
+          overrides.set('desktop_inspect_project_folder', () => ({
+            path: a.root,
+            has_config: false,
+            folder_name: 'A',
+          }));
+          app.state.projectPath = a.root;
+          await settle();
+          const form = findNode(app.root, (node) => node.tag === 'form' && !!node.props.onSubmit);
+          (form!.props.onSubmit as (event: Event) => void)(new Event('submit'));
+          await settle();
+        }
+        expect(calls).not.toContain('agent_unlock');
+        click(app, label);
+        await settle();
+
+        expect(app.state.activeContext).toEqual(target);
+        expectKeychainRequest(target);
+        expect(calls.indexOf('agent_status')).toBeLessThan(calls.indexOf('agent_unlock'));
+        expect(unlockDialog(app)).toBeUndefined();
+        expect(app.state.desktopError).toBeNull();
+        expect(findNode(app.root, (node) => node.props.role === 'alert')).toBeUndefined();
+        if (outcome === 'success') {
+          await vi.waitFor(() =>
+            expect(invoke).toHaveBeenCalledWith('agent_verify_audit', {
+              request: { project_id: target.project_id },
+            }),
+          );
+          expect(app.state.status?.lock_state).toBe('unlocked');
+          expect(findNode(app.root, (node) => node.text === 'No secrets yet')).toBeDefined();
+          expect(unlockBar(app)).toBeUndefined();
+        } else {
+          expect(app.state.status?.lock_state).toBe('locked');
+          expect(unlockBar(app)).toBeDefined();
+          expect(calls).not.toContain('agent_verify_audit');
+        }
+      },
+    );
+  });
+
+  it.each([a, shared])(
+    'opens known $project_name at startup without trying the keychain',
+    async (target) => {
+      lockState = 'locked';
+      overrides.set('desktop_list_projects', () => [target]);
+      const app = mountApp();
+      await settle();
+      expect(app.state.activeContext).toEqual(target);
+      expect(unlockBar(app)).toBeDefined();
+      expect(calls).not.toContain('agent_unlock');
+    },
+  );
+
+  it('discards a successful auto-unlock completion after the user switches vaults', async () => {
+    lockState = 'locked';
+    const pending = deferred<void>();
+    overrides.set('agent_unlock', () => pending.promise);
+    const app = mountApp();
+    await settle();
+    click(app, 'Create Global Vault (@shared)');
+    await settle();
+    expectKeychainRequest(shared);
+    await app.state.connectProject(false, b.root);
+    await settle();
+    expect(app.state.activeContext).toEqual(b);
+    const statusCalls = calls.filter((call) => call === 'agent_status').length;
+    pending.resolve();
+    await settle();
+    expect(calls.filter((call) => call === 'agent_status')).toHaveLength(statusCalls);
+    expect(calls).not.toContain('agent_verify_audit');
+    expect(unlockDialog(app)).toBeUndefined();
+    expect(button(app, 'Unlock with keychain')?.props.disabled).toBe(false);
+  });
+
+  it('unlocks with one keychain click without opening the modal', async () => {
+    lockState = 'locked';
+    const pending = deferred<void>();
+    overrides.set('agent_unlock', () => pending.promise);
+    const app = await connectedApp();
+    click(app, 'Unlock with keychain');
+    await settle();
+    expectKeychainRequest(a);
+    expect(unlockDialog(app)).toBeUndefined();
+    expect(button(app, 'Unlock with keychain')?.props.disabled).toBe(true);
+    expect(button(app, 'Use passphrase')?.props.disabled).toBe(true);
+    allowKeychainUnlock();
+    pending.resolve();
+    await settle();
+    expect(app.state.status?.lock_state).toBe('unlocked');
+    expect(unlockBar(app)).toBeUndefined();
+    expect(unlockDialog(app)).toBeUndefined();
+  });
+
+  it('opens the unlock modal with the keychain error if one-click unlock fails', async () => {
+    lockState = 'locked';
+    overrides.set('agent_unlock', keychainDenied);
+    const app = await connectedApp();
+    click(app, 'Unlock with keychain');
+    await settle();
+    expectKeychainRequest(a);
+    const dialog = unlockDialog(app);
+    expect(dialog).toBeDefined();
+    expect(findNode(dialog!, (node) => node.props.role === 'alert')?.text).toContain(
+      'Keychain access was denied.',
+    );
+    expect(app.state.desktopError).toBeNull();
+  });
+
+  it('opens the modal in passphrase mode without calling the keychain', async () => {
+    lockState = 'locked';
+    const app = await connectedApp();
+    click(app, 'Use passphrase');
+    await settle();
+    const dialog = unlockDialog(app);
+    expect(dialog).toBeDefined();
+    expect(findNode(dialog!, (node) => node.props.type === 'password')).toBeDefined();
+    expect(findNode(dialog!, (node) => node.props.role === 'alert')).toBeUndefined();
+    expect(calls).not.toContain('agent_unlock');
+  });
+});
+
 describe('automatic locking availability', () => {
   it.each([undefined, 'unavailable: native observer unavailable'])(
     'shows manual-lock guidance when monitoring is %s',
@@ -205,7 +392,7 @@ describe('automatic locking availability', () => {
   );
 });
 
-it('shows a retriable variables error and marks the agent offline until recovery', async () => {
+it('shows a retriable secrets error and marks the agent offline until recovery', async () => {
   const app = await connectedApp();
   overrides.set('agent_list_secrets', () => {
     throw {
@@ -232,23 +419,65 @@ it('shows a retriable variables error and marks the agent offline until recovery
   const status = () => findNode(app.root, (node) => node.props['aria-label'] === 'Agent status');
   expect(status()?.props['data-connected']).toBe('false');
   expect(findNode(status()!, (node) => node.text.trim() === 'Offline')).toBeDefined();
-  expect(findNode(app.root, (node) => node.text === 'Variables · development')).toBeDefined();
-  expect(findNode(app.root, (node) => node.text === "Can't load variables")).toBeDefined();
+  expect(findNode(app.root, (node) => node.text === 'Secrets · development')).toBeDefined();
+  expect(findNode(app.root, (node) => node.text === "Can't load secrets")).toBeDefined();
   expect(findNode(app.root, (node) => node.text === 'AgentUnavailable')).toBeDefined();
   const recovery = findNode(app.root, (node) => node.props.role === 'alert');
   expect(recovery).toBeDefined();
   expect(getButton('Start agent', recovery).props.class).toContain('companion-button--primary');
   expect(getButton('Retry', recovery).props.class).not.toContain('companion-button--primary');
   expect(
-    findNode(app.root, (node) => node.props['aria-label'] === 'Refresh variables')?.props.disabled,
+    findNode(app.root, (node) => node.props['aria-label'] === 'Refresh secrets')?.props.disabled,
   ).toBe(true);
-  expect(getButton('Add variable').props.disabled).toBe(true);
+  expect(getButton('Add secret').props.disabled).toBe(true);
 
   overrides.delete('agent_list_secrets');
   clickButton('Retry');
   await settle();
   expect(status()?.props['data-connected']).toBe('true');
-  expect(findNode(app.root, (node) => node.text === "Can't load variables")).toBeUndefined();
+  expect(findNode(app.root, (node) => node.text === "Can't load secrets")).toBeUndefined();
+});
+
+it('uses Secrets in the list, command palette, and history navigation', async () => {
+  overrides.set('agent_list_secrets', () => ({
+    rows: [
+      {
+        id: 'token',
+        profile_id: a.profile_id,
+        name: 'TOKEN',
+        source: 'team-managed',
+        source_precedence: 0,
+        origin: 'team',
+        current_version: 1,
+        state: 'active',
+        required: true,
+        created_at: 0,
+        updated_at: 0,
+        last_rotated_at: null,
+      } satisfies SecretWireRow,
+    ],
+  }));
+  const app = await connectedApp();
+  app.state.selectView('secrets');
+  await settle();
+  const heading = findNode(app.root, (node) => node.props.id === 'secret-metadata-list-heading');
+  expect(heading).toBeDefined();
+  expect(findNode(heading!, (node) => node.text === '1 secret · development')).toBeDefined();
+  expect(findNode(app.root, (node) => node.props['aria-label'] === 'Search secrets')).toBeDefined();
+  const paletteOption = (label: string) =>
+    findNode(
+      app.root,
+      (node) =>
+        node.props.role === 'option' && !!findNode(node, (content) => content.text === label),
+    );
+  expect(paletteOption('Add secret')?.parent?.props['aria-labelledby']).toBe(
+    'palette-group-Quick-actions',
+  );
+  const token = paletteOption('TOKEN');
+  expect(token?.parent?.props['aria-labelledby']).toBe('palette-group-Secrets');
+  (token!.props.onClick as () => void)();
+  await settle();
+  expect(findNode(app.root, (node) => node.text === 'Secret history')).toBeDefined();
 });
 
 describe('reveal request lifetime in the mounted app', () => {
@@ -759,8 +988,9 @@ describe('desktop scan terminal handoff in the mounted app', () => {
     app.unmount();
   });
 
-  it('opens Global Vault from Welcome and lands directly in Secrets', async () => {
+  it('opens Global Vault from Welcome and offers migration setup from the empty vault', async () => {
     overrides.set('desktop_list_projects', () => (nativeSelection ? [shared] : []));
+    overrides.set('desktop_copy_text_plain', () => undefined);
     const app = mountApp();
     await settle();
     const button = findNode(
@@ -776,6 +1006,66 @@ describe('desktop scan terminal handoff in the mounted app', () => {
     expect(app.state.selectedProject).toEqual(shared);
     expect(findNode(app.root, (node) => node.text.includes('default'))).toBeDefined();
     expect(findNode(app.root, (node) => node.text === 'Welcome to Locket')).toBeUndefined();
+
+    const copy = findNode(
+      app.root,
+      (node) =>
+        node.tag === 'button' &&
+        !!findNode(node, (content) => content.text.trim() === 'Copy AI migration prompt'),
+    );
+    expect(copy).toBeDefined();
+    (copy!.props.onClick as () => void)();
+    await settle();
+    expect(invoke).toHaveBeenCalledWith('desktop_copy_text_plain', {
+      text: expect.stringContaining('Global Vault (@shared)'),
+    });
+    expect(
+      findNode(
+        app.root,
+        (node) => node.props.role === 'status' && node.text === 'Copied AI migration prompt.',
+      ),
+    ).toBeDefined();
+    const setup = findNode(
+      app.root,
+      (node) =>
+        node.tag === 'button' &&
+        !!findNode(node, (content) => content.text.trim() === 'AI agent & MCP setup'),
+    );
+    expect(setup).toBeDefined();
+    (setup!.props.onClick as () => void)();
+    await settle();
+    expect(findNode(app.root, (node) => node.props.id === 'settings-mcp')).toBeDefined();
+    app.unmount();
+  });
+
+  it('copies migration instructions and the native MCP JSON from Quick actions', async () => {
+    const locket = { command: '/Applications/Locket Dev.app/locket', args: ['mcp'] };
+    const json = JSON.stringify({ mcpServers: { locket } }, null, 2);
+    overrides.set('desktop_copy_text_plain', () => undefined);
+    overrides.set('desktop_mcp_config_snippet', () => ({ ...locket, json }));
+    const app = mountApp();
+    await settle();
+
+    for (const [label, text] of [
+      ['Copy AI agent .env migration prompt', expect.stringContaining('locket env scan --json')],
+      ['Copy MCP config JSON', json],
+    ] as const) {
+      const action = findNode(
+        app.root,
+        (node) =>
+          node.props.role === 'option' && !!findNode(node, (content) => content.text === label),
+      );
+      expect(action?.parent?.props['aria-labelledby']).toBe('palette-group-Quick-actions');
+      (action!.props.onClick as () => void)();
+      await settle();
+      expect(invoke).toHaveBeenLastCalledWith('desktop_copy_text_plain', { text });
+    }
+    expect(
+      findNode(
+        app.root,
+        (node) => node.props.role === 'status' && node.text === 'Copied MCP JSON.',
+      ),
+    ).toBeDefined();
     app.unmount();
   });
 
@@ -834,6 +1124,7 @@ describe('Global Vault workspace actions', () => {
   }
 
   it('clears a project import path and requires an absolute env path in Global Vault', async () => {
+    overrides.set('desktop_list_projects', () => [a, shared]);
     const app = await connectedApp();
     overrides.set('desktop_import_env', () => ({ summary: 'Imported 1 variable.' }));
     app.state.selectView('secret-editor');
@@ -858,6 +1149,7 @@ describe('Global Vault workspace actions', () => {
       importForm!,
       (node) => node.tag === 'button' && node.props.type === 'submit',
     );
+    expect(submit?.text).toContain('Import secrets');
     const submitImport = () =>
       (submit?.parent?.props.onSubmit as (event: Event) => void)(new Event('submit'));
     app.state.envPath = '.env';

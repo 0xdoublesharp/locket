@@ -1,10 +1,15 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue';
 import type { UnlockRequest } from '../agent/types';
-const props = defineProps<{ projectLabel: string; busy: boolean; errorMessage?: string | null }>();
+const props = defineProps<{
+  projectLabel: string;
+  busy: boolean;
+  errorMessage?: string | null;
+  preferPassphrase?: boolean;
+}>();
 const emit = defineEmits<{ submit: [source: UnlockRequest['source']]; dismiss: [] }>();
 const passphrase = ref('');
-const usePassphrase = ref(false);
+const usePassphrase = ref(!!props.preferPassphrase);
 watch(
   () => props.errorMessage,
   () => {
@@ -92,12 +97,13 @@ function onDismiss(): void {
   z-index: 100;
 }
 .modal {
+  box-sizing: border-box;
   background: var(--bg-elevated);
   border: 1px solid var(--border-subtle);
   border-radius: 0.5rem;
   padding: 1.5rem 1.75rem;
-  min-width: 320px;
-  max-width: 480px;
+  width: min(30rem, calc(100% - 1.5rem));
+  overflow-wrap: anywhere;
   display: flex;
   flex-direction: column;
   gap: 1rem;
@@ -127,6 +133,7 @@ function onDismiss(): void {
 }
 .modal__actions {
   display: flex;
+  flex-wrap: wrap;
   justify-content: flex-end;
   gap: 0.5rem;
 }
