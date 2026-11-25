@@ -201,6 +201,21 @@ async fn export_checks_scope_recipient_and_path_before_writing_sealed_history() 
     invalid_path["output_path"] = json!(vault.dir.path().join("missing/bundle"));
     assert_denied(vault.rpc(method, invalid_path).await, "CorruptDb");
 
+    let rejected_path = vault.dir.path().join("unaudited.locket-bundle");
+    let mut rejected = request.clone();
+    rejected["output_path"] = json!(&rejected_path);
+    store.connection().execute_batch(
+        "CREATE TRIGGER deny_export BEFORE INSERT ON audit_log
+         WHEN NEW.action = 'BACKUP_EXPORT' BEGIN SELECT RAISE(ABORT, 'fixture denied'); END",
+    )?;
+    assert_denied(vault.rpc(method, rejected.clone()).await, "CorruptDb");
+    assert!(!rejected_path.exists(), "audit failure left a sealed output behind");
+    assert_eq!(vault.audit("BACKUP_EXPORT")?, Vec::<serde_json::Value>::new());
+    fs::write(&rejected_path, b"existing bundle")?;
+    assert_denied(vault.rpc(method, rejected).await, "InvalidReference");
+    assert_eq!(fs::read(&rejected_path)?, b"existing bundle");
+    store.connection().execute_batch("DROP TRIGGER deny_export")?;
+
     request["include_personal"] = json!(true);
     request["include_history"] = json!(true);
     assert_status(vault.rpc(method, request.clone()).await, "exported");

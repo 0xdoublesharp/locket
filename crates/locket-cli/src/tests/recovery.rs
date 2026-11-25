@@ -968,9 +968,134 @@ fn initial_recovery_with_default_device_restores_identity() -> Result<(), Box<dy
 }
 
 #[test]
+fn recovery_restore_rejects_code_rotated_during_the_prompt()
+-> Result<(), Box<dyn std::error::Error>> {
+    struct RotateDuringPrompt {
+        context: RuntimeContext,
+        old_code: zeroize::Zeroizing<String>,
+    }
+
+    impl crate::runtime::prompts::RecoveryCodeReader for RotateDuringPrompt {
+        fn read_recovery_code(
+            &self,
+            _prompt: &str,
+        ) -> Result<zeroize::Zeroizing<String>, crate::CliError> {
+            crate::recovery_rotate_command(&self.context, &mut Vec::new())?;
+            Ok(self.old_code.clone())
+        }
+    }
+
+    let directory = tempdir()?;
+    let mut context = test_context(&directory);
+    let mut output = Vec::new();
+    run_with_context(
+        Cli::try_parse_from([
+            "locket",
+            "init",
+            "--recovery-code",
+            "--no-device",
+            "--no-passkey",
+            "--name",
+            "app",
+        ])?,
+        &context,
+        &mut output,
+    )?;
+    let output = zeroize::Zeroizing::new(String::from_utf8(output)?);
+    let old_code = zeroize::Zeroizing::new(recovery_code_from_output(&output)?.to_owned());
+    context.recovery_code_reader = Arc::new(RotateDuringPrompt {
+        context: context_with_recovery_code(&context, &old_code),
+        old_code,
+    });
+
+    let result = run_with_context(
+        Cli::try_parse_from(["locket", "recover", "--force"])?,
+        &context,
+        &mut Vec::new(),
+    );
+    assert_error_contains(result, "recovery envelope changed while reading the code");
+    let resolved = crate::require_project(&context)?;
+    let actions = crate::open_store(&context)?
+        .list_recent_audit_actions(resolved.config.project_id.as_str(), 10)?;
+    assert!(actions.iter().any(|action| action == "RECOVERY_ROTATE"));
+    assert!(actions.iter().all(|action| action != "RECOVER" && action != "RECOVERY_RESTORE_BEGIN"));
+    Ok(())
+}
+
+#[test]
+fn recovery_restore_rolls_back_master_and_device_keys_on_audit_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    let mut output = Vec::new();
+    run_with_context(
+        Cli::try_parse_from([
+            "locket",
+            "init",
+            "--recovery-code",
+            "--no-passkey",
+            "--name",
+            "app",
+        ])?,
+        &context,
+        &mut output,
+    )?;
+    let output = String::from_utf8(output)?;
+    let code = locket_crypto::recovery_code_decode(recovery_code_from_output(&output)?)?;
+    let resolved = crate::require_project(&context)?;
+    let project = resolved.config.project_id.as_str();
+    let store = crate::open_store(&context)?;
+    let device = store.get_active_local_device(project)?.ok_or("missing local device")?;
+    let storage =
+        crate::commands::team::device::build_device_private_key_storage(&context, project)?;
+    let sealing_path = storage.envelope_path(&device.id)?;
+    let signing_path = storage.for_signing().envelope_path(&device.fingerprint)?;
+    let prior_sealing = fs::read(&sealing_path)?;
+    fs::remove_file(&signing_path)?;
+    let recovery_dir = directory.path().join(".locket/recovery");
+    let kdf = crate::load_recovery_kdf_toml(&recovery_dir)?;
+    let envelope = crate::load_recovery_envelope(&recovery_dir)?;
+    let previous_master = [17; 32];
+    context.key_store.store_master_key(project, &previous_master)?;
+    store.connection().execute_batch(
+        "CREATE TRIGGER deny_recovery BEFORE INSERT ON audit_log
+         WHEN NEW.action = 'RECOVER' BEGIN SELECT RAISE(ABORT, 'injected recovery audit failure'); END",
+    )?;
+
+    assert_error_contains(
+        crate::restore_from_recovery_code(
+            &context,
+            &mut Vec::new(),
+            &resolved,
+            &kdf,
+            &envelope,
+            &code,
+            true,
+        ),
+        "injected recovery audit failure",
+    );
+    assert_eq!(
+        sha2::Sha256::digest(context.key_store.load_master_key(project)?.as_ref()),
+        sha2::Sha256::digest(previous_master)
+    );
+    assert_eq!(fs::read(&sealing_path)?, prior_sealing);
+    assert!(!signing_path.exists());
+    assert!(
+        !store.list_recent_audit_actions(project, 10)?.iter().any(|action| action == "RECOVER")
+    );
+    let intent: String = store.connection().query_row(
+        "SELECT status FROM audit_log WHERE action = 'RECOVERY_RESTORE_BEGIN'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(intent, "STARTED");
+    Ok(())
+}
+
+#[test]
 fn recovery_rotation_rejection_or_audit_failure_preserves_previous_backup()
 -> Result<(), Box<dyn std::error::Error>> {
-    for fail_audit in [false, true] {
+    for failure in ["confirmation", "audit insert", "audit commit"] {
         let directory = tempdir()?;
         let context = test_context(&directory);
         let mut output = Vec::new();
@@ -979,7 +1104,6 @@ fn recovery_rotation_rejection_or_audit_failure_preserves_previous_backup()
                 "locket",
                 "init",
                 "--recovery-code",
-                "--no-device",
                 "--no-passkey",
                 "--name",
                 "app",
@@ -992,18 +1116,25 @@ fn recovery_rotation_rejection_or_audit_failure_preserves_previous_backup()
         let dir = directory.path().join(".locket/recovery");
         let previous = fs::read(dir.join("envelope.bin"))?;
         let old_kdf = crate::load_recovery_kdf_toml(&dir)?;
-        if fail_audit {
-            crate::open_store(&context)?.connection().execute_batch(
-                "CREATE TRIGGER deny_rotation BEFORE INSERT ON audit_log WHEN NEW.action='RECOVERY_ROTATE' BEGIN SELECT RAISE(ABORT, 'injected audit failure'); END;",
-            )?;
-        }
+        assert_eq!(crate::load_recovery_envelope(&dir)?.entries.len(), 3);
+        let store = crate::open_store(&context)?;
+        store.connection().execute_batch(match failure {
+            "audit insert" => "CREATE TRIGGER deny_rotation BEFORE INSERT ON audit_log WHEN NEW.action='RECOVERY_ROTATE' BEGIN SELECT RAISE(ABORT, 'injected audit failure'); END;",
+            "audit commit" => "CREATE TABLE deferred_rotation (project_id TEXT REFERENCES projects(id) DEFERRABLE INITIALLY DEFERRED);
+                CREATE TRIGGER deny_rotation_commit AFTER INSERT ON audit_log WHEN NEW.action='RECOVERY_ROTATE'
+                BEGIN INSERT INTO deferred_rotation VALUES ('missing project'); END;",
+            _ => "",
+        })?;
         let rotate = context_with_confirmation(
             &context_with_recovery_code(&context, old_code),
-            if fail_audit { "app" } else { "not acknowledged" },
+            if failure == "confirmation" { "not acknowledged" } else { "app" },
         );
         let result = crate::recovery_rotate_command(&rotate, &mut Vec::new());
-        assert!(result.is_err(), "rotation must fail when confirmation or audit fails");
-        assert_eq!(fs::read(dir.join("envelope.bin"))?, previous);
+        assert!(result.is_err(), "rotation succeeded despite {failure}");
+        assert!(
+            fs::read(dir.join("envelope.bin"))? == previous,
+            "{failure} changed the previous envelope"
+        );
         assert_eq!(crate::load_recovery_kdf_toml(&dir)?.kdf_profile_id, old_kdf.kdf_profile_id);
     }
     Ok(())

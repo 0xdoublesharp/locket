@@ -4,8 +4,10 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::{Mutex, MutexGuard};
 
 use locket_core::{Duration as LocketDuration, privacy_alias};
+use locket_platform::write_user_only_file;
 use locket_store::{AuditWrite, Store};
 use rusqlite::OptionalExtension as _;
 use serde::{Deserialize, Serialize};
@@ -25,6 +27,11 @@ const VERIFICATION_DANGEROUS_PROFILE_SWITCH: &str =
 const VERIFICATION_RECOVERY: &str = "user_verification_required_for.recovery";
 const VERIFICATION_TEAM_ACCEPT: &str = "user_verification_required_for.team_accept";
 const VERIFICATION_DEVICE_REGISTER: &str = "user_verification_required_for.device_register";
+static CONFIG_WRITES: Mutex<()> = Mutex::new(());
+
+fn lock_config() -> io::Result<MutexGuard<'static, ()>> {
+    CONFIG_WRITES.lock().map_err(|_| io::Error::other("config write lock poisoned"))
+}
 
 pub fn requires_user_verification(
     user_config_path: Option<&Path>,
@@ -238,6 +245,8 @@ pub enum ConfigRpcError {
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
+    Platform(#[from] locket_platform::PlatformError),
+    #[error(transparent)]
     TomlDeserialize(#[from] toml::de::Error),
     #[error(transparent)]
     TomlSerialize(#[from] toml::ser::Error),
@@ -249,6 +258,7 @@ impl ConfigRpcError {
             Self::Protocol(_) => "ProtocolError",
             Self::MetadataInvalid(_)
             | Self::Io(_)
+            | Self::Platform(_)
             | Self::TomlDeserialize(_)
             | Self::TomlSerialize(_) => "MetadataInvalid",
             Self::UnlockRequired => "UnlockRequired",
@@ -318,7 +328,6 @@ async fn read_settings(
     request: &ReadConfigRequest,
     state: &crate::AgentSocketState,
 ) -> Result<AgentConfigSettings, ConfigRpcError> {
-    let config = read_config_table(&request.config_path)?;
     let store = if let (Some(path), Some(project_id), Some(_)) = (
         request.store_path.as_deref(),
         request.project_id.as_deref(),
@@ -338,6 +347,8 @@ async fn read_settings(
     } else {
         None
     };
+    let _guard = lock_config()?;
+    let config = read_config_table(&request.config_path)?;
     settings_from_config(
         &config,
         store.as_ref(),
@@ -355,48 +366,6 @@ async fn write_settings(
     let master_key = cached_master_key(state, &request.project_id, now_unix_nanos)
         .await?
         .ok_or(ConfigRpcError::UnlockRequired)?;
-    let mut config = read_config_table(&request.config_path)?;
-    let mut changed_keys = Vec::new();
-
-    if let Some(value) = request.changes.privacy_redact_names {
-        set_config_value(&mut config, PRIVACY_REDACT_NAMES, toml::Value::Boolean(value))?;
-        changed_keys.push(PRIVACY_REDACT_NAMES.to_owned());
-    }
-    if let Some(value) = request.changes.agent_unlock_ttl.as_deref() {
-        validate_duration(value)?;
-        set_config_value(&mut config, AGENT_UNLOCK_TTL, toml::Value::String(value.to_owned()))?;
-        changed_keys.push(AGENT_UNLOCK_TTL.to_owned());
-    }
-    if let Some(verification) = &request.changes.user_verification_required_for {
-        push_bool_patch(&mut config, &mut changed_keys, VERIFICATION_UNLOCK, verification.unlock)?;
-        push_bool_patch(&mut config, &mut changed_keys, VERIFICATION_REVEAL, verification.reveal)?;
-        push_bool_patch(&mut config, &mut changed_keys, VERIFICATION_COPY, verification.copy)?;
-        push_bool_patch(
-            &mut config,
-            &mut changed_keys,
-            VERIFICATION_DANGEROUS_PROFILE_SWITCH,
-            verification.dangerous_profile_switch,
-        )?;
-        push_bool_patch(
-            &mut config,
-            &mut changed_keys,
-            VERIFICATION_RECOVERY,
-            verification.recovery,
-        )?;
-        push_bool_patch(
-            &mut config,
-            &mut changed_keys,
-            VERIFICATION_TEAM_ACCEPT,
-            verification.team_accept,
-        )?;
-        push_bool_patch(
-            &mut config,
-            &mut changed_keys,
-            VERIFICATION_DEVICE_REGISTER,
-            verification.device_register,
-        )?;
-    }
-
     let (mut store, _) = crate::keys::open_verified_store_for_state(
         state,
         &request.project_id,
@@ -405,11 +374,35 @@ async fn write_settings(
     )
     .await?;
     let audit_key = unwrap_audit_key_with_master(&store, &request.project_id, &master_key)?;
-    if !changed_keys.is_empty() {
-        write_config_table(&request.config_path, &config)?;
+
+    // The user config is shared across projects. Serialize agent reads and
+    // writes across publication, audit commit, and any rollback.
+    let _guard = lock_config()?;
+    let config_path = match fs::symlink_metadata(&request.config_path) {
+        Ok(metadata) if metadata.is_symlink() => fs::canonicalize(&request.config_path)?,
+        _ => request.config_path.clone(),
+    };
+    let previous = read_config_text(&config_path)?;
+    let mut config = toml::from_str(previous.as_deref().unwrap_or_default())?;
+    let mut changed_keys = apply_settings_patch(&mut config, &request.changes)?;
+    let profile_change = request
+        .changes
+        .dangerous_profile
+        .map(|dangerous| {
+            let name = request.profile_name.as_deref().ok_or_else(|| {
+                ConfigRpcError::Protocol(
+                    "profile_name is required for dangerous_profile".to_owned(),
+                )
+            })?;
+            Ok::<_, ConfigRpcError>((name, dangerous))
+        })
+        .transpose()?;
+    let settings_changed = !changed_keys.is_empty();
+    let mut attempted_file_write = false;
+    let result = store.with_atomic_write(|store| {
         for key in &changed_keys {
             append_config_update_audit(
-                &mut store,
+                store,
                 &request.project_id,
                 &request.config_path,
                 key,
@@ -417,36 +410,122 @@ async fn write_settings(
                 timestamp,
             )?;
         }
-    }
-
-    if let Some(dangerous) = request.changes.dangerous_profile {
-        let profile_name = request.profile_name.as_deref().ok_or_else(|| {
-            ConfigRpcError::Protocol("profile_name is required for dangerous_profile".to_owned())
-        })?;
-        let audit = locket_store::ProfileDangerousAudit {
-            audit_key: audit_key.as_ref(),
-            timestamp,
-            command: "agent config",
-        };
-        let change = store.set_profile_dangerous_with_audit(
-            &request.project_id,
-            profile_name,
-            dangerous,
-            audit,
-        )?;
-        if change.is_none() {
-            return Err(ConfigRpcError::ProfileNotFound);
+        if let Some((name, dangerous)) = profile_change {
+            update_profile_dangerous(
+                store,
+                &request.project_id,
+                name,
+                dangerous,
+                audit_key.as_ref(),
+                timestamp,
+            )?;
+            changed_keys.push("profile.dangerous".to_owned());
         }
-        changed_keys.push("profile.dangerous".to_owned());
+        let settings = settings_from_config(
+            &config,
+            Some(store),
+            Some(&request.project_id),
+            request.profile_name.as_deref(),
+        )?;
+        if settings_changed {
+            let text = toml::to_string_pretty(&config)?;
+            attempted_file_write = true;
+            write_config_file(&config_path, &text)?;
+        }
+        Ok(WriteConfigResponse { settings, changed_keys })
+    });
+    if let Err(error) = &result
+        && attempted_file_write
+        && read_config_text(&config_path).as_ref().ok() != Some(&previous)
+        && let Err(rollback) = restore_config_file(&config_path, previous.as_deref())
+    {
+        return Err(io::Error::other(format!("{error}; config rollback failed: {rollback}")).into());
+    }
+    result
+}
+
+fn apply_settings_patch(
+    config: &mut toml::Table,
+    changes: &WriteConfigChanges,
+) -> Result<Vec<String>, ConfigRpcError> {
+    let mut changed_keys = Vec::new();
+    if let Some(value) = changes.privacy_redact_names {
+        set_config_value(config, PRIVACY_REDACT_NAMES, toml::Value::Boolean(value))?;
+        changed_keys.push(PRIVACY_REDACT_NAMES.to_owned());
+    }
+    if let Some(value) = changes.agent_unlock_ttl.as_deref() {
+        validate_duration(value)?;
+        set_config_value(config, AGENT_UNLOCK_TTL, toml::Value::String(value.to_owned()))?;
+        changed_keys.push(AGENT_UNLOCK_TTL.to_owned());
+    }
+    if let Some(verification) = &changes.user_verification_required_for {
+        push_bool_patch(config, &mut changed_keys, VERIFICATION_UNLOCK, verification.unlock)?;
+        push_bool_patch(config, &mut changed_keys, VERIFICATION_REVEAL, verification.reveal)?;
+        push_bool_patch(config, &mut changed_keys, VERIFICATION_COPY, verification.copy)?;
+        push_bool_patch(
+            config,
+            &mut changed_keys,
+            VERIFICATION_DANGEROUS_PROFILE_SWITCH,
+            verification.dangerous_profile_switch,
+        )?;
+        push_bool_patch(config, &mut changed_keys, VERIFICATION_RECOVERY, verification.recovery)?;
+        push_bool_patch(
+            config,
+            &mut changed_keys,
+            VERIFICATION_TEAM_ACCEPT,
+            verification.team_accept,
+        )?;
+        push_bool_patch(
+            config,
+            &mut changed_keys,
+            VERIFICATION_DEVICE_REGISTER,
+            verification.device_register,
+        )?;
     }
 
-    let settings = settings_from_config(
-        &config,
-        Some(&store),
-        Some(request.project_id.as_str()),
-        request.profile_name.as_deref(),
+    Ok(changed_keys)
+}
+
+fn update_profile_dangerous(
+    store: &mut Store,
+    project_id: &str,
+    name: &str,
+    dangerous: bool,
+    audit_key: &[u8],
+    timestamp: i64,
+) -> Result<(), ConfigRpcError> {
+    // The standalone audited setter starts its own SQLite transaction.
+    // Compose the update and the same audit row in the caller's savepoint.
+    let profile =
+        store.get_profile_by_name(project_id, name)?.ok_or(ConfigRpcError::ProfileNotFound)?;
+    if !store.set_profile_dangerous(project_id, name, dangerous)? {
+        return Err(ConfigRpcError::ProfileNotFound);
+    }
+    let metadata = json!({
+        "schema_version": 1,
+        "action": "PROFILE_CHANGE",
+        "status": "SUCCESS",
+        "command": "agent config",
+        "operation": "set_dangerous",
+        "profile_id": profile.id,
+        "profile_name": profile.name,
+        "prior_dangerous": profile.dangerous,
+        "new_dangerous": dangerous,
+    });
+    store.append_audit(
+        audit_key,
+        &AuditWrite {
+            project_id,
+            profile_id: Some(&profile.id),
+            action: "PROFILE_CHANGE",
+            status: "SUCCESS",
+            secret_name: None,
+            command: Some("agent config"),
+            metadata_json: &metadata,
+            timestamp,
+        },
     )?;
-    Ok(WriteConfigResponse { settings, changed_keys })
+    Ok(())
 }
 
 fn push_bool_patch(
@@ -553,34 +632,32 @@ fn dangerous_profile_setting(
 }
 
 fn read_config_table(path: &Path) -> Result<toml::Table, ConfigRpcError> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(toml::Table::new()),
-        Err(error) => return Err(error.into()),
-    };
-    Ok(toml::from_str::<toml::Table>(&text)?)
+    Ok(toml::from_str(read_config_text(path)?.as_deref().unwrap_or_default())?)
 }
 
-fn write_config_table(path: &Path, config: &toml::Table) -> Result<(), ConfigRpcError> {
-    if let Some(parent) = path.parent() {
+fn read_config_text(path: &Path) -> io::Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn write_config_file(path: &Path, text: &str) -> Result<(), ConfigRpcError> {
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
     }
-    let text = toml::to_string_pretty(config)?;
-    fs::write(path, text)?;
-    set_user_only_file_permissions(path)?;
+    write_user_only_file(path, text.as_bytes())?;
     Ok(())
 }
 
-#[cfg(unix)]
-fn set_user_only_file_permissions(path: &Path) -> Result<(), io::Error> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
-#[allow(clippy::unnecessary_wraps)] // Keep the shared fallible interface; Windows inherits ACLs.
-const fn set_user_only_file_permissions(_path: &Path) -> Result<(), io::Error> {
-    Ok(())
+fn restore_config_file(path: &Path, previous: Option<&str>) -> Result<(), ConfigRpcError> {
+    if let Some(previous) = previous {
+        write_config_file(path, previous)
+    } else {
+        fs::remove_file(path)?;
+        Ok(())
+    }
 }
 
 fn bool_config_value(config: &toml::Table, key: &str) -> Result<Option<bool>, ConfigRpcError> {
@@ -819,7 +896,7 @@ mod tests {
         let directory = tempdir().expect("tempdir");
         let config_path = directory.path().join("config.toml");
         let store_path = directory.path().join("store.db");
-        let _store = initialized_store(&store_path);
+        let store = initialized_store(&store_path);
         let state = AgentSocketState::locked("test-version");
         state.unlock_cache.lock().await.insert(
             "lk_proj_test".to_owned(),
@@ -838,6 +915,7 @@ mod tests {
                 "store_path": store_path,
                 "project_id": "lk_proj_test",
                 "changes": {
+                    "privacy_redact_names": true,
                     "dangerous_profile": true
                 }
             }),
@@ -849,6 +927,60 @@ mod tests {
 
         assert_eq!(error.error, "ProtocolError");
         assert!(!config_path.exists());
+        assert_eq!(
+            store.list_recent_audit_actions("lk_proj_test", 10).expect("audit actions"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_config_rolls_back_when_profile_audit_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let config_path = directory.path().join("config.toml");
+        let store_path = directory.path().join("store.db");
+        let store = initialized_store(&store_path);
+        let original = "# preserve this comment\n[privacy]\nredact_names = false\n";
+        fs::write(&config_path, original)?;
+        let state = AgentSocketState::locked("test-version");
+        let now = current_unix_nanos();
+        state.unlock_cache.lock().await.insert(
+            "lk_proj_test".to_owned(),
+            UnlockEntry::new(vec![42; 32], now, Duration::from_secs(60), UnlockMethod::Passphrase),
+        );
+        let request = WriteConfigRequest {
+            config_path: config_path.clone(),
+            store_path,
+            project_id: "lk_proj_test".to_owned(),
+            profile_name: Some("default".to_owned()),
+            changes: serde_json::from_value(
+                json!({"privacy_redact_names": true, "dangerous_profile": true}),
+            )?,
+        };
+        for (trigger, expected_error) in [
+            (
+                "CREATE TRIGGER deny_profile_audit BEFORE INSERT ON audit_log
+                 WHEN NEW.action = 'PROFILE_CHANGE' BEGIN SELECT RAISE(ABORT, 'fixture denied'); END",
+                "fixture denied",
+            ),
+            (
+                "CREATE TABLE deferred_config (project_id TEXT REFERENCES projects(id) DEFERRABLE INITIALLY DEFERRED);
+                 CREATE TRIGGER deny_profile_audit AFTER INSERT ON audit_log WHEN NEW.action = 'PROFILE_CHANGE'
+                 BEGIN INSERT INTO deferred_config VALUES ('missing project'); END;",
+                "FOREIGN KEY constraint failed",
+            ),
+        ] {
+            store.connection().execute_batch(trigger)?;
+            let Err(error) = write_settings(&request, &state, now).await else {
+                panic!("expected {expected_error}");
+            };
+            assert!(error.to_string().contains(expected_error), "{error}");
+            assert_eq!(fs::read_to_string(&config_path)?, original);
+            assert!(!store.get_profile_by_name("lk_proj_test", "default")?.ok_or("profile")?.dangerous);
+            assert_eq!(store.list_recent_audit_actions("lk_proj_test", 10)?, Vec::<String>::new());
+            store.connection().execute_batch("DROP TRIGGER deny_profile_audit")?;
+        }
+        Ok(())
     }
 
     #[tokio::test(flavor = "current_thread")]

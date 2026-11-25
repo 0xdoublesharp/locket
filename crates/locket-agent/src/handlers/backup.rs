@@ -662,7 +662,12 @@ fn export_bundle(
         .output_path
         .clone()
         .unwrap_or_else(|| default_bundle_output_path(&unlocked.store_path, timestamp));
-    write_bundle_file(&output_path, &container)?;
+    validate_bundle_output(&output_path)?;
+    let bytes = container.serialize().map_err(|error| {
+        ("BundleVerificationFailed", format!("bundle serialize failed: {error}"))
+    })?;
+    // Commit the audit before opening the public path. A process stop or a
+    // delayed audit commit failure cannot leave an unaudited bundle there.
     write_export_audit(
         &mut store,
         &request.project_id,
@@ -672,6 +677,7 @@ fn export_bundle(
         output_path_kind(&output_path, &unlocked.store_path),
         timestamp,
     )?;
+    write_bundle_file(&output_path, &bytes)?;
     Ok(BackupActionResponse {
         action: "export-bundle".to_owned(),
         status: "exported".to_owned(),
@@ -2204,34 +2210,51 @@ fn backup_key_error(error: KeyError, scope: &str) -> (&'static str, String) {
     }
 }
 
-fn write_bundle_file(path: &Path, bundle: &BundleContainer) -> BackupResult<()> {
-    let bytes = bundle.serialize().map_err(|error| {
-        ("BundleVerificationFailed", format!("bundle serialize failed: {error}"))
-    })?;
+fn validate_bundle_output(path: &Path) -> BackupResult<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => return Err(output_exists_error()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(("CorruptDb", format!("could not inspect bundle output: {error}")));
+        }
+    }
+    let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty());
+    if path.file_name().is_none() || parent.is_some_and(|parent| !parent.is_dir()) {
+        return Err(("CorruptDb", "bundle output requires an existing directory".to_owned()));
+    }
+    Ok(())
+}
+
+fn output_exists_error() -> (&'static str, String) {
+    ("InvalidReference", "bundle output already exists".to_owned())
+}
+
+fn write_bundle_file(path: &Path, bytes: &[u8]) -> BackupResult<()> {
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
     let mut file = options.open(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::AlreadyExists {
-            ("InvalidReference", "bundle output already exists".to_owned())
+            output_exists_error()
         } else {
             ("CorruptDb", format!("could not create bundle output: {error}"))
         }
     })?;
-    file.write_all(&bytes)
-        .map_err(|error| ("CorruptDb", format!("could not write bundle output: {error}")))?;
-    set_user_only_file_permissions(path)
-}
-
-#[cfg(unix)]
-fn set_user_only_file_permissions(path: &Path) -> BackupResult<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .map_err(|error| ("CorruptDb", format!("could not set bundle permissions: {error}")))
-}
-
-#[cfg(not(unix))]
-#[allow(clippy::unnecessary_wraps)] // Keep the shared fallible interface; Windows inherits ACLs.
-const fn set_user_only_file_permissions(_path: &Path) -> BackupResult<()> {
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let mut message = format!("could not write bundle output: {error}");
+        if let Err(cleanup) = fs::remove_file(path)
+            && cleanup.kind() != std::io::ErrorKind::NotFound
+        {
+            use std::fmt::Write as _;
+            let _ = write!(message, "; could not remove incomplete output: {cleanup}");
+        }
+        return Err(("CorruptDb", message));
+    }
     Ok(())
 }
 
