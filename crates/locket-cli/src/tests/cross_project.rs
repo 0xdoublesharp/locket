@@ -460,7 +460,8 @@ fn mcp_exchange(context: &RuntimeContext, requests: &[Value]) -> Result<String, 
 }
 
 #[test]
-fn mcp_roundtrip_has_seven_tools_and_never_returns_values() -> Result<(), Box<dyn Error>> {
+#[allow(clippy::too_many_lines)] // Keep the complete exchange in one session.
+fn mcp_roundtrip_lists_tools_and_never_returns_values() -> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;
     let context = test_context_with_secret_value(&directory, CANARY);
     init(&context, "app")?;
@@ -535,7 +536,11 @@ fn mcp_roundtrip_has_seven_tools_and_never_returns_values() -> Result<(), Box<dy
         output.lines().map(serde_json::from_str::<Value>).collect::<Result<Vec<_>, _>>()?;
     assert_eq!(replies.len(), 16);
     assert_eq!(replies[0]["result"]["protocolVersion"], "2025-03-26");
-    assert_eq!(replies[1]["result"]["tools"].as_array().ok_or("expected tools")?.len(), 7);
+    let tools = replies[1]["result"]["tools"].as_array().ok_or("expected tools")?;
+    assert_eq!(tools.len(), 10);
+    for name in ["locket_inspect_env_keys", "locket_scan_env_files", "locket_import_env"] {
+        assert!(tools.iter().any(|tool| tool["name"] == name), "missing {name}");
+    }
     let payload = |id: usize| -> Result<Value, Box<dyn Error>> {
         Ok(serde_json::from_str(
             replies[id]["result"]["content"][0]["text"].as_str().ok_or("missing MCP text")?,
@@ -560,5 +565,204 @@ fn mcp_roundtrip_has_seven_tools_and_never_returns_values() -> Result<(), Box<dy
     assert_eq!(payload(13)?["reference"], "lk://dev/FROM_FILE");
     assert_eq!(replies[14]["result"], json!({}));
     assert_eq!(replies[15]["error"]["code"], -32602);
+    Ok(())
+}
+
+fn mcp_env_call(
+    context: &RuntimeContext,
+    tool: &str,
+    args: &Value,
+    error: Option<LocketError>,
+) -> Result<Value, Box<dyn Error>> {
+    let output = mcp_exchange(context, &[rpc(1, tool, args)])?;
+    assert!(!output.contains(CANARY), "{tool} leaked a value");
+    let reply = serde_json::from_str::<Value>(&output)?;
+    let result = &reply["result"];
+    assert_eq!(result["isError"], error.is_some(), "{output}");
+    let payload: Value =
+        serde_json::from_str(result["content"][0]["text"].as_str().ok_or("missing MCP text")?)?;
+    if let Some(kind) = error {
+        assert_eq!(payload["error"]["code"], format!("{kind:?}"));
+    }
+    Ok(payload)
+}
+
+#[test]
+fn mcp_env_discovery_respects_cwd_and_registered_roots() -> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let trusted = tempdir()?;
+    let outside = tempdir()?;
+    let context = test_context_with_secret_value(&directory, CANARY);
+    let trusted_context = RuntimeContext { cwd: trusted.path().to_path_buf(), ..context.clone() };
+    for root in [&directory, &trusted, &outside] {
+        fs::write(root.path().join(".env.prod"), format!("OPENAI_API_KEY={CANARY}\n"))?;
+    }
+    let inspect = "locket_inspect_env_keys";
+    let scan = "locket_scan_env_files";
+    let keys = mcp_env_call(&context, inspect, &json!({"path": ".env.prod"}), None)?;
+    assert_eq!(keys["keys"], json!(["OPENAI_API_KEY"]));
+    assert_eq!(keys["metadata_only"], true);
+
+    let nested = directory.path().join("nested");
+    fs::create_dir(&nested)?;
+    fs::write(nested.join(".env"), format!("NESTED_KEY={CANARY}\n"))?;
+    let report = mcp_env_call(&context, scan, &json!({}), None)?;
+    assert_eq!(report["total_files"], 2);
+    assert_eq!(report["files"][0]["keys"], json!(["OPENAI_API_KEY"]));
+    assert_eq!(report["files"][0]["suggested_profile"], "prod");
+    assert_eq!(report["shared_candidates"][0]["key"], "OPENAI_API_KEY");
+    let shallow = mcp_env_call(&context, scan, &json!({"max_depth": 0}), None)?;
+    assert_eq!(shallow["total_files"], 1);
+    let deep = directory.path().join(["nested"; 9].join("/"));
+    fs::create_dir_all(deep.join("too-deep"))?;
+    fs::write(deep.join(".env"), format!("AT_LIMIT={CANARY}\n"))?;
+    fs::write(deep.join("too-deep/.env"), format!("OVER_LIMIT={CANARY}\n"))?;
+    let capped = mcp_env_call(&context, scan, &json!({"max_depth": 50}), None)?;
+    assert_eq!(capped["total_files"], 3);
+    assert!(capped.to_string().contains("AT_LIMIT"));
+    assert!(!capped.to_string().contains("OVER_LIMIT"));
+
+    assert!(!context.store_path.exists());
+    init(&trusted_context, "trusted")?;
+    mcp_env_call(&context, inspect, &json!({"path": trusted.path().join(".env.prod")}), None)?;
+    mcp_env_call(&context, scan, &json!({"path": trusted.path()}), None)?;
+    for (tool, path) in [(inspect, outside.path().join(".env.prod")), (scan, outside.path().into())]
+    {
+        mcp_env_call(&context, tool, &json!({"path": path}), Some(LocketError::AccessDenied))?;
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn mcp_env_discovery_rejects_symlink_inputs_and_skips_scan_links() -> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempdir()?;
+    let outside = tempdir()?;
+    let context = test_context_with_secret_value(&directory, CANARY);
+    fs::write(directory.path().join(".env"), format!("LOCAL={CANARY}\n"))?;
+    fs::write(outside.path().join(".env"), format!("EXTERNAL={CANARY}\n"))?;
+    symlink(directory.path().join(".env"), directory.path().join(".env.link"))?;
+    symlink(outside.path(), directory.path().join("foreign"))?;
+
+    let inspect = "locket_inspect_env_keys";
+    let scan = "locket_scan_env_files";
+    mcp_env_call(
+        &context,
+        inspect,
+        &json!({"path": ".env.link"}),
+        Some(LocketError::MetadataInvalid),
+    )?;
+    mcp_env_call(
+        &context,
+        inspect,
+        &json!({"path": "foreign/.env"}),
+        Some(LocketError::AccessDenied),
+    )?;
+    mcp_env_call(
+        &context,
+        scan,
+        &json!({"path": "foreign/."}),
+        Some(LocketError::MetadataInvalid),
+    )?;
+    let report = mcp_env_call(&context, scan, &json!({}), None)?;
+    assert_eq!(report["total_files"], 1);
+    assert_eq!(report["files"][0]["keys"], json!(["LOCAL"]));
+    Ok(())
+}
+
+#[test]
+fn mcp_env_import_shared_filters_and_dry_run_leaves_store_unchanged() -> Result<(), Box<dyn Error>>
+{
+    let directory = tempdir()?;
+    let outside = tempdir()?;
+    let context = RuntimeContext {
+        key_store: Arc::new(ProjectKeys::default()),
+        ..test_context_with_secret_value(&directory, CANARY)
+    };
+    let detached = RuntimeContext { cwd: outside.path().to_path_buf(), ..context.clone() };
+    let (_, shared) = json_run(&context, &["shared", "init", "--json"])?;
+    let path = directory.path().join(".env");
+    fs::write(&path, format!("KEEP={CANARY}-keep\nOMIT={CANARY}-omit\n"))?;
+    fs::write(directory.path().join("invalid.env"), format!("BROKEN=\"{CANARY}\n"))?;
+    let tool = "locket_import_env";
+    let mut args = json!({"project": "@shared", "path": ".env", "only": ["KEEP"], "dry_run": true});
+    let planned = mcp_env_call(&context, tool, &args, None)?;
+    assert_eq!(planned["dry_run"], true);
+    assert_eq!(planned["imported_names"], json!(["KEEP"]));
+    assert_eq!(planned["filtered_out_names"], json!(["OMIT"]));
+    let mut detached_args = args.clone();
+    detached_args["path"] = json!(path);
+    mcp_env_call(&detached, tool, &detached_args, Some(LocketError::AccessDenied))?;
+    init(&context, "trusted")?;
+    let store = Store::open_read_only(&context.store_path)?;
+    let id = shared["project_id"].as_str().ok_or("missing shared id")?;
+    let profile = store.get_profile_by_name(id, "default")?.ok_or("missing profile")?;
+    assert!(store.get_active_secret(id, &profile.id, "KEEP", "user-local")?.is_none());
+
+    args["dry_run"] = json!(false);
+    let mut rejected = args.clone();
+    rejected["value"] = json!(CANARY);
+    mcp_env_call(&context, tool, &rejected, Some(LocketError::MetadataInvalid))?;
+    rejected.as_object_mut().ok_or("missing arguments")?.remove("value");
+    rejected["path"] = json!("invalid.env");
+    mcp_env_call(&context, tool, &rejected, Some(LocketError::MetadataInvalid))?;
+    detached_args["dry_run"] = json!(false);
+    let imported = mcp_env_call(&detached, tool, &detached_args, None)?;
+    assert_eq!(imported["imported_names"], json!(["KEEP"]));
+    assert_eq!(imported["metadata_only"], true);
+    assert!(path.is_file());
+    assert!(store.get_active_secret(id, &profile.id, "KEEP", "user-local")?.is_some());
+    assert!(store.get_active_secret(id, &profile.id, "OMIT", "user-local")?.is_none());
+    Ok(())
+}
+
+#[test]
+fn mcp_env_import_project_requires_its_root_and_confirms_dangerous_overwrite()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let context = test_context_with_secret_value(&directory, CANARY);
+    let root = directory.path().join("project");
+    fs::create_dir(&root)?;
+    let inside = RuntimeContext { cwd: root.clone(), ..context.clone() };
+    init(&inside, "app")?;
+    run(&inside, &["profile", "create", "prod"])?;
+    run(&context_with_confirmation(&inside, "prod\n"), &["profile", "mark-dangerous", "prod"])?;
+    let tool = "locket_import_env";
+    fs::write(directory.path().join(".env"), format!("TOKEN={CANARY}-outside\n"))?;
+    fs::write(root.join(".env"), format!("TOKEN={CANARY}-initial\n"))?;
+    let mut args =
+        json!({"project": "app", "profile": "prod", "path": ".env", "source": "machine-local"});
+    mcp_env_call(&context, tool, &args, Some(LocketError::AccessDenied))?;
+    args["project"] = json!(root);
+    args["path"] = json!("project/.env");
+    let created = mcp_env_call(&context, tool, &args, None)?;
+    assert_eq!(created["imported_names"], json!(["TOKEN"]));
+    assert_eq!(created["source"], "machine-local");
+
+    args["project"] = created["project_id"].clone();
+    fs::write(root.join(".env"), format!("TOKEN={CANARY}-updated\n"))?;
+    args["overwrite"] = json!(true);
+    args["dry_run"] = json!(true);
+    let planned = mcp_env_call(&context, tool, &args, None)?;
+    assert_eq!(planned["overwritten_names"], json!(["TOKEN"]));
+    args["dry_run"] = json!(false);
+    mcp_env_call(&context, tool, &args, Some(LocketError::DangerousProfileConfirmationRequired))?;
+
+    let id = created["project_id"].as_str().ok_or("missing project id")?;
+    let store = Store::open_read_only(&context.store_path)?;
+    let profile = store.get_profile_by_name(id, "prod")?.ok_or("missing profile")?;
+    let version = || -> Result<_, Box<dyn Error>> {
+        Ok(store
+            .get_active_secret(id, &profile.id, "TOKEN", "machine-local")?
+            .ok_or("missing token")?
+            .current_version)
+    };
+    assert_eq!(version()?, 1);
+    args["confirm_dangerous"] = json!(true);
+    let updated = mcp_env_call(&context, tool, &args, None)?;
+    assert_eq!(updated["overwritten_names"], json!(["TOKEN"]));
+    assert_eq!(version()?, 2);
     Ok(())
 }

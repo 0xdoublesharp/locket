@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use locket_agent::DiscoveryFilters;
 use locket_core::{LocketError, SecretName};
@@ -13,14 +13,18 @@ use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
 use crate::commands::discovery::{
-    discover_rows, error_json, project_rows, require_metadata_store, select_project,
-    trusted_project_configs,
+    discover_rows, error_json, project_rows, read_metadata_store, require_metadata_store,
+    select_project, trusted_project_configs,
 };
 use crate::commands::secrets::generate::{GenerateFormat, generate_value};
+use crate::commands::secrets::import::{
+    EnvImportOptions, import_env_to_target, inspect_env_file_keys, scan_workspace_env_files,
+};
 use crate::commands::secrets::set::{
     SecretWriteKeys, WriteRequest, WriteTarget, confirm_write, select_target,
     validate_write_metadata, write_value,
 };
+use crate::runtime::error::access_denied_error;
 use crate::{
     CliError, RuntimeContext, SecretMetadataFlags, SecretSourceArg, load_project_key,
     metadata_invalid_error, now_unix_nanos, open_store, secret_deleted_error,
@@ -28,6 +32,8 @@ use crate::{
 };
 
 const MAX_INPUT_BYTES: u64 = 1_048_576;
+const DEFAULT_ENV_SCAN_DEPTH: i64 = 5;
+const MAX_ENV_SCAN_DEPTH: i64 = 10;
 
 pub fn serve(
     input: &mut impl BufRead,
@@ -149,15 +155,7 @@ impl SecretArgs {
     }
 
     fn source(&self) -> Result<Option<SecretSourceArg>, CliError> {
-        self.source
-            .as_deref()
-            .map(|source| match source {
-                "user-local" => Ok(SecretSourceArg::UserLocal),
-                "machine-local" => Ok(SecretSourceArg::MachineLocal),
-                "team-managed" => Ok(SecretSourceArg::TeamManaged),
-                _ => Err(metadata_invalid_error("invalid secret source")),
-            })
-            .transpose()
+        self.source.as_deref().map(parse_secret_source).transpose()
     }
 
     fn record(&self, store: &Store, target: &WriteTarget) -> Result<SecretRecord, CliError> {
@@ -176,6 +174,15 @@ impl SecretArgs {
             .filter(|row| row.state == "active")
             .max_by_key(|row| source_precedence(&row.source))
             .ok_or_else(|| secret_deleted_error("secret source is deleted"))
+    }
+}
+
+fn parse_secret_source(source: &str) -> Result<SecretSourceArg, CliError> {
+    match source {
+        "user-local" => Ok(SecretSourceArg::UserLocal),
+        "machine-local" => Ok(SecretSourceArg::MachineLocal),
+        "team-managed" => Ok(SecretSourceArg::TeamManaged),
+        _ => Err(metadata_invalid_error("invalid secret source")),
     }
 }
 
@@ -222,6 +229,45 @@ struct UpdateArgs {
     metadata: MetadataArgs,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InspectEnvArgs {
+    path: PathBuf,
+    #[serde(default)]
+    literal: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScanEnvArgs {
+    path: Option<PathBuf>,
+    max_depth: Option<i64>,
+    #[serde(default)]
+    literal: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)] // Independent MCP options.
+struct ImportEnvArgs {
+    project: String,
+    path: PathBuf,
+    profile: Option<String>,
+    source: Option<String>,
+    #[serde(default)]
+    only: Vec<String>,
+    #[serde(default)]
+    exclude: Vec<String>,
+    #[serde(default)]
+    overwrite: bool,
+    #[serde(default)]
+    literal: bool,
+    #[serde(default)]
+    dry_run: bool,
+    #[serde(default)]
+    confirm_dangerous: bool,
+}
+
 fn args_as<T: DeserializeOwned>(args: Value) -> Result<T, CliError> {
     serde_json::from_value(if args.is_null() { json!({}) } else { args })
         .map_err(|_| metadata_invalid_error("invalid MCP tool arguments"))
@@ -251,8 +297,114 @@ fn call_tool(context: &RuntimeContext, name: &str, mut args: Value) -> Result<Va
         "locket_list_project_policies" => {
             list_policies(context, &args_as::<ProjectArgs>(args)?.project)
         }
+        "locket_inspect_env_keys" => inspect_env(context, &args_as::<InspectEnvArgs>(args)?),
+        "locket_scan_env_files" => scan_env(context, &args_as::<ScanEnvArgs>(args)?),
+        "locket_import_env" => import_env(context, args_as::<ImportEnvArgs>(args)?),
         _ => Err(metadata_invalid_error("unknown MCP tool")),
     }
+}
+
+fn inspect_env(context: &RuntimeContext, args: &InspectEnvArgs) -> Result<Value, CliError> {
+    let path = canonical_env_path(context, &args.path, EnvPathKind::File)?;
+    require_workspace_env_path(context, &path, None)?;
+    inspect_env_file_keys(&path, args.literal)
+}
+
+fn scan_env(context: &RuntimeContext, args: &ScanEnvArgs) -> Result<Value, CliError> {
+    let path = args.path.as_deref().unwrap_or_else(|| Path::new("."));
+    let root = canonical_env_path(context, path, EnvPathKind::Directory)?;
+    require_workspace_env_path(context, &root, None)?;
+    let max_depth = args.max_depth.unwrap_or(DEFAULT_ENV_SCAN_DEPTH).clamp(1, MAX_ENV_SCAN_DEPTH);
+    scan_workspace_env_files(&root, usize::try_from(max_depth).unwrap_or(5), args.literal)
+}
+
+fn import_env(context: &RuntimeContext, args: ImportEnvArgs) -> Result<Value, CliError> {
+    let source =
+        args.source.as_deref().map_or(Ok(SecretSourceArg::UserLocal), parse_secret_source)?;
+    let mut store =
+        if args.dry_run { require_metadata_store(context)? } else { open_store(context)? };
+    let target = select_target(context, &store, Some(&args.project), args.profile.as_deref())?;
+    let path = canonical_env_path(context, &args.path, EnvPathKind::File)?;
+    if target.project.id.starts_with("lk_proj_shared_") {
+        require_workspace_env_path(context, &path, Some(&store))?;
+    } else if !path_in_project_roots(&store, &target.project.id, &path)? {
+        return Err(access_denied_error(
+            "dotenv file must be inside a trusted target project root",
+        ));
+    }
+    if args.overwrite && !args.dry_run {
+        confirm_write(&target.profile, args.confirm_dangerous, "set confirm_dangerous to true")?;
+    }
+    let options = EnvImportOptions {
+        only: args.only,
+        exclude: args.exclude,
+        overwrite: args.overwrite,
+        literal: args.literal,
+        dry_run: args.dry_run,
+        source,
+    };
+    import_env_to_target(context, &mut store, &target, &path, &options)
+}
+
+#[derive(Clone, Copy)]
+enum EnvPathKind {
+    File,
+    Directory,
+}
+
+fn canonical_env_path(
+    context: &RuntimeContext,
+    path: &Path,
+    kind: EnvPathKind,
+) -> Result<PathBuf, CliError> {
+    // Strip trailing separators and dots so they cannot hide a final symlink.
+    let path = context.cwd.join(path).components().collect::<PathBuf>();
+    let metadata = fs::symlink_metadata(&path)?;
+    match kind {
+        EnvPathKind::File if !metadata.is_file() => {
+            return Err(metadata_invalid_error("dotenv input must be a regular file"));
+        }
+        EnvPathKind::Directory if !metadata.is_dir() => {
+            return Err(metadata_invalid_error("dotenv scan root must be a directory"));
+        }
+        _ => {}
+    }
+    Ok(path.canonicalize()?)
+}
+
+fn require_workspace_env_path(
+    context: &RuntimeContext,
+    canonical: &Path,
+    store: Option<&Store>,
+) -> Result<(), CliError> {
+    if context.cwd.canonicalize().is_ok_and(|cwd| canonical.starts_with(cwd)) {
+        return Ok(());
+    }
+    let metadata_store = if store.is_none() { read_metadata_store(context)? } else { None };
+    if let Some(store) = store.or(metadata_store.as_ref()) {
+        for project in store.list_projects()? {
+            if path_in_project_roots(store, &project.id, canonical)? {
+                return Ok(());
+            }
+        }
+    }
+    Err(access_denied_error(
+        "dotenv path must be inside the working directory or a trusted project root",
+    ))
+}
+
+fn path_in_project_roots(
+    store: &Store,
+    project_id: &str,
+    canonical: &Path,
+) -> Result<bool, CliError> {
+    Ok(store.list_project_roots(project_id)?.into_iter().any(|root| {
+        root.display_path.and_then(|path| fs::canonicalize(path).ok()).is_some_and(|path| {
+            canonical.starts_with(&path)
+                && path.is_dir()
+                && crate::root_hash(&path).is_ok_and(|hash| hash == root.root_hash)
+        })
+    }))
 }
 
 fn get_secret_metadata(context: &RuntimeContext, args: &SecretArgs) -> Result<Value, CliError> {
@@ -325,17 +477,8 @@ fn read_value_file(
         return Err(metadata_invalid_error("value_file must be a regular file"));
     }
     let canonical = path.canonicalize()?;
-    let trusted = store.list_project_roots(project_id)?.into_iter().any(|root| {
-        root.display_path.and_then(|path| fs::canonicalize(path).ok()).is_some_and(|path| {
-            canonical != path
-                && canonical.starts_with(&path)
-                && crate::root_hash(&path).is_ok_and(|hash| hash == root.root_hash)
-        })
-    });
-    if !trusted {
-        return Err(crate::runtime::error::access_denied_error(
-            "value_file must be inside a trusted project root",
-        ));
+    if !path_in_project_roots(store, project_id, &canonical)? {
+        return Err(access_denied_error("value_file must be inside a trusted project root"));
     }
     let file = open_value_file(&canonical)?;
     if !file.metadata()?.is_file() {
@@ -485,6 +628,8 @@ fn tool(name: &str, description: &str, properties: &Value, required: &[&str]) ->
 fn tools() -> Vec<Value> {
     let string = json!({"type": "string"});
     let boolean = json!({"type": "boolean"});
+    let optional_flag = json!({"type": "boolean", "default": false});
+    let key_list = json!({"type": "array", "items": string});
     let target = json!({
         "project": string, "profile": string, "name": string, "source": string,
         "confirm_dangerous_profile": string,
@@ -509,6 +654,32 @@ fn tools() -> Vec<Value> {
             "List local project metadata.",
             &json!({"redact_names": boolean}),
             &[],
+        ),
+        tool(
+            "locket_inspect_env_keys",
+            "Read dotenv key names and diagnostics from a file in the working directory or a trusted project root.",
+            &json!({"path": string, "literal": optional_flag}),
+            &["path"],
+        ),
+        tool(
+            "locket_scan_env_files",
+            "Find dotenv files, keys, profile hints, and shared-key candidates in the working directory or a trusted project root.",
+            &json!({
+                "path": string, "literal": optional_flag,
+                "max_depth": {"type": "integer", "minimum": 1, "maximum": MAX_ENV_SCAN_DEPTH, "default": DEFAULT_ENV_SCAN_DEPTH},
+            }),
+            &[],
+        ),
+        tool(
+            "locket_import_env",
+            "Import dotenv keys into an encrypted vault and return metadata. Use dry_run to preview changes. Confirm overwrites in dangerous profiles with confirm_dangerous.",
+            &json!({
+                "project": string, "path": string, "profile": string,
+                "source": {"type": "string", "enum": ["team-managed", "user-local", "machine-local"], "default": "user-local"},
+                "only": key_list, "exclude": key_list, "overwrite": optional_flag,
+                "literal": optional_flag, "dry_run": optional_flag, "confirm_dangerous": optional_flag,
+            }),
+            &["project", "path"],
         ),
         tool(
             "locket_discover_secrets",
