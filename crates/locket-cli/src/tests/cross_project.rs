@@ -1212,3 +1212,27 @@ fn parity_checks_plaintext_only_on_explicit_request_and_uses_trusted_root()
     assert!(!human.contains(CANARY));
     Ok(())
 }
+
+#[test]
+fn mcp_command_detection_preserves_command_metadata_for_local_manifests()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let context = test_context_with_secret_value(&directory, CANARY);
+    let root = directory.path();
+    fs::write(
+        root.join("package.json"),
+        json!({"scripts": {"dev": CANARY, "db:migrate": CANARY, "build": ""}}).to_string(),
+    )?;
+    fs::write(root.join("pnpm-lock.yaml"), "")?;
+    fs::write(root.join("Cargo.toml"), "[package]\nname = 'fixture'\n")?;
+    fs::create_dir(root.join("src"))?;
+    fs::write(root.join("src/main.rs"), "fn main() {}\n")?;
+    fs::write(root.join("Makefile"), "lint:\n\t@true\nrun::=fixture\n")?;
+    fs::write(root.join("pyproject.toml"), "")?;
+    fs::write(root.join("uv.lock"), "")?;
+    let expected = crate::commands::project::detect::detect_policy_commands(root, false)?;
+    let response = mcp_call(&context, "locket_detect_commands", &json!({}), None)?;
+    assert_eq!(response["commands"], serde_json::to_value(expected)?);
+    assert!(!response.to_string().contains(CANARY));
+    Ok(())
+}

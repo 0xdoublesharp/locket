@@ -197,7 +197,7 @@ pub async fn handle_team_sync_now(
     if !granted(&typed, state).await {
         return error(request, "GrantRequired", "explicit local grant required for team sync");
     }
-    match run_cached_sync(state, typed.project_id, typed.store_path).await {
+    match run_cached_sync(state, typed.project_id.clone(), Some(typed)).await {
         Ok(status) => response(request, status),
         Err(failure) => error(request, "TeamSyncRejected", &failure.to_string()),
     }
@@ -206,12 +206,17 @@ pub async fn handle_team_sync_now(
 async fn run_cached_sync(
     state: &AgentSocketState,
     project: String,
-    selected_store: Option<PathBuf>,
+    request: Option<TeamSyncRequest>,
 ) -> team_sync::Result<SyncStatus> {
     let (key, context, expiry, pin) = cached_sync_context(state, &project).await?;
-    let authorization = commit_authorization(state, &project, &context.store_path, expiry, &key);
+    let unlock = commit_authorization(state, &project, &context.store_path, expiry, &key);
+    let authorization = match &request {
+        Some(request) => granted_commit_authorization(state, request, unlock),
+        None => unlock,
+    };
     run_sync_worker(state, project.clone(), context.store_path.clone(), pin, move |store| {
-        check_selected_store(selected_store.as_deref(), &context.store_path)?;
+        let selected_store = request.as_ref().and_then(|request| request.store_path.as_deref());
+        check_selected_store(selected_store, &context.store_path)?;
         let configured = store.connection().query_row(
             "SELECT EXISTS(SELECT 1 FROM team_sync_folders WHERE project_id=?1 AND enabled=1)",
             [&project],
@@ -886,7 +891,8 @@ mod tests {
             ],
             profiles: vec![],
         };
-        let first = SignedStatement::sign(&statement, &signing)?.seal(&local.sealing_key)?;
+        let signed = SignedStatement::sign(&statement, &signing)?;
+        let first = signed.seal(&local.sealing_key)?;
         team_sync::apply_package(
             &mut store,
             &first,
@@ -902,12 +908,35 @@ mod tests {
         locket_platform::WrappedLocalFileDevicePrivateKeyStorage::new(&private, "project", memory)
             .store(&local.id, &sealing)?;
         team_sync::configure_folder(&store, "project", &folder, &private, false)?;
+        let state = cached_projects(&path).await;
+        let mut valid_update = statement.clone();
+        valid_update.nonce = [6; 24];
+        valid_update.epoch = 2;
+        valid_update.previous_digest = locket_core::team_package::digest(&signed.statement);
+        let update_path = folder.join("valid.lkpkg");
+        std::fs::write(
+            &update_path,
+            SignedStatement::sign(&valid_update, &signing)?.seal(&local.sealing_key)?,
+        )?;
+        let request = TeamSyncRequest {
+            project_id: "project".into(),
+            store_path: Some(path.clone()),
+            profile_id: Some("profile".into()),
+            grant_id: Some("withdrawn-grant".into()),
+            binding: None,
+        };
+        let denied = run_cached_sync(&state, "project".into(), Some(request))
+            .await
+            .err()
+            .ok_or("withdrawn team sync grant was accepted")?;
+        assert!(denied.to_string().contains("team sync grant expired or changed before commit"));
+        assert_eq!(team_sync::status(&store, "project")?.epoch, 1);
+        std::fs::remove_file(update_path)?;
         statement.nonce = [5; 24];
         std::fs::write(
             folder.join("fork.lkpkg"),
             SignedStatement::sign(&statement, &signing)?.seal(&local.sealing_key)?,
         )?;
-        let state = cached_projects(&path).await;
         let failure =
             run_cached_sync(&state, "project".into(), None).await.err().ok_or("fork accepted")?;
         assert!(failure.to_string().contains("fork or rollback detected"));

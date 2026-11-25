@@ -1184,3 +1184,56 @@ fn env_import_refreshes_the_selected_folder_and_keeps_plaintext()
     assert!(!directory.path().join(".gitignore").exists());
     Ok(())
 }
+
+#[test]
+fn import_overwrite_checks_the_current_profile_policy_before_mutating()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::commands::secrets::import::{EnvImportOptions, import_env_to_target};
+    use crate::commands::secrets::set::select_target;
+    use crate::{SecretSourceArg, open_store};
+    use locket_core::LocketError;
+
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--no-device", "--no-passkey", "--profile", "dev"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    let path = directory.path().join(".env");
+    std::fs::write(&path, "TOKEN=first-fixture\n")?;
+    let mut store = open_store(&context)?;
+    let target = select_target(&context, &store, None, None)?;
+    let mut options = EnvImportOptions {
+        only: Vec::new(),
+        exclude: Vec::new(),
+        overwrite: false,
+        literal: false,
+        dry_run: false,
+        confirmed_profile: None,
+        source: SecretSourceArg::UserLocal,
+    };
+    import_env_to_target(&context, &mut store, &target, std::fs::File::open(&path)?, &options)?;
+    assert!(store.set_profile_dangerous(&target.project.id, &target.profile.name, true)?);
+    std::fs::write(&path, "TOKEN=second-fixture\n")?;
+    options.overwrite = true;
+    options.dry_run = true;
+    let preview =
+        import_env_to_target(&context, &mut store, &target, std::fs::File::open(&path)?, &options)?;
+    assert_eq!(preview["overwritten"], 1);
+    options.dry_run = false;
+    let error =
+        import_env_to_target(&context, &mut store, &target, std::fs::File::open(&path)?, &options)
+            .err()
+            .ok_or("overwrite needed confirmation after the policy change")?;
+    assert_eq!(error.exit_code(), LocketError::DangerousProfileConfirmationRequired.exit_code());
+    let current = store
+        .get_secret_by_source(&target.project.id, &target.profile.id, "TOKEN", "user-local")?
+        .ok_or("missing fixture secret")?;
+    assert_eq!(current.current_version, 1);
+    options.confirmed_profile = Some(target.profile.name.clone());
+    let report =
+        import_env_to_target(&context, &mut store, &target, std::fs::File::open(&path)?, &options)?;
+    assert_eq!(report["overwritten"], 1);
+    Ok(())
+}

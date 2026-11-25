@@ -16,10 +16,14 @@ use serde_json::Value;
 use zeroize::Zeroizing;
 
 use self::env_files::{
-    Diagnostic, ParsedEnvFile, read_env_file, write_env_keys, write_env_scan, write_warnings,
+    Diagnostic, ParsedEnvFile, open_env_file, read_env_file, write_env_keys, write_env_scan,
+    write_warnings,
 };
 #[allow(clippy::redundant_pub_crate, reason = "Crate-level API shared with MCP")]
-pub(crate) use self::env_files::{inspect_env_file_keys, scan_workspace_env_files};
+pub(crate) use self::env_files::{
+    InputDirectory, input_parent, inspect_open_env_file, open_scoped_file, scan_open_workspace,
+};
+use self::env_files::{inspect_env_file_keys, scan_workspace_env_files};
 use super::set::{
     NewSecret, Rotation, SecretWriteKeys, WriteTarget, confirm_write, create_value, rotate_value,
     select_target,
@@ -49,6 +53,7 @@ pub(crate) struct EnvImportOptions {
     pub overwrite: bool,
     pub literal: bool,
     pub dry_run: bool,
+    pub confirmed_profile: Option<String>,
     pub source: SecretSourceArg,
 }
 
@@ -78,17 +83,16 @@ pub fn env_file_command(
 
 /// Import into an already resolved target or compare keys without writing.
 ///
-/// The caller must confirm dangerous overwrites before invoking a real import.
-/// This operation leaves the source file and project files untouched.
+/// Reads the supplied handle and leaves the source and project files untouched.
 #[allow(clippy::redundant_pub_crate, reason = "Crate-level API shared with MCP")]
 pub(crate) fn import_env_to_target(
     context: &RuntimeContext,
     store: &mut Store,
     target: &WriteTarget,
-    env_path: &Path,
+    env_file: fs::File,
     options: &EnvImportOptions,
 ) -> Result<Value, CliError> {
-    let report = run_import(context, store, target, env_path, options, |_, _| Ok(()))?;
+    let report = run_import(context, store, target, env_file, options, |_, _| Ok(()))?;
     Ok(serde_json::to_value(report)?)
 }
 
@@ -138,6 +142,7 @@ fn import_cli(
         }
         select_target(context, &store, selection.project.as_deref(), args.profile.as_deref())?
     };
+    let mut confirmed_profile = selection.confirm_dangerous.clone();
     if args.overwrite && !selection.dry_run && target.profile.dangerous {
         if let Some(confirmation) = &selection.confirm_dangerous {
             validate_overwrite_confirmation(&target.profile, confirmation)?;
@@ -153,6 +158,7 @@ fn import_cli(
                 &target.profile,
                 context.confirmation_reader.as_ref(),
             )?;
+            confirmed_profile = Some(target.profile.name.clone());
         }
     }
     let root = if selection.dry_run || target.project.id.starts_with("lk_proj_shared_") {
@@ -169,14 +175,16 @@ fn import_cli(
         overwrite: args.overwrite,
         literal: args.literal,
         dry_run: selection.dry_run,
+        confirmed_profile,
         source: args.source.unwrap_or(SecretSourceArg::UserLocal),
     };
+    let file = open_env_file(&path)?;
     if selection.json {
-        let report = import_env_to_target(context, &mut store, &target, &path, &options)?;
+        let report = import_env_to_target(context, &mut store, &target, file, &options)?;
         refresh_import_project_files(context, root)?;
         return Ok(report);
     }
-    let report = run_import(context, &mut store, &target, &path, &options, |warnings, errors| {
+    let report = run_import(context, &mut store, &target, file, &options, |warnings, errors| {
         write_import_diagnostics(output, warnings, errors)
     })?;
     refresh_import_project_files(context, root)?;
@@ -306,13 +314,13 @@ fn run_import(
     context: &RuntimeContext,
     store: &mut Store,
     target: &WriteTarget,
-    path: &Path,
+    file: fs::File,
     options: &EnvImportOptions,
     diagnostics: impl FnOnce(&[Diagnostic], &[Diagnostic]) -> Result<(), CliError>,
 ) -> Result<ImportReport, CliError> {
     let only = import_filter(&options.only)?;
     let exclude = import_filter(&options.exclude)?;
-    let ParsedEnvFile { entries, warnings, errors } = read_env_file(path, options.literal)?;
+    let ParsedEnvFile { entries, warnings, errors } = read_env_file(file, options.literal)?;
     if !errors.is_empty() {
         drop(entries);
         diagnostics(&warnings, &errors)?;
@@ -344,7 +352,7 @@ fn run_import(
     let counts = if options.dry_run {
         plan_import(store, target, source, options.overwrite, &env_names)?
     } else {
-        import_entries(context, store, target, source, options.overwrite, values)?
+        import_entries(context, store, target, source, options, values)?
     };
     let profile_names = active_profile_secret_names(store, &target.project.id, &target.profile.id)?;
     let missing_in_profile = env_names.difference(&profile_names).cloned().collect();
@@ -431,18 +439,32 @@ fn import_entries(
     store: &mut Store,
     target: &WriteTarget,
     source: &str,
-    overwrite: bool,
+    options: &EnvImportOptions,
     parsed: Vec<(String, Zeroizing<String>)>,
 ) -> Result<ImportNames, CliError> {
     let project_id = &target.project.id;
     let profile_id = &target.profile.id;
     let metadata = SecretMetadataFlags::default();
     store.with_atomic_write(|store| {
+        if options.overwrite {
+            // Resolve the policy again in the transaction that performs the overwrite.
+            let profile = store
+                .get_profile_by_name(project_id, &target.profile.name)?
+                .filter(|profile| &profile.id == profile_id)
+                .ok_or_else(|| {
+                    profile_not_found_error("target profile changed; retry the import")
+                })?;
+            confirm_write(
+                &profile,
+                options.confirmed_profile.as_deref() == Some(&profile.name),
+                "confirm the dangerous profile before retrying the import",
+            )?;
+        }
         let mut names = ImportNames::default();
         let mut keys = None;
         for (name, value) in parsed {
             let existing = existing_import_secret(store, target, source, &name)?;
-            if existing.is_some() && !overwrite {
+            if existing.is_some() && !options.overwrite {
                 drop(value);
                 names.skipped.insert(name);
                 continue;

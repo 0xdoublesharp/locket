@@ -1,35 +1,37 @@
 //! Stdio MCP server for metadata queries and encrypted vault writes.
 
+use std::ffi::OsStr;
 use std::fs;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 
 use locket_agent::DiscoveryFilters;
-use locket_core::{LocketError, SecretName};
+use locket_core::{LocketError, PolicyDocument, SecretName};
 use locket_crypto::KeyPurpose;
 use locket_store::{AuditContext, AuditWrite, SecretMetadataUpdate, SecretRecord, Store};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::commands::discovery::{
     discover_rows, error_json, project_rows, read_metadata_store, require_metadata_store,
-    select_project, trusted_project_config, trusted_project_configs,
+    select_project,
 };
-use crate::commands::project::detect::detect_policy_commands;
+use crate::commands::project::detect::PolicyDetection;
 use crate::commands::secrets::generate::{GenerateFormat, generate_value};
 use crate::commands::secrets::import::{
-    EnvImportOptions, import_env_to_target, inspect_env_file_keys, scan_workspace_env_files,
+    EnvImportOptions, InputDirectory, import_env_to_target, input_parent, inspect_open_env_file,
+    open_scoped_file, scan_open_workspace,
 };
 use crate::commands::secrets::set::{
-    SecretWriteKeys, WriteRequest, WriteTarget, confirm_write, select_target,
-    validate_write_metadata, write_value,
+    SecretWriteKeys, WriteRequest, WriteTarget, confirm_write, validate_write_metadata, write_value,
 };
 use crate::runtime::error::{access_denied_error, typed_cli_error};
 use crate::{
-    CliError, RuntimeContext, SecretMetadataFlags, SecretSourceArg, load_project_key,
-    metadata_invalid_error, now_unix_nanos, open_store, secret_deleted_error,
-    secret_not_found_error, source_arg_to_str, source_precedence,
+    CliError, LOCKET_TOML, PROJECT_CONFIG_SCHEMA_VERSION, ProjectConfig, RuntimeContext,
+    SecretMetadataFlags, SecretSourceArg, load_project_key, metadata_invalid_error, now_unix_nanos,
+    open_store, secret_deleted_error, secret_not_found_error, source_arg_to_str, source_precedence,
 };
 
 const MAX_INPUT_BYTES: u64 = 1_048_576;
@@ -43,6 +45,7 @@ pub fn serve(
     output: &mut impl Write,
     context: &RuntimeContext,
 ) -> Result<(), CliError> {
+    let context = RuntimeContext { cwd: context.cwd.canonicalize()?, ..context.clone() };
     let mut frame = Zeroizing::new(Vec::new());
     loop {
         // Clear each frame before reading the next request, including reused buffer capacity.
@@ -57,7 +60,7 @@ pub fn serve(
         }
         let response = serde_json::from_slice(&frame).map_or_else(
             |_| Some(rpc_error(&Value::Null, -32700, "invalid JSON")),
-            |message| dispatch(context, message),
+            |message| dispatch(&context, message),
         );
         if let Some(response) = response {
             send(output, &response)?;
@@ -146,7 +149,7 @@ struct SecretArgs {
 
 impl SecretArgs {
     fn target(&self, context: &RuntimeContext, store: &Store) -> Result<WriteTarget, CliError> {
-        select_target(context, store, Some(&self.project), self.profile.as_deref())
+        select_mcp_target(context, store, &self.project, self.profile.as_deref())
     }
 
     fn confirm(&self, target: &WriteTarget) -> Result<(), CliError> {
@@ -316,9 +319,9 @@ fn call_tool(context: &RuntimeContext, name: &str, mut args: Value) -> Result<Va
 }
 
 fn inspect_env(context: &RuntimeContext, args: &InspectEnvArgs) -> Result<Value, CliError> {
-    let path = canonical_input_path(context, &args.path, InputPathKind::EnvFile)?;
-    require_workspace_path(context, &path, None, ENV_PATH_SCOPE)?;
-    inspect_env_file_keys(&path, args.literal)
+    let path = canonical_input_path(context, &args.path, InputPathKind::File("dotenv input"))?;
+    require_workspace_path(context, input_parent(&path)?.0, None, ENV_PATH_SCOPE)?;
+    inspect_open_env_file(open_scoped_file(&path)?, args.literal)
 }
 
 fn scan_env(context: &RuntimeContext, args: &ScanEnvArgs) -> Result<Value, CliError> {
@@ -329,25 +332,26 @@ fn scan_env(context: &RuntimeContext, args: &ScanEnvArgs) -> Result<Value, CliEr
         InputPathKind::Directory("dotenv scan root must be a directory"),
     )?;
     require_workspace_path(context, &root, None, ENV_PATH_SCOPE)?;
+    let directory = InputDirectory::open(&root)?;
     let max_depth = args.max_depth.unwrap_or(DEFAULT_ENV_SCAN_DEPTH).clamp(1, MAX_ENV_SCAN_DEPTH);
-    scan_workspace_env_files(&root, usize::try_from(max_depth).unwrap_or(5), args.literal)
+    scan_open_workspace(&directory, usize::try_from(max_depth).unwrap_or(5), args.literal)
 }
 
 fn detect_commands(context: &RuntimeContext, args: DetectCommandsArgs) -> Result<Value, CliError> {
-    let root = if let Some(selector) = args.project {
+    let (root, directory) = if let Some(selector) = args.project {
         if args.path.is_some() {
             return Err(metadata_invalid_error("supply either path or project"));
         }
         let store = require_metadata_store(context)?;
         let project = select_project(&store, &context.cwd, &selector)?;
-        trusted_project_config(&store, &project.id)?
-            .ok_or_else(|| {
+        let resolved =
+            trusted_mcp_configs(&store, &project.id)?.into_iter().next().ok_or_else(|| {
                 typed_cli_error(
                     LocketError::ProjectRootUntrusted,
                     "project has no trusted workspace root",
                 )
-            })?
-            .root
+            })?;
+        (resolved.root, resolved.directory)
     } else {
         let path = args.path.as_deref().unwrap_or_else(|| Path::new("."));
         let root = canonical_input_path(
@@ -361,10 +365,104 @@ fn detect_commands(context: &RuntimeContext, args: DetectCommandsArgs) -> Result
             None,
             "command detection path must be inside the working directory or a trusted project root",
         )?;
-        root
+        let directory = InputDirectory::open(&root)?;
+        (root, directory)
     };
-    let commands = detect_policy_commands(&root, false)?;
+    let commands = detect_open_workspace(&directory)?;
     Ok(json!({"root": root.display().to_string(), "commands": commands, "metadata_only": true}))
+}
+
+fn read_workspace_manifest(
+    directory: &InputDirectory,
+    name: &str,
+) -> Result<Option<Zeroizing<String>>, CliError> {
+    if !directory.is_regular(name) {
+        return Ok(None);
+    }
+    let file = directory.open_file(OsStr::new(name))?;
+    let mut text = Zeroizing::new(String::new());
+    file.take(MAX_INPUT_BYTES + 1).read_to_string(&mut text)?;
+    if text.len() as u64 > MAX_INPUT_BYTES {
+        return Err(metadata_invalid_error(format!("{name} exceeds size limit")));
+    }
+    Ok(Some(text))
+}
+
+fn detect_open_workspace(directory: &InputDirectory) -> Result<Vec<PolicyDetection>, CliError> {
+    // Keep manifest reads on the directory handle. Only fixed task and runner names reach MCP.
+    let config = read_workspace_manifest(directory, LOCKET_TOML)?
+        .map(|text| toml::from_str::<toml::Value>(&text))
+        .transpose()
+        .map_err(|_| metadata_invalid_error("could not parse locket.toml"))?;
+    let configured = config.as_ref().and_then(|value| value.get("commands"));
+    let mut commands = Vec::new();
+    let mut add = |name, argv: Vec<&'static str>, source_file| {
+        commands.push(PolicyDetection {
+            name,
+            command_preview: argv.join(" "),
+            argv,
+            source_file,
+            already_configured: configured
+                .and_then(|value| value.get(name))
+                .is_some_and(toml::Value::is_table),
+        });
+    };
+
+    if let Some(manifest) = read_workspace_manifest(directory, "package.json")? {
+        let document: Value = serde_json::from_str(&manifest)
+            .map_err(|_| metadata_invalid_error("could not parse package.json"))?;
+        let runner = if directory.is_regular("pnpm-lock.yaml") {
+            "pnpm"
+        } else if directory.is_regular("yarn.lock") {
+            "yarn"
+        } else if directory.is_regular("bun.lock") || directory.is_regular("bun.lockb") {
+            "bun"
+        } else {
+            "npm"
+        };
+        for name in ["dev", "start", "build", "test", "lint", "typecheck", "migrate", "db:migrate"]
+        {
+            if document["scripts"][name].as_str().is_some_and(|script| !script.trim().is_empty()) {
+                add(name, vec![runner, "run", name], "package.json");
+            }
+        }
+    }
+    if let Some(manifest) = read_workspace_manifest(directory, "Cargo.toml")? {
+        let cargo: toml::Value = toml::from_str(&manifest)
+            .map_err(|_| metadata_invalid_error("could not parse Cargo.toml"))?;
+        add("test", vec!["cargo", "test"], "Cargo.toml");
+        if cargo
+            .get("bin")
+            .and_then(toml::Value::as_array)
+            .is_some_and(|bins| bins.iter().any(toml::Value::is_table))
+            || directory.child_has_file("src", "main.rs")
+        {
+            add("run", vec!["cargo", "run"], "Cargo.toml");
+        }
+    }
+    if let Some(makefile) = read_workspace_manifest(directory, "Makefile")? {
+        let targets: std::collections::BTreeSet<_> = makefile
+            .lines()
+            .filter_map(|line| {
+                let (name, remainder) = line.split_once(':')?;
+                (!remainder.trim_start_matches(':').starts_with('=')).then_some(name)
+            })
+            .collect();
+        for name in ["dev", "test", "build", "lint", "run"] {
+            if targets.contains(name) {
+                add(name, vec!["make", name], "Makefile");
+            }
+        }
+    }
+    if directory.is_regular("pyproject.toml") {
+        let argv = if directory.is_regular("uv.lock") {
+            vec!["uv", "run", "pytest"]
+        } else {
+            vec!["pytest"]
+        };
+        add("test", argv, "pyproject.toml");
+    }
+    Ok(commands)
 }
 
 fn import_env(context: &RuntimeContext, args: ImportEnvArgs) -> Result<Value, CliError> {
@@ -372,11 +470,12 @@ fn import_env(context: &RuntimeContext, args: ImportEnvArgs) -> Result<Value, Cl
         args.source.as_deref().map_or(Ok(SecretSourceArg::UserLocal), parse_secret_source)?;
     let mut store =
         if args.dry_run { require_metadata_store(context)? } else { open_store(context)? };
-    let target = select_target(context, &store, Some(&args.project), args.profile.as_deref())?;
-    let path = canonical_input_path(context, &args.path, InputPathKind::EnvFile)?;
+    let target = select_mcp_target(context, &store, &args.project, args.profile.as_deref())?;
+    let path = canonical_input_path(context, &args.path, InputPathKind::File("dotenv input"))?;
+    let (parent, _) = input_parent(&path)?;
     if target.project.id.starts_with("lk_proj_shared_") {
-        require_workspace_path(context, &path, Some(&store), ENV_PATH_SCOPE)?;
-    } else if !path_in_project_roots(&store, &target.project.id, &path)? {
+        require_workspace_path(context, parent, Some(&store), ENV_PATH_SCOPE)?;
+    } else if !path_in_project_roots(&store, &target.project.id, parent)? {
         return Err(access_denied_error(
             "dotenv file must be inside a trusted target project root",
         ));
@@ -390,14 +489,15 @@ fn import_env(context: &RuntimeContext, args: ImportEnvArgs) -> Result<Value, Cl
         overwrite: args.overwrite,
         literal: args.literal,
         dry_run: args.dry_run,
+        confirmed_profile: args.confirm_dangerous.then(|| target.profile.name.clone()),
         source,
     };
-    import_env_to_target(context, &mut store, &target, &path, &options)
+    import_env_to_target(context, &mut store, &target, open_scoped_file(&path)?, &options)
 }
 
 #[derive(Clone, Copy)]
 enum InputPathKind {
-    EnvFile,
+    File(&'static str),
     Directory(&'static str),
 }
 
@@ -410,15 +510,19 @@ fn canonical_input_path(
     let path = context.cwd.join(path).components().collect::<PathBuf>();
     let metadata = fs::symlink_metadata(&path)?;
     match kind {
-        InputPathKind::EnvFile if !metadata.is_file() => {
-            return Err(metadata_invalid_error("dotenv input must be a regular file"));
+        InputPathKind::File(label) if !metadata.is_file() => {
+            return Err(metadata_invalid_error(format!("{label} must be a regular file")));
         }
         InputPathKind::Directory(message) if !metadata.is_dir() => {
             return Err(metadata_invalid_error(message));
         }
         _ => {}
     }
-    Ok(path.canonicalize()?)
+    // Resolve ancestors for scope checks, then open every component without following links.
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => Ok(parent.canonicalize()?.join(name)),
+        _ => Ok(path.canonicalize()?),
+    }
 }
 
 fn require_workspace_path(
@@ -427,7 +531,7 @@ fn require_workspace_path(
     store: Option<&Store>,
     outside_scope_message: &str,
 ) -> Result<(), CliError> {
-    if context.cwd.canonicalize().is_ok_and(|cwd| canonical.starts_with(cwd)) {
+    if canonical.starts_with(&context.cwd) {
         return Ok(());
     }
     let metadata_store = if store.is_none() { read_metadata_store(context)? } else { None };
@@ -441,18 +545,77 @@ fn require_workspace_path(
     Err(access_denied_error(outside_scope_message))
 }
 
+fn registered_project_roots(store: &Store, project_id: &str) -> Result<Vec<PathBuf>, CliError> {
+    Ok(store
+        .list_project_roots(project_id)?
+        .into_iter()
+        .filter_map(|root| {
+            let path = fs::canonicalize(root.display_path?).ok()?;
+            // The stored authorization is over this exact canonical path.
+            (Sha256::digest(path.to_string_lossy().as_bytes())[..] == root.root_hash)
+                .then_some(path)
+        })
+        .collect())
+}
+
 fn path_in_project_roots(
     store: &Store,
     project_id: &str,
     canonical: &Path,
 ) -> Result<bool, CliError> {
-    Ok(store.list_project_roots(project_id)?.into_iter().any(|root| {
-        root.display_path.and_then(|path| fs::canonicalize(path).ok()).is_some_and(|path| {
-            canonical.starts_with(&path)
-                && path.is_dir()
-                && crate::root_hash(&path).is_ok_and(|hash| hash == root.root_hash)
-        })
-    }))
+    Ok(registered_project_roots(store, project_id)?
+        .into_iter()
+        .any(|path| canonical.starts_with(path)))
+}
+
+struct TrustedMcpConfig {
+    root: PathBuf,
+    directory: InputDirectory,
+    config: ProjectConfig,
+    text: Zeroizing<String>,
+}
+
+fn trusted_mcp_configs(store: &Store, project_id: &str) -> Result<Vec<TrustedMcpConfig>, CliError> {
+    let mut configs = Vec::new();
+    for root in registered_project_roots(store, project_id)? {
+        let directory = InputDirectory::open(&root)?;
+        let Some(text) = read_workspace_manifest(&directory, LOCKET_TOML)? else { continue };
+        let config: ProjectConfig = toml::from_str(&text)
+            .map_err(|_| metadata_invalid_error("could not read trusted project configuration"))?;
+        if config.schema_version != PROJECT_CONFIG_SCHEMA_VERSION {
+            return Err(metadata_invalid_error("could not read trusted project configuration"));
+        }
+        if config.project_id.as_str() == project_id {
+            configs.push(TrustedMcpConfig { root, directory, config, text });
+        }
+    }
+    Ok(configs)
+}
+
+fn select_mcp_target(
+    context: &RuntimeContext,
+    store: &Store,
+    selector: &str,
+    profile: Option<&str>,
+) -> Result<WriteTarget, CliError> {
+    let project = select_project(store, &context.cwd, selector)?;
+    let default_profile = if profile.is_none() {
+        trusted_mcp_configs(store, &project.id)?
+            .into_iter()
+            .next()
+            .map(|resolved| resolved.config.default_profile)
+    } else {
+        None
+    };
+    let name = profile
+        .or_else(|| default_profile.as_ref().map(locket_core::ProfileName::as_str))
+        .unwrap_or("default");
+    let profile = store.get_profile_by_name(&project.id, name)?.ok_or_else(|| {
+        crate::profile_not_found_error(
+            "target profile not found; pass --profile to select a profile",
+        )
+    })?;
+    Ok(WriteTarget { project, profile })
 }
 
 fn get_secret_metadata(context: &RuntimeContext, args: &SecretArgs) -> Result<Value, CliError> {
@@ -520,18 +683,12 @@ fn read_value_file(
     project_id: &str,
     path: &str,
 ) -> Result<Zeroizing<String>, CliError> {
-    let path = context.cwd.join(Path::new(path));
-    if !fs::symlink_metadata(&path)?.is_file() {
-        return Err(metadata_invalid_error("value_file must be a regular file"));
-    }
-    let canonical = path.canonicalize()?;
-    if !path_in_project_roots(store, project_id, &canonical)? {
+    let canonical =
+        canonical_input_path(context, Path::new(path), InputPathKind::File("value_file"))?;
+    if !path_in_project_roots(store, project_id, input_parent(&canonical)?.0)? {
         return Err(access_denied_error("value_file must be inside a trusted project root"));
     }
-    let file = open_value_file(&canonical)?;
-    if !file.metadata()?.is_file() {
-        return Err(metadata_invalid_error("value_file must be a regular file"));
-    }
+    let file = open_scoped_file(&canonical)?;
     let mut bytes = Zeroizing::new(Vec::new());
     file.take(MAX_INPUT_BYTES + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_INPUT_BYTES {
@@ -540,46 +697,6 @@ fn read_value_file(
     let value = std::str::from_utf8(&bytes)
         .map_err(|_| metadata_invalid_error("value file must contain UTF-8"))?;
     Ok(Zeroizing::new(value.trim_end_matches(['\r', '\n']).to_owned()))
-}
-
-#[cfg(unix)]
-fn open_value_file(path: &Path) -> Result<fs::File, CliError> {
-    use rustix::fs::{Mode, OFlags, openat};
-
-    // Walk from the filesystem root using open directory descriptors so a
-    // renamed component cannot redirect the open through a symlink.
-    let mut directory = fs::File::open("/")?;
-    let mut components = path.components().skip(1).peekable();
-    while let Some(component) = components.next() {
-        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-        let flags = if components.peek().is_some() {
-            flags | OFlags::DIRECTORY
-        } else {
-            flags | OFlags::NONBLOCK
-        };
-        directory = openat(&directory, component.as_os_str(), flags, Mode::empty())
-            .map(fs::File::from)
-            .map_err(io::Error::from)?;
-    }
-    Ok(directory)
-}
-
-#[cfg(windows)]
-fn open_value_file(path: &Path) -> Result<fs::File, CliError> {
-    use std::os::windows::fs::OpenOptionsExt;
-
-    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    let file =
-        fs::OpenOptions::new().read(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(path)?;
-    if path.canonicalize()? != path {
-        return Err(metadata_invalid_error("value_file changed while opening"));
-    }
-    Ok(file)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn open_value_file(path: &Path) -> Result<fs::File, CliError> {
-    Ok(fs::File::open(path)?)
 }
 
 fn update_metadata(context: &RuntimeContext, args: UpdateArgs) -> Result<Value, CliError> {
@@ -642,14 +759,13 @@ fn list_policies(context: &RuntimeContext, selector: &str) -> Result<Value, CliE
     let store = require_metadata_store(context)?;
     let project = select_project(&store, &context.cwd, selector)?;
     let mut policies = Vec::new();
-    for resolved in trusted_project_configs(&store, &project.id)? {
-        let document = crate::read_policy_document(&resolved.root.join(crate::LOCKET_TOML))
-            .map_err(|_| {
-                crate::runtime::error::typed_cli_error(
-                    LocketError::InvalidPolicy,
-                    "could not read project policy metadata",
-                )
-            })?;
+    for resolved in trusted_mcp_configs(&store, &project.id)? {
+        let document = PolicyDocument::from_toml_str(&resolved.text).map_err(|_| {
+            crate::runtime::error::typed_cli_error(
+                LocketError::InvalidPolicy,
+                "could not read project policy metadata",
+            )
+        })?;
         policies.extend(document.commands.into_values().map(|policy| json!({
             "name": policy.name, "cwd": resolved.root,
             "required_secrets": policy.required_secrets.iter().map(SecretName::as_str).collect::<Vec<_>>(),

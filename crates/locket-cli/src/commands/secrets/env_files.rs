@@ -1,12 +1,13 @@
 //! Bounded dotenv reads and metadata-only workspace discovery.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
+use std::ffi::{OsStr, OsString};
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use locket_core::dotenv::{DotenvDiagnostic, DotenvOptions, parse_dotenv};
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use serde_json::Value;
 use zeroize::Zeroizing;
 
@@ -66,14 +67,20 @@ pub(super) struct ParsedEnvFile {
     pub errors: Vec<Diagnostic>,
 }
 
-pub(super) fn read_env_file(path: &Path, literal: bool) -> Result<ParsedEnvFile, CliError> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_file() {
-        return Err(metadata_invalid_error("dotenv input must be a regular file"));
-    }
-    let mut file = open_env_file(path)?;
+pub(super) fn open_env_file(path: &Path) -> Result<File, CliError> {
+    let (parent, name) = input_parent(path)?;
+    let directory = InputDirectory::open(&parent.canonicalize()?)?;
+    directory.open_file(name)
+}
+
+pub fn open_scoped_file(canonical: &Path) -> Result<File, CliError> {
+    let (parent, name) = input_parent(canonical)?;
+    InputDirectory::open(parent)?.open_file(name)
+}
+
+pub(super) fn read_env_file(mut file: File, literal: bool) -> Result<ParsedEnvFile, CliError> {
     let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
+    if !metadata.is_file() {
         return Err(metadata_invalid_error("dotenv input must be a regular file"));
     }
     if metadata.len() > MAX_ENV_BYTES as u64 {
@@ -109,26 +116,213 @@ pub(super) fn read_env_file(path: &Path, literal: bool) -> Result<ParsedEnvFile,
     })
 }
 
-fn open_env_file(path: &Path) -> io::Result<File> {
+pub fn input_parent(path: &Path) -> Result<(&Path, &OsStr), CliError> {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => Ok((parent, name)),
+        _ => Err(metadata_invalid_error("input must name a file")),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EntryKind {
+    File,
+    Directory,
+    Other,
+}
+
+/// Files and directory entries are looked up relative to an opened directory.
+pub struct InputDirectory {
+    path: PathBuf,
     #[cfg(unix)]
-    {
-        use rustix::fs::{Mode, OFlags, open};
-        open(
-            path,
-            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
-            Mode::empty(),
-        )
-        .map(File::from)
-        .map_err(io::Error::from)
-    }
+    handle: File,
     #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        fs::OpenOptions::new().read(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(path)
+    _handles: Vec<File>,
+}
+
+impl InputDirectory {
+    pub fn open(path: &Path) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use rustix::fs::{Mode, OFlags, openat};
+            use std::path::Component;
+
+            let mut components = path.components();
+            if components.next() != Some(Component::RootDir) {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "expected absolute path"));
+            }
+            let mut handle = File::open("/")?;
+            for part in components {
+                let Component::Normal(name) = part else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "invalid path component",
+                    ));
+                };
+                handle = openat(
+                    &handle,
+                    name,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map(File::from)?;
+            }
+            Ok(Self { path: path.to_owned(), handle })
+        }
+        #[cfg(windows)]
+        {
+            // Keep every ancestor open without FILE_SHARE_DELETE for pathname-based operations.
+            let mut handles = Vec::new();
+            let ancestors: Vec<_> = path.ancestors().collect();
+            for ancestor in ancestors.into_iter().rev() {
+                let handle = open_windows_entry(ancestor, true)?;
+                if !windows_entry_is_plain(&handle)? || !handle.metadata()?.is_dir() {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "expected directory"));
+                }
+                handles.push(handle);
+            }
+            Ok(Self { path: path.to_owned(), _handles: handles })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = path;
+            Err(io::Error::new(io::ErrorKind::Unsupported, "secure file opening unavailable"))
+        }
     }
-    #[cfg(not(any(unix, windows)))]
-    File::open(path)
+
+    fn child_directory(&self, name: &OsStr) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use rustix::fs::{Mode, OFlags, openat};
+            let handle = openat(
+                &self.handle,
+                name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?;
+            Ok(Self { path: self.path.join(name), handle: File::from(handle) })
+        }
+        #[cfg(not(unix))]
+        Self::open(&self.path.join(name))
+    }
+
+    pub fn open_file(&self, name: &OsStr) -> Result<File, CliError> {
+        let file = self.file_handle(name).map_err(|error| {
+            #[cfg(unix)]
+            if error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) {
+                return metadata_invalid_error("dotenv input must be a regular file");
+            }
+            #[cfg(windows)]
+            if error.kind() == io::ErrorKind::InvalidInput {
+                return metadata_invalid_error("dotenv input must be a regular file");
+            }
+            error.into()
+        })?;
+        if !file.metadata()?.is_file() {
+            return Err(metadata_invalid_error("dotenv input must be a regular file"));
+        }
+        Ok(file)
+    }
+
+    fn file_handle(&self, name: &OsStr) -> io::Result<File> {
+        #[cfg(unix)]
+        {
+            use rustix::fs::{Mode, OFlags, openat};
+            openat(
+                &self.handle,
+                name,
+                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+                Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(io::Error::from)
+        }
+        #[cfg(windows)]
+        {
+            let file = open_windows_entry(&self.path.join(name), false)?;
+            if windows_entry_is_plain(&file)? {
+                Ok(file)
+            } else {
+                Err(io::Error::new(io::ErrorKind::InvalidInput, "input is a reparse point"))
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = name;
+            Err(io::Error::new(io::ErrorKind::Unsupported, "secure file opening unavailable"))
+        }
+    }
+
+    fn entry_kind(&self, name: &OsStr) -> io::Result<EntryKind> {
+        #[cfg(unix)]
+        {
+            use rustix::fs::{AtFlags, FileType, statat};
+            let stat = statat(&self.handle, name, AtFlags::SYMLINK_NOFOLLOW)?;
+            Ok(match FileType::from_raw_mode(stat.st_mode) {
+                FileType::RegularFile => EntryKind::File,
+                FileType::Directory => EntryKind::Directory,
+                _ => EntryKind::Other,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let metadata = std::fs::symlink_metadata(self.path.join(name))?;
+            Ok(if metadata.is_file() {
+                EntryKind::File
+            } else if metadata.is_dir() {
+                EntryKind::Directory
+            } else {
+                EntryKind::Other
+            })
+        }
+    }
+
+    pub fn is_regular(&self, name: &str) -> bool {
+        self.entry_kind(OsStr::new(name)).is_ok_and(|kind| kind == EntryKind::File)
+    }
+
+    pub fn child_has_file(&self, directory: &str, name: &str) -> bool {
+        self.child_directory(OsStr::new(directory)).is_ok_and(|dir| dir.is_regular(name))
+    }
+
+    fn names(&self) -> io::Result<Vec<OsString>> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            rustix::fs::Dir::read_from(&self.handle)?
+                .filter_map(|entry| match entry {
+                    Ok(entry) if matches!(entry.file_name().to_bytes(), b"." | b"..") => None,
+                    Ok(entry) => {
+                        Some(Ok(OsStr::from_bytes(entry.file_name().to_bytes()).to_owned()))
+                    }
+                    Err(error) => Some(Err(error.into())),
+                })
+                .collect()
+        }
+        #[cfg(not(unix))]
+        std::fs::read_dir(&self.path)?.map(|entry| entry.map(|entry| entry.file_name())).collect()
+    }
+}
+
+#[cfg(windows)]
+fn open_windows_entry(path: &Path, directory: bool) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_SHARE_READ_WRITE: u32 = 0x0000_0003;
+    let flags =
+        FILE_FLAG_OPEN_REPARSE_POINT | if directory { FILE_FLAG_BACKUP_SEMANTICS } else { 0 };
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ_WRITE)
+        .custom_flags(flags)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn windows_entry_is_plain(file: &File) -> io::Result<bool> {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    Ok(file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0)
 }
 
 #[derive(Serialize)]
@@ -139,8 +333,8 @@ struct EnvFileKeys {
     metadata_only: bool,
 }
 
-fn read_keys(path: &Path, literal: bool) -> Result<EnvFileKeys, CliError> {
-    let ParsedEnvFile { entries, warnings, errors } = read_env_file(path, literal)?;
+fn read_keys(file: File, literal: bool) -> Result<EnvFileKeys, CliError> {
+    let ParsedEnvFile { entries, warnings, errors } = read_env_file(file, literal)?;
     let keys = entries
         .into_iter()
         .map(|(name, value)| {
@@ -153,7 +347,11 @@ fn read_keys(path: &Path, literal: bool) -> Result<EnvFileKeys, CliError> {
 
 /// Read the names and safe diagnostics from a standalone dotenv file.
 pub fn inspect_env_file_keys(path: &Path, literal: bool) -> Result<Value, CliError> {
-    Ok(serde_json::to_value(read_keys(path, literal)?)?)
+    inspect_open_env_file(open_env_file(path)?, literal)
+}
+
+pub fn inspect_open_env_file(file: File, literal: bool) -> Result<Value, CliError> {
+    Ok(serde_json::to_value(read_keys(file, literal)?)?)
 }
 
 pub(super) fn write_env_keys(
@@ -161,7 +359,7 @@ pub(super) fn write_env_keys(
     path: &Path,
     literal: bool,
 ) -> Result<(), CliError> {
-    let report = read_keys(path, literal)?;
+    let report = read_keys(open_env_file(path)?, literal)?;
     for name in report.keys {
         writeln!(output, "{name}")?;
     }
@@ -183,8 +381,10 @@ pub(super) fn write_warnings(
 
 #[derive(Serialize)]
 struct ScannedEnvFile {
-    path: String,
-    project_root: String,
+    #[serde(serialize_with = "serialize_path")]
+    path: PathBuf,
+    #[serde(serialize_with = "serialize_path")]
+    project_root: PathBuf,
     has_locket_config: bool,
     suggested_profile: &'static str,
     suggested_source: &'static str,
@@ -194,6 +394,10 @@ struct ScannedEnvFile {
     invalid: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+fn serialize_path<S: Serializer>(path: &Path, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.collect_str(&path.display())
 }
 
 #[derive(Default)]
@@ -231,64 +435,105 @@ pub fn scan_workspace_env_files(
 fn scan_env_files(root: &Path, max_depth: usize, literal: bool) -> Result<EnvScanReport, CliError> {
     // Resolve a trailing "." before screening the root so "symlink/." cannot bypass it.
     let root = root.components().collect::<PathBuf>();
-    if !fs::symlink_metadata(&root)?.is_dir() {
+    if !std::fs::symlink_metadata(&root)?.is_dir() {
         return Err(metadata_invalid_error("dotenv scan root must be a directory"));
     }
-    let root = root.canonicalize()?;
-    let mut walker = ignore::WalkBuilder::new(&root);
-    walker.standard_filters(false).follow_links(false).max_depth(Some(max_depth)).filter_entry(
-        |entry| {
-            entry.depth() == 0
-                || entry.file_type().is_some_and(|kind| {
-                    let skipped_directory = kind.is_dir()
-                        && entry
-                            .file_name()
-                            .to_str()
-                            .is_some_and(|name| SKIP_DIRECTORIES.contains(&name));
-                    !kind.is_symlink() && !skipped_directory
-                })
-        },
-    );
-
-    let mut paths = Vec::new();
-    for entry in walker.build() {
-        let entry = entry.map_err(|_| metadata_invalid_error("could not walk dotenv scan root"))?;
-        if entry.file_type().is_some_and(|kind| kind.is_file())
-            && entry.file_name().to_str().is_some_and(is_env_filename)
-        {
-            paths.push(entry.into_path());
-        }
-    }
-    paths.sort();
-    Ok(scan_paths(&root, paths, literal))
+    let parent = root.parent().map(Path::canonicalize).transpose()?;
+    let root = match (parent, root.file_name()) {
+        (Some(parent), Some(name)) => parent.join(name),
+        _ => root.canonicalize()?,
+    };
+    build_scan_report(&InputDirectory::open(&root)?, max_depth, literal)
 }
 
-fn scan_paths(root: &Path, paths: Vec<PathBuf>, literal: bool) -> EnvScanReport {
+pub fn scan_open_workspace(
+    root: &InputDirectory,
+    max_depth: usize,
+    literal: bool,
+) -> Result<Value, CliError> {
+    Ok(serde_json::to_value(build_scan_report(root, max_depth, literal)?)?)
+}
+
+fn scan_directory(
+    directory: &InputDirectory,
+    inherited_root: &Path,
+    inherited_config: bool,
+    remaining_depth: usize,
+    literal: bool,
+    files: &mut Vec<ScannedEnvFile>,
+) -> Result<(), CliError> {
+    if remaining_depth == 0 {
+        return Ok(());
+    }
+    let has_config = directory.is_regular(crate::LOCKET_TOML);
+    let has_git =
+        directory.entry_kind(OsStr::new(".git")).is_ok_and(|kind| kind != EntryKind::Other);
+    let (project_root, has_locket_config) = if has_config || has_git {
+        (directory.path.as_path(), has_config)
+    } else {
+        (inherited_root, inherited_config)
+    };
+    let names =
+        directory.names().map_err(|_| metadata_invalid_error("could not walk dotenv scan root"))?;
+    for name in names {
+        match directory.entry_kind(&name) {
+            Ok(EntryKind::Directory)
+                if remaining_depth > 1
+                    && !name.to_str().is_some_and(|name| SKIP_DIRECTORIES.contains(&name)) =>
+            {
+                // A directory replaced after enumeration is no longer part of this scan.
+                if let Ok(child) = directory.child_directory(&name) {
+                    scan_directory(
+                        &child,
+                        project_root,
+                        has_locket_config,
+                        remaining_depth - 1,
+                        literal,
+                        files,
+                    )?;
+                }
+            }
+            Ok(EntryKind::File) if name.to_str().is_some_and(is_env_filename) => {
+                let path = directory.path.join(&name);
+                let (keys, warnings_count, invalid, error) =
+                    match directory.open_file(&name).and_then(|file| read_keys(file, literal)) {
+                        Ok(report) => (report.keys, report.warnings.len(), report.invalid, None),
+                        Err(error) => (BTreeSet::new(), 0, 1, Some(error.to_string())),
+                    };
+                files.push(ScannedEnvFile {
+                    suggested_profile: suggested_profile(&path),
+                    path,
+                    project_root: project_root.to_owned(),
+                    has_locket_config,
+                    suggested_source: "user-local",
+                    key_count: keys.len(),
+                    keys,
+                    warnings_count,
+                    invalid,
+                    error,
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn build_scan_report(
+    root: &InputDirectory,
+    max_depth: usize,
+    literal: bool,
+) -> Result<EnvScanReport, CliError> {
     let mut locations = BTreeMap::<String, KeyLocations>::new();
     let mut files = Vec::new();
-    for path in paths {
-        let (project_root, has_locket_config) = scan_project_root(root, &path);
-        let (keys, warnings_count, invalid, error) = match read_keys(&path, literal) {
-            Ok(report) => (report.keys, report.warnings.len(), report.invalid, None),
-            Err(error) => (BTreeSet::new(), 0, 1, Some(error.to_string())),
-        };
-        for key in &keys {
+    scan_directory(root, &root.path, false, max_depth, literal, &mut files)?;
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    for file in &files {
+        for key in &file.keys {
             let found = locations.entry(key.clone()).or_default();
-            found.files.insert(path.clone());
-            found.projects.insert(project_root.to_path_buf());
+            found.files.insert(file.path.clone());
+            found.projects.insert(file.project_root.clone());
         }
-        files.push(ScannedEnvFile {
-            path: path.display().to_string(),
-            project_root: project_root.display().to_string(),
-            has_locket_config,
-            suggested_profile: suggested_profile(&path),
-            suggested_source: "user-local",
-            key_count: keys.len(),
-            keys,
-            warnings_count,
-            invalid,
-            error,
-        });
     }
     let shared_candidates = locations
         .into_iter()
@@ -301,33 +546,20 @@ fn scan_paths(root: &Path, paths: Vec<PathBuf>, literal: bool) -> EnvScanReport 
             projects: found.projects.iter().map(|path| path.display().to_string()).collect(),
         })
         .collect();
-    EnvScanReport {
-        root: root.display().to_string(),
+    Ok(EnvScanReport {
+        root: root.path.display().to_string(),
         total_files: files.len(),
         total_keys: files.iter().map(|file| file.key_count).sum(),
         files,
         shared_candidates,
         metadata_only: true,
-    }
+    })
 }
 
 fn is_env_filename(name: &str) -> bool {
     (name == ".env" || name.starts_with(".env."))
         && !ENV_TEMPLATES.contains(&name)
         && !Path::new(name).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("bak"))
-}
-
-fn scan_project_root<'a>(root: &'a Path, path: &'a Path) -> (&'a Path, bool) {
-    for ancestor in path.ancestors().skip(1) {
-        let has_config =
-            fs::symlink_metadata(ancestor.join(crate::LOCKET_TOML)).is_ok_and(|m| m.is_file());
-        let has_git =
-            fs::symlink_metadata(ancestor.join(".git")).is_ok_and(|m| m.is_file() || m.is_dir());
-        if has_config || has_git || ancestor == root {
-            return (ancestor, has_config);
-        }
-    }
-    (root, false)
 }
 
 fn suggested_profile(path: &Path) -> &'static str {
@@ -353,8 +585,8 @@ pub(super) fn write_env_scan(
         writeln!(
             output,
             "{:?}  project_root={:?}  profile={}  source={}  keys={}  warnings={}  invalid={}",
-            file.path,
-            file.project_root,
+            file.path.display().to_string(),
+            file.project_root.display().to_string(),
             file.suggested_profile,
             file.suggested_source,
             file.key_count,
@@ -371,4 +603,31 @@ pub(super) fn write_env_scan(
     }
     writeln!(output, "metadata_only: yes")?;
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn scan_and_reads_use_the_open_directory_after_its_path_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().canonicalize()?.join("workspace");
+        fs::create_dir(&root)?;
+        fs::write(root.join(".env"), "ORIGINAL=fixture\n")?;
+        let directory = InputDirectory::open(&root)?;
+
+        fs::rename(&root, fixture.path().join("old-workspace"))?;
+        fs::create_dir(&root)?;
+        fs::write(root.join(".env"), "REPLACEMENT=fixture\n")?;
+
+        let keys = inspect_open_env_file(directory.open_file(OsStr::new(".env"))?, false)?;
+        assert_eq!(keys["keys"], serde_json::json!(["ORIGINAL"]));
+        let scan = scan_open_workspace(&directory, 1, false)?;
+        assert_eq!(scan["total_files"], 1);
+        assert_eq!(scan["files"][0]["keys"], serde_json::json!(["ORIGINAL"]));
+        Ok(())
+    }
 }

@@ -12,11 +12,25 @@ Project == "project"
 Nonces == {"nonceA", "nonceB", "nonceC"}
 Absent == <<>>
 
-VARIABLES scenario, team, audit
-vars == <<scenario, team, audit>>
+VARIABLES scenario, team, audit, roster
+vars == <<scenario, team, audit, roster>>
+
+Member == "developerA"
+Replicas == Recipients
+RosterStatus == {"active", "omitted", "revoked"}
+RosterDocument(status, revision, signer, invitation) ==
+    [status |-> status, revision |-> revision, predecessor |-> revision - 1,
+     signer |-> signer, invitation |-> invitation]
+FirstRoster == RosterDocument("active", 1, Owner, Absent)
+NewReplica == [revision |-> 1, status |-> "active", removedAt |-> 0, keyEpoch |-> 1]
+RosterInit ==
+    [published |-> <<FirstRoster>>, invitation |-> Absent,
+     replicas |-> [d \in Replicas |-> NewReplica],
+     inbox |-> [d \in Replicas |-> 0]]
 
 Init ==
-    /\ scenario \in {"team", "audit"}
+    /\ scenario \in {"team", "audit", "roster"}
+    /\ roster = RosterInit
     /\ team = [roles |-> [d \in Devices |->
                             CASE d = Owner -> "admin"
                               [] d = "developerA" -> "developer"
@@ -79,7 +93,55 @@ Reconcile ==
 TeamStep ==
     /\ scenario = "team"
     /\ Membership \/ PreparePackage \/ Publish \/ Reconcile
-    /\ UNCHANGED <<audit, scenario>>
+    /\ UNCHANGED <<audit, roster, scenario>>
+
+PublishRemoval ==
+    /\ Len(roster.published) = 1
+    /\ \E status \in {"omitted", "revoked"}:
+        roster' = [roster EXCEPT !.published = Append(@, RosterDocument(status, 2, Owner, Absent))]
+
+\* Separate authorization, bound to the pinned owner, removed identity and revision.
+OwnerReinvites ==
+    /\ Len(roster.published) = 2
+    /\ roster.invitation = Absent
+    /\ roster' = [roster EXCEPT !.invitation = <<Owner, Member, 2>>]
+
+PublishRelisting ==
+    /\ Len(roster.published) = 2
+    /\ \E signer \in {Owner, Member}, claimed \in {Absent, <<Owner, Member, 2>>}:
+        /\ (signer = Owner /\ claimed # Absent) => claimed = roster.invitation
+        /\ roster' = [roster EXCEPT !.published =
+            Append(@, RosterDocument("active", 3, signer, claimed))]
+
+ReceiveRoster ==
+    \E d \in Replicas, i \in 1..Len(roster.published):
+        /\ roster.inbox[d] = 0
+        /\ roster' = [roster EXCEPT !.inbox[d] = i]
+
+ReconcileRoster ==
+    \E d \in Replicas:
+        /\ roster.inbox[d] # 0
+        /\ LET local == roster.replicas[d]
+               update == roster.published[roster.inbox[d]]
+               accepted == /\ update.signer = Owner
+                           /\ update.revision = local.revision + 1
+                           /\ update.predecessor = local.revision
+                           /\ IF update.status = "active" /\ local.removedAt > 0
+                              THEN /\ update.invitation = <<Owner, Member, local.removedAt>>
+                                   /\ update.invitation = roster.invitation
+                              ELSE TRUE
+               nextReplica == [revision |-> update.revision, status |-> update.status,
+                               removedAt |-> IF update.status = "active" THEN local.removedAt
+                                             ELSE update.revision,
+                               keyEpoch |-> IF update.status = "active" THEN update.revision
+                                            ELSE local.keyEpoch]
+           IN roster' = [roster EXCEPT !.inbox[d] = 0,
+                                       !.replicas[d] = IF accepted THEN nextReplica ELSE @]
+
+RosterStep ==
+    /\ scenario = "roster"
+    /\ PublishRemoval \/ OwnerReinvites \/ PublishRelisting \/ ReceiveRoster \/ ReconcileRoster
+    /\ UNCHANGED <<team, audit, scenario>>
 
 Last(chain) == chain[Len(chain)]
 SeqNo(chain) == IF chain = <<>> THEN 0 ELSE Last(chain).seqNo
@@ -152,13 +214,13 @@ Restart ==
 AuditStep ==
     /\ scenario = "audit"
     /\ AppendAudit \/ Submit \/ SignOrReject \/ Persist \/ RestoreOrModifyLocal \/ Restart
-    /\ UNCHANGED <<team, scenario>>
+    /\ UNCHANGED <<team, roster, scenario>>
 
-Next == TeamStep \/ AuditStep
+Next == TeamStep \/ AuditStep \/ RosterStep
 Spec == Init /\ [][Next]_vars
 
 TypeInvariant ==
-    /\ scenario \in {"team", "audit"}
+    /\ scenario \in {"team", "audit", "roster"}
     /\ team.roles \in [Devices -> Roles]
     /\ team.keyEpoch \in 1..(Cardinality(Recipients) + 1)
     /\ team.revokedAt \in [Recipients -> 0..team.keyEpoch]
@@ -186,6 +248,38 @@ TypeInvariant ==
         /\ Head(audit.submitted).seqNo \in 1..MaxTip
         /\ Head(audit.submitted).nonce \in Nonces
     /\ \A i \in 1..Len(audit.external): audit.external[i].seqNo \in 1..MaxTip
+
+\* Derive removal from the accepted prefix, independently of the receiver's tombstone.
+NoSilentMemberReinstatement ==
+    \A d \in Replicas:
+        LET local == roster.replicas[d]
+        IN \A i \in 1..local.revision:
+            (/\ roster.published[i].status # "active"
+             /\ local.status = "active" \/ local.keyEpoch >= i) =>
+                    \E j \in (i + 1)..local.revision:
+                        LET update == roster.published[j]
+                        IN /\ update.status = "active"
+                           /\ update.signer = Owner
+                           /\ update.invitation = <<Owner, Member, i>>
+                           /\ update.invitation = roster.invitation
+
+RosterReconciliationMonotonicity ==
+    /\ Len(roster.published) \in 1..3
+    /\ \A d \in Replicas:
+        LET local == roster.replicas[d]
+        IN /\ roster.inbox[d] \in 0..Len(roster.published)
+           /\ local.revision \in 1..Len(roster.published)
+           /\ local.status = roster.published[local.revision].status
+           /\ local.status \in RosterStatus
+           /\ local.keyEpoch \in 1..local.revision
+           /\ local.removedAt \in 0..local.revision
+           /\ \A i \in 1..local.revision:
+                /\ roster.published[i].signer = Owner
+                /\ roster.published[i].revision = i
+                /\ roster.published[i].predecessor = i - 1
+    /\ \A a, b \in Replicas:
+        roster.replicas[a].revision = roster.replicas[b].revision =>
+            roster.replicas[a] = roster.replicas[b]
 
 RevokedDeviceExcludedFromNewEpochs ==
     \A d \in Recipients:

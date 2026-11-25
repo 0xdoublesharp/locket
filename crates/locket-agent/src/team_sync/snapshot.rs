@@ -537,12 +537,15 @@ pub fn apply_package_with_consent_guarded(
         return Err(reject("owner pin changed; explicit re-pin required"));
     }
     let signed = SignedStatement::open(bytes, sealing)?;
-    let established: bool = store.connection().query_row(
-        "SELECT EXISTS(SELECT 1 FROM team_sync_heads WHERE project_id=?1)",
-        [project],
-        |r| r.get(0),
-    )?;
-    let verified = if established {
+    let head: Option<(i64, String, String, String)> = store
+        .connection()
+        .query_row(
+            "SELECT epoch,digest,state,members_json FROM team_sync_heads WHERE project_id=?1",
+            [project],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let verified = if head.is_some() {
         signed.verify_update(pin, project, local, now)?
     } else {
         signed.verify(pin, project, local, now)?
@@ -555,14 +558,6 @@ pub fn apply_package_with_consent_guarded(
     {
         return Err(reject("team or pinned signing identity changed"));
     }
-    let head: Option<(i64, String, String, String)> = store
-        .connection()
-        .query_row(
-            "SELECT epoch,digest,state,members_json FROM team_sync_heads WHERE project_id=?1",
-            [project],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )
-        .optional()?;
     if let Some((epoch, hash, state, _)) = &head {
         let join_epoch: Option<i64> = store
             .connection()
@@ -596,36 +591,18 @@ pub fn apply_package_with_consent_guarded(
             || (incoming_epoch == epoch + 1 && statement.previous_digest != *hash)
         {
             let _authorization = authorization.map(|authorize| authorize()).transpose()?;
-            store.connection().execute(
-                "UPDATE team_sync_heads SET state='fork' WHERE project_id=?1",
-                [project],
+            let marked = store.connection().execute(
+                "UPDATE team_sync_heads SET state='fork'
+                 WHERE project_id=?1 AND epoch=?2 AND digest=?3",
+                params![project, epoch, hash],
             )?;
+            if marked == 0 {
+                return Err(reject("receiver predecessor changed; retry"));
+            }
             return Err(reject("fork or rollback detected; automatic sync stopped"));
         }
         if incoming_epoch != epoch + 1 {
             return Err(super::SyncError::MissingPredecessor);
-        }
-    }
-    if let Some((_, _, _, members)) = &head {
-        let previous: Vec<TeamMember> = serde_json::from_str(members)?;
-        for old in previous.iter().filter(|m| m.removed) {
-            if statement.members.iter().any(|m| m.device == old.device && !m.removed) {
-                return Err(reject("revoked identity cannot be reinstated"));
-            }
-        }
-    }
-    for member in statement.members.iter().filter(|m| !m.removed) {
-        // Removed memberships remain authoritative even if a later roster omitted them.
-        let removed: bool = store.connection().query_row(
-            "SELECT EXISTS (
-                SELECT 1 FROM team_members
-                WHERE team_id = ?1 AND device_id = ?2 AND removed_at IS NOT NULL
-            )",
-            (&statement.team_id, &member.device.id),
-            |row| row.get(0),
-        )?;
-        if removed {
-            return Err(reject("removed membership cannot be reinstated"));
         }
     }
     // Authenticate every active value before a transaction can advance security state.
@@ -636,8 +613,20 @@ pub fn apply_package_with_consent_guarded(
     }
     let _authorization = authorization.map(|authorize| authorize()).transpose()?;
     store.with_atomic_write(|store| {
-        let current_head: Option<(i64,String)> = store.connection().query_row("SELECT epoch,digest FROM team_sync_heads WHERE project_id=?1",[project],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
-        if current_head != head.as_ref().map(|row|(row.0,row.1.clone())) { return Err(reject("receiver predecessor changed; retry")); }
+        let current_head: Option<(i64, String, String)> = store.connection().query_row(
+            "SELECT epoch,digest,state FROM team_sync_heads WHERE project_id=?1",
+            [project], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        ).optional()?;
+        if current_head.as_ref().is_some_and(|row| row.2 == "fork") {
+            return Err(reject("sync stopped after fork; obtain explicit owner recovery checkpoint"));
+        }
+        if current_head != head.as_ref().map(|row| (row.0, row.1.clone(), row.2.clone()))
+            || anchor(store, project)? != existing
+        {
+            return Err(reject("receiver predecessor changed; retry"));
+        }
+        let previous = head.as_ref().map(|row| row.3.as_str());
+        validate_roster_transition(store, statement, previous)?;
         if existing.is_none() {
             if store.get_team_by_project(project)?.is_some_and(|t|t.id!=statement.team_id) {return Err(reject("existing team differs; use a separate store"));}
             if store.get_team_by_project(project)?.is_none() {store.insert_team(&TeamRecord{id:statement.team_id.clone(),project_id:project.into(),name:statement.team_id.clone(),created_at:nanos(now)?,updated_at:nanos(now)?})?;}
@@ -664,10 +653,53 @@ pub fn apply_package_with_consent_guarded(
         Ok(result)
     })
 }
+fn validate_roster_transition(
+    store: &Store,
+    statement: &TeamStatement,
+    previous_roster: Option<&str>,
+) -> Result<()> {
+    let previous: Vec<TeamMember> =
+        previous_roster.map(serde_json::from_str).transpose()?.unwrap_or_default();
+    for member in &statement.members {
+        let binding: Option<(String, Option<String>)> = store
+            .connection()
+            .query_row(
+                "SELECT team_id,device_id FROM team_members WHERE id=?1",
+                [&member.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((team, device)) = binding {
+            if team != statement.team_id {
+                return Err(reject("cross-team member ID"));
+            }
+            if device.as_deref() != Some(member.device.id.as_str()) {
+                return Err(reject("member ID cannot change device identity"));
+            }
+        }
+        if member.removed {
+            continue;
+        }
+        if previous
+            .iter()
+            .any(|old| old.removed && old.device.sealing_key == member.device.sealing_key)
+        {
+            return Err(reject("revoked identity cannot be reinstated"));
+        }
+        // Omission leaves a local tombstone. The sealing key identifies recipients
+        // even when a later statement uses a new device or member ID.
+        if store.bundle_recipient_is_denied(&statement.project_id, &member.device.sealing_key)? {
+            return Err(reject("removed membership cannot be reinstated"));
+        }
+    }
+    Ok(())
+}
+
 fn apply_roster(store: &Store, s: &TeamStatement, now: i64) -> Result<()> {
     // Retain absent members as revoked. A snapshot cannot erase revocation history.
     store.connection().execute(
-        "UPDATE team_members SET removed_at=COALESCE(removed_at,?2) WHERE team_id=?1",
+        "UPDATE team_members SET removed_at=MAX(joined_at,?2)
+         WHERE team_id=?1 AND removed_at IS NULL",
         params![s.team_id, nanos(now)?],
     )?;
     for m in &s.members {
@@ -692,15 +724,14 @@ fn apply_roster(store: &Store, s: &TeamStatement, now: i64) -> Result<()> {
                 now,
             )?)?;
         }
-        let foreign: bool = store.connection().query_row(
-            "SELECT EXISTS(SELECT 1 FROM team_members WHERE id=?1 AND team_id!=?2)",
-            (&m.id, &s.team_id),
-            |r| r.get(0),
+        store.connection().execute(
+            "INSERT INTO team_members(id,team_id,device_id,display_name,role,profiles_json,joined_at,removed_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+             ON CONFLICT(id) DO UPDATE SET role=excluded.role,profiles_json=excluded.profiles_json,
+                 removed_at=CASE WHEN excluded.removed_at IS NULL THEN NULL ELSE team_members.removed_at END",
+            params![m.id,s.team_id,m.device.id,m.name,m.role,serde_json::to_string(&m.profiles)?,
+                nanos(now)?,if m.removed {Some(nanos(now)?)} else {None}],
         )?;
-        if foreign {
-            return Err(reject("cross-team member ID"));
-        }
-        store.connection().execute("INSERT INTO team_members(id,team_id,device_id,display_name,role,profiles_json,joined_at,removed_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(id) DO UPDATE SET role=excluded.role,profiles_json=excluded.profiles_json,removed_at=excluded.removed_at",params![m.id,s.team_id,m.device.id,m.name,m.role,serde_json::to_string(&m.profiles)?,nanos(now)?,if m.removed{Some(nanos(now)?)}else{None}])?;
         if m.removed {
             store.connection().execute(
                 "UPDATE devices SET revoked_at=COALESCE(revoked_at,?2) WHERE id=?1",
@@ -1290,4 +1321,84 @@ pub fn resume_pending_profiles_guarded(
         audit_event(store,project,master,"TEAM_SYNC",now,&serde_json::json!({"pending_retry":true,"applied":result.applied,"pending_profiles":result.pending_profiles}))?;
         Ok(result)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn member(id: &str, device: DeviceIdentity, role: &str) -> TeamMember {
+        TeamMember {
+            id: id.into(),
+            name: id.into(),
+            role: role.into(),
+            profiles: Vec::new(),
+            device,
+            removed: false,
+        }
+    }
+
+    #[test]
+    fn roster_omission_preserves_the_device_and_membership_binding()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path().join("roster.db"))?;
+        store.initialize_schema()?;
+        store.insert_project_if_absent("project", "project", 1)?;
+        store.insert_team(&TeamRecord {
+            id: "team".into(),
+            project_id: "project".into(),
+            name: "team".into(),
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        let owner = DeviceIdentity::new("owner".into(), [4; 32], [5; 32]);
+        let observer = DeviceIdentity::new("observer".into(), [6; 32], [7; 32]);
+        let omitted = member("historical-member", observer.clone(), "developer");
+        let mut statement = TeamStatement {
+            v: 1,
+            team_id: "team".into(),
+            project_id: "project".into(),
+            epoch: 1,
+            previous_digest: String::new(),
+            issued_at: 1,
+            expires_at: 60,
+            nonce: [0; 24],
+            publisher: owner.clone(),
+            recipient: observer.clone(),
+            members: vec![member("owner-member", owner, "owner"), omitted.clone()],
+            profiles: Vec::new(),
+        };
+
+        validate_roster_transition(&store, &statement, None)?;
+        apply_roster(&store, &statement, 1)?;
+        statement.members.pop();
+        validate_roster_transition(&store, &statement, None)?;
+        apply_roster(&store, &statement, 2)?;
+        let removed = store.get_team_member("team", &omitted.id)?.ok_or("missing tombstone")?;
+        assert_eq!(removed.removed_at, Some(nanos(2)?));
+
+        let new_device = DeviceIdentity::new("replacement".into(), [8; 32], [9; 32]);
+        statement.members.push(member("fresh-member", new_device, "developer"));
+        validate_roster_transition(&store, &statement, None)?;
+        let replacement = statement.members.last_mut().ok_or("missing replacement")?;
+        replacement.id.clone_from(&omitted.id);
+        assert!(matches!(
+            validate_roster_transition(&store, &statement, None),
+            Err(super::super::SyncError::Rejected(message))
+                if message == "member ID cannot change device identity"
+        ));
+
+        let replacement = statement.members.last_mut().ok_or("missing replacement")?;
+        replacement.id = "fresh-member".into();
+        replacement.device =
+            DeviceIdentity::new("replacement".into(), [8; 32], observer.sealing_key);
+        assert!(matches!(
+            validate_roster_transition(&store, &statement, None),
+            Err(super::super::SyncError::Rejected(message))
+                if message == "removed membership cannot be reinstated"
+        ));
+        assert_eq!(store.get_team_member("team", &omitted.id)?, Some(removed));
+        Ok(())
+    }
 }
