@@ -11,11 +11,16 @@ contents = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(contents)
 
 class PackageContentsTests(unittest.TestCase):
-    def artifact(self, root, extra=None, version='0.1.0'):
+    def artifact(self, root, extra=None, version='0.1.0', publisher='locket', name='locket-vscode', manifest=None):
         filename = pathlib.Path(root) / 'fixture.vsix'
+        if manifest is None:
+            manifest = ('<PackageManifest xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011">'
+                        '<Metadata>'
+                        f'<Identity Publisher="{publisher}" Id="{name}" Version="{version}"/>'
+                        '</Metadata></PackageManifest>')
         with zipfile.ZipFile(filename, 'w', compression=zipfile.ZIP_DEFLATED) as z:
-            z.writestr('extension/package.json', json.dumps(dict(publisher='locket', name='locket-vscode', version=version, main='./out/extension.js')))
-            z.writestr('extension.vsixmanifest', f'<Identity Version="{version}"/>')
+            z.writestr('extension/package.json', json.dumps(dict(publisher=publisher, name=name, version=version, main='./out/extension.js')))
+            z.writestr('extension.vsixmanifest', manifest)
             z.writestr('extension/out/extension.js', 'exports.activate = () => {};')
             for name, data in (extra or {}).items():
                 z.writestr(name, data)
@@ -30,8 +35,23 @@ class PackageContentsTests(unittest.TestCase):
                 contents.inspect_vsix(self.artifact(root, {'extension/out/leak.js': 'LOCKET_CANARY=hidden'}), '0.1.0')
             with self.assertRaisesRegex(ValueError, 'unsafe'):
                 contents.inspect_vsix(self.artifact(root, {'../escape': 'bad'}), '0.1.0')
-            with self.assertRaisesRegex(ValueError, 'development'):
-                contents.inspect_vsix(self.artifact(root, {'extension/out/a.test.js': 'test'}), '0.1.0')
+
+    def test_rejects_unrelated_or_inconsistent_vsix_identity(self):
+        with tempfile.TemporaryDirectory(dir=os.environ['TMPDIR']) as root:
+            for publisher, name in [('other', 'locket-vscode'), ('locket', 'other')]:
+                with self.subTest(publisher=publisher, name=name), self.assertRaisesRegex(ValueError, 'identity'):
+                    contents.inspect_vsix(self.artifact(root, publisher=publisher, name=name), '0.1.0')
+            wrong_manifest = ('<PackageManifest xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011">'
+                              '<Metadata><Identity Publisher="other" Id="locket-vscode" Version="0.1.0"/>'
+                              '</Metadata></PackageManifest>')
+            with self.assertRaisesRegex(ValueError, 'identity'):
+                contents.inspect_vsix(self.artifact(root, manifest=wrong_manifest), '0.1.0')
+
+    def test_rejects_development_files(self):
+        with tempfile.TemporaryDirectory(dir=os.environ['TMPDIR']) as root:
+            for name in ('extension/out/a.test.js', 'extension/out/a.js.map', 'extension/integration/packaged-host.cjs'):
+                with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'development'):
+                    contents.inspect_vsix(self.artifact(root, {name: 'fixture'}), '0.1.0')
 
 
 class NativePackageContentsTests(unittest.TestCase):

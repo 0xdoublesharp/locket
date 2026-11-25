@@ -72,7 +72,7 @@ scan_artifacts_for_canaries() {
     echo "artifact root not found: ${artifact_root}" >&2
     exit 66
   fi
-  if rg -a -l "lk-canary|LOCKET_CANARY|DATABASE_URL_CANARY" "${artifact_root}"; then
+  if rg --no-config --hidden --no-ignore -a -l "lk-canary|LOCKET_CANARY|DATABASE_URL_CANARY" "${artifact_root}"; then
     echo "known canary marker leaked into packaged artifacts" >&2
     exit 1
   else

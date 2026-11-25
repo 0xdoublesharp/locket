@@ -59,10 +59,12 @@ jobs:
           python-version: '3.12'
       - name: Ensure package inspection commands
         run: |
+          python3_cmd=python3
           if ! command -v python3 >/dev/null 2>&1; then
             mkdir -p "$LOCKET_BUILD_ROOT/tools/bin"
-            printf '#!/usr/bin/env bash\nexec python "$@"\n' > "$LOCKET_BUILD_ROOT/tools/bin/python3"
-            chmod +x "$LOCKET_BUILD_ROOT/tools/bin/python3"
+            python3_cmd="$LOCKET_BUILD_ROOT/tools/bin/python3"
+            printf '#!/usr/bin/env bash\nexec python "$@"\n' > "$python3_cmd"
+            chmod +x "$python3_cmd"
             echo "$LOCKET_BUILD_ROOT/tools/bin" >> "$GITHUB_PATH"
           fi
           if ! command -v rg >/dev/null 2>&1; then
@@ -73,7 +75,7 @@ jobs:
                 rg_root="$LOCKET_BUILD_ROOT/tools/ripgrep"
                 mkdir -p "$rg_root"
                 curl --fail --location --retry 3 --output "$rg_root/rg.zip" https://github.com/BurntSushi/ripgrep/releases/download/14.1.1/ripgrep-14.1.1-x86_64-pc-windows-msvc.zip
-                python3 -c 'import hashlib,pathlib,sys,zipfile; archive=pathlib.Path(sys.argv[1]); assert hashlib.sha256(archive.read_bytes()).hexdigest()=="d0f534024c42afd6cb4d38907c25cd2b249b79bbe6cc1dbee8e3e37c2b6e25a1", "ripgrep checksum mismatch"; zipfile.ZipFile(archive).extractall(sys.argv[2])' "$rg_root/rg.zip" "$rg_root"
+                "$python3_cmd" -c 'import hashlib,pathlib,sys,zipfile; archive=pathlib.Path(sys.argv[1]); assert hashlib.sha256(archive.read_bytes()).hexdigest()=="d0f534024c42afd6cb4d38907c25cd2b249b79bbe6cc1dbee8e3e37c2b6e25a1", "ripgrep checksum mismatch"; zipfile.ZipFile(archive).extractall(sys.argv[2])' "$rg_root/rg.zip" "$rg_root"
                 echo "$rg_root/ripgrep-14.1.1-x86_64-pc-windows-msvc" >> "$GITHUB_PATH"
                 ;;
 

@@ -4,7 +4,6 @@ import argparse
 import json
 import pathlib
 import plistlib
-import re
 import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
@@ -13,6 +12,9 @@ import zipfile
 CANARIES = (b'lk-canary', b'LOCKET_CANARY', b'DATABASE_URL_CANARY')
 MAX_ENTRY = 64 * 1024 * 1024
 MAX_ARCHIVE = 256 * 1024 * 1024
+VSIX_PUBLISHER = 'locket'
+VSIX_NAME = 'locket-vscode'
+VSIX_NAMESPACE = 'http://schemas.microsoft.com/developer/vsx-schema/2011'
 
 
 def scan(data, name):
@@ -34,17 +36,24 @@ def inspect_vsix(filename, version):
                 raise ValueError('unsafe VSIX entry')
             scan(archive.read(entry), entry.filename)
         package = json.loads(archive.read('extension/package.json'))
+        if (package.get('publisher'), package.get('name')) != (VSIX_PUBLISHER, VSIX_NAME):
+            raise ValueError('VSIX extension identity mismatch')
         if package.get('version') != version:
             raise ValueError('VSIX version mismatch')
         main = package.get('main', '').removeprefix('./')
         if not main.endswith('.js') or f'extension/{main}' not in names:
             raise ValueError('VSIX compiled entry point is missing')
-        if any('/node_modules/' in name or name.startswith('extension/src/') or name.endswith('.test.js') for name in names):
+        if any('/node_modules/' in name or name.startswith(('extension/src/', 'extension/integration/'))
+               or name.endswith(('.test.js', '.map')) for name in names):
             raise ValueError('VSIX contains development-only files')
-        manifest = archive.read('extension.vsixmanifest').decode('utf8')
-        if not re.search(r'Version="' + re.escape(version) + r'"', manifest):
+        manifest = ET.fromstring(archive.read('extension.vsixmanifest'))
+        identities = manifest.findall('Metadata/Identity', {'': VSIX_NAMESPACE})
+        if (manifest.tag != f'{{{VSIX_NAMESPACE}}}PackageManifest' or len(identities) != 1
+                or (identities[0].get('Publisher'), identities[0].get('Id')) != (VSIX_PUBLISHER, VSIX_NAME)):
+            raise ValueError('VSIX manifest identity mismatch')
+        if identities[0].get('Version') != version:
             raise ValueError('VSIX manifest version mismatch')
-        return f"{package['publisher']}.{package['name']}"
+        return f'{VSIX_PUBLISHER}.{VSIX_NAME}'
 
 
 def inspect_app(folder, version):
