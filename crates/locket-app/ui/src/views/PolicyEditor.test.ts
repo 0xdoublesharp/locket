@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { desktopVariableReadiness } from '../agent/client';
+import { desktopCopyTextPlain, desktopVariableReadiness } from '../agent/client';
 import {
   button,
   byProp,
@@ -58,6 +58,38 @@ beforeEach(() => {
 });
 
 afterEach(() => vi.unstubAllGlobals());
+
+it('copies the selected CLI invocation and clears its feedback', async () => {
+  vi.useFakeTimers();
+  vi.mocked(desktopCopyTextPlain).mockResolvedValue({ ok: true, value: undefined });
+  const view = mountComponent(PolicyEditor, {
+    rows: sampleRows,
+    privacyMode: false,
+    loading: false,
+    metadataLoaded: true,
+    actionsEnabled: true,
+  });
+  try {
+    const detail = byProp(view.root, 'id', 'policy-detail');
+    expect(nodeText(detail)).toContain('locket run deploy-prod');
+    await click(button(detail, 'Copy command'));
+    expect(desktopCopyTextPlain).toHaveBeenCalledExactlyOnceWith('locket run deploy-prod');
+    expect(nodeText(detail)).toContain('Copied');
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(nodeText(detail)).not.toContain('Copied');
+    view.setProps({ rows: [{ ...sampleRows[0]!, name: 'check $HOME' }] });
+    await settle();
+    await click(button(detail, 'Copy command'));
+    expect(desktopCopyTextPlain).toHaveBeenLastCalledWith("locket run 'check $HOME'");
+    view.setProps({ privacyMode: true });
+    await settle();
+    expect(nodeText(detail)).not.toContain('locket run');
+    expect(findNode(detail, (node) => node.props['aria-label'] === 'Copy command')).toBeUndefined();
+  } finally {
+    view.unmount();
+    vi.useRealTimers();
+  }
+});
 
 it('redacts commandPreview from display and search when privacyMode is enabled', async () => {
   const view = mountComponent(PolicyEditor, {

@@ -6,7 +6,7 @@ import type {
   SecretRowMeta,
 } from '../types/views';
 export type StartHereTarget =
-  'connect' | 'start-agent' | 'unlock' | 'refresh' | 'secret-editor' | 'policies';
+  'connect' | 'start-agent' | 'unlock' | 'refresh' | 'secrets' | 'policies';
 export type StartHereTone = 'ok' | 'warn' | 'critical' | 'neutral';
 export interface StartHereAction {
   id: string;
@@ -75,10 +75,10 @@ export function startHereActions(input: StartHereInput): StartHereAction[] {
   if (input.secrets.length === 0)
     return action(
       'add-secret',
-      'Import or add variables',
-      'Import an env file or add a value for this environment.',
-      'secret-editor',
-      'Add variables',
+      'Import or add secrets',
+      'Import an .env file or add a secret for this environment.',
+      'secrets',
+      'Open Secrets',
     );
   if (input.policies.length === 0)
     return action(

@@ -1,8 +1,11 @@
 <script setup lang="ts">
 import { formatTime } from '../utils/formatTime';
-import { computed, ref, watch } from 'vue';
+import { computed, onScopeDispose, ref, watch } from 'vue';
+import { desktopCopyTextPlain } from '../agent/client';
 import AppIcon from '../components/AppIcon.vue';
 import VariableReadinessPanel from '../components/VariableReadinessPanel.vue';
+import { createRequestLifetime } from '../utils/requestLifetime';
+import { shellQuote } from '../utils/shellQuote';
 
 import type { CommandPolicyRow } from '../types/views';
 import type { DetectedCommandRow } from '../agent/types';
@@ -61,6 +64,43 @@ const selectedPolicy = computed<CommandPolicyRow | null>(() => {
   }
   return filteredRows.value.find((row) => row.id === selectedId.value) ?? filteredRows.value[0];
 });
+
+const invocation = computed(() => {
+  const name = selectedPolicy.value?.name;
+  return !props.privacyMode && name ? `locket run ${shellQuote(name)}` : '';
+});
+const copyStatus = ref('');
+const copyRequests = createRequestLifetime();
+let copyTimer: ReturnType<typeof setTimeout> | undefined;
+
+function resetCopyStatus(): void {
+  clearTimeout(copyTimer);
+  copyStatus.value = '';
+}
+
+watch(
+  [invocation, () => props.projectId, () => props.profileId],
+  () => {
+    copyRequests.invalidate();
+    resetCopyStatus();
+  },
+  { flush: 'sync' },
+);
+onScopeDispose(() => {
+  copyRequests.dispose();
+  clearTimeout(copyTimer);
+});
+
+async function copyInvocation(): Promise<void> {
+  const command = invocation.value;
+  if (!command) return;
+  resetCopyStatus();
+  const isCurrent = copyRequests.begin();
+  const result = await desktopCopyTextPlain(command);
+  if (!isCurrent()) return;
+  copyStatus.value = result.ok ? 'Copied' : 'Could not copy command.';
+  copyTimer = setTimeout(resetCopyStatus, 2000);
+}
 
 watch(
   () => [props.projectId, props.profileId, selectedPolicy.value?.name],
@@ -340,6 +380,25 @@ function startDelete(): void {
             <AppIcon name="terminal" />
             {{ running ? 'Opening terminal…' : 'Run in terminal' }}
           </button>
+          <div v-if="invocation" class="policy-detail__invocation">
+            <code class="policy-detail__command">{{ invocation }}</code>
+            <button
+              type="button"
+              class="companion-button icon-label"
+              aria-label="Copy command"
+              @click="copyInvocation"
+            >
+              <AppIcon :name="copyStatus === 'Copied' ? 'check' : 'copy'" />
+              {{ copyStatus === 'Copied' ? 'Copied' : 'Copy' }}
+            </button>
+          </div>
+          <p
+            class="view__empty"
+            :class="{ 'visually-hidden': !copyStatus || copyStatus === 'Copied' }"
+            role="status"
+          >
+            {{ copyStatus }}
+          </p>
         </header>
         <p v-if="configurationMissing" class="policy-detail__blocked" role="status">
           <AppIcon name="alert" :size="14" />
@@ -677,6 +736,19 @@ function startDelete(): void {
 }
 
 .policy-detail__title {
+  min-width: 0;
+}
+
+.policy-detail__invocation {
+  display: flex;
+  align-items: stretch;
+  gap: 0.375rem;
+  flex-basis: 100%;
+  min-width: 0;
+}
+
+.policy-detail__invocation code {
+  flex: 1;
   min-width: 0;
 }
 

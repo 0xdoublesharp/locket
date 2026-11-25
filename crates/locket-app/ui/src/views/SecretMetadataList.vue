@@ -28,6 +28,8 @@ interface Props {
   loading: boolean;
   metadataLoaded: boolean;
   isShared?: boolean;
+  canImportEnv?: boolean;
+  importBusy?: boolean;
   dangerousProfile?: boolean;
   mutationDisabled?: boolean;
   mutationError?: { id: string; message: string } | null;
@@ -39,8 +41,8 @@ const props = defineProps<Props>();
 
 const emit = defineEmits<{
   (e: 'select', row: SecretRowMeta): void;
-  (e: 'refresh' | 'add' | 'retry' | 'start' | 'openAgentSetup'): void;
-  (e: 'copyValue' | 'revealValue' | 'copyToShared', row: SecretRowMeta): void;
+  (e: 'refresh' | 'add' | 'retry' | 'start' | 'openAgentSetup' | 'importEnv'): void;
+  (e: 'copyValue' | 'revealValue' | 'copyToShared' | 'rotate', row: SecretRowMeta): void;
   (e: 'deleteSecret', row: SecretRowMeta, confirmation?: string): void;
 }>();
 
@@ -229,6 +231,16 @@ function graceDetails(row: SecretRowMeta): string {
           <span class="variables__refresh-label">Refresh</span>
         </button>
         <button
+          v-if="canImportEnv"
+          class="companion-button icon-label"
+          type="button"
+          :disabled="importBusy"
+          @click="emit('importEnv')"
+        >
+          <AppIcon name="folder" />
+          Import .env
+        </button>
+        <button
           v-if="!isEmpty || loadError || actionGuidance"
           class="companion-button icon-label"
           :class="{ 'companion-button--primary': connected }"
@@ -261,7 +273,6 @@ function graceDetails(row: SecretRowMeta): string {
       aria-labelledby="variables-onboarding-heading"
     >
       <h3 id="variables-onboarding-heading">No secrets yet</h3>
-      <p>Add a secret or ask your AI agent to migrate existing <code>.env</code> files.</p>
       <div class="variables__onboarding-actions">
         <button
           class="companion-button companion-button--primary icon-label"
@@ -270,7 +281,17 @@ function graceDetails(row: SecretRowMeta): string {
           @click="emit('add')"
         >
           <AppIcon name="plus" />
-          Add a secret
+          Add secret
+        </button>
+        <button
+          v-if="canImportEnv"
+          class="companion-button icon-label"
+          type="button"
+          :disabled="importBusy"
+          @click="emit('importEnv')"
+        >
+          <AppIcon name="folder" />
+          Import .env
         </button>
         <button
           class="companion-button icon-label"
@@ -475,13 +496,23 @@ function graceDetails(row: SecretRowMeta): string {
           >
             <header class="variable-inspector__header">
               <h3 id="variable-inspector-title">Secret details</h3>
-              <button
-                class="companion-button icon-label"
-                type="button"
-                @click="emit('select', row)"
-              >
-                <AppIcon name="clock" /> Version history
-              </button>
+              <div class="variables__actions">
+                <button
+                  v-if="canMutate && !privacyMode"
+                  class="companion-button icon-label"
+                  type="button"
+                  @click="emit('rotate', row)"
+                >
+                  <AppIcon name="refresh" /> Rotate
+                </button>
+                <button
+                  class="companion-button icon-label"
+                  type="button"
+                  @click="emit('select', row)"
+                >
+                  <AppIcon name="clock" /> Version history
+                </button>
+              </div>
             </header>
             <dl class="variable-inspector__metadata">
               <div v-if="inspectedReference" class="variable-inspector__reference">
@@ -617,6 +648,7 @@ function graceDetails(row: SecretRowMeta): string {
 }
 .variables__header {
   justify-content: space-between;
+  flex-wrap: wrap;
 }
 .variables__header h2 {
   margin: 0;
@@ -627,6 +659,10 @@ function graceDetails(row: SecretRowMeta): string {
 .variables__actions,
 .variables__row-actions {
   flex: none;
+}
+.variables__actions {
+  flex-wrap: wrap;
+  max-width: 100%;
 }
 .variables__actions .companion-button:disabled:not(.companion-button--primary) {
   background: transparent;

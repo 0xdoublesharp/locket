@@ -56,6 +56,7 @@ import {
   desktopInspectProjectFolder,
   desktopInitializeProject,
   desktopImportEnv,
+  desktopPickFile,
   desktopStartAgent,
   desktopRunPolicy,
   desktopScanProject,
@@ -208,16 +209,17 @@ watch(
   { flush: 'sync' },
 );
 const envPath = ref('.env');
+const envImportOpen = ref(false);
+const envImportHeading = ref<HTMLElement | null>(null);
+const envPickerBusy = ref(false);
+const envPickerFailed = ref(false);
+const envPickerRequests = createRequestLifetime();
 const importOverwrite = ref(false);
 const importConfirmation = ref('');
 const importLiteral = ref(false);
 const envPathReady = computed(() => {
   const path = envPath.value.trim();
   return path !== '' && (!selectedIsShared.value || /^(?:\/|[a-z]:[\\/]|\\\\)/i.test(path));
-});
-watch(selectedIsShared, (shared) => {
-  envPath.value = shared ? '' : '.env';
-  importConfirmation.value = '';
 });
 const commandRunning = ref(false);
 const commandRunError = ref<string | null>(null);
@@ -226,6 +228,9 @@ useTray(status, error);
 
 const agentOnline = computed(
   () => connected.value && !error.value && !isAgentUnavailable(secretsLoadError.value),
+);
+const canImportEnv = computed(
+  () => desktopAvailable && projectConnected.value && agentOnline.value,
 );
 const connectionLabel = computed(() => {
   if (agentOnline.value) return 'Live';
@@ -256,6 +261,17 @@ const previewViews: ViewKey[] = [
 ];
 const currentView = ref<ViewKey>(
   previewViews.find((view) => view === previewParams?.get('view')) ?? 'dashboard',
+);
+const rotationTarget = ref<SecretRowMeta | null>(null);
+watch(
+  [
+    currentView,
+    selectionGeneration,
+    () => activeContext.value?.project_id,
+    () => activeContext.value?.profile_id,
+  ],
+  resetEnvImport,
+  { flush: 'sync' },
 );
 const paletteOpen = ref(previewParams?.get('modal') === 'palette');
 const paletteMessage = ref('');
@@ -289,7 +305,7 @@ const secondaryItems = computed<Array<{ key: ViewKey; label: string }>>(() => {
   if (['secrets', 'discover', 'secret-editor', 'versions'].includes(currentView.value))
     return [
       { key: 'secrets', label: 'Secrets' },
-      { key: 'secret-editor', label: 'Add or import' },
+      { key: 'secret-editor', label: 'Add or rotate' },
       { key: 'discover', label: 'Discover' },
       ...(selectedSecret.value ? [{ key: 'versions' as const, label: 'Secret history' }] : []),
     ];
@@ -637,14 +653,23 @@ watch(
 );
 
 function selectView(key: ViewKey): void {
+  if (key === 'secret-editor') rotationTarget.value = null;
   currentView.value = key;
   dismissVaultSwitcher();
 }
 
-async function addVariable(): Promise<void> {
+async function addSecret(): Promise<void> {
   selectView('secret-editor');
   await nextTick();
   document.getElementById('secret-editor-set-heading')?.focus();
+}
+
+async function rotateListedSecret(row: SecretRowMeta): Promise<void> {
+  if (!secretMutationAvailable.value) return;
+  selectView('secret-editor');
+  rotationTarget.value = row;
+  await nextTick();
+  document.getElementById('secret-editor-rotate-value')?.focus();
 }
 
 async function handleTrayMenuAction(action: TrayMenuAction): Promise<void> {
@@ -753,7 +778,7 @@ const paletteActions = computed<RunnablePaletteAction[]>(() => {
     icon: 'plus',
     badge: 'Action',
     label: 'Add secret',
-    run: addVariable,
+    run: addSecret,
   });
   if (desktopAvailable) {
     actions.push(
@@ -2012,6 +2037,7 @@ watch(
   [settingsContextKey, () => settings.value.privacyRedactNames],
   () => {
     secretMutationRequests.invalidate();
+    rotationTarget.value = null;
     secretMutationBusy.value = false;
     secretMutationError.value = null;
     if (settings.value.privacyRedactNames) desktopNotice.value = null;
@@ -2343,31 +2369,70 @@ async function handleUnlock(
     if (isCurrent()) unlockBusy.value = false;
   }
 }
+function resetEnvImport(): void {
+  envPickerRequests.invalidate();
+  envPickerBusy.value = false;
+  envPickerFailed.value = false;
+  envImportOpen.value = false;
+  envPath.value = selectedIsShared.value ? '' : '.env';
+  importOverwrite.value = false;
+  importConfirmation.value = '';
+  importLiteral.value = false;
+}
+
+async function pickEnvForImport(): Promise<void> {
+  if (!canImportEnv.value || envPickerBusy.value || desktopBusy.value) return;
+  const isCurrent = envPickerRequests.begin();
+  envPickerBusy.value = true;
+  const result = await desktopPickFile({ title: 'Browse for an env file' });
+  if (!isCurrent()) return;
+  envPickerBusy.value = false;
+  if (result.ok && !result.value) return;
+  envPickerFailed.value = !result.ok;
+  if (result.ok && result.value) envPath.value = result.value;
+  envImportOpen.value = true;
+  await nextTick();
+  envImportHeading.value?.focus?.();
+}
+
+const canSubmitEnvImport = computed(
+  () =>
+    envImportOpen.value &&
+    canImportEnv.value &&
+    !desktopBusy.value &&
+    !envPickerBusy.value &&
+    settingsReady.value &&
+    secretAccess.value.enabled &&
+    envPathReady.value &&
+    (!settings.value.dangerousProfileFlag ||
+      importConfirmation.value === activeContext.value?.profile_name),
+);
+
 async function importEnv(): Promise<void> {
-  const projectId = selectedProject.value?.project_id ?? status.value?.project_id;
-  if (!secretAccess.value.enabled || !projectId || desktopBusy.value || !envPathReady.value) return;
-  if (
-    settings.value.dangerousProfileFlag &&
-    importConfirmation.value !== activeContext.value?.profile_name
-  )
-    return;
+  const projectId = activeContext.value?.project_id;
+  if (!projectId || !canSubmitEnvImport.value) return;
   desktopBusy.value = true;
   desktopError.value = null;
   desktopNotice.value = null;
-  const result = await desktopImportEnv({
-    project_id: projectId,
-    path: envPath.value.trim(),
-    overwrite: importOverwrite.value,
-    literal: importLiteral.value,
-    confirmation: importConfirmation.value || undefined,
-  });
-  if (!result.ok) desktopError.value = actionError(result.error);
-  else {
-    desktopNotice.value = result.value.summary;
-    importConfirmation.value = '';
-    await refreshSecrets();
+  const context = settingsContextKey.value;
+  try {
+    const result = await desktopImportEnv({
+      project_id: projectId,
+      path: envPath.value.trim(),
+      overwrite: importOverwrite.value,
+      literal: importLiteral.value,
+      confirmation: importConfirmation.value || undefined,
+    });
+    if (context !== settingsContextKey.value) return;
+    if (!result.ok) desktopError.value = actionError(result.error);
+    else {
+      desktopNotice.value = result.value.summary;
+      resetEnvImport();
+      await refreshSecrets();
+    }
+  } finally {
+    desktopBusy.value = false;
   }
-  desktopBusy.value = false;
 }
 async function runCommand(row: CommandPolicyRow): Promise<void> {
   const projectId = activeContext.value?.project_id;
@@ -2459,6 +2524,7 @@ onBeforeUnmount(() => {
   detectionRequests.dispose();
   scanRequests.dispose();
   unlockRequests.dispose();
+  envPickerRequests.dispose();
   scanLaunching.value = false;
   scanError.value = null;
   scanNotice.value = null;
@@ -2751,12 +2817,15 @@ onUnmounted(() => {
         </div>
       </div>
       <section
-        v-if="currentView === 'secret-editor'"
+        v-if="currentView === 'secrets' && envImportOpen"
         class="shell__panel"
         aria-labelledby="import-heading"
       >
-        <h2 id="import-heading">Import an env file</h2>
+        <h2 id="import-heading" ref="envImportHeading" tabindex="-1">
+          Import .env · {{ profileLabel }}
+        </h2>
         <p v-if="secretAccess.guidance" role="status">{{ secretAccess.guidance }}</p>
+        <p v-if="envPickerFailed" role="status">Could not open the picker. Enter a path manually.</p>
         <form @submit.prevent="importEnv">
           <label>
             File path
@@ -2769,11 +2838,15 @@ onUnmounted(() => {
               :disabled="desktopBusy"
             />
           </label>
-          <PathBrowse
-            title="Browse for an env file"
-            :disabled="desktopBusy"
-            @pick="envPath = $event"
-          />
+          <button
+            class="companion-button icon-label"
+            type="button"
+            aria-label="Browse for an env file"
+            :disabled="!canImportEnv || desktopBusy || envPickerBusy"
+            @click="pickEnvForImport"
+          >
+            <AppIcon name="folder" /> Browse…
+          </button>
           <p v-if="selectedIsShared" id="env-path-hint">
             Choose an absolute path to a <code>.env</code> file.
           </p>
@@ -2796,18 +2869,10 @@ onUnmounted(() => {
               :disabled="desktopBusy"
             />
           </label>
-          <button
-            type="submit"
-            :disabled="
-              !desktopAvailable ||
-              desktopBusy ||
-              !secretAccess.enabled ||
-              !envPathReady ||
-              (settings.dangerousProfileFlag && importConfirmation !== activeContext?.profile_name)
-            "
-          >
+          <button type="submit" :disabled="!canSubmitEnvImport">
             {{ desktopBusy ? 'Importing…' : 'Import secrets' }}
           </button>
+          <button type="button" :disabled="desktopBusy" @click="resetEnvImport">Cancel import</button>
         </form>
       </section>
       <p v-if="desktopError" role="alert" class="shell__notice shell__notice--error">
@@ -3052,6 +3117,8 @@ onUnmounted(() => {
         :last-refreshed-at="secretsLastRefreshed"
         :metadata-loaded="secretAccess.enabled"
         :is-shared="selectedIsShared"
+        :can-import-env="canImportEnv"
+        :import-busy="desktopBusy || envPickerBusy"
         :dangerous-profile="settings.dangerousProfileFlag"
         :mutation-disabled="!secretMutationAvailable"
         :mutation-error="secretMutationError"
@@ -3064,7 +3131,9 @@ onUnmounted(() => {
         @refresh="retryVariables"
         @retry="retryVariables"
         @start="startAgent"
-        @add="addVariable"
+        @add="addSecret"
+        @rotate="rotateListedSecret"
+        @import-env="pickEnvForImport"
         @open-agent-setup="selectView('settings')"
       />
 
@@ -3082,7 +3151,7 @@ onUnmounted(() => {
 
       <SecretEditorView
         v-else-if="currentView === 'secret-editor'"
-        :key="settingsContextKey"
+        :key="`${settingsContextKey}:${rotationTarget?.id ?? 'add'}`"
         :rows="secretRows"
         :privacy-mode="settings.privacyRedactNames"
         :loading="secretsLoading"
@@ -3092,10 +3161,10 @@ onUnmounted(() => {
         :action-guidance="secretAccess.guidance"
         :project-id="activeContext?.project_id"
         :profile-id="activeContext?.profile_id"
+        :rotation-target="rotationTarget"
         :on-set-secret="handleSetSecret"
         :on-rotate-secret="handleRotateSecret"
         @refresh="refreshSecrets"
-        @reveal="handleEditorReveal"
         @manage="selectView('secrets')"
       />
 

@@ -14,6 +14,7 @@ import {
   findNode,
   input,
   mountComponent,
+  nodeBy,
   nodeText,
   select,
   settle,
@@ -92,11 +93,10 @@ const success: AgentResult<SetSecretResponse> = {
   value: { action: 'set', secret_id: 'id', version: 5, source: 'team-managed' },
 };
 
-it('validates and submits a masked new variable, ignores duplicate submission, and refreshes on success', async () => {
+it('validates and submits a masked new secret, ignores duplicate submission, and refreshes on success', async () => {
   const pending = deferred<AgentResult<SetSecretResponse>>();
   const onSetSecret = vi.fn<SetSecretAction>().mockReturnValue(pending.promise);
   const onRefresh = vi.fn();
-  const onReveal = vi.fn();
   const onManage = vi.fn();
   const { root, setProps } = mount(SecretEditorView, {
     rows: [secret, override, machine],
@@ -110,31 +110,30 @@ it('validates and submits a masked new variable, ignores duplicate submission, a
     onSetSecret,
     onRotateSecret: vi.fn(),
     onRefresh,
-    onReveal,
     onManage,
   });
   expect(nodeText(root)).toContain('Loading secret metadata');
   expect(nodeText(root)).toContain('Select an active project and environment');
   setProps({ metadataLoaded: true, loading: false });
   await settle();
-  expect(nodeText(root)).toContain('Variable A Shared v4');
-  expect(nodeText(root)).toContain('Variable B My override');
-  expect(nodeText(root)).toContain('Variable C This machine');
+  expect(findNode(root, (node) => node.tag === 'table')).toBeUndefined();
   expect(nodeText(root)).not.toContain('PRIVATE_TOKEN');
   expect(
     findNode(root, (node) => node.tag === 'option' && node.value === 'PRIVATE_TOKEN'),
   ).toBeUndefined();
-  const search = control(root, 'Search secrets');
-  await input(search, 'PRIVATE_TOKEN');
-  expect(nodeText(root)).toContain('No matching secrets.');
-  await input(search, 'required');
-  await click(button(root, 'Reveal (TTL)'));
-  expect(onReveal).toHaveBeenCalledWith(secret);
-  await click(button(root, 'Open secret list'));
+  await click(button(root, 'Back to Secrets'));
   expect(onManage).toHaveBeenCalledOnce();
 
   const form = byProp(root, 'aria-labelledby', 'secret-editor-set-heading');
   const field = (name: string) => byProp(form, 'data-testid', `secret-editor-set-${name}`);
+  expect(field('value').props.type).toBe('password');
+  await click(button(form, 'Generate'));
+  const token = field('value').value;
+  expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+  expect(invoke).not.toHaveBeenCalled();
+  await click(button(form, 'Show secret value'));
+  expect(field('value').props.type).toBe('text');
+  await click(button(form, 'Hide secret value'));
   expect(field('value').props.type).toBe('password');
   await input(field('name'), 'invalid-name');
   await input(field('value'), fixtureValue);
@@ -146,7 +145,10 @@ it('validates and submits a masked new variable, ignores duplicate submission, a
   expect(nodeText(form)).toContain('Description is too long');
   await input(control(form, 'Description'), 'Fixture metadata');
   await select(field('source'), 'team-managed');
+  await click(button(form, 'Show secret value'));
   await submit(form);
+  expect(field('value').value).toBe('');
+  expect(field('value').props.type).toBe('password');
   await submit(form);
   expect(onSetSecret).toHaveBeenCalledExactlyOnceWith({
     project_id: 'project',
@@ -199,8 +201,8 @@ it('rotates in the existing source and shows safe error labels with no plaintext
   expect(nodeText(root)).toContain('Metadata may be stale.');
   expect(nodeText(root)).toContain('Unlock to load updated metadata.');
   const form = byProp(root, 'aria-labelledby', 'secret-editor-rotate-heading');
-  const name = control(form, 'Existing secret name');
-  const value = control(form, 'New value');
+  const name = control(form, 'Secret name');
+  const value = byProp(form, 'id', 'secret-editor-rotate-value');
   const grace = control(form, 'Grace expiry');
   await input(name, secret.name);
   await input(value, fixtureValue);
@@ -219,10 +221,13 @@ it('rotates in the existing source and shows safe error labels with no plaintext
     }),
   );
   expect(nodeText(byProp(form, 'role', 'alert'))).toBe('Request failed.');
+  expect(value.value).toBe('');
+  await input(value, fixtureValue);
   await submit(form);
   expect(nodeText(byProp(form, 'role', 'alert'))).toBe('Denied');
   expect(nodeText(form)).not.toContain(fixtureValue);
   await input(name, 'UNTRACKED_NAME');
+  await input(value, fixtureValue);
   await submit(form);
   expect(onRotateSecret).toHaveBeenLastCalledWith(
     expect.objectContaining({ source: 'user-local' }),
@@ -325,6 +330,7 @@ it('offers migration guidance in an empty list and forwards only the requested a
   const onAdd = vi.fn();
   const onRefresh = vi.fn();
   const onOpenAgentSetup = vi.fn();
+  const onImportEnv = vi.fn();
   const { root, setProps } = mount(SecretMetadataList, {
     rows: [],
     versions: [],
@@ -338,11 +344,23 @@ it('offers migration guidance in an empty list and forwards only the requested a
     onAdd,
     onRefresh,
     onOpenAgentSetup,
+    onImportEnv,
+    canImportEnv: true,
   });
+  await click(
+    button(byProp(root, 'aria-labelledby', 'variables-onboarding-heading'), 'Import .env'),
+  );
+  await click(
+    button(
+      nodeBy(root, (node) => node.tag === 'header'),
+      'Import .env',
+    ),
+  );
+  expect(onImportEnv).toHaveBeenCalledTimes(2);
   await click(button(root, 'Refresh secrets'));
   expect(onRefresh).toHaveBeenCalledOnce();
-  expect(nodeText(root)).toContain('Add a secret or ask your AI agent to migrate');
-  await click(button(root, 'Add a secret'));
+  expect(nodeText(root)).toContain('No secrets yet');
+  await click(button(root, 'Add secret'));
   expect(onAdd).toHaveBeenCalledOnce();
   await click(button(root, 'AI agent & MCP setup'));
   expect(onOpenAgentSetup).toHaveBeenCalledOnce();
@@ -357,6 +375,11 @@ it('offers migration guidance in an empty list and forwards only the requested a
   await click(button(root, 'Copy AI migration prompt'));
   expect(nodeText(root)).toContain('Could not copy AI migration prompt.');
   expect(nodeText(root)).not.toContain(fixtureValue);
+  setProps({ canImportEnv: false });
+  await settle();
+  expect(
+    findNode(root, (node) => node.tag === 'button' && nodeText(node) === 'Import .env'),
+  ).toBeUndefined();
   setProps({ loading: true });
   await settle();
   expect(nodeText(root)).toContain('Loading secret metadata');

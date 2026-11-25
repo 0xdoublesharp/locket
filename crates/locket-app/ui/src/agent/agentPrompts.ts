@@ -1,7 +1,4 @@
-function shellQuote(value: string): string {
-  if (/^[A-Za-z0-9_./:@%+=,-]+$/.test(value)) return value;
-  return "'" + value.replaceAll("'", "'\\''") + "'";
-}
+import { shellQuote } from '../utils/shellQuote';
 
 export function mcpClientSnippets(command: string, args: string[]) {
   const launch = [command, ...args].map(shellQuote).join(' ');

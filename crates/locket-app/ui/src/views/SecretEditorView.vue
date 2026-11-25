@@ -1,13 +1,9 @@
 <script setup lang="ts">
+import { computed, onBeforeUnmount, ref } from 'vue';
 import { secretSourceWire } from '../agent/secrets';
+import SecretValueInput from '../components/SecretValueInput.vue';
+import VariableSourceBadge from '../components/VariableSourceBadge.vue';
 import { formatTime } from '../utils/formatTime';
-// Desktop view for gated secret set/rotate and TTL-bound reveal.
-// Plaintext enters the webview only for an active form
-// submission or reveal modal and is cleared when the flow completes.
-
-import { computed, ref } from 'vue';
-
-import RevealModal from '../components/RevealModal.vue';
 import {
   defaultRotateForm,
   defaultSetForm,
@@ -31,6 +27,7 @@ export type SetSecretAction = (
 
 interface Props {
   rows: SecretRowMeta[];
+  rotationTarget?: SecretRowMeta | null;
   privacyMode: boolean;
   loading: boolean;
   metadataLoaded: boolean;
@@ -53,11 +50,19 @@ const props = defineProps<Props>();
 
 const emit = defineEmits<{
   (event: 'refresh' | 'manage'): void;
-  (event: 'reveal', row: SecretRowMeta): void;
 }>();
 
 const setForm = ref<SecretSetFormState>(defaultSetForm());
-const rotateForm = ref<SecretRotateFormState>(defaultRotateForm());
+const rotateForm = ref<SecretRotateFormState>(newRotateForm());
+
+function newRotateForm(): SecretRotateFormState {
+  return { ...defaultRotateForm(), name: props.rotationTarget?.name ?? '' };
+}
+
+onBeforeUnmount(() => {
+  setForm.value.value = '';
+  rotateForm.value.value = '';
+});
 
 const setSubmitting = ref<boolean>(false);
 const rotateSubmitting = ref<boolean>(false);
@@ -67,25 +72,6 @@ const rotateError = ref<string | null>(null);
 
 const setNotice = ref<string | null>(null);
 const rotateNotice = ref<string | null>(null);
-
-const searchQuery = ref<string>('');
-
-const filteredRows = computed<SecretRowMeta[]>(() => {
-  const query = searchQuery.value.trim().toLowerCase();
-  if (query.length === 0) {
-    return props.rows;
-  }
-  return props.rows.filter((row) =>
-    [
-      props.privacyMode ? (row.alias ?? row.name) : row.name,
-      row.source,
-      row.required ? 'required' : 'optional',
-    ]
-      .join(' ')
-      .toLowerCase()
-      .includes(query),
-  );
-});
 
 const setValidation = computed(() => validateSetForm(setForm.value));
 const rotateValidation = computed(() => validateRotateForm(rotateForm.value));
@@ -102,6 +88,7 @@ const hasContext = computed<boolean>(
 );
 
 function rotateSourceFor(name: string): SecretSource {
+  if (props.rotationTarget) return secretSourceWire(props.rotationTarget.source);
   const trimmed = name.trim();
   const row = props.rows.find((entry) => entry.name === trimmed);
   return row ? secretSourceWire(row.source) : 'user-local';
@@ -109,13 +96,6 @@ function rotateSourceFor(name: string): SecretSource {
 
 function refresh(): void {
   emit('refresh');
-}
-
-function displayName(row: SecretRowMeta): string {
-  if (props.privacyMode) {
-    return row.alias ?? row.name;
-  }
-  return row.name;
 }
 
 async function onSet(): Promise<void> {
@@ -130,15 +110,8 @@ async function onSet(): Promise<void> {
     profileId: props.profileId ?? '',
     grantId: props.grantId ?? undefined,
   });
-  const wire: SetSecretRequest = {
-    project_id: payload.project_id,
-    profile_id: payload.profile_id,
-    secret_name: payload.secret_name,
-    value: payload.value,
-    source: payload.source,
-    grant_id: payload.grant_id,
-  };
-  const result = await props.onSetSecret(wire);
+  setForm.value.value = '';
+  const result = await props.onSetSecret(payload);
   setSubmitting.value = false;
   if (!result.ok) {
     setError.value = errorLabel(result.error);
@@ -162,28 +135,16 @@ async function onRotate(): Promise<void> {
     grantId: props.grantId ?? undefined,
     source: rotateSourceFor(rotateForm.value.name),
   });
-  const wire: SetSecretRequest = {
-    project_id: payload.project_id,
-    profile_id: payload.profile_id,
-    secret_name: payload.secret_name,
-    value: payload.value,
-    source: payload.source,
-    grace_until: payload.grace_until,
-    grant_id: payload.grant_id,
-  };
-  const result = await props.onRotateSecret(wire);
+  rotateForm.value.value = '';
+  const result = await props.onRotateSecret(payload);
   rotateSubmitting.value = false;
   if (!result.ok) {
     rotateError.value = errorLabel(result.error);
     return;
   }
   rotateNotice.value = rotateSecretSuccessNotice(payload.secret_name, result.value.version);
-  rotateForm.value = defaultRotateForm();
+  rotateForm.value = newRotateForm();
   refresh();
-}
-
-function onReveal(row: SecretRowMeta): void {
-  emit('reveal', row);
 }
 
 function errorLabel(error: AgentClientError): string {
@@ -203,7 +164,7 @@ function errorLabel(error: AgentClientError): string {
 <template>
   <section class="view" aria-labelledby="secret-editor-heading">
     <header class="view__header">
-      <h2 id="secret-editor-heading">Variable editor</h2>
+      <h2 id="secret-editor-heading">Add or rotate secret</h2>
       <div class="view__actions">
         <span v-if="lastRefreshedAt" class="view__muted">
           <time :datetime="lastRefreshedAt" :title="lastRefreshedAt">{{
@@ -212,6 +173,9 @@ function errorLabel(error: AgentClientError): string {
         </span>
         <button type="button" class="view__button" :disabled="loading" @click="refresh">
           Refresh
+        </button>
+        <button type="button" class="companion-button" @click="emit('manage')">
+          Back to Secrets
         </button>
       </div>
     </header>
@@ -222,95 +186,33 @@ function errorLabel(error: AgentClientError): string {
       Select an active project and environment before setting or rotating secrets.
     </p>
 
-    <section aria-labelledby="secret-editor-list-heading" class="view__panel">
-      <h3 id="secret-editor-list-heading" class="view__panel-heading">
-        Variables in this environment
-      </h3>
-      <label class="view__search">
-        <span class="view__search-label">Search secrets</span>
-        <input
-          v-model="searchQuery"
-          type="search"
-          autocomplete="off"
-          spellcheck="false"
-          placeholder="Filter by name or source"
-        />
-      </label>
-      <p v-if="actionGuidance" class="view__empty" role="status">{{ actionGuidance }}</p>
-      <p v-else-if="loading" class="view__loading" role="status">Loading secret metadata…</p>
-      <p v-else-if="metadataLoaded && filteredRows.length === 0" class="view__empty">
-        No matching secrets.
-      </p>
-      <table
-        v-else-if="metadataLoaded"
-        class="view__table"
-        aria-describedby="secret-editor-list-heading"
-      >
-        <thead>
-          <tr>
-            <th scope="col">Name</th>
-            <th scope="col">Source</th>
-            <th scope="col">Version</th>
-            <th scope="col">Reveal</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="row in filteredRows" :key="row.id">
-            <td>{{ displayName(row) }}</td>
-            <td>
-              {{
-                row.source === 'team'
-                  ? 'Shared'
-                  : row.source === 'user-local'
-                    ? 'My override'
-                    : 'This machine'
-              }}
-            </td>
-            <td>v{{ row.currentVersion }}</td>
-            <td>
-              <button
-                type="button"
-                class="view__button"
-                data-testid="secret-editor-reveal"
-                @click="onReveal(row)"
-              >
-                Reveal (TTL)
-              </button>
-            </td>
-          </tr>
-        </tbody>
-      </table>
-    </section>
+    <p v-if="actionGuidance" class="view__empty" role="status">{{ actionGuidance }}</p>
+    <p v-else-if="loading" class="view__empty" role="status">Loading secret metadata…</p>
 
-    <section aria-labelledby="secret-editor-set-heading" class="view__panel">
-      <h3 id="secret-editor-set-heading" class="view__panel-heading" tabindex="-1">Set variable</h3>
+    <section v-if="!rotationTarget" aria-labelledby="secret-editor-set-heading" class="view__panel">
+      <h3 id="secret-editor-set-heading" class="view__panel-heading" tabindex="-1">Add secret</h3>
       <form @submit.prevent="onSet">
         <label class="view__field">
-          <span>Name (KEY_FORMAT)</span>
+          <span>Secret name</span>
           <input
             v-model="setForm.name"
             type="text"
             autocomplete="off"
             spellcheck="false"
+            placeholder="DATABASE_URL"
             data-testid="secret-editor-set-name"
           />
           <span v-if="setValidation.errors.name" class="view__error">
             {{ setValidation.errors.name }}
           </span>
         </label>
-        <label class="view__field">
-          <span>Value</span>
-          <input
-            v-model="setForm.value"
-            type="password"
-            autocomplete="new-password"
-            spellcheck="false"
-            data-testid="secret-editor-set-value"
-          />
-          <span v-if="setValidation.errors.value" class="view__error">
-            {{ setValidation.errors.value }}
-          </span>
-        </label>
+        <SecretValueInput
+          id="secret-editor-set-value"
+          v-model="setForm.value"
+          label="Value"
+          :error="setValidation.errors.value"
+          :disabled="setSubmitting"
+        />
         <label class="view__field">
           <span>Description (metadata only)</span>
           <input v-model="setForm.description" type="text" autocomplete="off" spellcheck="false" />
@@ -335,7 +237,7 @@ function errorLabel(error: AgentClientError): string {
             :disabled="!canSubmitSet"
             data-testid="secret-editor-set-submit"
           >
-            {{ setSubmitting ? 'Submitting…' : 'Set secret' }}
+            {{ setSubmitting ? 'Submitting…' : 'Add secret' }}
           </button>
         </div>
       </form>
@@ -345,35 +247,34 @@ function errorLabel(error: AgentClientError): string {
       <h3 id="secret-editor-rotate-heading" class="view__panel-heading">Rotate secret</h3>
       <form @submit.prevent="onRotate">
         <label class="view__field">
-          <span>Existing secret name</span>
+          <span>Secret name</span>
           <input
             v-model="rotateForm.name"
             type="text"
-            :list="privacyMode ? undefined : 'secret-editor-known'"
+            :list="privacyMode || rotationTarget ? undefined : 'secret-editor-known'"
+            :readonly="Boolean(rotationTarget)"
             autocomplete="off"
             spellcheck="false"
+            placeholder="DATABASE_URL"
             data-testid="secret-editor-rotate-name"
           />
-          <datalist v-if="!privacyMode" id="secret-editor-known">
+          <datalist v-if="!privacyMode && !rotationTarget" id="secret-editor-known">
             <option v-for="row in props.rows" :key="row.id" :value="row.name" />
           </datalist>
           <span v-if="rotateValidation.errors.name" class="view__error">
             {{ rotateValidation.errors.name }}
           </span>
         </label>
-        <label class="view__field">
-          <span>New value</span>
-          <input
-            v-model="rotateForm.value"
-            type="password"
-            autocomplete="new-password"
-            spellcheck="false"
-            data-testid="secret-editor-rotate-value"
-          />
-          <span v-if="rotateValidation.errors.value" class="view__error">
-            {{ rotateValidation.errors.value }}
-          </span>
-        </label>
+        <div v-if="rotationTarget" class="view__source">
+          Source <VariableSourceBadge :source="rotationTarget.source" />
+        </div>
+        <SecretValueInput
+          id="secret-editor-rotate-value"
+          v-model="rotateForm.value"
+          label="New value"
+          :error="rotateValidation.errors.value"
+          :disabled="rotateSubmitting"
+        />
         <label class="view__field">
           <span>Grace expiry (optional)</span>
           <input
@@ -400,16 +301,6 @@ function errorLabel(error: AgentClientError): string {
         </div>
       </form>
     </section>
-
-    <section aria-labelledby="secret-editor-delete-heading" class="view__panel">
-      <h3 id="secret-editor-delete-heading" class="view__panel-heading">Delete secret</h3>
-      <p class="view__muted">Open Details for a secret in the list to delete it.</p>
-      <button type="button" class="companion-button" @click="emit('manage')">
-        Open secret list
-      </button>
-    </section>
-
-    <RevealModal />
   </section>
 </template>
 
@@ -437,6 +328,7 @@ function errorLabel(error: AgentClientError): string {
 }
 .view__actions {
   display: inline-flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 0.625rem;
   margin-left: auto;
@@ -472,6 +364,12 @@ function errorLabel(error: AgentClientError): string {
   font: inherit;
   font-size: 0.85rem;
 }
+.view__source {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+}
 .view__form-actions {
   display: flex;
   justify-content: flex-end;
@@ -497,12 +395,6 @@ function errorLabel(error: AgentClientError): string {
   color: var(--accent-fg);
   border-color: transparent;
 }
-.view__button--danger {
-  background: var(--danger);
-  color: var(--accent-fg);
-  border-color: transparent;
-}
-.view__loading,
 .view__empty {
   margin: 0;
   font-size: 0.875rem;
@@ -522,65 +414,8 @@ function errorLabel(error: AgentClientError): string {
   border-radius: 0.375rem;
   font-size: 0.8rem;
 }
-.view__notice code {
-  background: var(--bg-subtle);
-  padding: 0 0.25rem;
-  border-radius: 0.25rem;
-}
 .view__muted {
   color: var(--text-secondary);
   font-size: 0.8rem;
-}
-.view__muted code {
-  background: var(--bg-subtle);
-  padding: 0 0.25rem;
-  border-radius: 0.25rem;
-}
-.view__search {
-  display: grid;
-  gap: 0.25rem;
-}
-.view__search-label {
-  color: var(--text-secondary);
-  font-size: 0.75rem;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-}
-.view__search input {
-  box-sizing: border-box;
-  width: 100%;
-  min-height: 2rem;
-  border: 1px solid var(--border-strong);
-  border-radius: 0.375rem;
-  background: var(--bg-subtle);
-  color: var(--text-primary);
-  font: inherit;
-  padding: 0.375rem 0.625rem;
-}
-.view__table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 0.85rem;
-}
-.view__table th,
-.view__table td {
-  text-align: left;
-  padding: 0.5rem 0.75rem;
-  border-bottom: 1px solid var(--border-subtle);
-  vertical-align: top;
-}
-.view__table th {
-  font-weight: 600;
-  color: var(--text-secondary);
-  font-size: 0.75rem;
-  letter-spacing: 0.04em;
-}
-
-@media (max-width: 639px) {
-  .view__table th,
-  .view__table td {
-    padding-inline: 0.35rem;
-    overflow-wrap: anywhere;
-  }
 }
 </style>

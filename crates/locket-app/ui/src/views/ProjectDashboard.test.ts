@@ -72,8 +72,8 @@ it('routes setup actions and distinguishes unavailable metadata, empty counts, a
     expect(nodeText(byProp(root, 'role', 'alert'))).toBe(
       'Audit check failed. Retry from Activity.',
     );
-    await click(button(root, 'Add variables'));
-    expect(onAction).toHaveBeenLastCalledWith('secret-editor');
+    await click(button(root, 'Open Secrets'));
+    expect(onAction).toHaveBeenLastCalledWith('secrets');
     await click(metric('Project scan'));
     expect(onNavigate).toHaveBeenLastCalledWith('scan');
     await click(metric('Audit chain'));

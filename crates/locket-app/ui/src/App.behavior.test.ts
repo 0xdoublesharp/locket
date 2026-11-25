@@ -1433,13 +1433,20 @@ describe('Global Vault workspace actions', () => {
     overrides.set('desktop_list_projects', () => [a, shared]);
     const app = await connectedApp();
     overrides.set('desktop_import_env', () => ({ summary: 'Imported 1 variable.' }));
-    app.state.selectView('secret-editor');
-    app.state.envPath = 'config/.env';
+    overrides.set('desktop_pick_file', () => 'config/.env');
+    app.state.selectView('secrets');
     await settle();
+    await clickRendered(renderedButton(app.root, 'Import .env'));
+    expect(app.state.envPath).toBe('config/.env');
     expect(findNode(app.root, (node) => node.text.includes('Relative paths start'))).toBeDefined();
 
     await switchToShared(app);
     expect(app.state.envPath).toBe('');
+    expect(findNode(app.root, (node) => node.props.id === 'import-heading')).toBeUndefined();
+    app.state.selectView('secrets');
+    await settle();
+    overrides.set('desktop_pick_file', () => Promise.reject('Picker unavailable'));
+    await clickRendered(renderedButton(app.root, 'Import .env'));
     expect(
       findNode(app.root, (node) => node.text.includes('Choose an absolute path')),
     ).toBeDefined();
@@ -1471,7 +1478,7 @@ describe('Global Vault workspace actions', () => {
     submitImport();
     await settle();
     expect(invoke).toHaveBeenCalledWith('desktop_import_env', {
-      request: expect.objectContaining({ project_id: shared.project_id, path: app.state.envPath }),
+      request: expect.objectContaining({ project_id: shared.project_id, path: '/fixture/Downloads/.env' }),
     });
 
     await app.state.connectProject(false, b.root);
@@ -1765,6 +1772,59 @@ describe('connected desktop journeys through the preview fixture agent', () => {
     expect(nodeText(root)).toContain('Opened in your terminal. Complete any approval there.');
   });
 
+  it('opens the selected secret for rotation with its source and focuses the new value', async () => {
+    const app = await openFixtureProject();
+    const { root } = app;
+    const focus = vi.fn();
+    vi.stubGlobal('document', {
+      getElementById: (id: string) => (id === 'secret-editor-rotate-value' ? { focus } : null),
+    });
+    app.state.selectView('secrets');
+    await settle();
+    await clickRendered(renderedButton(root, 'Details for JWT_SIGNING_KEY'));
+    await clickRendered(renderedButton(byProp(root, 'id', 'variable-inspector'), 'Rotate'));
+    const rotate = byProp(root, 'aria-labelledby', 'secret-editor-rotate-heading');
+    expect(byProp(rotate, 'data-testid', 'secret-editor-rotate-name').value).toBe('JWT_SIGNING_KEY');
+    expect(nodeText(rotate)).toContain('This machine');
+    expect(focus).toHaveBeenCalledOnce();
+    await input(byProp(rotate, 'data-testid', 'secret-editor-rotate-value'), 'fixture-rotation');
+    await submit(rotate);
+    expect(invoke).toHaveBeenCalledWith('agent_rotate_secret', {
+      request: expect.objectContaining({ secret_name: 'JWT_SIGNING_KEY', source: 'machine-local' }),
+    });
+    await clickRendered(renderedButton(root, 'Back to Secrets'));
+    expect(nodeText(root)).toContain('JWT_SIGNING_KEY');
+    await clickRendered(renderedButton(root, 'Details for JWT_SIGNING_KEY'));
+    await clickRendered(renderedButton(byProp(root, 'id', 'variable-inspector'), 'Rotate'));
+    const reopened = byProp(root, 'aria-labelledby', 'secret-editor-rotate-heading');
+    await clickRendered(renderedButton(reopened, 'Generate'));
+    expect(byProp(reopened, 'data-testid', 'secret-editor-rotate-value').value).toHaveLength(43);
+    await clickRendered(renderedButton(root, 'Back to Secrets'));
+    await clickRendered(renderedButton(root, 'Details for JWT_SIGNING_KEY'));
+    await clickRendered(renderedButton(byProp(root, 'id', 'variable-inspector'), 'Rotate'));
+    const newDraft = byProp(root, 'data-testid', 'secret-editor-rotate-value');
+    expect(newDraft.value).toBe('');
+    expect(newDraft.props.type).toBe('password');
+  });
+
+  it('discards a pending env picker result when switching vaults', async () => {
+    const { root, state } = await openFixtureProject();
+    const selection = deferred<string>();
+    overrides.set('desktop_pick_file', () => selection.promise);
+    state.selectView('secrets');
+    await settle();
+    const trigger = renderedButton(root, 'Import .env');
+    await clickRendered(trigger);
+    expect(trigger.props.disabled).toBe(true);
+    const projects = await invoke<DesktopProjectContext[]>('desktop_list_projects', {});
+    await state.connectProject(false, projects.find((project) => project.project_id === 'web-app')!.root);
+    selection.resolve('/fixture/old-vault/.env');
+    await settle();
+    expect(state.activeContext?.project_id).toBe('web-app');
+    expect(findNode(root, (node) => node.props.id === 'import-heading')).toBeUndefined();
+    expect(calls).not.toContain('desktop_import_env');
+  });
+
   it('sets, rotates, and refreshes variable metadata through the editor without rendering its values', async () => {
     const app = await openFixtureProject();
     const { root } = app;
@@ -1774,7 +1834,7 @@ describe('connected desktop journeys through the preview fixture agent', () => {
     await input(byProp(create, 'data-testid', 'secret-editor-set-name'), 'FIXTURE_VALUE');
     await input(byProp(create, 'data-testid', 'secret-editor-set-value'), 'fixture-create-value');
     await submit(create);
-    expect(nodeText(root)).toContain('FIXTURE_VALUE My override v1');
+    expect(nodeText(root)).toContain('Created FIXTURE_VALUE v1.');
     expect(nodeText(root)).not.toContain('fixture-create-value');
 
     const rotate = byProp(root, 'aria-labelledby', 'secret-editor-rotate-heading');
@@ -1785,12 +1845,12 @@ describe('connected desktop journeys through the preview fixture agent', () => {
     );
     await submit(rotate);
     await settle();
-    expect(nodeText(root)).toContain('FIXTURE_VALUE My override v2');
+    expect(nodeText(root)).toContain('Rotated FIXTURE_VALUE to v2.');
     expect(nodeText(root)).not.toMatch(/fixture-create-value|fixture-rotate-value/);
     expect(invoke).toHaveBeenCalledWith('agent_rotate_secret', {
       request: expect.objectContaining({ profile_id: 'acme-api-dev', source: 'user-local' }),
     });
-    await clickRendered(renderedButton(root, 'Open secret list'));
+    await clickRendered(renderedButton(root, 'Back to Secrets'));
     await clickRendered(renderedButton(root, 'Open metadata for FIXTURE_VALUE'));
     expect(nodeText(root)).toContain('v2 current');
   });
@@ -2216,9 +2276,18 @@ describe('desktop metadata failure and recovery', () => {
     });
     state.selectView('secrets');
     await settle();
-    await clickRendered(renderedButton(root, 'Add a secret'));
+    await clickRendered(renderedButton(root, 'Add secret'));
     expect(focus).toHaveBeenCalledOnce();
-    expect(nodeText(root)).toContain('Variable editor');
+    expect(nodeText(root)).toContain('Add or rotate secret');
+    expect(findNode(root, (node) => node.props.id === 'import-heading')).toBeUndefined();
+    await clickRendered(renderedButton(root, 'Back to Secrets'));
+    overrides.set('desktop_pick_file', () => null);
+    await clickRendered(renderedButton(root, 'Import .env'));
+    expect(findNode(root, (node) => node.props.id === 'import-heading')).toBeUndefined();
+    overrides.set('desktop_pick_file', () => '/fixture/config/.env');
+    const onboarding = byProp(root, 'aria-labelledby', 'variables-onboarding-heading');
+    await clickRendered(renderedButton(onboarding, 'Import .env'));
+    expect(invoke).toHaveBeenCalledWith('desktop_pick_file', { title: 'Browse for an env file' });
     const panel = byProp(root, 'aria-labelledby', 'import-heading');
     const confirmation = control(panel, 'Type development to confirm');
     expect(renderedButton(panel, 'Import secrets').props.disabled).toBe(true);
@@ -2237,15 +2306,14 @@ describe('desktop metadata failure and recovery', () => {
     expect(invoke).toHaveBeenCalledWith('desktop_import_env', {
       request: {
         project_id: a.project_id,
-        path: '.env',
+        path: '/fixture/config/.env',
         overwrite: true,
         literal: true,
         confirmation: 'development',
       },
     });
     expect(nodeText(root)).toContain('Imported 1 variable.');
-    expect(confirmation.value).toBe('');
-    expect(renderedButton(panel, 'Import secrets').props.disabled).toBe(true);
+    expect(findNode(root, (node) => node.props.id === 'import-heading')).toBeUndefined();
   });
 });
 
@@ -2290,6 +2358,8 @@ it('requires fresh dangerous approval for saving and rotation, and drops approva
   expect(calls).not.toContain('agent_set_secret');
   expect(nodeText(create)).toContain('Request failed.');
   expect(nodeText(create)).not.toContain('fixture-only-draft');
+  expect(byProp(create, 'data-testid', 'secret-editor-set-value').value).toBe('');
+  await input(byProp(create, 'data-testid', 'secret-editor-set-value'), 'fixture-only-draft');
   await submit(create);
   await input(byProp(dialog, 'id', 'dangerous-action-profile'), a.profile_name);
   await submit(dialog);
