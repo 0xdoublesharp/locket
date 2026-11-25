@@ -505,7 +505,7 @@ export function actionError(error: AgentClientError): string {
     return `${error.display_reason} ${error.next_action} Desktop actions require the Locket desktop app.`;
   if (error.kind === 'rejected')
     return `${error.display_reason || error.message || error.code} (${error.code}). ${error.next_action || 'Check this project and environment access, then retry.'}`;
-  return `${error.reason}. Fix the reported issue, then retry.`;
+  return `${error.reason.replace(/\.+$/, '')}. Fix the reported issue, then retry.`;
 }
 
 export async function desktopVariableReadiness(request: {

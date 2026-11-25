@@ -107,6 +107,7 @@ impl RuntimeContext {
         let data_dir = project_dirs.data_dir();
         let config_dir = project_dirs.config_dir();
         fs::create_dir_all(data_dir)?;
+        crate::set_user_only_dir_permissions(data_dir)?;
         fs::create_dir_all(config_dir)?;
         Ok(Self {
             cwd,

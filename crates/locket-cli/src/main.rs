@@ -2676,14 +2676,14 @@ const fn set_user_only_file_permissions(_path: &Path) -> Result<(), CliError> {
 }
 
 #[cfg(unix)]
-fn set_user_only_dir_permissions(path: &Path) -> Result<(), CliError> {
+pub(crate) fn set_user_only_dir_permissions(path: &Path) -> Result<(), CliError> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
 
 #[cfg(not(unix))]
 #[allow(clippy::unnecessary_wraps)] // Retain the shared fallible interface; Windows inherits ACLs.
-const fn set_user_only_dir_permissions(_path: &Path) -> Result<(), CliError> {
+pub(crate) const fn set_user_only_dir_permissions(_path: &Path) -> Result<(), CliError> {
     Ok(())
 }
 

@@ -16,7 +16,7 @@ use crate::support::handoff::{heredoc_command, shell_words_command};
 use crate::{
     AGENT_LOG_FOLLOW_SLEEP_MS, AgentCommand, AgentInviteCommand, AgentInviteCreateArgs,
     AgentInviteRequestArgs, AgentLogsArgs, CliError, InternalAgentServeArgs, NANOS_PER_SECOND,
-    RuntimeContext, TeamAcceptArgs, TeamCommand, TeamInviteArgs, agent_data_dir, agent_log_path,
+    RuntimeContext, TeamAcceptArgs, TeamCommand, TeamInviteArgs, agent_log_path,
     agent_log_paths_oldest_first, agent_pid_path, agent_socket_path, append_agent_log,
     metadata_invalid_error, now_unix_nanos, prepare_agent_log_dir, read_agent_pid, require_project,
     resolve_project, sanitize_agent_log_line, set_user_only_file_permissions,
@@ -288,7 +288,7 @@ fn ensure_agent_running_with_launcher(
     context: &RuntimeContext,
     launcher: &dyn AgentDaemonLauncher,
 ) -> Result<AgentStartupReport, CliError> {
-    fs::create_dir_all(agent_data_dir(context))?;
+    prepare_agent_log_dir(context)?;
 
     let pid_path = agent_pid_path(context);
     let socket_path = agent_socket_path(context);
@@ -1470,6 +1470,25 @@ mod tests {
         };
         assert_eq!(kind, locket_core::LocketError::AgentUnavailable);
         assert!(message.contains("on-demand startup"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn on_demand_startup_tightens_agent_data_dir_to_owner_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir()?;
+        let wide_dir = directory.path().join("agent-dir");
+        fs::create_dir_all(&wide_dir)?;
+        fs::set_permissions(&wide_dir, fs::Permissions::from_mode(0o755))?;
+        let mut context = temp_context(&directory);
+        context.agent_data_dir = Some(wide_dir.clone());
+        let launcher = FakeLauncher::succeeding();
+
+        ensure_agent_running_with_launcher(&context, &launcher)?;
+        assert_eq!(fs::metadata(&wide_dir)?.permissions().mode() & 0o777, 0o700);
         Ok(())
     }
 }

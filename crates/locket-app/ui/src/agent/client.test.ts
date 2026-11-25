@@ -14,7 +14,7 @@ import { invoke, isTauri } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { handleStatusEvent, subscribeStatus } from './client';
+import { actionError, handleStatusEvent, subscribeStatus } from './client';
 import type { AgentStatusEvent } from './types';
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn(), isTauri: vi.fn() }));
@@ -138,5 +138,13 @@ describe('handleStatusEvent', () => {
     expect(onStatus.mock.calls.map((call) => (call[0] as AgentStatusEvent).sequence)).toEqual([
       1, 4,
     ]);
+  });
+});
+
+describe('actionError', () => {
+  it('avoids double periods when protocol reasons end with punctuation', () => {
+    expect(actionError({ kind: 'protocol', reason: 'Locket CLI failed during agent.' })).toBe(
+      'Locket CLI failed during agent. Fix the reported issue, then retry.',
+    );
   });
 });
