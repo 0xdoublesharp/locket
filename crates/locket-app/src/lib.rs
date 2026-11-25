@@ -909,6 +909,10 @@ mod tests {
 
     #[test]
     fn tray_icon_asset_styles_match_platform_requirements() {
+        assert_eq!(
+            tray_icon_asset_styles_for_os("freebsd"),
+            &[TrayIconAssetStyle::FullColorLight, TrayIconAssetStyle::FullColorDark]
+        );
         assert_eq!(tray_icon_asset_styles_for_os("macos"), &[TrayIconAssetStyle::TemplateMask]);
         assert_eq!(
             tray_icon_asset_styles_for_os("windows"),
@@ -930,25 +934,27 @@ mod tests {
             finding_count: Some(3),
         };
 
-        let notifications = [
-            TrayNotificationKind::RevealOrCopy.passive_notification(&context),
-            TrayNotificationKind::DeniedAccess.passive_notification(&context),
-            TrayNotificationKind::ScanFinding.passive_notification(&context),
-            TrayNotificationKind::ExecutionFailure.passive_notification(&context),
-        ];
-
-        for notification in notifications {
-            let rendered = format!("{} {}", notification.title, notification.body);
-            assert!(!rendered.contains("DATABASE_URL"));
-            assert!(!rendered.contains("deploy-prod"));
-            assert!(!rendered.contains("payments-api"));
-            assert!(!rendered.contains("postgres://"));
-            assert!(
-                rendered.contains("secret")
-                    || rendered.contains("policy")
-                    || rendered.contains("Scan")
-                    || rendered.contains("scan")
-            );
+        for (kind, expected_title, expected_body) in [
+            (
+                TrayNotificationKind::RevealOrCopy,
+                "Secret ready",
+                "The requested secret action completed.",
+            ),
+            (
+                TrayNotificationKind::DeniedAccess,
+                "Access denied",
+                "A secret or policy action needs attention in the app.",
+            ),
+            (TrayNotificationKind::ScanFinding, "Scan warning", "3 scan warnings need attention."),
+            (
+                TrayNotificationKind::ExecutionFailure,
+                "Policy failed",
+                "A saved policy failed. Open the app for details.",
+            ),
+        ] {
+            let notification = kind.passive_notification(&context);
+            assert_eq!(notification.title, expected_title);
+            assert_eq!(notification.body, expected_body);
         }
     }
 
@@ -994,6 +1000,10 @@ mod tests {
 
     #[test]
     fn scan_notifications_show_metadata_counts_only() {
+        let unknown = TrayNotificationKind::ScanFinding
+            .passive_notification(&TrayNotificationContext::default());
+        assert_eq!(unknown.body, "Scan warnings need attention.");
+
         let one =
             TrayNotificationKind::ScanFinding.passive_notification(&TrayNotificationContext {
                 finding_count: Some(1),

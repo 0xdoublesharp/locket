@@ -985,6 +985,19 @@ fn append_audit_rejects_metadata_json_shape_mismatches() -> Result<(), Box<dyn E
             expected_reason: "action must match audit row",
         },
         Case {
+            name: "command_present_without_convenience_column",
+            metadata: json!({
+                "schema_version": 1, "action": "DOCTOR", "status": "SUCCESS",
+                "check_names": ["audit_hmac_chain"], "command": "doctor",
+            }),
+            action: "DOCTOR",
+            status: "SUCCESS",
+            profile_id: None,
+            secret_name: None,
+            command: None,
+            expected_reason: "command must be omitted when absent",
+        },
+        Case {
             name: "missing_command_mirror",
             metadata: json!({
                 "schema_version": 1,
@@ -1654,12 +1667,28 @@ fn append_audit_enforces_required_fields_for_each_action_family() -> Result<(), 
     Ok(())
 }
 
+fn witness_statement(
+    project: &str,
+    seq_no: u64,
+    previous: Option<String>,
+    nonce: &str,
+) -> locket_core::AuditWitnessStatement {
+    locket_core::AuditWitnessStatement {
+        schema_version: locket_core::AUDIT_WITNESS_SCHEMA_VERSION,
+        project_id: project.to_owned(),
+        seq_no,
+        checkpoint_hmac_hex: "ab".repeat(32),
+        prev_receipt_sha256_hex: previous,
+        signer_id: "device".to_owned(),
+        witness_id: "external".to_owned(),
+        nonce_hex: nonce.to_owned(),
+        issued_at_unix_nanos: 17,
+    }
+}
+
 #[test]
 fn witness_receipts_persist_with_project_chain_cas() -> Result<(), Box<dyn Error>> {
-    use locket_core::{
-        AUDIT_WITNESS_SCHEMA_VERSION, AuditWitnessError, AuditWitnessStatement,
-        sign_audit_witness_statement,
-    };
+    use locket_core::{AuditWitnessError, sign_audit_witness_statement};
 
     const PROJECT: &str = "lk_proj_test";
     const OTHER_PROJECT: &str = "lk_proj_other";
@@ -1672,20 +1701,7 @@ fn witness_receipts_persist_with_project_chain_cas() -> Result<(), Box<dyn Error
 
     let key = (&[23; 32]).into();
     let sign = |seq_no, previous, nonce: &str| {
-        sign_audit_witness_statement(
-            AuditWitnessStatement {
-                schema_version: AUDIT_WITNESS_SCHEMA_VERSION,
-                project_id: PROJECT.to_owned(),
-                seq_no,
-                checkpoint_hmac_hex: "ab".repeat(32),
-                prev_receipt_sha256_hex: previous,
-                signer_id: "device".to_owned(),
-                witness_id: "external".to_owned(),
-                nonce_hex: nonce.to_owned(),
-                issued_at_unix_nanos: 17,
-            },
-            &key,
-        )
+        sign_audit_witness_statement(witness_statement(PROJECT, seq_no, previous, nonce), &key)
     };
     let public_key = key.verifying_key();
     let public_key = public_key.as_bytes();
@@ -1750,5 +1766,188 @@ fn witness_receipts_persist_with_project_chain_cas() -> Result<(), Box<dyn Error
     assert_eq!(store.list_audit_witness_receipts(OTHER_PROJECT)?, []);
     store.connection().execute("DELETE FROM projects WHERE id = ?1", [PROJECT])?;
     assert_eq!(other_connection.list_audit_witness_receipts(PROJECT)?, []);
+    Ok(())
+}
+
+#[test]
+fn audit_verification_reports_sequence_gaps_and_invalid_json() -> Result<(), Box<dyn Error>> {
+    for (change, expected_reason) in [
+        ("UPDATE audit_log SET sequence = 3 WHERE sequence = 2", "sequence gap or reordering"),
+        (
+            "UPDATE audit_log SET metadata_json = '{' WHERE sequence = 2",
+            "metadata_json is not valid JSON",
+        ),
+    ] {
+        let fixture = audit_display_fixture(None, None)?;
+        fixture.store.connection().execute(change, [])?;
+        let result = fixture.store.verify_audit_chain_read_only("lk_proj_test", &[42; 32])?;
+        assert!(!result.hmac_ok);
+        assert_eq!(result.first_break_sequence, Some(2));
+        assert_eq!(result.rows_verified, 1);
+        assert!(
+            result.first_break_reason.is_some_and(|reason| reason.starts_with(expected_reason))
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn malformed_audit_mac_prevents_verification_and_further_appends() -> Result<(), Box<dyn Error>> {
+    let mut fixture = audit_display_fixture(None, None)?;
+    let store = &mut fixture.store;
+    store.connection().execute_batch(
+        "PRAGMA ignore_check_constraints = ON;
+         UPDATE audit_log SET hmac = zeroblob(31) WHERE sequence = 2;
+         PRAGMA ignore_check_constraints = OFF;",
+    )?;
+    assert!(matches!(
+        store.verify_audit_chain_read_only("lk_proj_test", &[42; 32]),
+        Err(StoreError::AuditIntegrity { sequence: 2, reason }) if reason == "invalid hmac length 31"
+    ));
+    let metadata = json!({
+        "schema_version": 1,
+        "action": "DOCTOR",
+        "status": "SUCCESS",
+        "check_names": ["audit_hmac_chain"],
+    });
+    assert!(matches!(
+        store.append_audit(
+            &[42; 32],
+            &AuditWrite {
+                project_id: "lk_proj_test",
+                profile_id: None,
+                action: "DOCTOR",
+                status: "SUCCESS",
+                secret_name: None,
+                command: None,
+                metadata_json: &metadata,
+                timestamp: 300,
+            }
+        ),
+        Err(StoreError::InvalidAuditHmacLength { actual: 31 })
+    ));
+    assert_eq!(store.list_recent_audit_actions("lk_proj_test", 10)?.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn exported_audit_rows_keep_convenience_metadata_and_chain_links() -> Result<(), Box<dyn Error>> {
+    let fixture = audit_display_fixture(Some("DATABASE_URL"), Some("doctor"))?;
+    let store = &fixture.store;
+    let exported = store.list_exportable_audit_rows("lk_proj_test")?;
+    assert_eq!(exported.len(), 2);
+    assert_eq!(exported[0].sequence, 1);
+    assert_eq!(exported[0].schema_version, 1);
+    assert_eq!(exported[0].previous_hmac, [0; AUDIT_HMAC_LEN]);
+    assert_eq!(exported[0].secret_name, None);
+    assert_eq!(exported[1].sequence, 2);
+    assert_eq!(exported[1].previous_hmac, exported[0].hmac);
+    assert_eq!(exported[1].timestamp, 200);
+    assert_eq!(exported[1].profile_id.as_deref(), Some("lk_prof_test"));
+    assert_eq!(exported[1].action, "DOCTOR");
+    assert_eq!(exported[1].status, "SUCCESS");
+    assert_eq!(exported[1].secret_name.as_deref(), Some("DATABASE_URL"));
+    assert_eq!(exported[1].command.as_deref(), Some("doctor"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&exported[1].metadata_json)?["command"],
+        "doctor"
+    );
+    assert_eq!(store.list_exportable_audit_rows("other-project")?, []);
+    Ok(())
+}
+
+#[test]
+fn audit_verification_rejects_noncanonical_keys_even_for_an_empty_history()
+-> Result<(), Box<dyn Error>> {
+    let mut fixture = audit_display_fixture(None, None)?;
+    let store = &mut fixture.store;
+    for key in [b"".as_slice(), &[42; 31], &[42; 33]] {
+        for project in ["lk_proj_test", "no-audit-rows"] {
+            assert!(matches!(
+                store.verify_audit_chain_read_only(project, key),
+                Err(StoreError::InvalidAuditKeyLength { actual }) if actual == key.len()
+            ));
+            assert!(matches!(
+                store.verify_audit_chain_and_append(project, key, 300),
+                Err(StoreError::InvalidAuditKeyLength { actual }) if actual == key.len()
+            ));
+        }
+    }
+    assert_eq!(store.list_exportable_audit_rows("lk_proj_test")?.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn witness_append_refuses_corrupt_heads_and_leaves_the_chain_intact() -> Result<(), Box<dyn Error>>
+{
+    use locket_core::{AuditWitnessError, sign_audit_witness_statement};
+
+    let fixture = open_initialized_store()?;
+    let store = &fixture.store;
+    insert_project_profile(store)?;
+    let project = "lk_proj_test";
+    let key = (&[23; 32]).into();
+    let sign = |seq_no, previous, nonce| {
+        sign_audit_witness_statement(witness_statement(project, seq_no, previous, nonce), &key)
+    };
+    let public_key = key.verifying_key();
+    let head = store.insert_audit_witness_receipt(
+        "head",
+        project,
+        &sign(4, None, "01")?,
+        public_key.as_bytes(),
+        30,
+    )?;
+    let next = sign(9, Some(head.receipt_sha256_hex.clone()), "02")?;
+    assert!(matches!(
+        store.insert_audit_witness_receipt("head", project, &next, public_key.as_bytes(), 31),
+        Err(StoreError::Sqlite(error)) if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation)
+    ));
+    assert_eq!(store.list_audit_witness_receipts(project)?, [head]);
+
+    store
+        .connection()
+        .execute("UPDATE audit_witness_receipts SET receipt_sha256_hex = ?1", ["cd".repeat(32)])?;
+    assert!(matches!(
+        store.insert_audit_witness_receipt("next", project, &next, public_key.as_bytes(), 31),
+        Err(StoreError::AuditWitness(AuditWitnessError::PreviousReceiptMismatch))
+    ));
+    assert_eq!(store.list_audit_witness_receipts(project)?.len(), 1);
+    store.connection().execute("UPDATE audit_witness_receipts SET receipt_json = '{}'", [])?;
+    for result in [
+        store.get_latest_audit_witness_receipt(project).map(|_| ()),
+        store
+            .insert_audit_witness_receipt("next", project, &next, public_key.as_bytes(), 31)
+            .map(|_| ()),
+    ] {
+        assert!(matches!(
+            result,
+            Err(StoreError::Sqlite(rusqlite::Error::FromSqlConversionFailure(
+                1,
+                rusqlite::types::Type::Text,
+                _
+            )))
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn audit_reads_report_a_missing_log_instead_of_an_empty_history() -> Result<(), Box<dyn Error>> {
+    let fixture = audit_display_fixture(None, None)?;
+    let store = &fixture.store;
+    store.connection().execute_batch("ALTER TABLE audit_log RENAME TO unavailable_audit_log")?;
+    let project = "lk_proj_test";
+    for result in [
+        store.list_recent_audit_actions(project, 10).map(|_| ()),
+        store.list_audit_rows_since(project, "lk_prof_test", 0).map(|_| ()),
+        store.list_audit_rows_filtered(project, &AuditListFilter::default()).map(|_| ()),
+        store.list_exportable_audit_rows(project).map(|_| ()),
+        store.verify_audit_chain_read_only(project, &[42; 32]).map(|_| ()),
+    ] {
+        assert!(
+            matches!(result, Err(StoreError::Sqlite(error)) if error.to_string().contains("no such table: audit_log"))
+        );
+    }
     Ok(())
 }

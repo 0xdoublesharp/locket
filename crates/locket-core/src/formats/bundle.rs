@@ -805,15 +805,27 @@ mod tests {
     }
 
     #[test]
+    fn serialize_rejects_oversized_canonical_manifest() {
+        let mut manifest = sample_manifest();
+        manifest.recipient_fingerprints = vec!["a".repeat(64); 1_024];
+        let bundle = BundleContainer::new(manifest, Vec::new()).unwrap();
+        assert!(matches!(
+            bundle.serialize(),
+            Err(BundleContainerError::ManifestTooLarge(actual, BUNDLE_MAX_MANIFEST_LEN))
+                if actual > BUNDLE_MAX_MANIFEST_LEN
+        ));
+    }
+
+    #[test]
     fn serialize_rejects_oversized_payload() {
-        // Construct via direct struct init so we bypass new() validation.
-        let manifest = sample_manifest();
-        let container = BundleContainer { manifest, encrypted_payload: Vec::new() };
-        // serialize() rechecks size via payload_len.
-        // We can't easily allocate 256MiB+; instead, validate the cap constant is enforced
-        // by checking serialize succeeds on small payload (smoke).
-        let bytes = container.serialize().unwrap();
-        assert_ne!(bytes.len(), 0);
+        let size = BUNDLE_MAX_PAYLOAD_LEN + 1;
+        let bundle =
+            BundleContainer::new(sample_manifest(), vec![0; usize::try_from(size).unwrap()])
+                .unwrap();
+        assert_eq!(
+            bundle.serialize().unwrap_err(),
+            BundleContainerError::PayloadTooLarge(size, BUNDLE_MAX_PAYLOAD_LEN)
+        );
     }
 
     #[test]

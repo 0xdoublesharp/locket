@@ -33,3 +33,36 @@ pub fn nonce_from_row(
         )
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::{Connection, Error, types::Type};
+
+    use super::*;
+
+    #[test]
+    fn row_decoders_reject_blobs_with_noncanonical_lengths() -> rusqlite::Result<()> {
+        let connection = Connection::open_in_memory()?;
+        for bad_length in [31, 33] {
+            let result = connection.query_row("SELECT zeroblob(?1)", [bad_length], |row| {
+                root_hash_from_row(row, 0, "test.root_hash")
+            });
+            assert!(matches!(
+                result,
+                Err(Error::FromSqlConversionFailure(0, Type::Blob, error))
+                    if error.is::<InvalidFixedBytesLength>()
+            ));
+        }
+        for bad_length in [23, 25] {
+            let result = connection.query_row("SELECT zeroblob(?1)", [bad_length], |row| {
+                nonce_from_row(row, 0, "test.nonce")
+            });
+            assert!(matches!(
+                result,
+                Err(Error::FromSqlConversionFailure(0, Type::Blob, error))
+                    if error.is::<InvalidNonceLength>()
+            ));
+        }
+        Ok(())
+    }
+}

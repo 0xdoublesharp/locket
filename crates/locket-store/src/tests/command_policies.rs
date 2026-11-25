@@ -48,3 +48,28 @@ fn command_policy_index_upserts_and_deletes_metadata_only_rows() -> Result<(), B
     assert!(!test_store.store.delete_command_policy_index("lk_proj_test", "dev", None)?);
     Ok(())
 }
+
+#[test]
+fn command_policy_reads_fail_on_corrupt_json_in_either_column() -> Result<(), Box<dyn Error>> {
+    let mut fixture = open_initialized_store()?;
+    let store = &mut fixture.store;
+    insert_project_profile(store)?;
+    store.upsert_command_policy_index("lk_proj_test", "dev", &json!({}), &json!({}), 100, None)?;
+
+    // Simulate on-disk corruption in the temporary database.
+    store.connection().execute_batch("PRAGMA ignore_check_constraints = ON")?;
+    for (policy, normalized, column) in [("{", "{}", 2), ("{}", "{", 3)] {
+        store.connection().execute(
+            "UPDATE command_policies SET policy_json = ?1, normalized_json = ?2",
+            (policy, normalized),
+        )?;
+        assert!(matches!(
+            store.get_command_policy_index("lk_proj_test", "dev"),
+            Err(crate::StoreError::Sqlite(rusqlite::Error::FromSqlConversionFailure(
+                index, rusqlite::types::Type::Text, _
+            ))) if index == column
+        ));
+    }
+    store.connection().execute_batch("PRAGMA ignore_check_constraints = OFF")?;
+    Ok(())
+}

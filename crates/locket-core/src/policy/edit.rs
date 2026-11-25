@@ -153,6 +153,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn canonical_policy_round_trips_shell_and_all_external_sources()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let input = concat!(
+            "schema_version=1\n[commands.dev]\n",
+            "shell='printf test'\noverride='locket'\nttl='900s'\n",
+            "external_env_sources=['parent','compose','ide',{file='config/.env'}]\n",
+        );
+        let original = PolicyDocument::from_toml_str(input)?;
+        let mut desired: toml::Value = toml::from_str(input)?;
+        desired["commands"]["dev"] = command_policy_value(&original.commands["dev"]);
+        let rendered = render_policy_document(input, &desired)?;
+        assert_eq!(PolicyDocument::from_toml_str(&rendered)?, original);
+        Ok(())
+    }
+
+    #[test]
     fn shared_secrets_round_trip_and_change_source_digest() -> Result<(), Box<dyn std::error::Error>>
     {
         let source =

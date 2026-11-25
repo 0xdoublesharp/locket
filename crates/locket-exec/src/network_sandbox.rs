@@ -125,7 +125,13 @@ mod tests {
 
     fn run_probe(prepared: &PreparedExecution, policy: &NetworkContainmentPolicy) -> TestResult {
         let wrapped = wrap_command_with_network_containment(prepared, policy)?;
-        let output = wrapped.command().output()?;
+        let mut command = wrapped.command();
+        // This probe is another invocation of the instrumented test binary.
+        // Keep its profile alongside the parent's after the child env is cleared.
+        if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+            command.env("LLVM_PROFILE_FILE", profile);
+        }
+        let output = command.output()?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
         assert!(stdout.contains("1 passed"), "{stdout}");

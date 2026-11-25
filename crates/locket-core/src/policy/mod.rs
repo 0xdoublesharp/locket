@@ -34,6 +34,127 @@ mod tests {
     use crate::{EnvMode, EnvOverrideMode};
 
     #[test]
+    fn rejects_invalid_policy_shapes_and_scope_keys() {
+        use PolicyParseError::*;
+
+        assert_eq!(PolicyDocument::from_toml_value(&toml::Value::Integer(1)), Err(RootMustBeTable));
+        for (source, expected) in [
+            ("schema_version='1'", InvalidSchemaVersion),
+            ("schema_version=0", InvalidSchemaVersion),
+            ("schema_version=1\nsecrets=false", SecretsMustBeTable),
+            ("schema_version=1\npaths=[]", PathsMustBeTable),
+            ("schema_version=1\n[commands.'']\nargv=['true']", EmptyCommandName),
+            (
+                "schema_version=1\n[secrets]\nAPI_TOKEN=false",
+                SecretAclMustBeTable { secret: "API_TOKEN".into() },
+            ),
+            ("schema_version=1\n[paths]\napi=false", PathScopeMustBeTable { path: "api".into() }),
+            ("schema_version=1\n[paths.'   ']", EmptyPathScope),
+            ("schema_version=1\n[paths.'/outside']", InvalidPathScope { path: "/outside".into() }),
+        ] {
+            assert_eq!(PolicyDocument::from_toml_str(source), Err(expected), "{source}");
+        }
+        assert!(matches!(
+            PolicyDocument::from_toml_str("schema_version=1\n[secrets.API_TOKEN]\nallow_argv=true"),
+            Err(SecretAclSchema { secret, .. }) if secret == "API_TOKEN"
+        ));
+        assert!(matches!(
+            PolicyDocument::from_toml_str("schema_version=1\n[paths.api]\nrequired_secrets=true"),
+            Err(PathScopeSchema { path, .. }) if path == "api"
+        ));
+    }
+
+    #[test]
+    fn path_scoped_secret_lists_report_the_invalid_field() {
+        for field in ["required_secrets", "optional_secrets"] {
+            let policy = format!("schema_version=1\n[paths.api]\n{field}=['lowercase']");
+            assert_eq!(
+                PolicyDocument::from_toml_str(&policy),
+                Err(PolicyParseError::InvalidSecretName {
+                    command: "api".into(),
+                    field,
+                    name: "lowercase".into(),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_empty_acl_patterns_and_absolute_paths() {
+        for (field, source, expected_pattern) in [
+            ("allow_commands", "[' ']", " "),
+            ("allow_argv", "[[]]", "[]"),
+            ("allow_argv", "[['tool','']]", r#"["tool", ""]"#),
+            ("allow_paths", "[' ']", " "),
+            ("allow_paths", "['/outside']", "/outside"),
+        ] {
+            let policy = format!("schema_version=1\n[secrets.API_TOKEN]\n{field}={source}");
+            assert_eq!(
+                PolicyDocument::from_toml_str(&policy),
+                Err(PolicyParseError::InvalidSecretAclPattern {
+                    secret: "API_TOKEN".into(),
+                    field,
+                    pattern: expected_pattern.into(),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn effective_command_applies_the_deepest_path_and_reports_denied_names()
+    -> Result<(), Box<dyn Error>> {
+        use std::path::Path;
+
+        let document = PolicyDocument::from_toml_str(
+            "schema_version=1
+[commands.dev]
+argv=['tool','build']
+required_secrets=['KEEP']
+optional_secrets=['PROMOTED']
+[paths.packages]
+required_secrets=['OUTER_ONLY']
+[paths.'packages/app']
+required_secrets=['PROMOTED','SCOPED']
+optional_secrets=['KEEP','OPTIONAL']
+[secrets.SCOPED]
+allow_commands=['dev']
+allow_argv=[['tool','build']]
+allow_paths=['packages/app/**']
+",
+        )?;
+        let root = Path::new("/project");
+        let cwd = root.join("packages/app/src");
+        let effective = document.effective_command("dev", root, &cwd).ok_or("missing policy")?;
+        let names =
+            |names: &[crate::SecretName]| names.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(names(&effective.required_secrets), ["KEEP", "PROMOTED", "SCOPED"]);
+        assert_eq!(names(&effective.optional_secrets), ["OPTIONAL"]);
+        assert_eq!(names(&document.commands["dev"].optional_secrets), ["PROMOTED"]);
+        assert_eq!(effective.command, document.commands["dev"].command);
+        assert!(document.effective_command("missing", root, &cwd).is_none());
+        assert_eq!(
+            document.effective_command("dev", root, root).as_ref(),
+            document.commands.get("dev")
+        );
+
+        let argv = ["tool".into(), "build".into()];
+        let relative = cwd.strip_prefix(root)?;
+        assert_eq!(
+            document.denied_secrets("dev", Some(&argv), relative, &effective.allowed_secrets),
+            Vec::<&crate::SecretName>::new()
+        );
+        for (name, argv, cwd) in [
+            ("other", Some(argv.as_slice()), relative),
+            ("dev", None, relative),
+            ("dev", Some(argv.as_slice()), Path::new("packages/app-other")),
+        ] {
+            let denied = document.denied_secrets(name, argv, cwd, &effective.allowed_secrets);
+            assert_eq!(denied.iter().map(|name| name.as_str()).collect::<Vec<_>>(), ["SCOPED"]);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn parses_valid_argv_policy_with_defaults() -> Result<(), Box<dyn Error>> {
         let document = PolicyDocument::from_toml_str(
             r#"

@@ -69,3 +69,34 @@ fn key_scope_check_rejects_profile_purpose_without_profile() -> Result<(), Box<d
     assert!(result.is_err());
     Ok(())
 }
+
+#[test]
+fn unavailable_key_table_is_a_storage_error_for_reads_and_writes() -> Result<(), Box<dyn Error>> {
+    let fixture = open_initialized_store()?;
+    let store = &fixture.store;
+    insert_project_profile(store)?;
+    let key = KeyRecord {
+        id: "key".into(),
+        project_id: "lk_proj_test".into(),
+        profile_id: Some("lk_prof_test".into()),
+        purpose: "profile-secret".into(),
+        wrapped_material: vec![1, 2, 3],
+        nonce: [4; 24],
+        created_at: 100,
+    };
+    store.insert_key(&key)?;
+    store.connection().execute_batch("ALTER TABLE keys RENAME TO unavailable_keys")?;
+    for result in [
+        store.get_key(&key.id).map(|_| ()),
+        store
+            .get_key_by_scope(&key.project_id, key.profile_id.as_deref(), &key.purpose)
+            .map(|_| ()),
+        store.insert_key(&key),
+    ] {
+        assert!(matches!(
+            result,
+            Err(crate::StoreError::Sqlite(error)) if error.to_string().contains("no such table: keys")
+        ));
+    }
+    Ok(())
+}

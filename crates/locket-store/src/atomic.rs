@@ -82,6 +82,62 @@ mod tests {
     }
 
     #[test]
+    fn atomic_write_rolls_back_if_a_deferred_constraint_rejects_commit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut fixture = open_initialized_store()?;
+        let store = &mut fixture.store;
+        insert_project_profile(store)?;
+        store.connection().execute_batch("PRAGMA defer_foreign_keys = ON")?;
+        let result = store.with_atomic_write::<_, StoreError>(|store| {
+            store.insert_profile_if_absent("temporary", "lk_proj_test", "temporary", false, 300)?;
+            store.insert_profile_if_absent("orphan", "absent", "orphan", false, 300)
+        });
+        assert!(matches!(
+            result,
+            Err(StoreError::Sqlite(error))
+                if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation)
+        ));
+        assert!(store.get_profile_by_name("lk_proj_test", "temporary")?.is_none());
+        assert!(store.get_profile_by_name("absent", "orphan")?.is_none());
+        assert!(store.connection().is_autocommit());
+        Ok(())
+    }
+
+    #[test]
+    fn atomic_write_unwind_rolls_back_before_propagating_the_original_payload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut fixture = open_initialized_store()?;
+        let store = &mut fixture.store;
+        insert_project_profile(store)?;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.with_atomic_write::<(), StoreError>(|store| {
+                store.insert_profile_if_absent(
+                    "temporary",
+                    "lk_proj_test",
+                    "temporary",
+                    false,
+                    300,
+                )?;
+                std::panic::resume_unwind(Box::new("interrupted atomic write"));
+            })
+        }));
+        assert_eq!(
+            result.err().and_then(|payload| payload.downcast::<&str>().ok()).as_deref().copied(),
+            Some("interrupted atomic write")
+        );
+        assert!(store.get_profile_by_name("lk_proj_test", "temporary")?.is_none());
+        assert!(store.connection().is_autocommit());
+        assert!(store.insert_profile_if_absent(
+            "temporary",
+            "lk_proj_test",
+            "temporary",
+            false,
+            300
+        )?);
+        Ok(())
+    }
+
+    #[test]
     fn atomic_write_commits_composed_secret_lifecycle_operations()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut fixture = open_initialized_store()?;

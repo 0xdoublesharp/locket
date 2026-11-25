@@ -338,3 +338,92 @@ pub(super) fn basic_payload(value: &[u8]) -> Option<&[u8]> {
     let separator = value.iter().position(|byte| *byte == b' ')?;
     value[..separator].eq_ignore_ascii_case(b"basic").then(|| trim_ows(&value[separator + 1..]))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wire_rejects_truncated_or_oversized_heads() {
+        let stopping = AtomicBool::new(false);
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let oversized = vec![b'x'; HEAD_LIMIT + 1];
+        for bytes in [b"HTTP/1.1 200 OK\r\n".as_slice(), oversized.as_slice()] {
+            let mut wire = Wire::new(bytes, &stopping, deadline);
+            assert_eq!(
+                wire.head().err().map(|error| error.kind()),
+                Some(io::ErrorKind::InvalidData)
+            );
+        }
+    }
+
+    #[test]
+    fn wire_checks_body_boundaries_and_preserves_bytes_on_empty_reads() -> io::Result<()> {
+        let stopping = AtomicBool::new(false);
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        for (framing, bytes, consumed) in [
+            (Framing::Length(4), b"abc".as_slice(), b"abc".as_slice()),
+            (Framing::Chunked, b"invalid\r\n", b""),
+            (Framing::Chunked, b"1\r\na\n", b"a"),
+        ] {
+            let mut wire = Wire::new(bytes, &stopping, deadline);
+            assert_eq!(wire.read(&mut [])?, 0);
+            let mut output = Vec::new();
+            assert_eq!(
+                wire.copy_body(framing, &mut output).err().map(|error| error.kind()),
+                Some(io::ErrorKind::InvalidData)
+            );
+            assert_eq!(output, consumed);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn header_parser_trims_whitespace_and_rejects_invalid_tokens() -> io::Result<()> {
+        let (_, headers) = parse_head(b"GET / HTTP/1.1\r\nConnection: close, Custom \t\r\n\r\n")
+            .ok_or_else(invalid)?;
+        assert_eq!(connection_options(&headers), Some(vec!["close", "Custom"]));
+        assert!(hop_header("custom", &["close", "Custom"]));
+
+        for invalid_head in [
+            b"GET / HTTP/1.1\r\nBad Field: example\r\n\r\n".as_slice(),
+            b"GET / HTTP/1.1\r\nX-Field: control\x7f\r\n\r\n",
+        ] {
+            assert!(parse_head(invalid_head).is_none());
+        }
+        for value in [b"close, ".as_slice(), b"close, two words"] {
+            assert!(connection_options(&[Header { name: "Connection", value }]).is_none());
+        }
+        assert!(framing(&[Header { name: "Content-Length", value: b"not a number" }]).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn retry_handles_transient_io_errors_and_honors_cancellation() -> io::Result<()> {
+        let stopping = AtomicBool::new(false);
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let mut attempts = [
+            Err(io::ErrorKind::WouldBlock.into()),
+            Err(io::ErrorKind::Interrupted.into()),
+            Err(io::ErrorKind::TimedOut.into()),
+            Ok(b'a'),
+        ]
+        .into_iter();
+        assert_eq!(
+            retry(&stopping, deadline, || attempts
+                .next()
+                .unwrap_or_else(|| Err(io::Error::other("unexpected retry"))))?,
+            b'a'
+        );
+
+        stopping.store(true, Ordering::Relaxed);
+        let mut called = false;
+        let cancelled = retry(&stopping, deadline, || {
+            called = true;
+            Ok(())
+        });
+        assert!(!called);
+        assert_eq!(cancelled.err().map(|error| error.kind()), Some(io::ErrorKind::TimedOut));
+        Ok(())
+    }
+}

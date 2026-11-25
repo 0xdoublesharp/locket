@@ -645,6 +645,7 @@ mod tests {
     #[test]
     fn display_copy_covers_every_typed_error_without_secret_examples() {
         for error in ALL_ERRORS {
+            assert_eq!(LocketError::from_code_name(&format!("{error:?}")), Some(*error));
             let copy = error.display_copy();
             assert!(!copy.reason.is_empty(), "{error:?} must have a reason");
             assert!(!copy.next_action.is_empty(), "{error:?} must have a next action");

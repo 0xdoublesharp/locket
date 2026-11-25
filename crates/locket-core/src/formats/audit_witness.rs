@@ -273,6 +273,17 @@ mod tests {
             verify_audit_witness_receipt(&first, public_key.as_bytes(), PROJECT, None)?;
         let second =
             sign_audit_witness_statement(statement(19, Some(first_digest.clone()), "0304"), &key)?;
+        let mut wrong_previous = first.clone();
+        wrong_previous.statement.project_id = "other-project".into();
+        assert!(matches!(
+            verify_audit_witness_receipt(
+                &second,
+                public_key.as_bytes(),
+                PROJECT,
+                Some(&wrong_previous)
+            ),
+            Err(AuditWitnessError::ProjectMismatch)
+        ));
         let second_digest =
             verify_audit_witness_receipt(&second, public_key.as_bytes(), PROJECT, Some(&first))?;
         let json_receipt = serde_json::from_str(&serde_json::to_string_pretty(&second)?)?;

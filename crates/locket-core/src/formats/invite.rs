@@ -428,6 +428,7 @@ mod tests {
         let payload = make_payload(&sk, &sealing);
         let invite = sign_payload(&sk, &payload);
 
+        assert_eq!(SignedInvite::sign(&sk, payload).unwrap(), invite);
         let encoded = invite.encode().unwrap();
         assert!(encoded.starts_with(INVITE_PREFIX));
 

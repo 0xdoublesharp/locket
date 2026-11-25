@@ -383,6 +383,40 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_removes_the_directory_after_empty_or_missing_file()
+    -> Result<(), EphemeralEnvFileError> {
+        for remove_before_cleanup in [false, true] {
+            let mut handle = write_ephemeral_env_file(&EnvMap::new(), &temp_root()?)?;
+            assert_eq!(fs::metadata(handle.path())?.len(), 0);
+            if remove_before_cleanup {
+                fs::remove_file(handle.path())?;
+            }
+            handle.cleanup()?;
+            assert!(!handle.path().exists());
+            assert!(!handle.parent_dir().exists());
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_cleanup_distinguishes_absence_from_invalid_parent()
+    -> Result<(), EphemeralEnvFileError> {
+        let mut handle = write_ephemeral_env_file(&EnvMap::new(), &temp_root()?)?;
+        let absent = handle.parent_dir().join("missing");
+        zero_fill_then_remove(&absent)?;
+
+        let invalid = handle.path().join("cannot-have-a-child");
+        assert!(matches!(
+            zero_fill_then_remove(&invalid),
+            Err(EphemeralEnvFileError::Io(error)) if error.kind() == io::ErrorKind::NotADirectory
+        ));
+        assert!(handle.path().is_file());
+        handle.cleanup()?;
+        Ok(())
+    }
+
+    #[test]
     fn write_failure_removes_partial_plaintext_and_parent() -> Result<(), EphemeralEnvFileError> {
         let env = make_env(&[("KEY", "secret")]);
         let mut attempted = None;

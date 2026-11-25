@@ -137,6 +137,20 @@ fn profile_dangerous_marker_update_audits_in_same_transaction() -> Result<(), Bo
         200,
     )?;
 
+    assert_eq!(
+        test_store.store.set_profile_dangerous_with_audit(
+            "lk_proj_test",
+            "missing",
+            true,
+            ProfileDangerousAudit { audit_key: &[42; 32], timestamp: 250, command: "agent config" },
+        )?,
+        None
+    );
+    assert_eq!(
+        test_store.store.list_recent_audit_actions("lk_proj_test", 10)?,
+        Vec::<String>::new()
+    );
+
     let change = test_store
         .store
         .set_profile_dangerous_with_audit(

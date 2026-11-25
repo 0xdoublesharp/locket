@@ -545,3 +545,99 @@ fn rejects_line_breaks_and_nul_in_secret_bindings_at_startup() {
         }
     }
 }
+
+#[test]
+fn proxy_credentials_and_placeholders_are_rejected_in_request_structure() -> TestResult {
+    use std::collections::BTreeSet;
+
+    use super::substitution::Field;
+
+    let broker = EgressProxyBroker::start(
+        vec![binding("API_KEY", SECRET, "example.test".into())],
+        EgressProxyConfig { tls_mitm_enabled: false, ..EgressProxyConfig::default() },
+    )?;
+    let state = &broker.state;
+    let target = Authority::parse("example.test", Some(80)).ok_or("invalid fixture host")?;
+    let env = broker.child_env_overrides();
+    let placeholder = env["API_KEY"].as_bytes();
+    let credential = proxy_auth(&broker)?;
+    assert!(!state.authorized(b"Not-Basic supplied"));
+    assert!(matches!(
+        state.guard_structure(credential.as_bytes(), &target),
+        Err(error) if error.reason == EgressBlockReason::ProxyCredential
+    ));
+    assert!(matches!(
+        state.guard_structure(placeholder, &target),
+        Err(error) if error.reason == EgressBlockReason::InvalidRequest
+    ));
+    let mut used = BTreeSet::new();
+    for authorization in [b"Basic not valid base64".as_slice(), b"Basic dXNlcjpwYXNz"] {
+        assert!(matches!(state.rewrite_basic(authorization, &target, &mut used, 1024), Ok(None)));
+    }
+    assert!(used.is_empty());
+    assert!(matches!(state.rewrite(b"static", Field::Header, 1024, &target, &mut used), Ok(None)));
+    assert_eq!(broker.shutdown(), []);
+    Ok(())
+}
+
+#[test]
+fn secret_like_authorities_are_rejected_and_omitted_from_audits() -> TestResult {
+    let broker = EgressProxyBroker::start(
+        vec![binding("API_KEY", "synthetic-sensitive-host", "example.test".into())],
+        EgressProxyConfig { tls_mitm_enabled: false, ..EgressProxyConfig::default() },
+    )?;
+    let target = Authority::parse("synthetic-sensitive-host.example.test", Some(80))
+        .ok_or("invalid fixture host")?;
+    let state = &broker.state;
+    let rejection = state.guard_authority("synthetic-sensitive-host.example.test", &target);
+    assert!(matches!(rejection, Err(error) if error.reason == EgressBlockReason::InvalidRequest));
+    state.audit(Some(&target), None, Some(EgressBlockReason::InvalidRequest));
+    state.stopping.store(true, std::sync::atomic::Ordering::Relaxed);
+    state.audit(Some(&target), None, Some(EgressBlockReason::UpstreamUnavailable));
+    assert!(matches!(
+        &broker.shutdown()[..],
+        [EgressEvent::Blocked { target_host, .. }] if target_host.is_empty()
+    ));
+    Ok(())
+}
+
+#[test]
+fn substitution_preserves_encoded_forms_and_bounds_basic_headers() -> TestResult {
+    use std::collections::BTreeSet;
+
+    use super::substitution::Field;
+
+    let broker = EgressProxyBroker::start(
+        vec![binding("API_KEY", "fixture?", "example.test".into())],
+        EgressProxyConfig { tls_mitm_enabled: false, ..EgressProxyConfig::default() },
+    )?;
+    let state = &broker.state;
+    let target = Authority::parse("example.test", Some(80)).ok_or("invalid fixture host")?;
+    let env = broker.child_env_overrides();
+    let placeholder = env["API_KEY"].as_bytes();
+    let encoded = BASE64.encode(placeholder);
+    let first = encoded.as_bytes()[0];
+    let target_bytes = format!("/path/%{first:02X}{}", &encoded[1..]);
+    let mut used = BTreeSet::new();
+    let malformed = format!("/path/%ZZ{}", &encoded[1..]);
+    assert!(matches!(
+        state.rewrite(malformed.as_bytes(), Field::Target, 1024, &target, &mut used),
+        Ok(None)
+    ));
+    assert_eq!(used, BTreeSet::new());
+
+    let rewritten = state
+        .rewrite(target_bytes.as_bytes(), Field::Target, 1024, &target, &mut used)
+        .map_err(|_| "substitution failed")?
+        .ok_or("substitution missing")?;
+    let expected = Form::Url.encode(BASE64.encode(b"fixture?").as_bytes());
+    assert_eq!(&rewritten[b"/path/".len()..], expected.as_slice());
+    assert_eq!(used, BTreeSet::from([0]));
+
+    let authorization = format!("Basic {}", BASE64.encode(placeholder));
+    assert!(matches!(
+        state.rewrite_basic(authorization.as_bytes(), &target, &mut used, 12),
+        Err(error) if error.reason == EgressBlockReason::InvalidRequest
+    ));
+    Ok(())
+}

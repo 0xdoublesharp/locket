@@ -198,11 +198,11 @@ fn longest_match_at_a_position_and_intersecting_suffixes_are_covered() -> io::Re
 
 #[test]
 fn recognizes_all_encodings_even_at_eof() -> io::Result<()> {
-    let secret = "x?/\u{00ff}\"\n";
+    let secret = "x?/\u{00ff}\"\r\n";
     let defined = [
-        (Form::Url, &b"x%3F%2F%C3%BF%22%0A"[..]),
-        (Form::UrlLower, &b"x%3f%2f%c3%bf%22%0a"[..]),
-        (Form::Json, r#"x?/ÿ\"\n"#.as_bytes()),
+        (Form::Url, &b"x%3F%2F%C3%BF%22%0D%0A"[..]),
+        (Form::UrlLower, &b"x%3f%2f%c3%bf%22%0d%0a"[..]),
+        (Form::Json, r#"x?/ÿ\"\r\n"#.as_bytes()),
     ];
     for (form, expected) in defined {
         assert_eq!(form.encode(secret.as_bytes()).as_slice(), expected);
@@ -298,7 +298,7 @@ fn binary_marker_preserves_provider_scanning() -> io::Result<()> {
 #[test]
 fn additional_literals_can_invalidate_the_selected_marker() -> io::Result<()> {
     let patterns = super::RedactionPatterns::new(config(&[("TOKEN", "synthetic-secret")]));
-    let patterns = patterns.with_additional_literals(vec![env_value("REDACTED")]);
+    let patterns = patterns.with_additional_literals(vec![env_value(""), env_value("REDACTED")]);
     let mut output = Vec::new();
     let mut redactor = StreamingRedactor::with_patterns(&mut output, patterns);
     redactor.write_all(b"synthetic-secret REDACTED")?;
@@ -355,10 +355,17 @@ fn provider_scanning_preserves_utf8_positions_and_binary_lines() -> io::Result<(
     let mut config = config(&[]);
     config.redact_generic_patterns = true;
     let (output, stats) = redact(
-        &["α=ghp_abcdef123456".as_bytes(), b"7890ABCDEF1234567890abcd;ok\n\xff\xfe\nend"],
+        &[
+            "α=ghp_abcdef123456".as_bytes(),
+            b"7890ABCDEF1234567890abcd;ok\naB3dE6gH9jK2mN5pQ8sT1vW4\n\xff\xfe\nend",
+        ],
         config,
     )?;
-    assert_eq!(output, ["α=[REDACTED:locket];ok\n".as_bytes(), b"\xff\xfe\nend"].concat());
+    assert_eq!(
+        output,
+        ["α=[REDACTED:locket];ok\n".as_bytes(), b"aB3dE6gH9jK2mN5pQ8sT1vW4\n\xff\xfe\nend"]
+            .concat()
+    );
     assert_eq!(stats.redaction_count, 1);
     Ok(())
 }
@@ -398,5 +405,83 @@ fn empty_replacement_falls_back_to_nonempty_marker() -> io::Result<()> {
     assert_eq!(output, b"SEC[REDACTED:locket]RET");
     assert!(!output.windows(b"SECRET".len()).any(|window| window == b"SECRET"));
     assert_eq!(stats.redaction_count, 1);
+    Ok(())
+}
+
+#[test]
+fn generic_redactor_collapses_overlong_lines_and_recovers_on_newline() -> io::Result<()> {
+    let mut config = config(&[]);
+    config.redact_generic_patterns = true;
+    let limit = vec![b'a'; super::MAX_GENERIC_LINE];
+    let (output, stats) = redact(
+        &[&limit, b"!", b"discard this tail", b"\nnormal\n", &limit, b"!", b"discard at EOF"],
+        config,
+    )?;
+    assert_eq!(output, b"[REDACTED:locket]\nnormal\n[REDACTED:locket]");
+    assert_eq!(stats.redaction_count, 2);
+    Ok(())
+}
+
+#[test]
+fn finalized_redactor_rejects_additional_writes_and_finalization() -> io::Result<()> {
+    let mut output = Vec::new();
+    let mut writer = StreamingRedactor::new(&mut output, config(&[("KEY", "fixture-secret")]));
+    writer.write_all(b"fixture-secret")?;
+    writer.flush_final()?;
+    assert!(writer.write_all(b"more").is_err());
+    assert!(writer.flush_final().is_err());
+    assert_eq!(output, b"[REDACTED:locket]");
+    Ok(())
+}
+
+#[test]
+fn downstream_failure_stops_streaming_redaction() {
+    struct BrokenWriter;
+    impl Write for BrokenWriter {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut writer = StreamingRedactor::new(BrokenWriter, config(&[]));
+    assert_eq!(writer.write(b"data").err().map(|err| err.kind()), Some(io::ErrorKind::BrokenPipe));
+    assert_eq!(writer.write(b"more").err().map(|err| err.kind()), Some(io::ErrorKind::Other));
+    assert!(writer.flush_final().is_err());
+}
+
+#[test]
+fn copying_redacted_output_retries_interrupted_reads_and_returns_hard_errors() {
+    struct BrokenReader(bool);
+    impl io::Read for BrokenReader {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            let first = std::mem::replace(&mut self.0, false);
+            Err(if first { io::ErrorKind::Interrupted } else { io::ErrorKind::InvalidData }.into())
+        }
+    }
+    let result = super::copy_redacted(
+        BrokenReader(true),
+        io::sink(),
+        super::RedactionPatterns::new(config(&[])),
+    );
+    assert_eq!(result.err().map(|err| err.kind()), Some(io::ErrorKind::InvalidData));
+}
+
+#[cfg(unix)]
+#[test]
+fn child_redaction_requires_both_pipes_without_taking_the_available_pipe() -> io::Result<()> {
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let result = super::redact_child_output(&mut child, io::sink(), io::sink(), config(&[]));
+    assert!(child.wait()?.success());
+    assert!(child.stdout.is_some());
+    assert_eq!(result.err().map(|err| err.kind()), Some(io::ErrorKind::Other));
     Ok(())
 }

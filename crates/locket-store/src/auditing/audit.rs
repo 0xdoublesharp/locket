@@ -259,6 +259,10 @@ fn hmac_vec_to_array(sequence: u64, value: Vec<u8>) -> Result<[u8; AUDIT_HMAC_LE
     })
 }
 
+fn audit_key_bytes(audit_key: &[u8]) -> Result<&[u8; AUDIT_HMAC_LEN], StoreError> {
+    audit_key.try_into().map_err(|_| StoreError::InvalidAuditKeyLength { actual: audit_key.len() })
+}
+
 fn checkpoint_mac(
     checkpoint: &AuditCheckpoint,
     audit_key: &[u8; AUDIT_HMAC_LEN],
@@ -373,6 +377,7 @@ fn verify_audit_rows(
     rows: &[StoredAuditRow],
     audit_key: &[u8],
 ) -> Result<AuditChainVerification, StoreError> {
+    let audit_key = audit_key_bytes(audit_key)?;
     let mut previous_hmac = [0; AUDIT_HMAC_LEN];
     let mut rows_verified = 0_u64;
 
@@ -466,6 +471,7 @@ pub fn append_audit(
     audit: &AuditWrite<'_>,
 ) -> Result<(), StoreError> {
     validate_audit_metadata(audit)?;
+    let audit_key = audit_key_bytes(audit_key)?;
     let metadata_json = canonical_json_string(Some(audit.metadata_json));
     if metadata_json.len() > AUDIT_METADATA_JSON_LIMIT {
         return Err(StoreError::AuditMetadataTooLarge {
@@ -1204,10 +1210,7 @@ impl Store {
         let verification = verify_audit_rows(&rows, audit_key)?;
         require_verified_chain(&verification)?;
         if let Some(checkpoint) = checkpoint {
-            let key = audit_key
-                .try_into()
-                .map_err(|_| StoreError::InvalidAuditKeyLength { actual: audit_key.len() })?;
-            verify_checkpoint(project_id, key, checkpoint, &rows)?;
+            verify_checkpoint(project_id, audit_key_bytes(audit_key)?, checkpoint, &rows)?;
         }
 
         let rows_verified = verification.rows_verified;

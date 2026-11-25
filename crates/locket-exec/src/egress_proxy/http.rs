@@ -375,3 +375,88 @@ fn parse_status(line: &str) -> Option<u16> {
     let code = status.parse().ok()?;
     (100..=599).contains(&code).then_some(code)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    #[test]
+    fn requests_reject_unsupported_syntax_and_body_modes() -> io::Result<()> {
+        for line in [
+            "GET http://example.test/ HTTP/1.0",
+            "GET http://example.test/#fragment HTTP/1.1",
+            "INVALID/METHOD http://example.test/ HTTP/1.1",
+        ] {
+            assert!(Request::parse_line(line, false).is_none());
+        }
+        for (line, name, value) in [
+            ("GET http://example.test/ HTTP/1.1", "Content-Encoding", b"gzip".as_slice()),
+            ("GET http://example.test/ HTTP/1.1", "Expect", b"100-continue"),
+            ("GET http://example.test/ HTTP/1.1", "Transfer-Encoding", b"chunked"),
+            ("CONNECT example.test:443 HTTP/1.1", "Content-Length", b"1"),
+        ] {
+            let request = Request::parse_line(line, false).ok_or_else(wire::invalid)?;
+            assert!(request.framing(&[Header { name, value }]).is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn responses_skip_informational_headers_and_force_empty_body_when_required() -> io::Result<()> {
+        let stopping = AtomicBool::new(false);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for (method, response) in [
+            ("HEAD", "HTTP/1.1 200 OK"),
+            ("GET", "HTTP/1.1 204 No Content"),
+            ("GET", "HTTP/1.0 304 Not Modified"),
+        ] {
+            let bytes = format!(
+                "HTTP/1.1 103 Early Hints\r\nX-Hint: omitted\r\n\r\n{response}\r\nContent-Length: 5\r\n\r\n"
+            );
+            let mut wire = Wire::new(bytes.as_bytes(), &stopping, deadline);
+            let response = Response::read(&mut wire, method)?;
+            assert!(response.framing == Framing::Length(0));
+            assert!(!response.head.windows(b"X-Hint".len()).any(|bytes| bytes == b"X-Hint"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn responses_reject_unsupported_protocol_changes_and_representations() {
+        let stopping = AtomicBool::new(false);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let too_many_hints = b"HTTP/1.1 103 Early Hints\r\n\r\n".repeat(8);
+        for bytes in [
+            b"HTTP/1.1 101 Switching Protocols\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\r\n",
+            b"HTTP/2 200 OK\r\n\r\n",
+            too_many_hints.as_slice(),
+        ] {
+            let mut wire = Wire::new(bytes, &stopping, deadline);
+            assert_eq!(
+                Response::read(&mut wire, "GET").err().map(|error| error.kind()),
+                Some(io::ErrorKind::InvalidData)
+            );
+        }
+    }
+
+    #[test]
+    fn response_headers_have_bounded_size_and_redirects_reject_non_url_bytes() -> io::Result<()> {
+        let mut head = HeadBuffer(Zeroizing::new(Vec::new()));
+        head.write_all(&vec![b'x'; HEAD_LIMIT])?;
+        assert_eq!(
+            head.write(b"x").err().map(|error| error.kind()),
+            Some(io::ErrorKind::InvalidData)
+        );
+        assert_eq!(head.0.len(), HEAD_LIMIT);
+
+        let origin = Authority::parse("example.test", Some(443)).ok_or_else(wire::invalid)?;
+        for invalid in [b" /path".as_slice(), b"/bad\x80", b"/bad\\path"] {
+            assert!(!same_https_origin(invalid, &origin));
+        }
+        Ok(())
+    }
+}

@@ -263,3 +263,39 @@ fn spawn_and_completion_audit_sequences_are_preserved() -> Result<(), Box<dyn Er
     assert_eq!(completion_seq, 8);
     Ok(())
 }
+
+#[test]
+fn session_queries_reject_secret_names_of_the_wrong_json_type() -> Result<(), Box<dyn Error>> {
+    let fixture = open_initialized_store()?;
+    let store = &fixture.store;
+    insert_project_profile(store)?;
+    store.insert_runtime_session(&test_runtime_session("lk_sess_bad_metadata", 100))?;
+    store.connection().execute("UPDATE runtime_sessions SET secret_names_json = '{}'", [])?;
+
+    for result in [
+        store.list_incomplete_runtime_sessions("lk_proj_test"),
+        store.list_runtime_sessions_with_expired_secret_names("lk_proj_test", 100),
+    ] {
+        assert!(matches!(
+            result,
+            Err(crate::StoreError::Sqlite(rusqlite::Error::FromSqlConversionFailure(
+                9,
+                rusqlite::types::Type::Text,
+                _
+            )))
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn default_runtime_name_retention_keeps_names_for_ninety_days() {
+    let retention = RuntimeSessionSecretNameRetention::default();
+    assert_eq!(retention, RuntimeSessionSecretNameRetention::default_retention());
+    assert_eq!(
+        retention,
+        RuntimeSessionSecretNameRetention::RetainFor(locket_core::Duration::from_secs(7_776_000))
+    );
+    let names = vec!["API_TOKEN".into()];
+    assert_eq!(retention.secret_names_for_storage(&names), names);
+}

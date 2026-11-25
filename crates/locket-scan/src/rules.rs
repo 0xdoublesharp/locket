@@ -154,7 +154,9 @@ pub fn is_env_file_label(path_label: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_high_entropy_token, shannon_entropy, unicode_shannon_entropy};
+    use super::{
+        is_high_entropy_token, large_ascii_entropy, shannon_entropy, unicode_shannon_entropy,
+    };
 
     #[test]
     fn shannon_entropy_matches_character_counts_for_ascii_and_unicode() {
@@ -170,5 +172,17 @@ mod tests {
             assert!(is_high_entropy_token(token, 1, threshold));
             assert!(!is_high_entropy_token(token, 1, threshold.next_up()));
         }
+    }
+
+    #[test]
+    fn wide_ascii_counters_match_the_default_path_and_decline_unicode() {
+        // Exercise the wide-counter implementation without a four-GiB fixture.
+        let token = format!("{}{}", "a".repeat(70_000), "B".repeat(70_000));
+        let expected = shannon_entropy(&token);
+        assert!((expected - 1.0).abs() < f64::EPSILON);
+        assert!(
+            large_ascii_entropy(&token).is_some_and(|wide| (wide - expected).abs() < f64::EPSILON)
+        );
+        assert_eq!(large_ascii_entropy("é"), None);
     }
 }

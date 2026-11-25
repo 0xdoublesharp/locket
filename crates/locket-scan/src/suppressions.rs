@@ -338,26 +338,21 @@ mod tests {
     }
 
     #[test]
-    fn unclosed_block_is_rejected() -> Result<(), Box<dyn Error>> {
-        let text = "// locket-suppress-block-start: dangling start marker\n\
-                    inner\n";
-        let result = parse_suppression_map(text);
-        let Err(error) = result else {
-            return Err("must fail".into());
-        };
-        assert!(matches!(error, SuppressionParseError::UnclosedBlock { line: 1 }));
-        Ok(())
+    fn unclosed_block_is_rejected() {
+        let text = "// locket-suppress-block-start: dangling start marker\ninner\n";
+        assert_eq!(
+            parse_suppression_map(text).err(),
+            Some(SuppressionParseError::UnclosedBlock { line: 1 })
+        );
     }
 
     #[test]
-    fn orphan_block_end_is_rejected() -> Result<(), Box<dyn Error>> {
+    fn orphan_block_end_is_rejected() {
         let text = "outer\n# locket-suppress-block-end\n";
-        let result = parse_suppression_map(text);
-        let Err(error) = result else {
-            return Err("must fail".into());
-        };
-        assert!(matches!(error, SuppressionParseError::OrphanBlockEnd { line: 2 }));
-        Ok(())
+        assert_eq!(
+            parse_suppression_map(text).err(),
+            Some(SuppressionParseError::OrphanBlockEnd { line: 2 })
+        );
     }
 
     #[test]

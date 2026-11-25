@@ -498,6 +498,19 @@ mod tests {
     }
 
     #[test]
+    fn compose_rejects_a_missing_or_wrong_subcommand() {
+        for (argv, program) in [
+            (vec!["docker".to_owned()], "docker"),
+            (vec!["docker".to_owned(), "run".to_owned()], "docker run"),
+        ] {
+            assert_eq!(
+                prepare_compose(&argv, &EnvMap::new(), &EnvMap::new(), None, false),
+                Err(DockerError::UnexpectedCommand { program: program.into() })
+            );
+        }
+    }
+
+    #[test]
     fn validates_empty_docker_command() {
         let result = prepare_compose(&[], &EnvMap::new(), &EnvMap::new(), None, false);
 
@@ -522,6 +535,10 @@ mod tests {
             "tcp://host:invalid",
             "tcp://host:65536",
             "tcp://[::1",
+            "tcp://[invalid]:2376",
+            "tcp://[::1]suffix",
+            "tcp://user@host",
+            "npipe:////-/pipe/docker_engine",
             "ssh://",
             "ssh://user@",
             "https://?missing-host",
@@ -539,15 +556,15 @@ mod tests {
                     let argv = ["docker".to_owned(), subcommand.to_owned(), "app".to_owned()];
                     let prepare =
                         if subcommand == "run" { prepare_docker_run } else { prepare_compose };
-                    assert!(
+                    assert_eq!(
                         prepare(
                             &argv,
                             &EnvMap::new(),
                             &EnvMap::new(),
                             Some(endpoint),
                             allow_remote
-                        )
-                        .is_err(),
+                        ),
+                        Err(DockerError::UnknownEndpoint),
                         "unknown endpoint must be refused: {endpoint:?}"
                     );
                 }
@@ -583,7 +600,9 @@ mod tests {
         ] {
             assert_eq!(classify_docker_endpoint(Some(endpoint)), DockerContextClass::Local);
         }
-        for endpoint in ["tcp://[::1]:2376", "ssh://user@builder:2222", "tcp://localhost:2375"] {
+        for endpoint in
+            ["tcp://[::1]", "tcp://[::1]:2376", "ssh://user@builder:2222", "tcp://localhost:2375"]
+        {
             assert_eq!(classify_docker_endpoint(Some(endpoint)), DockerContextClass::Remote);
         }
         Ok(())
@@ -629,10 +648,10 @@ mod tests {
                     None,
                     true,
                 );
-                assert!(result.is_err(), "routing secret {name} was allowed");
-                if let Err(error) = result {
-                    assert!(!error.to_string().contains("routing-secret-canary"));
-                }
+                assert_eq!(result, Err(DockerError::RoutingSecretDenied { name: name.into() }));
+                assert!(
+                    result.is_err_and(|error| !error.to_string().contains("routing-secret-canary"))
+                );
             }
         }
     }

@@ -219,3 +219,57 @@ pub(super) const fn permitted(ip: IpAddr, allow_loopback: bool) -> bool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authority_rejects_explicit_malformed_ports_without_using_default() {
+        for address in ["example.test:", "example.test:+80", "[::1]:http", "example.test:0"] {
+            assert!(Authority::parse(address, Some(80)).is_none(), "{address}");
+        }
+    }
+
+    #[test]
+    fn resolver_capacity_and_cancellation_fail_closed_without_connecting() -> io::Result<()> {
+        let resolver = Resolver::new();
+        let stopping = AtomicBool::new(false);
+        let target = Authority::parse("example.test", Some(80))
+            .ok_or_else(|| io::Error::other("invalid fixture authority"))?;
+        resolver.in_flight.store(MAX_RESOLVERS, Ordering::Relaxed);
+        assert_eq!(
+            resolver.pin(&target, false, &stopping),
+            Err(EgressBlockReason::UpstreamUnavailable)
+        );
+        assert_eq!(resolver.in_flight.load(Ordering::Relaxed), MAX_RESOLVERS);
+
+        stopping.store(true, Ordering::Relaxed);
+        let address = SocketAddr::from(([127, 0, 0, 1], 1));
+        assert!(matches!(
+            Resolver::connect_pinned(&[address], &stopping),
+            Err(EgressBlockReason::UpstreamUnavailable)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn special_use_address_boundaries_stay_out_of_public_pins()
+    -> Result<(), std::net::AddrParseError> {
+        for address in [
+            "0.1.2.3",
+            "100.64.0.0",
+            "100.127.255.255",
+            "240.0.0.0",
+            "2001:db8::1",
+            "2002::1",
+            "3fff::1",
+        ] {
+            assert!(!permitted(address.parse()?, true), "{address}");
+        }
+        for address in ["100.63.255.255", "100.128.0.0", "2001:4860::1"] {
+            assert!(permitted(address.parse()?, false), "{address}");
+        }
+        Ok(())
+    }
+}

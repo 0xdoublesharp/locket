@@ -208,3 +208,126 @@ fn automation_client_private_key_refs_are_metadata_only() -> Result<(), Box<dyn 
     assert!(test_store.store.get_automation_client_private_key_ref("lk_client_test")?.is_none());
     Ok(())
 }
+
+#[test]
+fn automation_client_reads_reject_non_list_permissions() -> Result<(), Box<dyn Error>> {
+    let fixture = open_initialized_store()?;
+    let store = &fixture.store;
+    store.insert_project_if_absent("lk_proj_test", "test", 100)?;
+    store.insert_automation_client(&AutomationClientRecord {
+        id: "lk_client_bad_metadata".into(),
+        project_id: "lk_proj_test".into(),
+        name: "ci".into(),
+        public_key: vec![7; 32],
+        fingerprint: "fixture".into(),
+        storage: "external".into(),
+        allowed_actions: vec!["run-policy".into()],
+        allowed_policies: vec!["test".into()],
+        created_at: 200,
+        last_used_at: None,
+        revoked_at: None,
+    })?;
+    for (actions, policies, column) in [("{}", "[]", 6), ("[]", "{}", 7)] {
+        store.connection().execute(
+            "UPDATE automation_clients SET allowed_actions_json = ?1, allowed_policies_json = ?2",
+            (actions, policies),
+        )?;
+        assert!(matches!(
+            store.get_automation_client("lk_proj_test", "ci"),
+            Err(crate::StoreError::Sqlite(rusqlite::Error::FromSqlConversionFailure(
+                index, rusqlite::types::Type::Text, _
+            ))) if index == column
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn client_registration_and_authentication_roll_back_on_companion_write_failure()
+-> Result<(), Box<dyn Error>> {
+    use crate::{AuditWrite, StoreError};
+
+    let mut fixture = open_initialized_store()?;
+    let store = &mut fixture.store;
+    store.insert_project_if_absent("lk_proj_test", "test", 100)?;
+    let client = AutomationClientRecord {
+        id: "lk_client_atomic".into(),
+        project_id: "lk_proj_test".into(),
+        name: "ci".into(),
+        public_key: vec![7; 32],
+        fingerprint: "fixture".into(),
+        storage: "os-keychain".into(),
+        allowed_actions: vec!["run-policy".into()],
+        allowed_policies: vec!["test".into()],
+        created_at: 100,
+        last_used_at: None,
+        revoked_at: None,
+    };
+    let mut reference = AutomationClientPrivateKeyRefRecord {
+        client_id: client.id.clone(),
+        storage: "os-keychain".into(),
+        keychain_service: Some("locket-test".into()),
+        keychain_account: None,
+        local_path_hash: None,
+        metadata_json: "{}".into(),
+        created_at: 100,
+        updated_at: 100,
+    };
+    assert!(matches!(
+        store.insert_automation_client_with_private_key_ref(&client, Some(&reference)),
+        Err(StoreError::Sqlite(_))
+    ));
+    assert!(store.get_automation_client("lk_proj_test", "ci")?.is_none());
+    reference.keychain_account = Some("fixture-client".into());
+    store.insert_automation_client_with_private_key_ref(&client, Some(&reference))?;
+    assert_eq!(store.get_automation_client_private_key_ref(&client.id)?, Some(reference));
+
+    let nonce = AutomationClientNonceRecord {
+        client_id: client.id.clone(),
+        nonce: [3; 24],
+        request_timestamp: 110,
+        seen_at: 111,
+        expires_at: 300,
+    };
+    let metadata = serde_json::json!({
+        "schema_version": 1, "action": "CLIENT_AUTH", "status": "SUCCESS",
+        "client_id": client.id, "request_id": "fixture", "auth_result": "verified",
+    });
+    let audit = AuditWrite {
+        project_id: "lk_proj_test",
+        profile_id: None,
+        action: "CLIENT_AUTH",
+        status: "SUCCESS",
+        secret_name: None,
+        command: None,
+        metadata_json: &metadata,
+        timestamp: 111,
+    };
+    assert!(matches!(
+        store.record_automation_client_auth_with_audit(&nonce, 111, &[], &audit),
+        Err(StoreError::InvalidAuditKeyLength { .. })
+    ));
+    assert_eq!(store.get_automation_client("lk_proj_test", "ci")?, Some(client.clone()));
+    store.record_automation_client_auth_with_audit(&nonce, 111, &[42; 32], &audit)?;
+    assert_eq!(
+        store.get_automation_client("lk_proj_test", "ci")?.and_then(|row| row.last_used_at),
+        Some(111)
+    );
+    assert_eq!(store.list_recent_audit_actions("lk_proj_test", 10)?, ["CLIENT_AUTH"]);
+
+    assert!(store.revoke_automation_client("lk_proj_test", &client.id, 112)?);
+    let mut after_revoke = nonce;
+    after_revoke.nonce = [4; 24];
+    let result =
+        store.record_automation_client_auth_with_audit(&after_revoke, 113, &[42; 32], &audit);
+    assert!(
+        matches!(&result, Err(StoreError::AutomationClientRevoked { client_id }) if client_id == &client.id)
+    );
+    assert_eq!(
+        result.err().map(|err| err.locket_error()),
+        Some(locket_core::LocketError::AccessDenied)
+    );
+    assert_eq!(store.prune_automation_client_nonces(300)?, 1);
+    assert_eq!(store.list_recent_audit_actions("lk_proj_test", 10)?, ["CLIENT_AUTH"]);
+    Ok(())
+}

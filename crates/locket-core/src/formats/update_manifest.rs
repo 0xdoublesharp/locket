@@ -499,6 +499,71 @@ mod tests {
     }
 
     #[test]
+    fn validates_beta_fetch_paths_and_rejects_ambiguous_authorities()
+    -> Result<(), UpdateManifestError> {
+        let channel = UpdateChannel::Beta;
+        let request = build_update_manifest_fetch_request(
+            "https://updates.example.test/locket/",
+            channel,
+            "linux",
+            "x86_64",
+            "1.0.0-beta+1",
+        )?;
+        assert_eq!(
+            request.url,
+            "https://updates.example.test/locket/beta/linux/x86_64/1.0.0-beta+1/manifest.json"
+        );
+        for url in [
+            "http://updates.example.test",
+            "https:///missing-host",
+            "https://user@updates.example.test",
+            "https://updates.example.test:443",
+        ] {
+            assert_eq!(
+                build_update_manifest_fetch_request(url, channel, "linux", "x86_64", "1.0"),
+                Err(UpdateManifestError::InvalidMetadata)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_invalid_signed_metadata_before_signature_verification()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (valid, id, key) = signed_manifest()?;
+        let manifest: SignedUpdateManifest = serde_json::from_slice(&valid)?;
+        let mut no_artifacts = manifest.clone();
+        no_artifacts.signed.artifacts.clear();
+        let mut zero_size = manifest.clone();
+        zero_size.signed.artifacts[0].size_bytes = 0;
+        let mut invalid_version = manifest.clone();
+        invalid_version.signed.version = "1.0\n".into();
+        for invalid in [no_artifacts, zero_size, invalid_version] {
+            assert_eq!(
+                verify_update_manifest(&serde_json::to_vec(&invalid)?, &id, &key),
+                Err(UpdateManifestError::InvalidMetadata)
+            );
+        }
+        let current = ReleaseKey { key_id: id, public_key_base64url: key };
+        assert_eq!(
+            verify_update_manifest_key_rotation(&valid, &current, &current),
+            Err(UpdateManifestError::InvalidMetadata)
+        );
+        let next = ReleaseKey { key_id: "next".into(), ..current.clone() };
+        let mut wrong_schema = manifest;
+        wrong_schema.v += 1;
+        assert_eq!(
+            verify_update_manifest_key_rotation(
+                &serde_json::to_vec(&wrong_schema)?,
+                &current,
+                &next
+            ),
+            Err(UpdateManifestError::UnsupportedSchema)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn rejects_non_static_or_private_manifest_fetch_inputs() {
         let query = build_update_manifest_fetch_request(
             "https://updates.example.test/manifest.json?install_id=abc",

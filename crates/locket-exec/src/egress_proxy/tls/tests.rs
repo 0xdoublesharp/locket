@@ -225,3 +225,95 @@ fn https_verifies_upstream_root_and_hostname_before_delivering_secret() -> TestR
     }
     Ok(())
 }
+
+#[test]
+fn tls_rejects_expired_issuer_and_empty_explicit_trust_bundle() -> TestResult {
+    let mut authority = CertificateAuthority::new()?;
+    authority.expires = OffsetDateTime::UNIX_EPOCH;
+    assert_eq!(
+        authority.server_config("example.test").err().map(|error| error.to_string()).as_deref(),
+        Some("egress CA expired")
+    );
+    assert_eq!(
+        Tls::new(Some(b"")).err().map(|error| error.to_string()).as_deref(),
+        Some("no configured upstream CA certificates")
+    );
+    Ok(())
+}
+
+#[test]
+fn tls_absolute_request_targets_must_match_the_connected_authority() -> TestResult {
+    let target = Authority::parse("example.test", Some(443)).ok_or("invalid fixture host")?;
+    let broker = EgressProxyBroker::start(
+        vec![binding("API_KEY", SECRET, "example.test".into())],
+        EgressProxyConfig { tls_mitm_enabled: false, ..EgressProxyConfig::default() },
+    )?;
+    let state = &broker.state;
+    let deadline = Instant::now() + WAIT;
+    for (target_host, expected) in [("example.test", true), ("other.test", false)] {
+        let mut body = Wire::new(&[][..], &state.stopping, deadline);
+        let head = format!("GET https://{target_host} HTTP/1.1\r\nHost: example.test\r\n\r\n");
+        let result = parse_request(state, &target, &mut body, head.as_bytes());
+        assert_eq!(result.is_ok(), expected);
+        if let Err(error) = result {
+            assert_eq!(error.reason, EgressBlockReason::InvalidRequest);
+        }
+    }
+    assert_eq!(broker.shutdown(), []);
+    Ok(())
+}
+
+#[test]
+fn client_tls_identity_mismatch_does_not_open_an_upstream_socket() -> TestResult {
+    let server = listener()?;
+    let target = server.local_addr()?.to_string();
+    let broker = EgressProxyBroker::start(
+        vec![binding("API_KEY", SECRET, target.clone())],
+        allow_loopback(),
+    )?;
+    let mut client = child_stream(&broker, &target, "localhost")?;
+    let mut response = Vec::new();
+    let result = client.read_to_end(&mut response);
+    assert!(result.is_err());
+    assert_eq!(response.as_slice(), b"");
+    client.sock.shutdown(std::net::Shutdown::Write)?;
+    client.sock.read_to_end(&mut Vec::new())?;
+    assert_eq!(server.accept().err().map(|error| error.kind()), Some(io::ErrorKind::WouldBlock));
+    assert!(matches!(
+        &broker.shutdown()[..],
+        [EgressEvent::Blocked { reason: EgressBlockReason::InvalidRequest, .. }]
+    ));
+    Ok(())
+}
+
+#[test]
+fn cancelled_connect_stops_before_writing_to_the_client_or_upstream() -> TestResult {
+    use std::sync::atomic::Ordering;
+
+    let listener = self::listener()?;
+    let target = Authority::parse(&listener.local_addr()?.to_string(), None)
+        .ok_or("invalid fixture host")?;
+    let broker = EgressProxyBroker::start(
+        vec![binding("API_KEY", SECRET, listener.local_addr()?.to_string())],
+        allow_loopback(),
+    )?;
+    let child_listener = self::listener()?;
+    let mut child = TcpStream::connect(child_listener.local_addr()?)?;
+    child.set_nonblocking(true)?;
+    let broker_socket = accept(&child_listener)?;
+    let state = &broker.state;
+    state.stopping.store(true, Ordering::Relaxed);
+    let deadline = Instant::now() + WAIT;
+    let mut input = Wire::new(&broker_socket, &state.stopping, deadline);
+    let mut output = SocketWriter { stream: &broker_socket, stopping: &state.stopping, deadline };
+    let tls = state.tls.as_ref().ok_or("missing TLS fixture")?;
+    assert!(tls.serve(state, &target, &mut input, &mut output).is_ok());
+    super::super::tunnel(&mut input, &mut output, &broker_socket);
+    assert_eq!(
+        child.read(&mut [0]).err().map(|error| error.kind()),
+        Some(io::ErrorKind::WouldBlock)
+    );
+    assert_eq!(listener.accept().err().map(|error| error.kind()), Some(io::ErrorKind::WouldBlock));
+    assert_eq!(broker.shutdown(), []);
+    Ok(())
+}

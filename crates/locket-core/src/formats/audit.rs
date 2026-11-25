@@ -338,6 +338,17 @@ mod tests {
     }
 
     #[test]
+    fn audit_command_is_mirrored_and_canonical_json_escapes_form_feed() {
+        let mut metadata = Map::new();
+        insert_convenience_metadata(&mut metadata, None, Some("build"));
+        metadata.insert("label".into(), Value::String("page\u{0c}break".into()));
+        assert_eq!(
+            canonical_json(&Value::Object(metadata)),
+            r#"{"command":"build","label":"page\fbreak"}"#
+        );
+    }
+
+    #[test]
     fn audit_hmac_bytes_are_deterministic_for_object_key_order() {
         let left = json!({
             "schema_version": 1,

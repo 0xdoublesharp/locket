@@ -864,3 +864,78 @@ fn secret_expiry_notices_respect_boundaries_rotation_and_project_scope()
     assert_eq!(store.list_expiring_or_stale_secrets(Some("missing"), now, 0)?, []);
     Ok(())
 }
+
+#[test]
+fn copied_secret_is_listed_and_stale_tombstones_leave_the_target_intact()
+-> Result<(), Box<dyn Error>> {
+    let mut fixture = open_initialized_store()?;
+    let store = &mut fixture.store;
+    insert_project_profile(store)?;
+    let mut secret = test_secret();
+    secret.origin = "profile-copy".into();
+    let mut version = test_secret_version();
+    version.origin.clone_from(&secret.origin);
+    let blob = test_secret_blob();
+    store.copy_secret_with_audit(
+        SecretCopyTarget::Create(&secret),
+        &version,
+        &blob,
+        &test_secret_fingerprint(),
+        None,
+    )?;
+    assert_eq!(
+        store.list_secrets_by_name(&secret.project_id, &secret.profile_id, &secret.name)?,
+        [secret.clone()]
+    );
+    assert!(!store.purge_secret_versions(&secret.id, &[], 150)?);
+    assert_eq!(store.get_blob(&secret.id, version.version)?, Some(blob));
+
+    let metadata = secret_audit_metadata("DELETE");
+    let write = secret_audit("DELETE", &metadata);
+    let audit = AuditContext { key: &[42; 32], write: &write };
+    let stale = SecretRecord { current_version: 2, ..secret.clone() };
+    assert!(matches!(
+        store.tombstone_current_secret_with_audit(&stale, 200, audit),
+        Err(StoreError::SecretStateConflict { secret_id, expected_version: 2 }) if secret_id == secret.id
+    ));
+    assert_eq!(store.list_recent_audit_actions(&secret.project_id, 10)?, Vec::<String>::new());
+    store.tombstone_current_secret_with_audit(&secret, 200, audit)?;
+    assert_eq!(store.list_active_secrets_by_profile(&secret.project_id, &secret.profile_id)?, []);
+    assert_eq!(store.list_recent_audit_actions(&secret.project_id, 10)?, ["DELETE"]);
+    Ok(())
+}
+
+#[test]
+fn secret_queries_propagate_missing_schema_instead_of_reporting_absent_records()
+-> Result<(), Box<dyn Error>> {
+    let fixture = open_initialized_store()?;
+    let store = &fixture.store;
+    store.connection().execute_batch(
+        "ALTER TABLE blobs RENAME TO unavailable_blobs;
+         ALTER TABLE secret_versions RENAME TO unavailable_versions;
+         ALTER TABLE secrets RENAME TO unavailable_secrets;",
+    )?;
+    let secret = test_secret();
+    let (project, profile, name, source) = (
+        secret.project_id.as_str(),
+        secret.profile_id.as_str(),
+        secret.name.as_str(),
+        secret.source.as_str(),
+    );
+    for result in [
+        store.get_secret_mutable_metadata(&secret.id).map(|_| ()),
+        store.get_active_secret(project, profile, name, source).map(|_| ()),
+        store.get_secret_by_source(project, profile, name, source).map(|_| ()),
+        store.list_secrets_by_name(project, profile, name).map(|_| ()),
+        store.list_active_secrets_by_profile(project, profile).map(|_| ()),
+        store.list_active_secret_metadata_by_profile(project, profile).map(|_| ()),
+        store.list_secrets_by_profile(project, profile).map(|_| ()),
+        store.list_secret_versions(&secret.id).map(|_| ()),
+        store.list_secret_version_metadata_by_profile(project, profile).map(|_| ()),
+        store.get_secret_version(&secret.id, 1).map(|_| ()),
+        store.get_blob(&secret.id, 1).map(|_| ()),
+    ] {
+        assert!(matches!(result, Err(StoreError::Sqlite(_))));
+    }
+    Ok(())
+}

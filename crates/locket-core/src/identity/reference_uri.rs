@@ -280,6 +280,14 @@ mod tests {
     use super::{InvalidReferenceUri, LkReferenceUri, SecretSource};
 
     #[test]
+    fn version_pin_requires_a_secret_key() {
+        assert_eq!(
+            super::LkReferenceUri::parse("lk://dev/@v1"),
+            Err(super::InvalidReferenceUri::MissingKey)
+        );
+    }
+
+    #[test]
     fn runtime_source_precedence_uses_persisted_names() {
         for (source, rank) in [
             (SecretSource::MachineLocal, 3),

@@ -267,3 +267,186 @@ fn composed_invite_acceptance_rolls_back_membership_and_profile_updates()
     assert!(test.store.get_team_member("lk_team_test", "accepted-member")?.is_none());
     Ok(())
 }
+
+#[test]
+fn invite_writes_distinguish_missing_invites_and_replays() -> Result<(), Box<dyn Error>> {
+    let mut fixture = open_initialized_store()?;
+    let store = &mut fixture.store;
+    insert_project_profile(store)?;
+    insert_team_with_pending_invite(store, "existing")?;
+
+    let assert_accepted_result = |store: &mut crate::Store, id: &str, replay| {
+        let results = [
+            store.accept_team_invite(id, 600, None),
+            store.accept_team_invite_with_member_scope(
+                id,
+                600,
+                "member",
+                "device",
+                "Member",
+                "developer",
+                &[],
+                None,
+            ),
+            store.revoke_team_invite(id, 600, None),
+        ];
+        for result in results {
+            if replay {
+                assert!(
+                    matches!(result, Err(StoreError::InviteReplayDetected { invite_id }) if invite_id == id)
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(StoreError::InviteNotFound { invite_id }) if invite_id == id)
+                );
+            }
+        }
+    };
+    assert_accepted_result(store, "missing", false);
+
+    // A fixture-local trigger makes each conditional UPDATE affect zero rows
+    // after its initial SELECT observed a pending invite.
+    store.connection().execute_batch(
+        "CREATE TEMP TRIGGER skip_invite_update
+         BEFORE UPDATE ON team_invites BEGIN SELECT RAISE(IGNORE); END;",
+    )?;
+    assert!(matches!(
+        store.mark_invite_accepted("existing", 500),
+        Err(StoreError::InviteReplayDetected { invite_id }) if invite_id == "existing"
+    ));
+    assert_accepted_result(store, "existing", true);
+    store.connection().execute_batch("DROP TRIGGER skip_invite_update")?;
+
+    store.mark_invite_accepted("existing", 500)?;
+    assert_accepted_result(store, "existing", true);
+    let record =
+        store.get_team_invite("lk_team_test", "existing")?.ok_or("fixture invite missing")?;
+    assert_eq!(record.accepted_at, Some(500));
+    assert_eq!(record.revoked_at, None);
+    Ok(())
+}
+
+#[test]
+fn team_queries_reject_profile_scopes_of_the_wrong_json_type() -> Result<(), Box<dyn Error>> {
+    use rusqlite::{Error::FromSqlConversionFailure, types::Type::Text};
+
+    let fixture = open_initialized_store()?;
+    let store = &fixture.store;
+    insert_project_profile(store)?;
+    insert_team_with_pending_invite(store, "existing")?;
+    store.connection().execute_batch(
+        "UPDATE team_members SET profiles_json = '[1]';
+         UPDATE team_invites SET profiles_json = '[1]';",
+    )?;
+
+    assert!(matches!(
+        store.list_team_members("lk_team_test"),
+        Err(StoreError::Sqlite(FromSqlConversionFailure(3, Text, _)))
+    ));
+    assert!(matches!(
+        store.list_pending_team_invites("lk_team_test", 500),
+        Err(StoreError::Sqlite(FromSqlConversionFailure(2, Text, _)))
+    ));
+    assert!(matches!(
+        store.get_team_invite("lk_team_test", "existing"),
+        Err(StoreError::Sqlite(FromSqlConversionFailure(5, Text, _)))
+    ));
+    Ok(())
+}
+
+#[test]
+fn team_and_invite_queries_preserve_scope_at_expiry_and_member_removal()
+-> Result<(), Box<dyn Error>> {
+    let mut fixture = open_initialized_store()?;
+    let store = &mut fixture.store;
+    insert_project_profile(store)?;
+    let team = crate::TeamRecord {
+        id: "lk_team_test".into(),
+        project_id: "lk_proj_test".into(),
+        name: "Team".into(),
+        created_at: 100,
+        updated_at: 110,
+    };
+    store.insert_team(&team)?;
+    assert_eq!(store.get_team_by_project(&team.project_id)?, Some(team.clone()));
+    assert!(store.insert_team(&crate::TeamRecord { id: "second".into(), ..team.clone() }).is_err());
+    assert!(store.get_team_by_project("other-project")?.is_none());
+
+    let device = test_device();
+    store.insert_device(&device)?;
+    store.insert_team_member("owner", &team.id, Some(&device.id), "Owner", "owner", 120)?;
+    assert_eq!(store.count_active_owners(&team.id)?, 1);
+    let owner =
+        store.get_team_member_by_device(&team.id, &device.id)?.ok_or("active owner missing")?;
+    assert_eq!(owner.trusted_device_count, 1);
+    assert_eq!(store.list_team_members(&team.id)?, [owner]);
+
+    let invite = crate::TeamInviteRecord {
+        id: "pending".into(),
+        team_id: team.id.clone(),
+        issuer_member_id: "owner".into(),
+        recipient_device_fingerprint: "synthetic-recipient".into(),
+        role: "developer".into(),
+        profiles: vec!["dev".into()],
+        nonce: vec![0x41; 24],
+        created_at: 130,
+        expires_at: 200,
+    };
+    store.insert_team_invite(&invite, None)?;
+    let pending = store.list_pending_team_invites(&team.id, 199)?;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, invite.id);
+    assert_eq!(pending[0].profiles, invite.profiles);
+    assert_eq!(store.list_pending_team_invites(&team.id, 200)?, []);
+    store.revoke_team_invite(&invite.id, 150, None)?;
+    assert_eq!(store.list_pending_team_invites(&team.id, 199)?, []);
+
+    store.remove_team_member("owner", 180)?;
+    assert_eq!(store.count_active_owners(&team.id)?, 0);
+    assert!(store.get_team_member_by_device(&team.id, &device.id)?.is_none());
+    let removed = store.list_team_members(&team.id)?;
+    assert_eq!(removed[0].removed_at, Some(180));
+    Ok(())
+}
+
+#[test]
+fn scoped_invite_updates_existing_device_membership_without_reassigning_role()
+-> Result<(), Box<dyn Error>> {
+    let mut fixture = open_initialized_store()?;
+    let store = &mut fixture.store;
+    insert_project_profile(store)?;
+    insert_team_with_pending_invite(store, "existing-device")?;
+    let device = test_device();
+    store.insert_device(&device)?;
+    store.insert_team_member(
+        "current",
+        "lk_team_test",
+        Some(&device.id),
+        "Current",
+        "developer",
+        40,
+    )?;
+    store.set_team_member_profiles("current", &["dev".into()])?;
+
+    store.accept_team_invite_with_member_scope(
+        "existing-device",
+        50,
+        "new-id",
+        &device.id,
+        "New display name",
+        "owner",
+        &["staging".into(), "staging".into()],
+        None,
+    )?;
+    let current =
+        store.get_team_member_by_device("lk_team_test", &device.id)?.ok_or("missing member")?;
+    assert_eq!(current.id, "current");
+    assert_eq!(current.role, "developer");
+    assert_eq!(current.display_name, "Current");
+    assert_eq!(current.profiles, Some(vec!["staging".into()]));
+    assert!(store.get_team_member("lk_team_test", "new-id")?.is_none());
+    let invite =
+        store.get_team_invite("lk_team_test", "existing-device")?.ok_or("missing invite")?;
+    assert_eq!(invite.accepted_at, Some(50));
+    Ok(())
+}

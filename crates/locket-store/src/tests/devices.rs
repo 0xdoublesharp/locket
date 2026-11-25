@@ -135,3 +135,26 @@ fn bundle_recipient_rejects_revoked_and_removed_devices() -> Result<(), Box<dyn 
     assert!(test.store.bundle_recipient_is_denied("lk_proj_test", &[2; 32])?);
     Ok(())
 }
+
+#[test]
+fn absent_device_is_not_replaced_and_corrupt_safety_words_fail_reads() -> Result<(), Box<dyn Error>>
+{
+    let mut fixture = open_initialized_store()?;
+    let store = &mut fixture.store;
+    insert_project_profile(store)?;
+    let device = test_device();
+    assert!(!store.replace_local_device("lk_proj_test", "missing", 100, &device, None, None)?);
+    assert!(store.get_active_local_device("lk_proj_test")?.is_none());
+
+    store.insert_device(&device)?;
+    store.connection().execute("UPDATE devices SET safety_words_json = '[1]'", [])?;
+    assert!(matches!(
+        store.get_active_local_device("lk_proj_test"),
+        Err(StoreError::Sqlite(rusqlite::Error::FromSqlConversionFailure(
+            8,
+            rusqlite::types::Type::Text,
+            _
+        )))
+    ));
+    Ok(())
+}

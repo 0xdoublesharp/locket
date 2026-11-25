@@ -175,6 +175,14 @@ fn directory_grants_are_profile_scoped_and_revocable() -> Result<(), Box<dyn Err
     assert_eq!(revived_row.revoked_at, None);
     assert_eq!(revived_row.granted_by.as_deref(), Some("lk_member_alice"));
 
+    let store = &test_store.store;
+    assert_eq!(store.count_directory_grants_for_profile("lk_proj_test", "lk_prof_dev")?, 1);
+    assert_eq!(store.count_directory_grants_for_profile("lk_proj_test", "lk_prof_prod")?, 0);
+    assert_eq!(store.deny_all_directory_grants("other-project", 700)?, 0);
+    assert_eq!(store.deny_all_directory_grants("lk_proj_test", 700)?, 1);
+    assert_eq!(store.deny_all_directory_grants("lk_proj_test", 800)?, 0);
+    assert_eq!(store.count_directory_grants_for_profile("lk_proj_test", "lk_prof_dev")?, 0);
+
     Ok(())
 }
 

@@ -1,7 +1,7 @@
 //! Passkey/WebAuthn credential records and `Store` operations.
 
-use rusqlite::params;
 use rusqlite::types::Type;
+use rusqlite::{OptionalExtension, params};
 
 use crate::Store;
 use crate::error::StoreError;
@@ -176,7 +176,10 @@ impl Store {
         selector: &str,
     ) -> Result<Vec<PasskeyCredentialRecord>, StoreError> {
         let selector = selector.trim();
-        let credential_hex_prefix = selector.strip_prefix("0x").unwrap_or(selector).to_uppercase();
+        let candidate = selector.strip_prefix("0x").unwrap_or(selector);
+        let credential_hex_prefix = (!candidate.is_empty()
+            && candidate.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| candidate.to_ascii_uppercase());
         let mut statement = self.connection.prepare(
             "SELECT id, project_id, device_id, member_id, label, credential_id, public_key,
                     transports_json, prf_capable, webauthn_relying_party_id, user_handle,
@@ -250,7 +253,7 @@ impl Store {
                     created_at: row.get(5)?,
                 })
             })
-            .ok();
+            .optional()?;
         Ok(row)
     }
 

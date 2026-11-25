@@ -140,11 +140,13 @@ fn passphrase_fallback_key_derivation_is_salt_and_passphrase_bound() -> Result<(
         output_len: PASSPHRASE_FALLBACK_OUTPUT_LEN,
     };
 
-    let first = derive_passphrase_fallback_key_v1(b"correct horse", b"salt-one", params)?;
-    let second = derive_passphrase_fallback_key_v1(b"correct horse", b"salt-one", params)?;
-    let changed_passphrase =
-        derive_passphrase_fallback_key_v1(b"wrong horse", b"salt-one", params)?;
-    let changed_salt = derive_passphrase_fallback_key_v1(b"correct horse", b"salt-two", params)?;
+    let salt = super::generate_passphrase_salt()?;
+    let mut other_salt = salt;
+    other_salt[0] ^= 1;
+    let first = derive_passphrase_fallback_key_v1(b"correct horse", &salt, params)?;
+    let second = derive_passphrase_fallback_key_v1(b"correct horse", &salt, params)?;
+    let changed_passphrase = derive_passphrase_fallback_key_v1(b"wrong horse", &salt, params)?;
+    let changed_salt = derive_passphrase_fallback_key_v1(b"correct horse", &other_salt, params)?;
 
     assert_eq!(&*first, &*second);
     assert_ne!(&*first, &*changed_passphrase);
@@ -903,5 +905,137 @@ fn xchacha20_poly1305_reads_0_10_ciphertext_and_wrapped_key() -> Result<(), Cryp
         unwrap_key_material_v1(&key, &wrapped, b"different aad"),
         Err(CryptoError::DecryptionFailed)
     ));
+    Ok(())
+}
+
+#[test]
+fn recovery_kdf_defaults_and_missing_inputs_are_explicit() {
+    use super::{
+        RECOVERY_M_COST, RECOVERY_P_COST, RECOVERY_T_COST, RecoveryKdfParams,
+        derive_recovery_key_v1,
+    };
+
+    let defaults = RecoveryKdfParams::recovery_v1();
+    assert_eq!(
+        defaults,
+        RecoveryKdfParams {
+            m_cost: RECOVERY_M_COST,
+            t_cost: RECOVERY_T_COST,
+            p_cost: RECOVERY_P_COST,
+            output_len: 32,
+        }
+    );
+    for (salt, params) in [
+        (b"".as_slice(), defaults),
+        (b"test-salt", RecoveryKdfParams { m_cost: 0, ..defaults }),
+        (b"test-salt", RecoveryKdfParams { t_cost: 0, ..defaults }),
+        (b"test-salt", RecoveryKdfParams { p_cost: 0, ..defaults }),
+    ] {
+        assert_eq!(
+            derive_recovery_key_v1(&[0; RECOVERY_CODE_BYTES], salt, params),
+            Err(CryptoError::InvalidKdfParameters)
+        );
+    }
+}
+
+#[test]
+fn key_material_rejects_authenticated_plaintext_with_wrong_length() -> Result<(), CryptoError> {
+    let nonce = [5; NONCE_LEN];
+    let aad = b"test key material";
+    for size in [KEY_LEN - 1, KEY_LEN + 1] {
+        let ciphertext = super::aead::aead_encrypt(&MASTER_KEY, &nonce, &vec![0; size], aad)?;
+        let wrapped = super::WrappedKeyMaterial { ciphertext, nonce };
+        assert_eq!(
+            unwrap_key_material_v1(&MASTER_KEY, &wrapped, aad),
+            Err(CryptoError::InvalidWrappedKey)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn secret_value_rejects_authenticated_bytes_that_are_not_text() -> Result<(), CryptoError> {
+    let nonce = [5; NONCE_LEN];
+    let (value_aad, wrap_aad) = canonical_secret_aads()?;
+    let encrypted_dek = wrap_dek_v1(&PROFILE_SECRET_KEY, &MASTER_KEY, &wrap_aad)?;
+    let ciphertext = super::aead::aead_encrypt(&MASTER_KEY, &nonce, &[0xff], &value_aad)?;
+    let encrypted = super::EncryptedSecretValue {
+        encrypted_dek,
+        ciphertext,
+        value_nonce: nonce,
+        aad_schema_version: AAD_SCHEMA_V1,
+    };
+    assert_eq!(
+        decrypt_secret_value_v1(&PROFILE_SECRET_KEY, &encrypted, &value_aad, &wrap_aad),
+        Err(CryptoError::DecryptionFailed)
+    );
+    Ok(())
+}
+
+#[test]
+fn recovery_code_rejects_non_alphabet_characters_at_valid_length() {
+    for invalid in ['U', '?', '\t', 'é'] {
+        let code = format!("{invalid}{}", "0".repeat(RECOVERY_CODE_DATA_CHARS - 1));
+        assert_eq!(recovery_code_decode(&code), Err(CryptoError::InvalidSecretValue));
+    }
+}
+
+#[test]
+fn canonical_field_prefixes_count_utf8_bytes() -> Result<(), CryptoError> {
+    assert_eq!(canonical_field("é", "🦀")?, b"\x02\x00\xc3\xa9\x04\x00\x00\x00\xf0\x9f\xa6\x80");
+    Ok(())
+}
+
+#[test]
+fn recovery_code_decodes_the_entire_crockford_alphabet_and_aliases() -> Result<(), CryptoError> {
+    let alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let expected = [
+        0x00, 0x44, 0x32, 0x14, 0xc7, 0x42, 0x54, 0xb6, 0x35, 0xcf, 0x84, 0x65, 0x3a, 0x56, 0xd7,
+        0xc6, 0x75, 0xbe, 0x77, 0xdf,
+    ];
+    assert_eq!(recovery_code_decode(alphabet)?, expected);
+    for alias in ["oi", "OL", "Oi"] {
+        assert_eq!(recovery_code_decode(&format!("{alias}{}", &alphabet[2..]))?, expected);
+    }
+    assert_eq!(&recovery_code_encode(&expected)[..RECOVERY_CODE_DATA_CHARS], alphabet.as_bytes());
+    Ok(())
+}
+
+#[test]
+fn persisted_key_purposes_preserve_wire_labels_through_wrap_conversion() {
+    for (purpose, wrapping, label) in [
+        (KeyPurpose::ProjectMetadata, KeyWrapPurpose::ProjectMetadata, "project-metadata"),
+        (KeyPurpose::Audit, KeyWrapPurpose::Audit, "project-audit"),
+        (KeyPurpose::ProfileSecret, KeyWrapPurpose::ProfileSecret, "profile-secret"),
+        (KeyPurpose::ProfileFingerprint, KeyWrapPurpose::ProfileFingerprint, "profile-fingerprint"),
+    ] {
+        assert_eq!(KeyWrapPurpose::from(purpose), wrapping);
+        assert_eq!(purpose.as_str(), label);
+        assert_eq!(wrapping.as_str(), label);
+    }
+    assert_eq!(KeyWrapPurpose::SecretDek.as_str(), "secret-dek");
+}
+
+#[test]
+fn generated_recovery_material_round_trips_and_binds_to_its_salt() -> Result<(), CryptoError> {
+    use super::{
+        RecoveryKdfParams, derive_recovery_key_v1, generate_recovery_code_bytes,
+        generate_recovery_salt,
+    };
+    let code = generate_recovery_code_bytes()?;
+    let encoded = recovery_code_encode(&code);
+    assert_eq!(
+        recovery_code_decode(
+            std::str::from_utf8(&encoded).map_err(|_| CryptoError::InvalidSecretValue)?
+        )?,
+        code
+    );
+    let salt = generate_recovery_salt()?;
+    let mut other_salt = salt;
+    other_salt[0] ^= 1;
+    let params = RecoveryKdfParams { m_cost: 32, t_cost: 1, p_cost: 1, output_len: 32 };
+    let key = derive_recovery_key_v1(&code, &salt, params)?;
+    assert_eq!(derive_recovery_key_v1(&code, &salt, params)?, key);
+    assert_ne!(derive_recovery_key_v1(&code, &other_salt, params)?, key);
     Ok(())
 }

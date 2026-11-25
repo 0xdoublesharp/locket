@@ -260,6 +260,15 @@ mod tests {
     use super::{argv_pattern_matches, glob_matches, path_pattern_matches};
 
     #[test]
+    fn wildcard_path_and_zero_width_suffix_respect_scope_boundaries() {
+        assert!(path_pattern_matches("packages/*/src", Path::new("packages/tool/src")));
+        assert!(!path_pattern_matches("packages/*/src", Path::new("packages/tool/docs")));
+        assert!(!path_pattern_matches(".", Path::new("../outside")));
+        assert!(!path_pattern_matches(".", Path::new("/outside")));
+        assert!(glob_matches("npm:**", "npm:"));
+    }
+
+    #[test]
     fn token_glob_matches_within_one_value() {
         assert!(glob_matches("npm:*", "npm:dev"));
         assert!(glob_matches("release:*", "release:prod"));

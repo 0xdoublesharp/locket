@@ -346,4 +346,38 @@ setup_hint='Ask teammate'
         assert!(!error.contains("canary-secret"));
         Ok(())
     }
+
+    #[test]
+    fn deferred_contracts_report_unverified_and_validation_uses_only_selected_names()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let document = PolicyDocument::from_toml_str(
+            "schema_version=1
+[commands.dev]
+argv=['true']
+required_secrets=['PORT']
+shared_secrets=['TOKEN']
+[variables.PORT]
+type='integer'
+[variables.TOKEN]
+type='string'
+[variables.UNRELATED]
+type='boolean'
+",
+        )?;
+        let policy = &document.commands["dev"];
+        let rows = document.variable_readiness(policy, &BTreeMap::new(), true);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.state == VariableReadinessState::Unverified));
+        let mut env = crate::EnvMap::from([
+            ("PORT".into(), crate::env_value("1234")),
+            ("UNRELATED".into(), crate::env_value("invalid")),
+        ]);
+        assert_eq!(document.validate_variable_values(policy, &env), Ok(()));
+        env.insert("TOKEN".into(), crate::env_value("fixture\0secret"));
+        assert_eq!(
+            document.validate_variable_values(policy, &env),
+            Err(invalid("TOKEN", "NUL characters are invalid"))
+        );
+        Ok(())
+    }
 }

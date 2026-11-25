@@ -437,6 +437,7 @@ fn store_errors_map_to_stable_locket_failures() {
 #[test]
 fn foreign_keys_are_enforced() -> Result<(), Box<dyn Error>> {
     let test_store = open_initialized_store()?;
+    assert_eq!(test_store.store.integrity_check()?, ["ok"]);
 
     let result = test_store.store.connection().execute(
         "INSERT INTO profiles(id, project_id, name, dangerous, created_at)
@@ -681,5 +682,65 @@ fn read_only_store_does_not_create_a_missing_database() -> Result<(), Box<dyn Er
     let path = directory.path().join("missing.db");
     assert!(Store::open_read_only(&path).is_err());
     assert!(!path.exists());
+    Ok(())
+}
+
+#[test]
+fn read_only_store_rejects_metadata_writes_without_changing_the_vault() -> Result<(), Box<dyn Error>>
+{
+    use crate::tests::{insert_project_profile, test_device, test_runtime_session};
+
+    let fixture = open_initialized_store()?;
+    let writable = &fixture.store;
+    insert_project_profile(writable)?;
+    writable.insert_runtime_session(&test_runtime_session("session", 100))?;
+    writable.insert_device(&test_device())?;
+    let project = "lk_proj_test";
+    let hash = [7; 32];
+    writable.trust_project_root(project, &hash, None, 100)?;
+    let read_only = Store::open_read_only(fixture.directory.path().join("store.db"))?;
+
+    for result in [
+        read_only.insert_project_if_absent("other", "other", 200).map(|_| ()),
+        read_only.insert_profile_if_absent("other", project, "other", false, 200).map(|_| ()),
+        read_only.set_profile_dangerous(project, "default", true).map(|_| ()),
+        read_only.trust_project_root(project, &[8; 32], None, 200),
+        read_only.untrust_project_root(project, &hash).map(|_| ()),
+        read_only.insert_runtime_session(&test_runtime_session("other", 200)),
+        read_only.mark_runtime_session_completed("session", 200, Some(0), None).map(|_| ()),
+        read_only.revoke_device(project, "lk_dev_test", 200).map(|_| ()),
+    ] {
+        assert!(matches!(
+            result,
+            Err(crate::StoreError::Sqlite(error))
+                if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ReadOnly)
+        ));
+    }
+    assert!(writable.get_project("other")?.is_none());
+    assert!(writable.get_profile_by_name(project, "other")?.is_none());
+    assert!(!writable.get_profile_by_name(project, "default")?.ok_or("missing profile")?.dangerous);
+    assert_eq!(writable.list_incomplete_runtime_sessions(project)?.len(), 1);
+    assert_eq!(writable.get_active_local_device(project)?, Some(test_device()));
+    assert!(writable.project_root_is_trusted(project, &hash)?);
+    assert!(!writable.project_root_is_trusted(project, &[8; 32])?);
+    Ok(())
+}
+
+#[test]
+fn sqlite_file_header_corruption_maps_to_the_stable_database_failure() -> Result<(), Box<dyn Error>>
+{
+    let directory = tempdir()?;
+    let path = directory.path().join("store.db");
+    std::fs::write(&path, b"not a SQLite file")?;
+    let result = Store::open(&path);
+    assert!(matches!(
+        &result,
+        Err(StoreError::Sqlite(error))
+            if error.sqlite_error_code() == Some(rusqlite::ErrorCode::NotADatabase)
+    ));
+    assert_eq!(
+        result.err().map(|error| error.locket_error()),
+        Some(locket_core::LocketError::CorruptDb)
+    );
     Ok(())
 }

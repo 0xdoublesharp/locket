@@ -116,6 +116,24 @@ mod tests {
     }
 
     #[test]
+    fn secret_like_classification_distinguishes_content_from_display_errors() {
+        let field = "description".to_owned();
+        assert!(
+            !MetadataValidationError::InvalidCharacters { field: field.clone() }.is_secret_like()
+        );
+        assert!(
+            MetadataValidationError::KnownSecretValue { field: field.clone() }.is_secret_like()
+        );
+        assert!(
+            MetadataValidationError::SecretLike {
+                field,
+                finding: MetadataPrivacyFinding::HighEntropy
+            }
+            .is_secret_like()
+        );
+    }
+
+    #[test]
     fn accepts_plain_metadata() {
         assert!(
             validate_metadata_field("description", "primary database", ["other-value"], []).is_ok()

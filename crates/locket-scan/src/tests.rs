@@ -566,3 +566,26 @@ fn streaming_scan_and_redaction_preserve_punctuation_and_overlaps() {
     assert_eq!(redacted.counts.get(&FindingKind::KnownSecretValue), Some(&1));
     assert_eq!(redacted.counts.get(&FindingKind::ProviderTokenPattern), Some(&2));
 }
+
+#[test]
+fn suppression_rejects_nested_blocks_at_the_original_opening_line() {
+    let source = concat!(
+        "// header\n",
+        "// locket-suppress-block-start: generated fixture\n",
+        "// locket-suppress-block-start: nested fixture\n",
+        "// locket-suppress-block-end\n",
+    );
+    assert!(matches!(
+        super::parse_suppression_map(source),
+        Err(super::SuppressionParseError::UnclosedBlock { line: 2 })
+    ));
+}
+
+#[test]
+fn overlapping_known_value_takes_priority_over_entropy() {
+    let token = "aB3dE6gH9jK2mN5pQ8sT1vW4";
+    let known = KnownRedaction { value: "mN5", marker: "[protected]" };
+    let result = redact_text_with_known_values(token, &[known]);
+    assert_eq!(result.text, "[protected]");
+    assert_eq!(result.counts, [(FindingKind::KnownSecretValue, 1)].into());
+}

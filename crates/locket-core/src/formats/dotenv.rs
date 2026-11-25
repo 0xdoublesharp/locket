@@ -146,6 +146,38 @@ fn parse_quoted(raw: &str, quote: char) -> Result<Option<String>, &'static str> 
 mod tests {
     use super::*;
     #[test]
+    fn dotenv_rejects_lines_without_assignment() {
+        let doc = parse_dotenv("a value without an assignment\nNEXT=ok", DotenvOptions::default());
+        assert_eq!(doc.errors, [diagnostic(1, "expected a name and '='")]);
+        assert_eq!(doc.entries.len(), 1);
+        assert_eq!(doc.entries[0].line, 2);
+    }
+
+    #[test]
+    fn dotenv_recovers_after_invalid_values_and_preserves_carriage_return_escape() {
+        let doc = parse_dotenv(
+            "# comment\n\nNUL=before\0after\nBAD=\"invalid\\q\"\nNEXT=\"a\\rb\"\nLAST=\"unterminated\\",
+            DotenvOptions::default(),
+        );
+        assert_eq!(
+            doc.errors,
+            [
+                diagnostic(3, "NUL bytes are not allowed"),
+                diagnostic(4, "unsupported double-quote escape"),
+                diagnostic(6, "unterminated quoted value"),
+            ]
+        );
+        assert_eq!(doc.warnings, []);
+        assert_eq!(
+            doc.entries
+                .iter()
+                .map(|entry| (entry.key.as_str(), entry.value.as_str(), entry.line))
+                .collect::<Vec<_>>(),
+            [("NEXT", "a\rb", 5)]
+        );
+    }
+
+    #[test]
     fn dotenv_quotes_comments_multiline_and_escapes() {
         let doc = parse_dotenv(
             "export A=one # comment\nB=hash#literal\nC='line1\nline2'\nD=\"line1\\nline2\\t\\\"\\\\\" # ok\nEMPTY=\nSINGLE=''\n",
