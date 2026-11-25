@@ -1,6 +1,7 @@
 //! Audit command implementation.
 
 use std::fs;
+#[cfg(unix)]
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};

@@ -48,11 +48,13 @@ keyring-core = { workspace = true }
 locket-crypto = { version = "0.2.0", path = "../locket-crypto" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 zeroize = { workspace = true }
+
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+sha2 = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["fs", "mm", "process", "termios"] }

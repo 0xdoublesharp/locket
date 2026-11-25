@@ -26,16 +26,25 @@ pub struct StoreFileIdentity {
 
 impl StoreFileIdentity {
     pub(crate) fn capture(path: &Path) -> io::Result<(PathBuf, Self)> {
+        #[cfg(unix)]
         let metadata = check_store_files(path)?;
+        #[cfg(not(unix))]
+        let _ = check_store_files(path)?;
         let canonical = fs::canonicalize(path)?;
-        let metadata = if canonical == path { metadata } else { check_store_files(&canonical)? };
         #[cfg(unix)]
         let identity = {
             use std::os::unix::fs::MetadataExt;
+            let metadata =
+                if canonical == path { metadata } else { check_store_files(&canonical)? };
             Self { device: metadata.dev(), inode: metadata.ino() }
         };
         #[cfg(not(unix))]
-        let identity = Self { path: canonical.clone() };
+        let identity = {
+            if canonical != path {
+                let _ = check_store_files(&canonical)?;
+            }
+            Self { path: canonical.clone() }
+        };
         Ok((canonical, identity))
     }
 
