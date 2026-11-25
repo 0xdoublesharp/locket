@@ -19,11 +19,47 @@ defineProps<{ name: AppIconName; size?: number }>();
     focusable="false"
   >
     <template v-if="name === 'brand-lock'">
-      <rect x="1" y="1" width="22" height="22" rx="6" fill="currentColor" stroke="none" />
-      <g class="app-icon__brand-detail">
-        <rect x="6.75" y="10.5" width="10.5" height="7.5" rx="2" />
-        <path d="M9 10.5V8a3 3 0 1 1 6 0v2.5M12 13.5v1.4" />
-      </g>
+      <defs>
+        <linearGradient
+          id="locket-brand-ring"
+          x1="2"
+          y1="2"
+          x2="22"
+          y2="22"
+          gradientUnits="userSpaceOnUse"
+        >
+          <stop offset="0%" stop-color="#36d2d5" />
+          <stop offset="35%" stop-color="#6756d9" />
+          <stop offset="70%" stop-color="#ff6255" />
+          <stop offset="100%" stop-color="#a8db55" />
+        </linearGradient>
+      </defs>
+      <rect
+        x="1"
+        y="1"
+        width="22"
+        height="22"
+        rx="6"
+        fill="#111b23"
+        stroke="url(#locket-brand-ring)"
+        stroke-width="1.25"
+      />
+      <path d="M9.2 10.6V8.3a2.8 2.8 0 0 1 5.6 0v2.3" stroke="#f6d577" stroke-width="1.6" />
+      <rect
+        x="6.75"
+        y="10.6"
+        width="10.5"
+        height="7.6"
+        rx="2"
+        fill="#111b23"
+        stroke="#f6d577"
+        stroke-width="1.5"
+      />
+      <path
+        d="M12 14.4 9.7 12.1 12 13.1l2.3-1-2.3 2.3 2.3 2.3-2.3-1-2.3 1z"
+        fill="#f7fafb"
+        stroke="none"
+      />
     </template>
     <template v-else-if="name === 'lock' || name === 'unlock'">
       <rect x="5" y="10" width="14" height="11" rx="2.5" />
