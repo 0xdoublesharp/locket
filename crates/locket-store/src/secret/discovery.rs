@@ -1,6 +1,6 @@
 //! Cross-project queries over secret metadata.
 
-use locket_core::source_precedence;
+use locket_core::{privacy_alias, source_precedence};
 use rusqlite::{Row, params};
 
 use crate::{Store, StoreError};
@@ -105,6 +105,12 @@ impl DiscoveredSecretRecord {
             last_rotated_at: row.get(18)?,
         })
     }
+
+    fn redact_names(&mut self) {
+        self.project_name = privacy_alias("project", &self.project_id);
+        self.profile_name = privacy_alias("profile", &self.profile_id);
+        self.name = privacy_alias("secret", &self.name);
+    }
 }
 
 impl Store {
@@ -120,14 +126,40 @@ impl Store {
         &self,
         filter: &SecretDiscoveryFilter,
     ) -> Result<Vec<DiscoveredSecretRecord>, StoreError> {
+        self.discover_secrets_with_projection(filter, false)
+    }
+
+    /// Discovers secret metadata using privacy aliases for labels and omitting free-form metadata.
+    ///
+    /// Select projects by opaque ID and profiles by opaque ID or alias. Query and glob filters
+    /// see only the projected labels, and tag or owner filters yield no matches. The limit applies
+    /// after filtering, in an order based on opaque IDs and source precedence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when metadata cannot be queried or decoded.
+    pub fn discover_redacted_secrets(
+        &self,
+        filter: &SecretDiscoveryFilter,
+    ) -> Result<Vec<DiscoveredSecretRecord>, StoreError> {
+        self.discover_secrets_with_projection(filter, true)
+    }
+
+    fn discover_secrets_with_projection(
+        &self,
+        filter: &SecretDiscoveryFilter,
+        redact_names: bool,
+    ) -> Result<Vec<DiscoveredSecretRecord>, StoreError> {
         let limit = filter.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
-        if limit == 0 {
+        if limit == 0 || (redact_names && (filter.tag.is_some() || filter.owner.is_some())) {
             return Ok(Vec::new());
         }
 
         let mut statement = self.connection.prepare_cached(
             "SELECT p.id, p.name, f.id, f.name, f.dangerous, s.id, s.name, s.source,
-                    s.description, s.owner, s.tags_json, s.required,
+                    CASE WHEN NOT ?10 THEN s.description END,
+                    CASE WHEN NOT ?10 THEN s.owner END,
+                    CASE WHEN ?10 THEN '[]' ELSE s.tags_json END, s.required,
                     CASE s.source
                       WHEN 'machine-local' THEN ?6
                       WHEN 'user-local' THEN ?7
@@ -138,22 +170,28 @@ impl Store {
              FROM secrets s
              JOIN projects p ON p.id = s.project_id
              JOIN profiles f ON f.id = s.profile_id AND f.project_id = p.id
-             WHERE (?1 IS NULL OR p.id = ?1 OR p.name = ?1)
+             WHERE (?1 IS NULL OR p.id = ?1 OR (NOT ?10 AND p.name = ?1))
                AND (?2 IS NULL OR f.id = ?2 OR f.name = ?2)
                AND (?3 IS NULL OR s.source = ?3)
                AND (?4 OR s.state = 'active')
-             ORDER BY p.name, p.id, f.name, s.name, source_precedence DESC, s.source
+             ORDER BY CASE WHEN NOT ?10 THEN p.name END, p.id,
+                      CASE WHEN NOT ?10 THEN f.name END,
+                      CASE WHEN ?10 THEN f.id END,
+                      CASE WHEN NOT ?10 THEN s.name END,
+                      source_precedence DESC, s.source,
+                      CASE WHEN ?10 THEN s.id END
              LIMIT ?5",
         )?;
         // Only let SQL stop early when no remaining filters can discard rows.
         let needs_text_filter = filter.query.is_some()
             || filter.name_glob.is_some()
             || filter.tag.is_some()
-            || filter.owner.is_some();
+            || filter.owner.is_some()
+            || (redact_names && filter.profile.is_some());
         let sql_limit = if needs_text_filter { -1 } else { i64::try_from(limit).unwrap_or(-1) };
         let mut rows = statement.query(params![
             filter.project.as_deref(),
-            filter.profile.as_deref(),
+            if redact_names { None } else { filter.profile.as_deref() },
             filter.source.as_deref(),
             filter.include_deleted,
             sql_limit,
@@ -161,6 +199,7 @@ impl Store {
             source_precedence("user-local"),
             source_precedence("team-managed"),
             source_precedence(""),
+            redact_names,
         ])?;
 
         let query = filter.query.as_deref().map(str::to_lowercase);
@@ -168,6 +207,14 @@ impl Store {
         let mut results: Vec<DiscoveredSecretRecord> = Vec::new();
         while let Some(row) = rows.next()? {
             let mut record = DiscoveredSecretRecord::from_row(row)?;
+            if redact_names {
+                record.redact_names();
+                if filter.profile.as_ref().is_some_and(|selector| {
+                    selector != &record.profile_id && selector != &record.profile_name
+                }) {
+                    continue;
+                }
+            }
             if filter.tag.as_ref().is_some_and(|tag| !record.tags.contains(tag))
                 || filter
                     .name_glob
@@ -176,7 +223,9 @@ impl Store {
                 || owner
                     .as_deref()
                     .is_some_and(|owner| !contains_lowercase(record.owner.as_deref(), owner))
-                || query.as_deref().is_some_and(|query| !matches_query(&record, query))
+                || query
+                    .as_deref()
+                    .is_some_and(|query| !matches_query(&record, query, redact_names))
             {
                 continue;
             }
@@ -190,6 +239,7 @@ impl Store {
                 self.list_project_roots(&record.project_id)?
                     .into_iter()
                     .filter_map(|root| root.display_path)
+                    .map(|path| if redact_names { privacy_alias("root", &path) } else { path })
                     .collect()
             };
             results.push(record);
@@ -205,9 +255,10 @@ fn contains_lowercase(value: Option<&str>, lower_query: &str) -> bool {
     value.is_some_and(|value| value.to_lowercase().contains(lower_query))
 }
 
-fn matches_query(record: &DiscoveredSecretRecord, query: &str) -> bool {
+fn matches_query(record: &DiscoveredSecretRecord, query: &str, redact_names: bool) -> bool {
     record.name.to_lowercase().contains(query)
         || record.project_name.to_lowercase().contains(query)
+        || (redact_names && record.profile_name.contains(query))
         || contains_lowercase(record.description.as_deref(), query)
         || contains_lowercase(record.owner.as_deref(), query)
         || record.tags.iter().any(|tag| tag.to_lowercase().contains(query))

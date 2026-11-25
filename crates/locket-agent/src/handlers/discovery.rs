@@ -23,9 +23,9 @@ pub struct ListProjectsRequest {
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct DiscoveryFilters {
-    /// Exact project id, name, or trusted root.
+    /// Exact project id, name, or trusted root. Redacted discovery accepts id or alias.
     pub project: Option<String>,
-    /// Exact profile id or name.
+    /// Exact profile id or displayed name (alias in redacted discovery).
     pub profile: Option<String>,
     /// Search term applied to names and descriptive metadata.
     pub query: Option<String>,
@@ -117,13 +117,9 @@ pub fn list_projects(store: &Store, redact_names: bool) -> Result<Value, Discove
 pub fn discover_secrets(store: &Store, filters: DiscoveryFilters) -> Result<Value, DiscoveryError> {
     let project = filters
         .project
-        .map(|selector| match store.resolve_project_selector(&selector)? {
-            ProjectSelectorResolution::Found(project) => Ok(project.id),
-            ProjectSelectorResolution::NotFound => Err(DiscoveryError::ProjectNotFound),
-            ProjectSelectorResolution::Ambiguous(_) => Err(DiscoveryError::AmbiguousProject),
-        })
+        .map(|selector| resolve_discovery_project(store, &selector, filters.redact_names))
         .transpose()?;
-    let records = store.discover_secrets(&SecretDiscoveryFilter {
+    let filter = SecretDiscoveryFilter {
         project: project.clone(),
         profile: filters.profile,
         query: filters.query,
@@ -133,7 +129,12 @@ pub fn discover_secrets(store: &Store, filters: DiscoveryFilters) -> Result<Valu
         source: filters.source,
         include_deleted: filters.include_deleted,
         limit: filters.limit,
-    })?;
+    };
+    let records = if filters.redact_names {
+        store.discover_redacted_secrets(&filter)?
+    } else {
+        store.discover_secrets(&filter)?
+    };
     let notices = if store
         .current_schema_version()?
         .is_some_and(|version| version >= i64::from(locket_store::SCHEMA_VERSION))
@@ -152,50 +153,68 @@ pub fn discover_secrets(store: &Store, filters: DiscoveryFilters) -> Result<Valu
         .collect::<std::collections::BTreeMap<_, _>>();
     Ok(json!(
         records
-            .into_iter()
+            .iter()
             .filter(|record| project.as_ref().is_none_or(|id| &record.project_id == id))
             .map(|record| {
                 let notice = notices.get(record.secret_id.as_str()).copied();
-                secret_row(record, filters.redact_names, notice)
+                secret_row(record, notice)
             })
             .collect::<Vec<_>>()
     ))
 }
 
+fn resolve_discovery_project(
+    store: &Store,
+    selector: &str,
+    redact_names: bool,
+) -> Result<String, DiscoveryError> {
+    if !redact_names {
+        return match store.resolve_project_selector(selector)? {
+            ProjectSelectorResolution::Found(project) => Ok(project.id),
+            ProjectSelectorResolution::NotFound => Err(DiscoveryError::ProjectNotFound),
+            ProjectSelectorResolution::Ambiguous(_) => Err(DiscoveryError::AmbiguousProject),
+        };
+    }
+    if let Some(project) = store.get_project(selector)? {
+        return Ok(project.id);
+    }
+    let mut matches = store
+        .list_projects()?
+        .into_iter()
+        .filter(|project| privacy_alias("project", &project.id) == selector);
+    let project = matches.next().ok_or(DiscoveryError::ProjectNotFound)?;
+    if matches.next().is_some() {
+        return Err(DiscoveryError::AmbiguousProject);
+    }
+    Ok(project.id)
+}
+
 fn secret_row(
-    record: DiscoveredSecretRecord,
-    redact: bool,
+    record: &DiscoveredSecretRecord,
     notice: Option<&locket_store::SecretExpirationNotice>,
 ) -> Value {
-    let name = label("secret", &record.name, &record.name, redact);
-    let profile = label("profile", &record.profile_id, &record.profile_name, redact);
-    let roots = record
-        .project_roots
-        .iter()
-        .map(|path| label("root", path, path, redact))
-        .collect::<Vec<_>>();
     let mut row = json!({
         "project_id": record.project_id,
-        "project_name": label("project", &record.project_id, &record.project_name, redact),
-        "trusted_roots": roots,
+        "project_name": record.project_name,
+        "trusted_roots": record.project_roots,
         "profile_id": record.profile_id,
-        "profile": profile,
+        "profile": record.profile_name,
         "dangerous": record.profile_dangerous,
         "secret_id": record.secret_id,
-        "name": name,
+        "name": record.name,
         "source": record.source,
         "source_precedence": record.source_precedence,
         "origin": record.origin,
         "version": record.current_version,
         "state": record.state,
-        "description": record.description.filter(|_| !redact),
-        "owner": record.owner.filter(|_| !redact),
-        "tags": if redact { Vec::new() } else { record.tags },
+        "description": record.description,
+        "owner": record.owner,
+        "tags": record.tags,
         "required": record.required,
         "created_at": record.created_at,
         "updated_at": record.updated_at,
         "last_rotated_at": record.last_rotated_at,
-        "reference": format!("lk://{profile}/{name}"),
+        "reference": format!("lk://{}/{}", record.profile_name, record.name),
     });
     if let Some(notice) = notice {
         let status = notice.expiry_status.map(|status| match status {
@@ -358,7 +377,7 @@ mod tests {
             "redact",
             AgentMethod::DiscoverSecrets,
             json!({
-                "store_path": path, "project": "Second project", "redact_names": true,
+                "store_path": path, "project": "lk_proj_two", "redact_names": true,
             }),
         );
         let ResponseEnvelope::Success(search) = dispatch(&search, &state).await else {
@@ -378,6 +397,82 @@ mod tests {
         for hidden in ["SERVICE_TOKEN", "prod", "Second project", "Platform"] {
             assert!(!payload.contains(hidden));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn redacted_discovery_filters_projected_labels_before_limiting()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut store = Store::open(":memory:")?;
+        store.initialize_schema()?;
+        store.insert_project_if_absent("lk_proj_one", "First project", 0)?;
+        store.insert_project_if_absent("lk_proj_two", "Second project", 0)?;
+        store.insert_profile_if_absent("lk_prof_one", "lk_proj_one", "dev", false, 0)?;
+        store.insert_profile_if_absent("lk_prof_two", "lk_proj_two", "prod", true, 0)?;
+        store.connection().execute_batch(
+            r#"INSERT INTO secrets
+                (id, project_id, profile_id, name, source, origin, current_version, state,
+                 created_at, updated_at, owner, tags_json, required)
+             VALUES
+                ('lk_sec_one', 'lk_proj_one', 'lk_prof_one', 'SERVICE_KEY', 'user-local',
+                 'manual', 1, 'active', 0, 0, 'Platform', '["service"]', 0),
+                ('lk_sec_two', 'lk_proj_two', 'lk_prof_two', 'SERVICE_TOKEN', 'team-managed',
+                 'manual', 1, 'active', 0, 0, 'Platform', '["service"]', 0);"#,
+        )?;
+        let search = |mut filter: Value| {
+            filter["redact_names"] = json!(true);
+            filter["limit"] = json!(1);
+            discover_secrets(&store, serde_json::from_value(filter)?)
+                .map_err(Box::<dyn std::error::Error>::from)
+        };
+
+        for filters in [
+            json!({"query": "SERVICE_"}),
+            json!({"query": "service"}),
+            json!({"query": "PLATFORM"}),
+            json!({"query": "Second project"}),
+            json!({"name_glob": "SERVICE_*"}),
+            json!({"tag": "service"}),
+            json!({"owner": "plat"}),
+            json!({"profile": "prod"}),
+        ] {
+            assert_eq!(search(filters.clone())?, json!([]), "redacted filter {filters}");
+        }
+        assert!(matches!(
+            discover_secrets(
+                &store,
+                DiscoveryFilters {
+                    project: Some("Second project".into()),
+                    redact_names: true,
+                    ..Default::default()
+                },
+            ),
+            Err(DiscoveryError::ProjectNotFound)
+        ));
+
+        let project_alias = privacy_alias("project", "lk_proj_two");
+        let profile_alias = privacy_alias("profile", "lk_prof_two");
+        let secret_alias = privacy_alias("secret", "SERVICE_TOKEN");
+        for filter in [
+            json!({"query": project_alias.to_uppercase()}),
+            json!({"query": profile_alias.to_uppercase()}),
+            json!({"query": secret_alias.to_uppercase()}),
+            json!({"project": project_alias, "profile": profile_alias, "name_glob": secret_alias}),
+        ] {
+            let matches = search(filter)?;
+            assert_eq!(matches.as_array().ok_or("expected rows")?.len(), 1);
+            assert_eq!(matches[0]["name"], secret_alias);
+        }
+
+        let first = search(json!({}))?;
+        let matching = search(json!({"query": project_alias}))?;
+        store.connection().execute_batch(
+            "UPDATE projects SET name = 'A different project' WHERE id = 'lk_proj_two';
+             UPDATE profiles SET name = 'renamed' WHERE id = 'lk_prof_two';
+             UPDATE secrets SET owner = 'Different owner', tags_json = '[]';",
+        )?;
+        assert_eq!(search(json!({}))?, first);
+        assert_eq!(search(json!({"query": project_alias}))?, matching);
         Ok(())
     }
 }

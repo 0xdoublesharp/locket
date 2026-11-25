@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import AppIcon from '../components/AppIcon.vue';
 import { formatTime } from '../utils/formatTime';
-import { computed, ref } from 'vue';
+import { computed, ref, watch } from 'vue';
 
 import type { AuditLogRow } from '../types/views';
 
@@ -21,22 +21,37 @@ const emit = defineEmits<{
 }>();
 
 const searchQuery = ref<string>('');
+const publicSnapshots = new WeakSet<AuditLogRow[]>();
+
+// The agent returns redacted labels in the same fields as plain names.
+// Remember snapshots seen in public mode so they stay hidden during the transition.
+watch(
+  () => [props.rows, props.privacyMode] as const,
+  ([rows, privacyMode]) => {
+    if (!privacyMode) publicSnapshots.add(rows);
+  },
+  { immediate: true },
+);
+
+const visibleRows = computed(() =>
+  props.privacyMode && (props.loading || publicSnapshots.has(props.rows)) ? [] : props.rows,
+);
 
 const filteredRows = computed<AuditLogRow[]>(() => {
   const query = searchQuery.value.trim().toLowerCase();
   if (query.length === 0) {
-    return props.rows;
+    return visibleRows.value;
   }
-  return props.rows.filter((row) => searchText(row).includes(query));
+  return visibleRows.value.filter((row) => searchText(row).includes(query));
 });
 
-const isEmpty = computed<boolean>(() => props.rows.length === 0);
+const isEmpty = computed<boolean>(() => visibleRows.value.length === 0);
 const isFilteredEmpty = computed<boolean>(
-  () => props.rows.length > 0 && filteredRows.value.length === 0,
+  () => visibleRows.value.length > 0 && filteredRows.value.length === 0,
 );
 
 const firstBrokenSequence = computed<number | null>(() => {
-  for (const row of props.rows) {
+  for (const row of visibleRows.value) {
     if (row.hmacOk === false) {
       return row.sequence;
     }
@@ -56,14 +71,24 @@ const chainBannerText = computed<string>(() => {
   return 'Audit chain broken.';
 });
 
+function visibleLabel(
+  value: string | undefined,
+  alias: string | undefined,
+  wireAlias: RegExp,
+): string | null {
+  // Wire aliases are distinct from profile IDs (lk_prof_*) and uppercase secret names.
+  const label = props.privacyMode
+    ? (alias ?? (value && wireAlias.test(value) ? value : undefined))
+    : value;
+  return label?.trim() ? label : null;
+}
+
 function profileValue(row: AuditLogRow): string | null {
-  const value = props.privacyMode ? (row.profileAlias ?? row.profile) : row.profile;
-  return value && value.trim().length > 0 ? value : null;
+  return visibleLabel(row.profile, row.profileAlias, /^profile-[0-9a-f]{8}$/);
 }
 
 function secretValue(row: AuditLogRow): string | null {
-  const value = props.privacyMode ? (row.secretAlias ?? row.secretName) : row.secretName;
-  return value && value.trim().length > 0 ? value : null;
+  return visibleLabel(row.secretName, row.secretAlias, /^secret-[0-9a-f]{8}$/);
 }
 
 function profileLabel(row: AuditLogRow): string {

@@ -5778,6 +5778,11 @@ async fn metadata_rpcs_enforce_vault_identity_and_report_corrupt_metadata()
     store.insert_project_if_absent("other-metadata", "Synthetic vault", 1)?;
     let mut duplicate = payload.clone();
     duplicate["project"] = json!("Synthetic vault");
+    let redacted =
+        RequestEnvelope::new("redacted-duplicate", AgentMethod::DiscoverSecrets, duplicate.clone());
+    assert!(matches!(dispatch(&redacted, &state).await, ResponseEnvelope::Error(error)
+        if error.error == "ProjectNotFound"));
+    duplicate["redact_names"] = json!(false);
     let ambiguous = RequestEnvelope::new("ambiguous", AgentMethod::DiscoverSecrets, duplicate);
     assert!(matches!(dispatch(&ambiguous, &state).await, ResponseEnvelope::Error(error)
         if error.error == "AmbiguousProject"));

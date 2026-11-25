@@ -92,6 +92,46 @@ describe('Audit log', () => {
     expect(verify).toHaveBeenCalledOnce();
   });
 
+  it('hides cached names while the redacted audit snapshot is pending', async () => {
+    const cached = { ...auditRow, profileAlias: undefined, secretAlias: undefined };
+    const { root, setProps } = mount(AuditLog, {
+      rows: [cached],
+      privacyMode: false,
+      chainOk: false,
+    });
+    expect(nodeText(root)).toContain('private-prod');
+    expect(nodeText(root)).toContain('PRIVATE_TOKEN');
+
+    setProps({ privacyMode: true });
+    await settle();
+    expect(nodeText(root)).not.toMatch(/private-prod|PRIVATE_TOKEN/);
+
+    setProps({ loading: true });
+    await settle();
+    expect(nodeText(root)).toContain('Loading audit');
+    expect(nodeText(root)).not.toMatch(/private-prod|PRIVATE_TOKEN/);
+
+    const profile = 'profile-a0123456';
+    const secretName = 'secret-b0123456';
+    setProps({ rows: [{ ...cached, profile, secretName }], loading: false });
+    await settle();
+    expect(nodeText(root)).toContain(profile);
+    expect(nodeText(root)).toContain(secretName);
+    expect(nodeText(root)).not.toMatch(/private-prod|PRIVATE_TOKEN/);
+  });
+
+  it('omits unaliased wire fields when opened in privacy mode', async () => {
+    const { root } = mount(AuditLog, {
+      rows: [{ ...auditRow, profileAlias: undefined, secretAlias: undefined }],
+      privacyMode: true,
+      chainOk: false,
+    });
+    expect(nodeText(root)).toContain('#7');
+    expect(nodeText(root)).not.toMatch(/private-prod|PRIVATE_TOKEN/);
+    await input(byProp(root, 'type', 'search'), 'PRIVATE_TOKEN');
+    expect(nodeText(root)).toContain('No matching audit rows.');
+  });
+
   it('shows loading, empty, and retryable error states', async () => {
     const { root, setProps } = mount(AuditLog, {
       rows: [],
