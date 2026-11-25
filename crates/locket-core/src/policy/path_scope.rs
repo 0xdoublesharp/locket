@@ -94,9 +94,13 @@ impl PathEnvSet {
     /// Returns true when `relative_cwd` is inside this path scope.
     #[must_use]
     pub fn matches(&self, relative_cwd: &Path) -> bool {
-        self.path == Path::new(".")
-            || relative_cwd == self.path
-            || relative_cwd.starts_with(&self.path)
+        if relative_cwd.components().any(|component| {
+            matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_))
+        }) {
+            return false;
+        }
+        let relative_cwd = relative_cwd.strip_prefix(".").unwrap_or(relative_cwd);
+        self.path == Path::new(".") || relative_cwd.starts_with(&self.path)
     }
 
     /// Returns the path depth used for longest-prefix matching.
@@ -140,4 +144,30 @@ fn normalize_path_scope(path: &str) -> Result<PathBuf, PolicyParseError> {
         }
     }
     if normalized.as_os_str().is_empty() { Ok(PathBuf::from(".")) } else { Ok(normalized) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::PolicyDocument;
+
+    #[test]
+    fn path_scope_matches_only_normalized_relative_subtrees() -> Result<(), PolicyParseError> {
+        let document = PolicyDocument::from_toml_str("schema_version=1\n[paths.'.']\n[paths.app]")?;
+        let general = &document.path_scopes["."];
+        let app = &document.path_scopes["app"];
+        let root = Path::new("project");
+
+        for cwd in ["..", "app/../outside", "/app"] {
+            assert!(!general.matches(Path::new(cwd)));
+            assert!(!app.matches(Path::new(cwd)));
+        }
+        assert!(document.path_scope_for(root, &root.join("app/../outside")).is_none());
+        assert!(!app.matches(Path::new("app2/sub")));
+        for cwd in ["app", "./app/sub", "app/./sub"] {
+            assert!(app.matches(Path::new(cwd)));
+        }
+        assert!(general.matches(Path::new(".")));
+        Ok(())
+    }
 }
