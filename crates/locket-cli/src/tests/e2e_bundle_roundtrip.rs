@@ -1186,3 +1186,114 @@ fn independent_stores_import_personal_backup_into_empty_dev_and_decrypt()
 
     Ok(())
 }
+
+#[test]
+fn bundle_without_personal_data_previews_command_proposals_and_rejects_other_projects()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let other = tempdir()?;
+    let context = test_context_with_secret_value(&directory, "bundle-personal-synthetic-canary");
+    let other_context = test_context(&other);
+    let run = |ctx: &RuntimeContext, args: &[&str]| -> Result<String, Box<dyn std::error::Error>> {
+        let mut output = Vec::new();
+        let code = run_with_context(Cli::try_parse_from(args)?, ctx, &mut output)?;
+        assert_eq!(code, 0);
+        let output = String::from_utf8(output)?;
+        assert!(!output.contains("bundle-personal-synthetic-canary"));
+        Ok(output)
+    };
+    for ctx in [&context, &other_context] {
+        run(ctx, &["locket", "init", "--no-passkey", "--name", "app"])?;
+    }
+    run(&context, &["locket", "set", "PERSONAL_ONLY", "--source", "user-local"])?;
+    let config_path = directory.path().join("locket.toml");
+    let config = fs::read_to_string(&config_path)?;
+    fs::OpenOptions::new().append(true).open(&config_path)?.write_all(
+        br#"
+[commands.dev]
+argv = ["npm", "run", "dev"]
+optional_secrets = ["PERSONAL_ONLY"]
+external_env_sources = ["parent"]
+
+[commands.report]
+shell = "printf report"
+"#,
+    )?;
+
+    let descriptor = run(&context, &["locket", "device", "pubkey"])?;
+    let descriptor = parse_field(&descriptor, "descriptor").ok_or("device descriptor missing")?;
+    let export = ["locket", "export", "--sealed", "--recipient", descriptor, "--profile", "dev"];
+    let summary = run(&context, &export)?;
+    assert_eq!(parse_field(&summary, "secret_count"), Some("0"));
+    assert_eq!(parse_field(&summary, "command_policy_count"), Some("2"));
+    assert!(summary.contains("No team-managed values selected."));
+    let path = parse_field(&summary, "path").ok_or("default bundle path missing")?;
+    assert!(Path::new(path).starts_with(directory.path()));
+    let bytes = fs::read(path)?;
+    let error = run(&context, &[&export[..], &["--output", path]].concat())
+        .err()
+        .ok_or("export overwrote existing bundle")?;
+    assert!(error.to_string().contains("bundle output already exists"));
+    assert_eq!(bytes, fs::read(path)?);
+
+    let mut output = Vec::new();
+    let result = run_with_context(
+        Cli::try_parse_from(["locket", "import-bundle", path, "--accept-incoming"])?,
+        &other_context,
+        &mut output,
+    );
+    assert_error_contains(result, "bundle project id does not match current project");
+    assert_eq!(output, b"");
+
+    fs::write(&config_path, &config)?;
+    let preview = run_with_context(
+        Cli::try_parse_from(["locket", "import-bundle", path])?,
+        &context,
+        &mut output,
+    );
+    assert_error_contains(preview, "requires explicit acceptance");
+    let preview = String::from_utf8(output)?;
+    assert!(preview.contains("proposed_command: dev"));
+    assert!(preview.contains("proposed_command: report"));
+    assert!(preview.contains("proposed_commands=2"));
+    assert!(!preview.contains("bundle-personal-synthetic-canary"));
+    assert_eq!(fs::read_to_string(&config_path)?, config);
+
+    run(&context, &["locket", "import-bundle", path, "--accept-local"])?;
+    assert!(crate::read_policy_document(&config_path)?.commands.is_empty());
+    assert_eq!(store_row_count(&context.store_path, "SELECT COUNT(*) FROM secrets")?, 1);
+    Ok(())
+}
+
+#[test]
+fn bundle_accept_local_preserves_divergent_ciphertext() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let (context, _descriptor, bundle_path, _) =
+        export_sealed_bundle(&directory, "accept-local.locket-bundle")?;
+    let store = crate::open_store(&context)?;
+    let original: Vec<u8> =
+        store.connection().query_row("SELECT ciphertext FROM blobs", [], |row| row.get(0))?;
+    let mut different = original;
+    different[0] ^= 1;
+    store.connection().execute("UPDATE blobs SET ciphertext=?1", [&different])?;
+
+    let mut output = Vec::new();
+    run_with_context(
+        Cli::try_parse_from([
+            "locket",
+            "import-bundle",
+            bundle_path.to_str().ok_or("bundle path")?,
+            "--accept-local",
+        ])?,
+        &context,
+        &mut output,
+    )?;
+    let output = String::from_utf8(output)?;
+    assert_eq!(parse_field(&output, "conflict_policy"), Some("accept-local"));
+    assert!(output.contains("import: applied"));
+    assert!(!output.contains("postgres://bundle-secret"));
+    let preserved: Vec<u8> =
+        store.connection().query_row("SELECT ciphertext FROM blobs", [], |row| row.get(0))?;
+    assert_eq!(preserved, different);
+    Ok(())
+}

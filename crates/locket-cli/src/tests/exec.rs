@@ -2878,3 +2878,121 @@ fn generic_run_new_argv_requires_approval_and_persists_only_chosen_profile_names
     assert!(store.get_command_policy_index(resolved.config.project_id.as_str(), "dev")?.is_some());
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn docker_helpers_pass_secrets_by_environment_and_report_child_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    const FIXTURE: &str = "LOCKET_TEST_DOCKER_HELPERS_FIXTURE";
+    let Some(fixture) = std::env::var_os(FIXTURE) else {
+        // Isolate PATH and Docker configuration from the parallel harness.
+        let directory = tempdir()?;
+        let path = directory.path();
+        let docker = path.join("docker");
+        fs::write(
+            &docker,
+            r#"#!/bin/sh
+[ "${SERVICE_KEY:+present}" = present ] || exit 97
+printf '%s\n' "$@" > fixture-argv.txt
+case "$3" in
+  run) exit 0 ;;
+  compose) exit 19 ;;
+  *) exit 98 ;;
+esac
+"#,
+        )?;
+        fs::set_permissions(docker, fs::Permissions::from_mode(0o700))?;
+        let output = TestCommand::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "tests::exec::docker_helpers_pass_secrets_by_environment_and_report_child_failure",
+            ])
+            .env(FIXTURE, path)
+            .env("PATH", path)
+            .env("DOCKER_CONFIG", path)
+            .env_remove("DOCKER_HOST")
+            .env_remove("DOCKER_CONTEXT")
+            .env_remove("DOCKER_TLS")
+            .env_remove("DOCKER_TLS_VERIFY")
+            .env_remove("SERVICE_KEY")
+            .output()?;
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));
+        assert!(String::from_utf8(output.stdout)?.contains("1 passed"));
+        return Ok(());
+    };
+
+    let directory = tempdir()?;
+    let context = test_context_with_secret_value(&directory, "docker-fixture-synthetic-canary");
+    let mut output = Vec::new();
+    for args in [
+        vec!["locket", "init", "--name", "app", "--no-device", "--no-passkey"],
+        vec!["locket", "set", "SERVICE_KEY"],
+    ] {
+        run_with_context(Cli::try_parse_from(args)?, &context, &mut output)?;
+    }
+    fs::OpenOptions::new().append(true).open(context.cwd.join("locket.toml"))?.write_all(
+        br"
+[commands.container]
+argv = ['docker', 'run', 'fixture-image']
+required_secrets = ['SERVICE_KEY']
+inherit_env = ['PATH', 'DOCKER_CONFIG']
+",
+    )?;
+
+    assert!(Path::new(&fixture).join("docker").is_file());
+    output.clear();
+    run_with_context(
+        Cli::try_parse_from([
+            "locket",
+            "env",
+            "docker",
+            "--policy",
+            "container",
+            "--",
+            "docker",
+            "run",
+            "fixture-image",
+        ])?,
+        &context,
+        &mut output,
+    )?;
+    let argv = context.cwd.join("fixture-argv.txt");
+    assert_eq!(
+        fs::read_to_string(&argv)?,
+        "--host\nunix:///var/run/docker.sock\nrun\n--env\nSERVICE_KEY\nfixture-image\n",
+    );
+    let result = run_with_context(
+        Cli::try_parse_from([
+            "locket",
+            "compose",
+            "run",
+            "--policy",
+            "container",
+            "--profile",
+            "fixture",
+            "--",
+            "docker",
+            "compose",
+            "up",
+        ])?,
+        &context,
+        &mut output,
+    );
+    assert_eq!(result.err().ok_or("expected child failure")?.exit_code(), 19);
+    assert_eq!(
+        fs::read_to_string(&argv)?,
+        "--host\nunix:///var/run/docker.sock\ncompose\n--profile\nfixture\nup\n",
+    );
+    assert!(!String::from_utf8(output)?.contains("docker-fixture-synthetic-canary"));
+    let store = crate::open_store(&context)?;
+    let statuses = store
+        .connection()
+        .prepare("SELECT status FROM audit_log WHERE action='RUN' ORDER BY sequence")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(statuses, ["SUCCESS", "FAILED"]);
+    Ok(())
+}

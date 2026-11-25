@@ -273,3 +273,258 @@ fn signed_team_dangerous_sharing_requires_sender_confirmation()
     assert!(fs::read_dir(shared.path())?.count() > 0);
     Ok(())
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn signed_sync_reconciles_collisions_and_revokes_the_recipient()
+-> Result<(), Box<dyn std::error::Error>> {
+    let owner = tempdir()?;
+    let receiver = tempdir()?;
+    let shared = tempdir()?;
+    let folder = shared.path().to_str().ok_or("folder path must be UTF-8")?;
+    let owner_context = test_context_with_secret_value(&owner, "owner-sync-synthetic-canary");
+    let recipient_context =
+        test_context_with_secret_value(&receiver, "recipient-sync-synthetic-canary");
+    let run =
+        |context: &RuntimeContext, args: &[&str]| -> Result<String, Box<dyn std::error::Error>> {
+            let mut output = Vec::new();
+            let code = run_with_context(Cli::try_parse_from(args)?, context, &mut output)?;
+            assert_eq!(code, 0);
+            let output = String::from_utf8(output)?;
+            assert!(!output.contains("owner-sync-synthetic-canary"));
+            assert!(!output.contains("recipient-sync-synthetic-canary"));
+            Ok(output)
+        };
+
+    run(&owner_context, &["locket", "init", "--no-passkey", "--name", "app"])?;
+    run(&owner_context, &["locket", "profile", "create", "staging"])?;
+    run(
+        &owner_context,
+        &["locket", "set", "TEAM_TOKEN", "--source", "team-managed", "--profile", "staging"],
+    )?;
+    run(&owner_context, &["locket", "team", "init", "Sync team"])?;
+    run(&owner_context, &["locket", "team", "folder", folder])?;
+    fs::copy(owner.path().join("locket.toml"), receiver.path().join("locket.toml"))?;
+    run(&recipient_context, &["locket", "team", "join", "--request"])?;
+    let resolved = crate::require_project(&owner_context)?;
+    let project = resolved.config.project_id.as_str();
+    let issuer = crate::open_store(&owner_context)?;
+    let recipient = crate::open_store(&recipient_context)?;
+    let owner_device = issuer.get_active_local_device(project)?.ok_or("owner device missing")?;
+    let join_device =
+        recipient.get_active_local_device(project)?.ok_or("recipient device missing")?;
+    let descriptor = crate::encode_device_descriptor(&join_device)?;
+    let add = |pin| {
+        [
+            "locket",
+            "team",
+            "add",
+            "Receiver",
+            "--device",
+            &descriptor,
+            "--confirm-device-fingerprint",
+            pin,
+            "--profile",
+            "dev",
+            "--role",
+            "read-only",
+        ]
+    };
+    let wrong_pin = "0".repeat(64);
+    let error = run(&owner_context, &add(&wrong_pin)).err().ok_or("wrong device pin accepted")?;
+    assert!(error.to_string().contains("verify the full joining-device fingerprint"));
+    run(&owner_context, &add(&join_device.fingerprint))?;
+    run(&owner_context, &["locket", "team", "publish"])?;
+    let package = fs::read_dir(shared.path())?.next().ok_or("delivery missing")??.path();
+    let package = package.to_str().ok_or("package path must be UTF-8")?;
+    let join = |pin| ["locket", "team", "join", package, "--owner", pin];
+    let error = run(&recipient_context, &join("short")).err().ok_or("accepted short owner pin")?;
+    assert!(error.to_string().contains("full owner fingerprint"));
+    let wrong_owner = run(&recipient_context, &join(&wrong_pin))
+        .err()
+        .ok_or("accepted incorrect owner pin")?
+        .downcast::<crate::CliError>()?;
+    assert_eq!(wrong_owner.exit_code(), locket_core::LocketError::MetadataInvalid.exit_code());
+    assert!(locket_agent::team_sync::status(&recipient, project)?.owner_fingerprint.is_none());
+    let first = run(&recipient_context, &join(&owner_device.fingerprint.to_ascii_uppercase()))?;
+    assert!(first.contains("Owner fingerprint was supplied independently"));
+    run(&recipient_context, &["locket", "team", "folder", folder])?;
+    for args in [
+        vec!["locket", "device", "init", "--force"],
+        vec!["locket", "device", "remove", &join_device.id, "--force"],
+    ] {
+        let mut output = Vec::new();
+        let denied = run_with_context(Cli::try_parse_from(args)?, &recipient_context, &mut output);
+        assert!(matches!(
+            denied,
+            Err(crate::CliError::Typed { kind: locket_core::LocketError::AccessDenied, .. })
+        ));
+        assert_eq!(output, b"");
+        assert_eq!(
+            recipient.get_active_local_device(project)?.ok_or("device was removed")?.id,
+            join_device.id
+        );
+    }
+    let dev = recipient.get_profile_by_name(project, "dev")?.ok_or("joined profile missing")?;
+    for context in [&recipient_context, &owner_context] {
+        run(context, &["locket", "set", "COLLIDING_TOKEN", "--source", "team-managed"])?;
+    }
+    let local_secret = recipient
+        .get_secret_by_source(project, &dev.id, "COLLIDING_TOKEN", "team-managed")?
+        .ok_or("local secret missing")?;
+    let local_blob = recipient.get_blob(&local_secret.id, local_secret.current_version)?;
+
+    run(&recipient_context, &["locket", "profile", "create", "staging"])?;
+    run(
+        &recipient_context,
+        &["locket", "set", "LOCAL_TOKEN", "--profile", "staging", "--source", "user-local"],
+    )?;
+    let local =
+        recipient.get_profile_by_name(project, "staging")?.ok_or("local profile missing")?;
+    let incoming =
+        issuer.get_profile_by_name(project, "staging")?.ok_or("owner profile missing")?;
+    let team = issuer.get_team_by_project(project)?.ok_or("team missing")?;
+    let member = issuer
+        .get_active_team_member_by_device(&team.id, &join_device.id)?
+        .ok_or("member missing")?;
+    // Seed a scope expansion. The CLI can add recipients and publish their current scope.
+    issuer.set_team_member_profiles(&member.id, &["dev".to_owned(), "staging".to_owned()])?;
+    run(&owner_context, &["locket", "team", "publish"])?;
+    run(&recipient_context, &["locket", "team", "sync", "now"])?;
+
+    let pending = run(&recipient_context, &["locket", "team", "sync", "pending"])?;
+    assert!(pending.contains("profile-name-collision"));
+    assert!(pending.contains("secret-name-collision"));
+    assert!(pending.contains(&local_secret.id));
+    assert!(pending.contains(&local.id));
+    assert!(pending.contains(&incoming.id));
+    let rename =
+        |name| ["locket", "team", "sync", "rename-local-profile", &incoming.id, &local.id, name];
+    assert!(run(&recipient_context, &rename("dev")).is_err(), "occupied profile must block rename");
+    assert_eq!(
+        recipient.get_profile_by_name(project, "staging")?.ok_or("local profile missing")?.id,
+        local.id
+    );
+    let report = run(&recipient_context, &rename("personal-staging"))?;
+    assert!(report.contains("Directory grants remain bound to the renamed local profile ID"));
+    assert!(report.contains("No sync was started by this action"));
+    assert!(recipient.get_profile_by_name(project, "staging")?.is_none());
+    let preserved = run(
+        &recipient_context,
+        &["locket", "team", "sync", "keep-local-value", &dev.id, &local_secret.id],
+    )?;
+    assert!(preserved.contains("Local value preserved as a personal override"));
+    assert!(
+        recipient
+            .get_secret_by_source(project, &dev.id, "COLLIDING_TOKEN", "team-managed")?
+            .is_none()
+    );
+    let restored = recipient
+        .get_secret_by_source(project, &dev.id, "COLLIDING_TOKEN", "user-local")?
+        .ok_or("local override missing")?;
+    assert_eq!(restored.id, local_secret.id);
+    assert_eq!(recipient.get_blob(&local_secret.id, local_secret.current_version)?, local_blob);
+    run(&recipient_context, &["locket", "team", "sync", "now"])?;
+    let team_value = recipient
+        .get_secret_by_source(project, &dev.id, "COLLIDING_TOKEN", "team-managed")?
+        .ok_or("team value missing after retry")?;
+    assert_ne!(team_value.id, local_secret.id);
+    let status = run(&recipient_context, &["locket", "team", "sync", "status"])?;
+    let status: serde_json::Value = serde_json::from_str(&status)?;
+    assert_eq!(status["state"], "verified");
+    assert_eq!(status["pending_profiles"], json!({}));
+    assert_eq!(
+        recipient.get_profile_by_name(project, "staging")?.ok_or("incoming profile missing")?.id,
+        incoming.id
+    );
+    assert_eq!(
+        recipient
+            .get_profile_by_name(project, "personal-staging")?
+            .ok_or("local profile missing")?
+            .id,
+        local.id
+    );
+    assert!(
+        recipient.get_secret_by_source(project, &local.id, "LOCAL_TOKEN", "user-local")?.is_some()
+    );
+    assert!(
+        recipient
+            .get_secret_by_source(project, &incoming.id, "TEAM_TOKEN", "team-managed")?
+            .is_some()
+    );
+    let pending = run(&recipient_context, &["locket", "team", "sync", "pending"])?;
+    assert!(pending.contains("No profile values are waiting"));
+
+    let remove = ["locket", "team", "remove", &member.id];
+    assert!(run(&owner_context, &remove).is_err());
+    assert!(
+        issuer.get_team_member(&team.id, &member.id)?.ok_or("member missing")?.removed_at.is_none()
+    );
+    let confirmed = context_with_confirmation(&owner_context, "Receiver");
+    let removed = run(&confirmed, &remove)?;
+    let rotation = removed
+        .lines()
+        .find_map(|line| line.strip_prefix("Rotate credentials at their providers: "))
+        .ok_or("missing credential rotation checklist")?;
+    assert_eq!(
+        rotation.split(", ").collect::<BTreeSet<_>>(),
+        BTreeSet::from(["COLLIDING_TOKEN", "TEAM_TOKEN"])
+    );
+    assert!(removed.contains("Signed revocation delivered"));
+    assert!(
+        issuer.get_team_member(&team.id, &member.id)?.ok_or("member missing")?.removed_at.is_some()
+    );
+
+    let rejected_bundle = owner.path().join("revoked-recipient.locket-bundle");
+    let rejected_invite = owner.path().join("revoked-recipient.locket-invite");
+    for (args, expected) in [
+        (
+            vec![
+                "locket",
+                "export",
+                "--sealed",
+                "--recipient",
+                &descriptor,
+                "--profile",
+                "dev",
+                "--output",
+                rejected_bundle.to_str().ok_or("bundle path")?,
+            ],
+            locket_core::LocketError::AccessDenied,
+        ),
+        (
+            vec![
+                "locket",
+                "team",
+                "invite",
+                "Former recipient",
+                "--device",
+                &descriptor,
+                "--profile",
+                "dev",
+                "--role",
+                "developer",
+                "--output",
+                rejected_invite.to_str().ok_or("invite path")?,
+            ],
+            locket_core::LocketError::TeamRoleDenied,
+        ),
+    ] {
+        let error = run(&owner_context, &args)
+            .err()
+            .ok_or("revoked device received sharing material")?
+            .downcast::<crate::CliError>()?;
+        assert_eq!(error.exit_code(), expected.exit_code());
+        assert!(error.to_string().contains("recipient device is revoked"));
+    }
+    assert!(!rejected_bundle.exists());
+    assert!(!rejected_invite.exists());
+
+    run(&recipient_context, &["locket", "team", "sync", "disable"])?;
+    let disabled = run(&recipient_context, &["locket", "team", "sync", "status"])?;
+    let disabled: serde_json::Value = serde_json::from_str(&disabled)?;
+    assert_eq!(disabled["folder"], serde_json::Value::Null);
+    assert_eq!(disabled["epoch"], status["epoch"]);
+    assert_eq!(disabled["owner_fingerprint"], owner_device.fingerprint);
+    Ok(())
+}

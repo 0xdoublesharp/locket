@@ -5313,3 +5313,436 @@ fn team_join_request_supports_passphrase_only_private_key_envelopes()
     assert_eq!(signing.verifying_key().as_bytes().as_slice(), device.signing_public_key);
     Ok(())
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn dangerous_invite_requires_exact_scope_and_keeps_command_approval_local()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context_with_secret_value(&directory, "invite-synthetic-canary");
+    let mut output = Vec::new();
+    for args in [
+        vec!["locket", "init", "--no-passkey", "--name", "app"],
+        vec!["locket", "team", "init", "Invite team"],
+        vec!["locket", "profile", "create", "staging"],
+        vec!["locket", "set", "SERVICE_KEY"],
+    ] {
+        run_with_context(Cli::try_parse_from(args)?, &context, &mut output)?;
+    }
+    let policy_file = context.cwd.join("locket.toml");
+    let initial_config = fs::read_to_string(&policy_file)?;
+    fs::OpenOptions::new().append(true).open(&policy_file)?.write_all(
+        br#"
+[commands.dev]
+argv = ["true"]
+required_secrets = ["SERVICE_KEY"]
+inherit_env = ["PATH"]
+
+[commands.report]
+shell = "printf report"
+"#,
+    )?;
+    let resolved = crate::require_project(&context)?;
+    let project = resolved.config.project_id.as_str();
+    let store = crate::open_store(&context)?;
+    store
+        .connection()
+        .execute("UPDATE profiles SET dangerous=1 WHERE project_id=?1 AND name='dev'", [project])?;
+    let (recipient, recipient_key) = e2e_recipient_device(&directory)?;
+    let descriptor = crate::encode_device_descriptor(&recipient)?;
+    let invite = || {
+        Cli::try_parse_from([
+            "locket",
+            "team",
+            "invite",
+            "Teammate",
+            "--device",
+            &descriptor,
+            "--profile",
+            "dev",
+            "--profile",
+            "staging",
+            "--role",
+            "developer",
+        ])
+    };
+
+    output.clear();
+    let denied = run_with_context(invite()?, &context, &mut output);
+    assert_error_contains(denied, "confirmation did not match dangerous profile invite scope");
+    let summary = String::from_utf8(output)?;
+    assert!(summary.contains("dangerous_profiles: dev"));
+    assert!(!summary.contains("invite-synthetic-canary"));
+    assert_eq!(
+        store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM team_invites", [], |row| row.get::<_, i64>(0))?,
+        0
+    );
+    let mut output = Vec::new();
+    let confirmed = context_with_confirmation(&context, "team invite dev\r\n");
+    run_with_context(invite()?, &confirmed, &mut output)?;
+    let summary = String::from_utf8(output)?;
+    assert!(!summary.contains("invite-synthetic-canary"));
+    let path = fs::read_dir(directory.path())?
+        .filter_map(Result::ok)
+        .find(|entry| entry.path().extension() == Some(OsStr::new("locket-invite")))
+        .ok_or("default invite output missing")?
+        .path();
+    let signed = locket_core::SignedInvite::decode(fs::read_to_string(&path)?.trim())?;
+    signed.verify()?;
+    let plaintext = locket_core::decrypt_bundle_payload_with_x25519_secret(
+        &data_encoding::BASE64URL_NOPAD
+            .decode(signed.payload.sealed_payload.ciphertext_b64.as_bytes())?,
+        &recipient_key,
+    )?;
+    let payload: serde_json::Value = serde_json::from_slice(&plaintext)?;
+    assert_eq!(payload["command_policies"][0]["name"], "dev");
+    assert_eq!(payload["command_policies"][0]["required_secrets"], json!(["SERVICE_KEY"]));
+    assert_eq!(payload["command_policies"][1]["name"], "report");
+    assert_eq!(payload["command_policies"][1]["shell"], "printf report");
+    assert!(!std::str::from_utf8(&plaintext)?.contains("invite-synthetic-canary"));
+
+    let staging =
+        store.get_profile_by_name(project, "staging")?.ok_or("staging profile missing")?;
+    // Simulate an approved recipient with the pending invite but no staging keys or commands.
+    store.connection().execute("DELETE FROM profiles WHERE id=?1", [&staging.id])?;
+    fs::write(&policy_file, &initial_config)?;
+    insert_e2e_local_recipient_device(&context, &directory, &recipient, &recipient_key)?;
+    let confirming = context_with_confirmation(&context, &signed.payload.issuer_device_fingerprint);
+    let mut accepted = Vec::new();
+    run_with_context(
+        Cli::try_parse_from(["locket", "team", "accept", path.to_str().ok_or("invite path")?])?,
+        &confirming,
+        &mut accepted,
+    )?;
+    let accepted = String::from_utf8(accepted)?;
+    assert!(accepted.contains("approve separately"));
+    assert!(accepted.contains("applied_profiles: 1"));
+    assert!(accepted.contains("applied_profile_keys: 2"));
+    assert!(accepted.contains("applied_command_policies: 0"));
+    assert!(!accepted.contains("invite-synthetic-canary"));
+    assert_eq!(
+        store.get_profile_by_name(project, "staging")?.ok_or("missing restored profile")?.id,
+        staging.id
+    );
+    assert!(crate::read_policy_document(&policy_file)?.commands.is_empty());
+    Ok(())
+}
+
+#[test]
+fn setup_reports_import_detected_command_missing_input_and_ready_states()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    let mut output = Vec::new();
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--no-device", "--no-passkey", "--name", "app"])?,
+        &context,
+        &mut output,
+    )?;
+    let setup = || -> Result<String, Box<dyn std::error::Error>> {
+        let mut output = Vec::new();
+        run_with_context(
+            Cli::try_parse_from(["locket", "setup", "status"])?,
+            &context,
+            &mut output,
+        )?;
+        let result = String::from_utf8(output)?;
+        assert!(!result.contains("setup-synthetic-canary"));
+        Ok(result)
+    };
+    fs::write(context.cwd.join(".env"), "SERVICE_KEY=setup-synthetic-canary\n")?;
+    fs::write(context.cwd.join("package.json"), r#"{"scripts":{"dev":"touch never-run"}}"#)?;
+    assert!(setup()?.contains("next_action: locket import .env"));
+
+    let confirming = context_with_confirmation(&context, "import .env");
+    output.clear();
+    crate::commands::project::setup::interactive_project_setup(&confirming, &mut output)?;
+    let text = String::from_utf8(output)?;
+    assert!(text.contains("Existing .env found"));
+    assert!(text.contains("command: not approved"));
+    assert!(!text.contains("setup-synthetic-canary"));
+    assert!(setup()?.contains("next_action: locket run -- npm run dev"));
+
+    let path = context.cwd.join("locket.toml");
+    let config = fs::read_to_string(&path)?;
+    fs::write(
+        &path,
+        format!(
+            "{config}\n[commands.dev]\nargv=['npm', 'run', 'dev']\nrequired_secrets=['OTHER_KEY']\n"
+        ),
+    )?;
+    assert!(setup()?.contains("next_action: locket set OTHER_KEY"));
+    fs::write(
+        &path,
+        format!(
+            "{config}\n[commands.dev]\nargv=['npm', 'run', 'dev']\nrequired_secrets=['SERVICE_KEY']\n"
+        ),
+    )?;
+    assert!(setup()?.contains("next_action: locket run dev"));
+
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&path)?
+        .write_all(b"external_env_sources=[{file='missing-private.env'}]\n")?;
+    let status = setup()?;
+    assert!(status.contains("next_action: locket env inspect dev"));
+    assert!(status.contains("availability: unverified"));
+    assert!(!context.cwd.join("never-run").exists());
+    Ok(())
+}
+
+#[test]
+fn bootstrap_reports_shell_tool_uncertainty_missing_inputs_and_unmanaged_hook()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    let mut output = Vec::new();
+    run_git(directory.path(), &["init", "-q"])?;
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--no-passkey", "--no-device", "--name", "app"])?,
+        &context,
+        &mut output,
+    )?;
+    let hook = context.cwd.join(".git/hooks/pre-commit");
+    fs::write(&hook, "#!/bin/sh\nexit 0\n")?;
+    fs::remove_file(context.cwd.join(".env.example"))?;
+    fs::OpenOptions::new().append(true).open(context.cwd.join("locket.toml"))?.write_all(
+        br#"
+[commands.dev]
+shell = '''
+# don't interpret tool-in-a-comment
+TOOL="$DYNAMIC_TOOL" ( 'locket-missing-quoted-tool' ) 2>>'not-a-tool'
+echo skipped | "locket-missing-pipe-tool" || locket-missing-escaped\ tool
+'''
+required_secrets = ['SERVICE_KEY']
+
+[commands.broken]
+argv = ['locket-missing-other-tool']
+required_secrets = ['UNKNOWN_KEY']
+external_env_sources = [{file = 'missing.env'}]
+
+[bootstrap]
+"#,
+    )?;
+    output.clear();
+    run_with_context(Cli::try_parse_from(["locket", "bootstrap"])?, &context, &mut output)?;
+    let report = String::from_utf8(output)?;
+    for text in [
+        "pre_commit_hook: unmanaged",
+        "tools_unchecked: shell:compound,shell:dynamic",
+        "locket-missing-quoted-tool",
+        "locket-missing-pipe-tool",
+        "locket-missing-escaped tool",
+        "missing_variables: SERVICE_KEY",
+        "unverified_variables: UNKNOWN_KEY",
+        "run locket emit-example",
+        "run locket install-hooks",
+        "run locket set SERVICE_KEY",
+        "run locket env inspect broken",
+    ] {
+        assert!(report.contains(text), "missing {text:?} in report");
+    }
+    assert!(!report.contains("tool-in-a-comment"));
+    assert!(!report.contains("not-a-tool"));
+    assert!(!context.cwd.join("not-a-tool").exists());
+    assert_eq!(fs::read_to_string(hook)?, "#!/bin/sh\nexit 0\n");
+    Ok(())
+}
+
+#[test]
+fn team_accept_rejects_signed_but_inconsistent_claims_without_consuming_invite()
+-> Result<(), Box<dyn std::error::Error>> {
+    use data_encoding::BASE64URL_NOPAD;
+    use locket_core::{InvitePayload, LocketError, SignedInvite};
+
+    type InviteEdit = fn(&mut InvitePayload);
+
+    let fixture = team_accept_invite_fixture(
+        "lk_invite_signed_scope_fixture",
+        4_102_444_800,
+        None,
+        None,
+        None,
+        None,
+    )?;
+    let original = SignedInvite::decode(fs::read_to_string(&fixture.invite_path)?.trim())?;
+    let issuer = ed25519_dalek::SigningKey::from_bytes(&[51; 32]);
+    let context = context_with_confirmation(&fixture.context, &fixture.issuer_fingerprint);
+    let invite_path = fixture.invite_path.to_str().ok_or("invite path must be UTF-8")?;
+    let argv = || Cli::try_parse_from(["locket", "team", "accept", invite_path]);
+    let cases: [(InviteEdit, LocketError, &str); 7] = [
+        (
+            |payload| payload.recipient_device_fingerprint = "0".repeat(64),
+            LocketError::DeviceDescriptorInvalid,
+            "recipient fingerprint does not match local device",
+        ),
+        (
+            |payload| payload.recipient_sealing_public_key = BASE64URL_NOPAD.encode(&[7; 32]),
+            LocketError::DeviceDescriptorInvalid,
+            "recipient sealing key does not match local device",
+        ),
+        (
+            |payload| payload.role = locket_core::TeamRole::Owner,
+            LocketError::MetadataInvalid,
+            "claims differ from the locally approved pending scope",
+        ),
+        (
+            |payload| payload.sealed_payload.v = 2,
+            LocketError::MetadataInvalid,
+            "sealed payload schema is unsupported",
+        ),
+        (
+            |payload| payload.sealed_payload.aad_schema_version = 2,
+            LocketError::MetadataInvalid,
+            "sealed payload AAD schema is unsupported",
+        ),
+        (
+            |payload| {
+                payload.sealed_payload.recipient_sealing_public_key_b64 =
+                    BASE64URL_NOPAD.encode(&[8; 32]);
+            },
+            LocketError::MetadataInvalid,
+            "sealed payload recipient key does not match invite recipient",
+        ),
+        (
+            |payload| {
+                payload.sealed_payload.ciphertext_b64 = "invalid-synthetic-ciphertext%".to_owned();
+            },
+            LocketError::MetadataInvalid,
+            "sealed payload is not valid base64url",
+        ),
+    ];
+    for (edit, kind, message) in cases {
+        let mut payload = original.payload.clone();
+        edit(&mut payload);
+        let invite = SignedInvite::sign(&issuer, payload)?;
+        invite.verify()?;
+        fs::write(&fixture.invite_path, invite.encode()?)?;
+        let mut output = Vec::new();
+        let result = run_with_context(argv()?, &context, &mut output);
+        assert_typed_error(result, kind, message)?;
+        let output = String::from_utf8(output)?;
+        assert!(!output.contains("team_accept: accepted"));
+        assert!(!output.contains("invalid-synthetic-ciphertext"));
+        assert_invite_not_accepted(&fixture.directory, &fixture.invite_id)?;
+    }
+    fs::write(&fixture.invite_path, original.encode()?)?;
+    let mut output = Vec::new();
+    run_with_context(argv()?, &context, &mut output)?;
+    assert!(String::from_utf8(output)?.contains("team_accept: accepted"));
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn team_invite_authority_and_revocation_are_enforced_before_mutation()
+-> Result<(), Box<dyn std::error::Error>> {
+    use locket_core::LocketError;
+
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    for args in [
+        vec!["locket", "init", "--name", "app", "--no-passkey"],
+        vec!["locket", "team", "init", "Invite scope team"],
+    ] {
+        run_with_context(Cli::try_parse_from(args)?, &context, &mut Vec::new())?;
+    }
+    let resolved = crate::require_project(&context)?;
+    let project = resolved.config.project_id.as_str();
+    let store = crate::open_store(&context)?;
+    let team = store.get_team_by_project(project)?.ok_or("team missing")?;
+    let local = store.get_active_local_device(project)?.ok_or("issuer device missing")?;
+    let member = store
+        .get_active_team_member_by_device(&team.id, &local.id)?
+        .ok_or("issuer is not a member")?;
+    let self_descriptor = crate::encode_device_descriptor(&local)?;
+    let (recipient, _) = e2e_recipient_device(&directory)?;
+    let descriptor = crate::encode_device_descriptor(&recipient)?;
+    let path = directory.path().join("invite.locket-invite");
+    let filename = path.to_str().ok_or("path must be UTF-8")?;
+    let issue = |name, device, profile, role| {
+        Cli::try_parse_from([
+            "locket",
+            "team",
+            "invite",
+            name,
+            "--device",
+            device,
+            "--profile",
+            profile,
+            "--role",
+            role,
+            "--output",
+            filename,
+        ])
+    };
+    for (name, device, profile, kind, message) in [
+        (" ", descriptor.as_str(), "dev", LocketError::MetadataInvalid, "invalid invitee name"),
+        (
+            "Teammate",
+            &self_descriptor,
+            "dev",
+            LocketError::MetadataInvalid,
+            "recipient device must differ",
+        ),
+        (
+            "Teammate",
+            &descriptor,
+            "missing",
+            LocketError::ProfileNotFound,
+            "profile not found: missing",
+        ),
+    ] {
+        let mut output = Vec::new();
+        let result =
+            run_with_context(issue(name, device, profile, "developer")?, &context, &mut output);
+        assert_typed_error(result, kind, message)?;
+        assert_eq!(output, b"");
+        assert!(!path.exists());
+    }
+    run_with_context(issue("Teammate", &descriptor, "dev", "owner")?, &context, &mut Vec::new())?;
+    let signed = locket_core::SignedInvite::decode(fs::read_to_string(&path)?.trim())?;
+    let invite_id = signed.payload.invite_id.as_str();
+    let revoke = || Cli::try_parse_from(["locket", "team", "revoke-invite", invite_id]);
+    store
+        .connection()
+        .execute("UPDATE team_members SET role='developer' WHERE id=?1", [&member.id])?;
+    assert_typed_error(
+        run_with_context(revoke()?, &context, &mut Vec::new()),
+        LocketError::TeamRoleDenied,
+        "team role cannot revoke this invite",
+    )?;
+    assert!(
+        store.get_team_invite(&team.id, invite_id)?.ok_or("invite missing")?.revoked_at.is_none()
+    );
+    assert_typed_error(
+        run_with_context(
+            issue("Teammate", &descriptor, "dev", "developer")?,
+            &context,
+            &mut Vec::new(),
+        ),
+        LocketError::TeamRoleDenied,
+        "team role cannot issue this invite",
+    )?;
+    store.connection().execute("UPDATE team_members SET role='owner' WHERE id=?1", [&member.id])?;
+    run_with_context(revoke()?, &context, &mut Vec::new())?;
+    let revoked = store.get_team_invite(&team.id, invite_id)?.ok_or("invite missing")?;
+    assert!(revoked.revoked_at.is_some());
+    assert_eq!(
+        run_with_context(revoke()?, &context, &mut Vec::new())
+            .err()
+            .ok_or("revoked invite replayed")?
+            .exit_code(),
+        LocketError::ReplayDetected.exit_code(),
+    );
+    let result = run_with_context(
+        Cli::try_parse_from(["locket", "team", "revoke-invite", "lk_invite_missing"])?,
+        &context,
+        &mut Vec::new(),
+    );
+    assert_typed_error(result, LocketError::SecretNotFound, "team invite not found")?;
+    assert_eq!(fs::read_to_string(path)?.trim(), signed.encode()?);
+    Ok(())
+}

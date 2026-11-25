@@ -1201,3 +1201,114 @@ fn debug_bundle_refuses_to_overwrite_existing_output() -> Result<(), Box<dyn std
     assert_eq!(fs::read_to_string(output_path)?, "existing");
     Ok(())
 }
+
+#[test]
+fn doctor_reports_damaged_metadata_and_untrusted_clone_without_values()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let source = directory.path().join("source");
+    let clone = directory.path().join("clone");
+    fs::create_dir(&source)?;
+    fs::create_dir(&clone)?;
+    let context = test_context_with_secret_value(&directory, "doctor-synthetic-canary");
+    let source_context = RuntimeContext { cwd: source.clone(), ..context.clone() };
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--name", "app", "--no-passkey", "--no-device"])?,
+        &source_context,
+        &mut Vec::new(),
+    )?;
+    run_with_context(
+        Cli::try_parse_from(["locket", "set", "SERVICE_KEY"])?,
+        &source_context,
+        &mut Vec::new(),
+    )?;
+    fs::copy(source.join("locket.toml"), clone.join("locket.toml"))?;
+    run_git(&clone, &["init", "-q"])?;
+    let store = crate::open_store(&context)?;
+    store.connection().execute("DROP INDEX secrets_bundle_conflict_idx", [])?;
+    store
+        .connection()
+        .execute("CREATE INDEX secrets_bundle_conflict_idx ON secrets(project_id, name)", [])?;
+    fs::write(&context.config_path, "[runtime]\nsession_secret_name_retention = false\n")?;
+    let mut output = Vec::new();
+    let context = RuntimeContext { cwd: clone, ..context };
+    let code = run_with_context(Cli::try_parse_from(["locket", "doctor"])?, &context, &mut output)?;
+    assert_eq!(code, 2);
+    let output = String::from_utf8(output)?;
+    for diagnostic in [
+        "fail bundle_conflict_index: unexpected secrets_bundle_conflict_idx columns=project_id,name",
+        "fail trusted_roots: current_root_trusted=no",
+        "fail runtime_session_secret_name_retention:",
+        "warn .gitignore: missing",
+        "warn pre_commit_hook: missing",
+    ] {
+        assert!(output.contains(diagnostic), "missing check {diagnostic:?}");
+    }
+    assert!(!output.contains("doctor-synthetic-canary"));
+    assert_eq!(
+        store.connection().query_row(
+            "SELECT status FROM audit_log WHERE action = 'DOCTOR' ORDER BY sequence DESC LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0)
+        )?,
+        "FAILED",
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_status_removes_unreachable_live_pid_metadata_without_signaling()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--name", "app", "--no-device", "--no-passkey"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    let pid_path = crate::agent_pid_path(&context);
+    let pid = std::process::id();
+    fs::write(&pid_path, format!("{pid}\n"))?;
+    let mut output = Vec::new();
+    run_with_context(Cli::try_parse_from(["locket", "agent", "status"])?, &context, &mut output)?;
+    let text = String::from_utf8(output)?;
+    assert!(text.contains("agent: stopped"));
+    assert!(text.contains(&format!("last_known_pid: {pid}")));
+    assert!(text.contains("lock_state: unknown"));
+    assert!(text.contains("active_profile: dev"));
+    assert!(!pid_path.exists());
+
+    // An unparsable identifier cannot be mistaken for a process to terminate.
+    fs::write(&pid_path, "no-pid\n")?;
+    let mut output = Vec::new();
+    run_with_context(Cli::try_parse_from(["locket", "agent", "stop"])?, &context, &mut output)?;
+    assert!(String::from_utf8(output)?.contains("removed_stale_pid: yes"));
+    assert!(!pid_path.exists());
+    Ok(())
+}
+
+#[test]
+fn agent_logs_accepts_minimum_unix_nanosecond_timestamp() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    fs::write(
+        crate::agent_log_path(&context),
+        format!(
+            "{}\n",
+            json!({"timestamp": 1, "action": "fixture", "grant_token": "log-synthetic-canary"})
+        ),
+    )?;
+    let mut output = Vec::new();
+    run_with_context(
+        Cli::try_parse_from(["locket", "agent", "logs", "--since=-9223372036854775808"])?,
+        &context,
+        &mut output,
+    )?;
+    let output = String::from_utf8(output)?;
+    let event: serde_json::Value = serde_json::from_str(&output)?;
+    assert_eq!(event["action"], "fixture");
+    assert!(!output.contains("log-synthetic-canary"));
+    Ok(())
+}

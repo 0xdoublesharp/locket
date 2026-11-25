@@ -1134,3 +1134,80 @@ fn meta_requires_source_for_multiple_active_sources_and_updates_explicit_source(
     assert!(!audit_metadata.contains("postgres://localhost"));
     Ok(())
 }
+
+#[test]
+fn generate_alphanumeric_stores_requested_entropy_without_printing_the_value()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--name", "app", "--no-device", "--no-passkey"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    let mut output = Vec::new();
+    let code = run_with_context(
+        Cli::try_parse_from([
+            "locket",
+            "generate",
+            "SERVICE_TOKEN",
+            "--format",
+            "alphanumeric",
+            "--bytes",
+            "16",
+            "--json",
+        ])?,
+        &context,
+        &mut output,
+    )?;
+    assert_eq!(code, 0);
+    let report: serde_json::Value = serde_json::from_slice(&output)?;
+    assert_eq!(report["name"], "SERVICE_TOKEN");
+    assert_eq!(report["version"], 1);
+    assert_eq!(report["origin_detail"], "generated");
+    let project = crate::require_project(&context)?;
+    let project_id = project.config.project_id.as_str();
+    let store = crate::open_store(&context)?;
+    let profile = crate::default_profile(&store, &project.config)?;
+    let secret = store
+        .get_secret_by_source(project_id, &profile.id, "SERVICE_TOKEN", "user-local")?
+        .ok_or("generated secret missing")?;
+    let value = crate::decrypt_secret_version(
+        &context,
+        &store,
+        project_id,
+        &profile.id,
+        &secret,
+        secret.current_version,
+    )?;
+    assert_eq!(value.len(), 32);
+    assert!(value.bytes().all(|byte| byte.is_ascii_alphanumeric()));
+    assert!(!std::str::from_utf8(&output)?.contains(value.as_str()));
+
+    for (format, bytes) in [("alphanumeric", "15"), ("base64url", "257"), ("uuid", "17")] {
+        output.clear();
+        let code = run_with_context(
+            Cli::try_parse_from([
+                "locket",
+                "generate",
+                "REJECTED_TOKEN",
+                "--format",
+                format,
+                "--bytes",
+                bytes,
+                "--json",
+            ])?,
+            &context,
+            &mut output,
+        )?;
+        assert_eq!(code, locket_core::LocketError::MetadataInvalid.exit_code());
+        let error: serde_json::Value = serde_json::from_slice(&output)?;
+        assert_eq!(error["error"]["code"], "MetadataInvalid");
+        assert!(
+            store
+                .get_secret_by_source(project_id, &profile.id, "REJECTED_TOKEN", "user-local")?
+                .is_none()
+        );
+    }
+    Ok(())
+}

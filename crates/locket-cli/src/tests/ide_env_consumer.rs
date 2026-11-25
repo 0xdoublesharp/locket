@@ -379,3 +379,44 @@ fn ide_env_source_missing_agent_returns_typed_error() -> Result<(), Box<dyn std:
     assert!(error.to_string().contains("AgentUnavailable"));
     Ok(())
 }
+
+#[test]
+fn require_agent_run_uses_bound_grants_and_reports_no_values()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let mut context = fixture(&directory)?;
+    let source = directory.path().join("locket.toml");
+    let text = fs::read_to_string(&source)?
+        .replace("external_env_sources = [\"ide\"]", "require_agent = true")
+        .replace("\"true\"", r#""test -n \"$DATABASE_URL\" && printf present > fixture-ran""#);
+    fs::write(&source, text)?;
+    context.agent_data_dir = Some(directory.path().to_path_buf());
+
+    let agent = IdeTestAgent::start(&context)?;
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let mut output = Vec::new();
+        let code = run_with_context(
+            Cli::try_parse_from(["locket", "run", "ide_run", "--redact-output"])?,
+            &context,
+            &mut output,
+        )?;
+        assert_eq!(code, 0);
+        assert_eq!(fs::read_to_string(directory.path().join("fixture-ran"))?, "present");
+        assert!(!String::from_utf8(output)?.contains("postgres://localhost/app"));
+        let store = crate::open_store(&context)?;
+        let audit: String = store.connection().query_row(
+            "SELECT metadata_json FROM audit_log WHERE action = 'RUN_POLICY' AND status='SUCCESS' ORDER BY sequence DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(audit.contains("DATABASE_URL"));
+        let metadata: serde_json::Value = serde_json::from_str(&audit)?;
+        assert_eq!(metadata["grant_actions"], json!(["RunPolicy"]));
+        assert_eq!(metadata["process_id"], std::process::id());
+        assert_eq!(metadata["child_exit"], 0);
+        assert!(!audit.contains("postgres://localhost/app"));
+        Ok(())
+    })();
+    agent.stop()?;
+    result
+}

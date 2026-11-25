@@ -346,13 +346,14 @@ fn ensure_agent_running_with_launcher(
         AGENT_START_POLL_INTERVAL,
     );
 
-    let pid = read_running_pid(context)?;
     let snapshot = launcher.status_snapshot(&socket_path).map_err(|error| {
         typed_cli_error(
             locket_core::LocketError::AgentUnavailable,
             format!("agent did not become reachable after on-demand startup: {error}"),
         )
     })?;
+    // The daemon binds before publishing its PID, and serves requests afterward.
+    let pid = read_running_pid(context)?;
     Ok(AgentStartupReport {
         started: true,
         pid,
@@ -871,7 +872,7 @@ fn run_internal_agent_worker(
     // any parallel test that emits SIGTERM, allowing the test process to
     // exit instead of the daemon.
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    let result = runtime.block_on(async {
+    runtime.block_on(async {
         let (listener, state) = bind_and_record(args, store_path)?;
         let sync_task = locket_agent::team_sync::spawn_team_sync_poll(state.clone());
         let expiry_task = state.spawn_unlock_expiry();
@@ -881,12 +882,10 @@ fn run_internal_agent_worker(
                 .map_err(CliError::Io);
         sync_task.abort();
         expiry_task.abort();
+        let _ignored = fs::remove_file(&args.socket);
+        let _ignored = fs::remove_file(&args.pid_file);
         result
-    });
-
-    let _ignored = fs::remove_file(&args.socket);
-    let _ignored = fs::remove_file(&args.pid_file);
-    result
+    })
 }
 
 #[cfg(unix)]
@@ -1202,7 +1201,11 @@ fn parse_agent_log_since(value: &str) -> Result<i64, CliError> {
 }
 
 const fn normalize_log_since(value: i64) -> i64 {
-    if value.abs() < 10_000_000_000 { value.saturating_mul(NANOS_PER_SECOND) } else { value }
+    if value.unsigned_abs() < 10_000_000_000 {
+        value.saturating_mul(NANOS_PER_SECOND)
+    } else {
+        value
+    }
 }
 
 fn read_agent_log_lines(
@@ -1451,6 +1454,65 @@ mod tests {
             }
         );
         assert_eq!(launcher.spawn_calls(), 1);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_second_worker_preserves_the_existing_agent_endpoint()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        let directory = tempdir()?;
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))?;
+        let context = temp_context(&directory);
+        let socket = agent_socket_path(&context);
+        let pid_file = agent_pid_path(&context);
+        let listener = UnixListener::bind(&socket)?;
+        let existing_pid = format!("{}\n", std::process::id());
+        fs::write(&pid_file, &existing_pid)?;
+        let args = InternalAgentServeArgs { socket, pid_file, require_session_monitoring: false };
+
+        let result = run_internal_agent_worker(&args, &context.store_path);
+
+        assert!(matches!(
+            result,
+            Err(CliError::Typed { kind: locket_core::LocketError::AgentSocketInUse, .. })
+        ));
+        assert_eq!(fs::read_to_string(&args.pid_file)?, existing_pid);
+        let _peer = UnixStream::connect(&args.socket)?;
+        let _connection = listener.accept()?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_reports_pid_written_between_socket_bind_and_first_reply()
+    -> Result<(), Box<dyn std::error::Error>> {
+        struct LatePidLauncher(std::path::PathBuf);
+
+        impl AgentDaemonLauncher for LatePidLauncher {
+            fn spawn(&self, socket: &Path, _pid_file: &Path) -> Result<(), CliError> {
+                // The daemon binds first, then initializes its observer and writes its PID.
+                fs::write(socket, b"")?;
+                Ok(())
+            }
+
+            fn status_snapshot(&self, _socket: &Path) -> Result<Value, io::Error> {
+                fs::write(&self.0, format!("{}\n", std::process::id()))?;
+                Ok(json!({"lock_state": "locked"}))
+            }
+        }
+
+        let directory = tempdir()?;
+        let context = temp_context(&directory);
+        let report = ensure_agent_running_with_launcher(
+            &context,
+            &LatePidLauncher(agent_pid_path(&context)),
+        )?;
+        assert!(report.started);
+        assert_eq!(report.pid, Some(std::process::id()));
         Ok(())
     }
 

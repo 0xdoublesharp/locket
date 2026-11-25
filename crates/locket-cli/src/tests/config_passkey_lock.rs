@@ -788,6 +788,7 @@ fn passkey_unlock_without_registered_passkey_fails() -> Result<(), Box<dyn std::
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn passkey_list_and_remove_use_project_store_and_audit() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempdir()?;
     let context = test_context_with_confirmation(&directory, "work-laptop\n");
@@ -834,6 +835,39 @@ fn passkey_list_and_remove_use_project_store_and_audit() -> Result<(), Box<dyn s
     assert!(list_output.contains("backup_state=no"));
     assert!(list_output.contains("private_key_material: never displayed"));
 
+    let second = locket_store::PasskeyCredentialRecord {
+        id: "lk_passkey_other".to_owned(),
+        credential_id: vec![0xab, 0x11, 0x22, 0x33, 0x44],
+        label: "second-key".to_owned(),
+        ..credential
+    };
+    store.insert_passkey_credential(&second)?;
+    for action in ["remove", "unlock"] {
+        let mut output = Vec::new();
+        let result = run_with_context(
+            Cli::try_parse_from(["locket", "passkey", action, "ab"])?,
+            &context,
+            &mut output,
+        );
+        assert!(matches!(result, Err(crate::CliError::Typed {
+            kind: locket_core::LocketError::MetadataInvalid, ref message,
+        }) if message.contains("identifier is ambiguous")));
+        assert_eq!(output, b"");
+    }
+    assert_eq!(store.list_passkey_credentials(&project_id, false)?.len(), 2);
+    store.revoke_passkey_credential(&project_id, &second.id, 300)?;
+    let wrong_confirmation = context_with_confirmation(&context, "different key");
+    let result = run_with_context(
+        Cli::try_parse_from(["locket", "passkey", "remove", "work-laptop"])?,
+        &wrong_confirmation,
+        &mut Vec::new(),
+    );
+    assert!(matches!(
+        result,
+        Err(crate::CliError::Typed { kind: locket_core::LocketError::ConfirmationFailed, .. })
+    ));
+    assert_eq!(store.list_passkey_credentials(&project_id, false)?.len(), 1);
+
     let mut remove_output = Vec::new();
     run_with_context(
         Cli::try_parse_from(["locket", "passkey", "remove", "work-laptop"])?,
@@ -849,8 +883,8 @@ fn passkey_list_and_remove_use_project_store_and_audit() -> Result<(), Box<dyn s
     let active = store.list_passkey_credentials(&project_id, false)?;
     assert_eq!(active.len(), 0);
     let all = store.list_passkey_credentials(&project_id, true)?;
-    assert_eq!(all.len(), 1);
-    assert!(all[0].revoked_at.is_some());
+    assert_eq!(all.len(), 2);
+    assert!(all.iter().all(|key| key.revoked_at.is_some()));
     let metadata: String = store.connection().query_row(
         "SELECT metadata_json FROM audit_log WHERE action = 'PASSKEY_REMOVE'",
         [],

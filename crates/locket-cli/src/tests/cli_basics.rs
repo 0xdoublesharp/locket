@@ -1580,3 +1580,55 @@ fn context_json_returns_real_metadata_and_never_creates_missing_stores()
     );
     Ok(())
 }
+
+#[test]
+fn client_create_with_invalid_recovery_code_cleans_up_unregistered_key()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let test = test_context(&directory);
+    for args in [
+        vec!["locket", "init", "--name", "app", "--no-device", "--no-passkey", "--recovery-code"],
+        vec!["locket", "policy", "add", "ci", "--", "cargo", "test"],
+    ] {
+        run_with_context(Cli::try_parse_from(args)?, &test, &mut Vec::new())?;
+    }
+    let envelope_path = directory.path().join(".locket/recovery/envelope.bin");
+    let initial_envelope = fs::read(&envelope_path)?;
+    let context = context_with_recovery_code(&test, "invalid-synthetic-recovery-code");
+    let mut output = Vec::new();
+    let result = run_with_context(
+        Cli::try_parse_from([
+            "locket",
+            "client",
+            "create",
+            "unregistered",
+            "--action",
+            "run-policy",
+            "--policy",
+            "ci",
+            "--storage",
+            "wrapped-local-file",
+        ])?,
+        &context,
+        &mut output,
+    );
+    let error = result.err().ok_or("invalid recovery code accepted")?;
+    assert!(!error.to_string().contains("invalid-synthetic-recovery-code"));
+    assert_eq!(output, b"");
+    assert_eq!(fs::read(envelope_path)?, initial_envelope);
+    assert_eq!(fs::read_dir(directory.path().join("automation-clients"))?.count(), 0);
+    run_with_context(
+        Cli::try_parse_from(["locket", "client", "list", "--all"])?,
+        &context,
+        &mut output,
+    )?;
+    assert!(String::from_utf8(output)?.contains("clients: none"));
+    let store = crate::open_store(&context)?;
+    let clients = store.connection().query_row(
+        "SELECT COUNT(*) FROM automation_client_private_key_refs",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    assert_eq!(clients, 0);
+    Ok(())
+}

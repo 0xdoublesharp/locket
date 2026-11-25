@@ -63,20 +63,23 @@ fn parity_report(context: &RuntimeContext, args: &ParityArgs) -> Result<Value, C
     let store = require_metadata_store(context)?;
     let (project_id, root) = if let Some(selector) = &args.project {
         let project = select_project(&store, &context.cwd, selector)?;
-        let local = crate::resolve_project(&context.cwd)?.filter(|resolved| {
-            resolved.config.project_id.as_str() == project.id
-                && crate::ensure_trusted_project_root(&store, resolved).is_ok()
-        });
-        let workspace = if local.is_some() || !args.check_plaintext {
-            local
+        let workspace = if args.check_plaintext {
+            let local = crate::resolve_project(&context.cwd)?.filter(|resolved| {
+                resolved.config.project_id.as_str() == project.id
+                    && crate::ensure_trusted_project_root(&store, resolved).is_ok()
+            });
+            match local {
+                Some(resolved) => Some(resolved),
+                None => trusted_project_config(&store, &project.id)?,
+            }
         } else {
-            trusted_project_config(&store, &project.id)?
+            None
         };
         (project.id, workspace.map(|resolved| resolved.root))
     } else {
         let resolved = require_project(context)?;
         crate::ensure_trusted_project_root(&store, &resolved)?;
-        (resolved.config.project_id.into_string(), Some(resolved.root))
+        (resolved.config.project_id.into_string(), args.check_plaintext.then_some(resolved.root))
     };
 
     let profiles = store.list_profiles(&project_id)?;

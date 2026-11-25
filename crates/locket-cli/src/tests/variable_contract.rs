@@ -311,3 +311,89 @@ allow_commands=['allowed']
     assert!(!context.store_path.exists());
     Ok(())
 }
+
+#[test]
+fn env_inspect_explains_external_conflicts_scoped_names_and_public_defaults()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context_with_secret_value(&directory, "inspect-synthetic-vault-canary");
+    let run = |ctx: &RuntimeContext, args: &[&str]| -> Result<String, Box<dyn std::error::Error>> {
+        let mut output = Vec::new();
+        let code = run_with_context(Cli::try_parse_from(args)?, ctx, &mut output)?;
+        assert_eq!(code, 0);
+        let output = String::from_utf8(output)?;
+        for value in [
+            "inspect-synthetic-vault-canary",
+            "inspect-synthetic-env-canary",
+            "inspect-synthetic-public-default",
+        ] {
+            assert!(!output.contains(value));
+        }
+        Ok(output)
+    };
+    run(&context, &["locket", "init", "--name", "app", "--no-device", "--no-passkey"])?;
+    run(&context, &["locket", "profile", "create", "staging"])?;
+    run(
+        &context,
+        &["locket", "set", "APP_TOKEN", "--source", "user-local", "--profile", "staging"],
+    )?;
+    run(
+        &context,
+        &["locket", "set", "APP_TOKEN", "--source", "machine-local", "--profile", "staging"],
+    )?;
+    fs::write(context.cwd.join(".env.dev"), "APP_TOKEN=inspect-synthetic-env-canary\n")?;
+    let child_dir = context.cwd.join("apps/api");
+    fs::create_dir_all(&child_dir)?;
+    let path = context.cwd.join("locket.toml");
+    let base = fs::read_to_string(&path)?;
+    let scoped = RuntimeContext { cwd: child_dir, ..context.clone() };
+    for (mode, decision) in [
+        ("error", "error-conflict"),
+        ("preserve", "preserve-existing"),
+        ("locket", "inject-overwrite"),
+    ] {
+        let document = format!(
+            r"{base}
+[commands.dev]
+argv = ['never-run']
+required_secrets = ['APP_TOKEN', 'PUBLIC_MODE']
+optional_secrets = ['OPTIONAL_TOKEN']
+shared_secrets = ['SHARED_SERVICE_KEY']
+override = '{mode}'
+external_env_sources = [{{file = '.env.dev'}}]
+
+[paths.'apps/api']
+profile = 'staging'
+optional_secrets = ['SCOPED_NAME']
+
+[variables.PUBLIC_MODE]
+classification = 'public'
+default = 'inspect-synthetic-public-default'
+description = 'Public display mode'
+setup_hint = 'Choose an app mode'
+"
+        );
+        fs::write(&path, document)?;
+        let report = run(&scoped, &["locket", "env", "inspect", "--policy", "dev"])?;
+        assert!(report.contains("path_scope=apps/api"));
+        assert!(report.contains("path_scope_profile=staging"));
+        assert!(report.contains("Public display mode"));
+        assert!(report.contains("Choose an app mode"));
+        assert!(report.lines().any(|line| {
+            line.starts_with("secret APP_TOKEN ")
+                && line.contains("conflicts=multiple-active-sources,external-source")
+                && line.ends_with(decision)
+        }));
+        for (name, decision) in [
+            ("PUBLIC_MODE", "public-default"),
+            ("SHARED_SERVICE_KEY", "missing-required"),
+            ("SCOPED_NAME", "skip-missing"),
+        ] {
+            assert!(report.lines().any(
+                |line| line.starts_with(&format!("secret {name} ")) && line.ends_with(decision)
+            ));
+        }
+    }
+    assert!(!context.cwd.join("never-run").exists());
+    Ok(())
+}

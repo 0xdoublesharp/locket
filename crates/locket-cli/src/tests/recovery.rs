@@ -298,6 +298,14 @@ fn recovery_restore_requires_device_entries_when_local_device_exists()
     };
     assert_eq!(error.exit_code(), locket_core::LocketError::UnrecoverableVault.exit_code());
     assert!(error.to_string().contains("device_signing_private_key"));
+    assert!(
+        matches!(
+            context.key_store.load_master_key(&project_id),
+            Err(PlatformError::MasterKeyNotFound)
+        ),
+        "a rejected envelope must not install a master key"
+    );
+
     Ok(())
 }
 
@@ -998,5 +1006,52 @@ fn recovery_rotation_rejection_or_audit_failure_preserves_previous_backup()
         assert_eq!(fs::read(dir.join("envelope.bin"))?, previous);
         assert_eq!(crate::load_recovery_kdf_toml(&dir)?.kdf_profile_id, old_kdf.kdf_profile_id);
     }
+    Ok(())
+}
+
+#[test]
+fn recovery_rotate_creates_first_envelope_without_reading_an_old_code()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context_with_secret_value(&directory, "recover-first-synthetic-canary");
+    for args in [
+        vec!["locket", "init", "--name", "app", "--no-device", "--no-passkey"],
+        vec!["locket", "set", "SERVICE_KEY"],
+    ] {
+        run_with_context(Cli::try_parse_from(args)?, &context, &mut Vec::new())?;
+    }
+    let recovery_dir = directory.path().join(".locket/recovery");
+    assert!(!recovery_dir.join("envelope.bin").exists());
+    // The default recovery-code reader returns an empty string, so any
+    // attempt to unwrap an old envelope fails.
+    let mut output = Vec::new();
+    run_with_context(
+        Cli::try_parse_from(["locket", "recovery", "rotate"])?,
+        &context,
+        &mut output,
+    )?;
+    let output = String::from_utf8(output)?;
+    assert!(!output.contains("recover-first-synthetic-canary"));
+    let code = recovery_code_from_output(&output)?;
+    let resolved = crate::require_project(&context)?;
+    let kdf = crate::load_recovery_kdf_toml(&recovery_dir)?;
+    let envelope = crate::load_recovery_envelope(&recovery_dir)?;
+    assert_eq!(envelope.entries.len(), 1);
+    assert_eq!(envelope.entries[0].entry_kind, "master_key");
+    let project = resolved.config.project_id.as_str();
+    let original = context.key_store.load_master_key(project)?;
+    context.key_store.delete_master_key(project)?;
+    let mut restored = Vec::new();
+    run_with_context(
+        Cli::try_parse_from(["locket", "recover"])?,
+        &context_with_recovery_code(&context, code),
+        &mut restored,
+    )?;
+    let restored = String::from_utf8(restored)?;
+    assert!(restored.contains("recovered: master_key"));
+    assert!(!restored.contains(code));
+    assert_eq!(*context.key_store.load_master_key(project)?, *original);
+    assert!(!restored.contains("recover-first-synthetic-canary"));
+    assert_eq!(kdf.kdf_profile_id, envelope.kdf_profile_id);
     Ok(())
 }

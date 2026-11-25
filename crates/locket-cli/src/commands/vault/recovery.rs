@@ -156,6 +156,7 @@ pub fn restore_from_recovery_code(
         .map_err(|error| metadata_invalid_error(format!("recovery kdf salt: {error}")))?;
     let unwrap_root = derive_recovery_key_v1(code_bytes, &salt, kdf.to_crypto_params())?;
     let mut restored = RecoveryRestoreSummary::default();
+    let mut recovered_master = None;
     for entry in &envelope.entries {
         if entry.entry_kind != "master_key" {
             continue;
@@ -176,12 +177,14 @@ pub fn restore_from_recovery_code(
         }
         let mut master_key = zeroize::Zeroizing::new([0_u8; locket_crypto::KEY_LEN]);
         master_key.copy_from_slice(&plaintext);
-        context.key_store.store_master_key(project_id, &master_key)?;
+        recovered_master = Some(master_key);
         restored.master += 1;
     }
-    if restored.master == 0 {
-        return Err(metadata_invalid_error("no master_key entries found in recovery envelope"));
-    }
+    let master_key = recovered_master.ok_or_else(|| {
+        metadata_invalid_error("no master_key entries found in recovery envelope")
+    })?;
+    let device_keys = read_device_recovery_keys(context, project_id, kdf, envelope, &unwrap_root)?;
+    context.key_store.store_master_key(project_id, &master_key)?;
     restore_automation_client_private_keys(
         context,
         resolved,
@@ -190,7 +193,14 @@ pub fn restore_from_recovery_code(
         &unwrap_root,
         &mut restored,
     )?;
-    restore_device_private_keys(context, resolved, kdf, envelope, &unwrap_root, &mut restored)?;
+    if let Some(keys) = device_keys {
+        let storage =
+            crate::commands::team::device::build_device_private_key_storage(context, project_id)?;
+        storage.store(&keys.device_id, &keys.sealing)?;
+        storage.for_signing().store(&keys.fingerprint, &keys.signing)?;
+        restored.device_signing_private += 1;
+        restored.device_sealing_private += 1;
+    }
     write_recover_audit(
         context,
         resolved,
@@ -224,18 +234,23 @@ struct RecoveryRestoreSummary {
     skipped_automation_client_private: usize,
 }
 
-fn restore_device_private_keys(
+struct DeviceRecoveryKeys {
+    device_id: String,
+    fingerprint: String,
+    signing: zeroize::Zeroizing<locket_crypto::KeyBytes>,
+    sealing: zeroize::Zeroizing<locket_crypto::KeyBytes>,
+}
+
+fn read_device_recovery_keys(
     context: &RuntimeContext,
-    resolved: &ResolvedProject,
+    project_id: &str,
     kdf: &RecoveryKdfToml,
     envelope: &RecoveryEnvelope,
     unwrap_root: &locket_crypto::KeyBytes,
-    restored: &mut RecoveryRestoreSummary,
-) -> Result<(), CliError> {
-    let project_id = resolved.config.project_id.as_str();
+) -> Result<Option<DeviceRecoveryKeys>, CliError> {
     let store = open_store(context)?;
     let Some(device) = store.get_active_local_device(project_id)? else {
-        return Ok(());
+        return Ok(None);
     };
     let signing = open_required_device_recovery_entry(
         envelope,
@@ -267,17 +282,16 @@ fn restore_device_private_keys(
     }
     let mut sealing_key = zeroize::Zeroizing::new([0_u8; locket_crypto::KEY_LEN]);
     sealing_key.copy_from_slice(&sealing);
-    let storage =
-        crate::commands::team::device::build_device_private_key_storage(context, project_id)?;
     let derived = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*sealing_key));
     if derived.as_bytes().as_slice() != device.sealing_public_key.as_slice() {
         return Err(metadata_invalid_error("recovery envelope device sealing key mismatch"));
     }
-    storage.store(&device.id, &sealing_key)?;
-    storage.for_signing().store(&device.fingerprint, &signing_key)?;
-    restored.device_signing_private += 1;
-    restored.device_sealing_private += 1;
-    Ok(())
+    Ok(Some(DeviceRecoveryKeys {
+        device_id: device.id,
+        fingerprint: device.fingerprint,
+        signing: signing_key,
+        sealing: sealing_key,
+    }))
 }
 
 fn open_required_device_recovery_entry(

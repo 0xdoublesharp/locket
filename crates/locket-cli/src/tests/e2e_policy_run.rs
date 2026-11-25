@@ -870,3 +870,100 @@ impl TestAgent {
         Ok(())
     }
 }
+
+#[test]
+fn run_does_not_leave_runtime_sessions_after_spawn_or_registration_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context_with_secret_value(&directory, "runtime-synthetic-canary");
+    for args in [
+        vec!["locket", "init", "--name", "app", "--no-device", "--no-passkey"],
+        vec!["locket", "set", "RUNTIME_TOKEN"],
+        vec!["locket", "policy", "add", "missing-program", "--", "locket-missing-runtime-fixture"],
+        vec!["locket", "policy", "add", "register-fails", "--", test_true()],
+        vec!["locket", "policy", "require", "missing-program", "RUNTIME_TOKEN"],
+        vec!["locket", "policy", "require", "register-fails", "RUNTIME_TOKEN"],
+    ] {
+        run_with_context(Cli::try_parse_from(args)?, &context, &mut Vec::new())?;
+    }
+    let store = crate::open_store(&context)?;
+    let session_count = || {
+        store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM runtime_sessions", [], |row| row.get::<_, i64>(0))
+    };
+    let mut output = Vec::new();
+    let missing = run_with_context(
+        Cli::try_parse_from(["locket", "run", "missing-program"])?,
+        &context,
+        &mut output,
+    );
+    assert!(
+        matches!(missing, Err(crate::CliError::Io(ref error)) if error.kind() == std::io::ErrorKind::NotFound)
+    );
+    assert_eq!(session_count()?, 0);
+
+    store.connection().execute_batch(
+        "CREATE TRIGGER fixture_fail_registration BEFORE INSERT ON runtime_sessions
+         BEGIN SELECT RAISE(ABORT, 'fixture registration failed'); END;",
+    )?;
+    let result = run_with_context(
+        Cli::try_parse_from(["locket", "run", "register-fails"])?,
+        &context,
+        &mut output,
+    );
+    let error = result.err().ok_or("registration failure was ignored")?;
+    assert!(error.to_string().contains("fixture registration failed"));
+    assert!(!error.to_string().contains("runtime-synthetic-canary"));
+    assert!(!String::from_utf8(output)?.contains("runtime-synthetic-canary"));
+    assert_eq!(session_count()?, 0);
+    Ok(())
+}
+
+#[test]
+fn invalid_dotenv_source_is_reported_without_printing_values_or_starting_child()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--name", "app", "--no-device", "--no-passkey"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    fs::write(
+        context.cwd.join(".env.runtime"),
+        "APP_TOKEN=runtime-valid-synthetic-canary\nOTHER_TOKEN='runtime-invalid-synthetic-canary\n",
+    )?;
+    fs::OpenOptions::new().append(true).open(context.cwd.join("locket.toml"))?.write_all(
+        br#"
+[commands.dev]
+argv = ["deliberately-missing-fixture-command"]
+required_secrets = ["APP_TOKEN", "OTHER_TOKEN"]
+external_env_sources = [{file = ".env.runtime"}]
+"#,
+    )?;
+    let mut output = Vec::new();
+    let result =
+        run_with_context(Cli::try_parse_from(["locket", "run", "dev"])?, &context, &mut output);
+    let error = result.err().ok_or("invalid dotenv source accepted")?;
+    assert_eq!(error.exit_code(), locket_core::LocketError::MetadataInvalid.exit_code());
+    let text = error.to_string();
+    assert!(text.contains("external env file line 2"));
+    assert!(!text.contains("synthetic-canary"));
+    assert!(!String::from_utf8(output)?.contains("synthetic-canary"));
+    let store = crate::open_store(&context)?;
+    let denied: String = store.connection().query_row(
+        "SELECT metadata_json FROM audit_log WHERE action='RUN_POLICY' AND status='DENIED'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert!(!denied.contains("synthetic-canary"));
+    let metadata: serde_json::Value = serde_json::from_str(&denied)?;
+    assert_eq!(metadata["failure_reason"], "external_source_metadata_invalid");
+    let sessions: u32 =
+        store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM runtime_sessions", [], |row| row.get(0))?;
+    assert_eq!(sessions, 0);
+    Ok(())
+}

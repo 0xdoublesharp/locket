@@ -1047,3 +1047,168 @@ fn mcp_env_import_project_requires_its_root_and_confirms_dangerous_overwrite()
     assert_eq!(version()?, 2);
     Ok(())
 }
+
+#[test]
+fn explicit_profile_get_resolves_only_the_selected_project_profile_and_source()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let context = test_context_with_secret_value(&directory, CANARY);
+    init(&context, "app")?;
+    run(&context, &["profile", "create", "staging"])?;
+    for source in ["user-local", "machine-local"] {
+        run(&context, &["set", "SHARED_NAME", "--profile", "staging", "--source", source])?;
+    }
+    let project = crate::require_project(&context)?;
+    let id = project.config.project_id.as_str();
+    let (_, out) = run(&context, &["get", "--project", id, "--profile", "staging", "SHARED_NAME"])?;
+    assert_eq!(out, "SHARED_NAME source=machine-local version=1\n");
+    let (_, out) =
+        run(&context, &["get", "--profile", "staging", "SHARED_NAME", "--source", "user-local"])?;
+    assert_eq!(out, "SHARED_NAME source=user-local version=1\n");
+
+    for (args, expected) in [
+        (
+            vec!["get", "--project", id, "--profile", "staging", "bad name"],
+            LocketError::InvalidSecretName,
+        ),
+        (
+            vec!["get", "--project", id, "--profile", "dev", "SHARED_NAME"],
+            LocketError::SecretNotFound,
+        ),
+        (
+            vec!["get", "--project", "missing-vault", "--profile", "staging", "SHARED_NAME"],
+            LocketError::ProjectNotFound,
+        ),
+        (
+            vec![
+                "get",
+                "--project",
+                id,
+                "--profile",
+                "staging",
+                "SHARED_NAME",
+                "--source",
+                "team-managed",
+            ],
+            LocketError::SecretNotFound,
+        ),
+    ] {
+        let mut out = Vec::new();
+        let result = run_with_context(
+            Cli::try_parse_from(std::iter::once("locket").chain(args))?,
+            &context,
+            &mut out,
+        );
+        let error = result.err().ok_or("invalid scope accepted")?;
+        assert_eq!(error.exit_code(), expected.exit_code());
+        assert_eq!(out, b"");
+        assert!(!error.to_string().contains(CANARY));
+    }
+    let store = crate::open_store(&context)?;
+    let profile = store.get_profile_by_name(id, "staging")?.ok_or("missing profile")?;
+    store.connection().execute(
+        "UPDATE secrets SET state='deleted' WHERE project_id=?1 AND profile_id=?2 AND source='machine-local'",
+        [id, &profile.id],
+    )?;
+    let mut out = Vec::new();
+    let cli = Cli::try_parse_from([
+        "locket",
+        "get",
+        "--profile",
+        "staging",
+        "SHARED_NAME",
+        "--source",
+        "machine-local",
+    ])?;
+    let error = run_with_context(cli, &context, &mut out).err().ok_or("deleted source returned")?;
+    assert_eq!(error.exit_code(), LocketError::SecretDeleted.exit_code());
+    assert_eq!(out, b"");
+    let (_, out) = run(&context, &["get", "--profile", "staging", "SHARED_NAME"])?;
+    assert_eq!(out, "SHARED_NAME source=user-local version=1\n");
+    Ok(())
+}
+
+#[test]
+fn discovery_human_output_marks_dangerous_profiles_and_ambiguous_projects_fail_closed()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let a = directory.path().join("project-a");
+    let b = directory.path().join("project-b");
+    fs::create_dir(&a)?;
+    fs::create_dir(&b)?;
+    let context = RuntimeContext {
+        key_store: Arc::new(ProjectKeys::default()),
+        ..test_context_with_secret_value(&directory, CANARY)
+    };
+    let a = RuntimeContext { cwd: a, ..context.clone() };
+    let b = RuntimeContext { cwd: b, ..context.clone() };
+    init(&a, "app")?;
+    init(&b, "app")?;
+    run(&a, &["set", "TOKEN_A"])?;
+    run(&b, &["set", "TOKEN_B"])?;
+    let project = crate::require_project(&a)?;
+    let id = project.config.project_id.as_str();
+    let store = Store::open(&context.store_path)?;
+    store.connection().execute("UPDATE profiles SET dangerous=1 WHERE project_id=?1", [id])?;
+
+    let (_, list) = run(&context, &["project", "list"])?;
+    assert!(list.contains("profile dev [dangerous]"));
+    assert!(list.contains("project-a"));
+    assert!(list.contains("project-b"));
+    assert!(!list.contains(CANARY));
+    let (_, matches) = run(&context, &["discover", "--project", "project-a", "--name", "TOKEN_*"])?;
+    assert!(matches.contains("TOKEN_A"));
+    assert!(matches.contains("[dangerous]"));
+    assert!(!matches.contains("TOKEN_B"));
+    assert!(!matches.contains(CANARY));
+
+    let (code, error) = json_run(&context, &["discover", "--project", "app", "--json"])?;
+    assert_eq!(code, LocketError::InvalidReference.exit_code());
+    assert_eq!(error["error"]["code"], "InvalidReference");
+    assert_eq!(error["error"]["message"], "project selector is ambiguous; select by project id");
+    Ok(())
+}
+
+#[test]
+fn parity_checks_plaintext_only_on_explicit_request_and_uses_trusted_root()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let root = directory.path().join("trusted");
+    let clone = directory.path().join("untrusted");
+    fs::create_dir(&root)?;
+    fs::create_dir(&clone)?;
+    let context =
+        RuntimeContext { cwd: root.clone(), ..test_context_with_secret_value(&directory, CANARY) };
+    init(&context, "app")?;
+    run(&context, &["set", "PRIVATE_TOKEN"])?;
+    fs::write(root.join(".env.dev"), format!("PRIVATE_TOKEN={CANARY}\n"))?;
+    fs::write(clone.join(".env.clone"), format!("PRIVATE_TOKEN={CANARY}\n"))?;
+    fs::copy(root.join("locket.toml"), clone.join("locket.toml"))?;
+    let project = crate::require_project(&context)?;
+    let id = project.config.project_id.as_str();
+    let outside = RuntimeContext { cwd: clone, ..context.clone() };
+    for (context, args) in [
+        (&context, vec!["parity", "--json"]),
+        (&context, vec!["parity", "--project", id, "--json"]),
+        (&outside, vec!["parity", "--project", id, "--json"]),
+    ] {
+        let (code, report) = json_run(context, &args)?;
+        assert_eq!(code, 0);
+        assert_eq!(report["plaintext_checked"], false);
+        assert_eq!(report["plaintext_drift"], json!([]));
+    }
+
+    let (code, rejected) = json_run(&outside, &["parity", "--check-plaintext", "--json"])?;
+    assert_eq!(code, LocketError::ProjectRootUntrusted.exit_code());
+    assert_eq!(rejected["error"]["code"], "ProjectRootUntrusted");
+    let (code, checked) =
+        json_run(&outside, &["parity", "--project", id, "--check-plaintext", "--json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(checked["plaintext_checked"], true);
+    assert_eq!(checked["plaintext_drift"], json!([{"file": ".env.dev", "overlap_count": 1}]));
+    let (_, human) = run(&context, &["parity", "--check-plaintext"])?;
+    assert!(human.contains("dev: missing []"));
+    assert!(human.contains("plaintext drift: .env.dev (1 overlapping keys)"));
+    assert!(!human.contains(CANARY));
+    Ok(())
+}

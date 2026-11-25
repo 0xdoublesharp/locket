@@ -2594,6 +2594,41 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn malformed_profile_keys_fail_without_committing_bundle_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path().join("store.db"))?;
+        store.initialize_schema()?;
+        store.insert_project_if_absent("project", "Project", 1)?;
+        for (purpose, material, message) in [
+            ("invalid-purpose", "AQ", "unknown profile key purpose in bundle"),
+            (
+                "profile-secret",
+                "invalid-synthetic-key%",
+                "profile key material is not valid base64url",
+            ),
+            ("profile-secret", "AQ", "profile key material has wrong length"),
+        ] {
+            let mut payload = import_fixture("incoming", "incoming-secret", 1)?;
+            payload.profile_keys.push(SealedBundleProfileKeyV1 {
+                profile_id: "incoming".to_owned(),
+                purpose: purpose.to_owned(),
+                key_material_b64: material.to_owned(),
+            });
+            refresh_fixture_counts(&mut payload);
+            let error =
+                import_apply(&mut store, "project", &payload, ConflictResolution::AcceptIncoming)
+                    .err()
+                    .ok_or("malformed profile key was applied")?;
+            assert!(error.to_string().contains(message), "{error}");
+            assert!(!error.to_string().contains("invalid-synthetic-key"));
+            assert_eq!(store.list_profiles("project")?, Vec::new());
+            assert_eq!(store.list_secrets_by_profile("project", "incoming")?, Vec::new());
+        }
+        Ok(())
+    }
+
     fn import_fixture(
         profile: &str,
         id: &str,

@@ -103,3 +103,88 @@ fn env_flag_set(name: &str) -> bool {
 fn env_value_is(name: &str, values: &[&str]) -> bool {
     env::var(name).is_ok_and(|actual| values.iter().any(|value| actual.eq_ignore_ascii_case(value)))
 }
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    #[test]
+    fn style_respects_color_opt_in_and_no_color_override() -> Result<(), Box<dyn std::error::Error>>
+    {
+        const MODE: &str = "LOCKET_TEST_STYLE_CHILD";
+        if let Ok(mode) = std::env::var(MODE) {
+            return check_init_output(mode == "ansi");
+        }
+
+        // Color settings are process-wide. Isolate both cases from the parallel harness.
+        for mode in ["ansi", "plain"] {
+            let mut command = std::process::Command::new(std::env::current_exe()?);
+            command
+                .args([
+                    "--exact",
+                    "support::style::tests::style_respects_color_opt_in_and_no_color_override",
+                ])
+                .env(MODE, mode)
+                .env("LOCKET_STYLE", "ANSI")
+                .env_remove("FORCE_COLOR")
+                .env_remove("CLICOLOR_FORCE")
+                .env_remove("NO_COLOR");
+            if mode == "plain" {
+                command.env("NO_COLOR", "1");
+            }
+            let output = command.output()?;
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));
+            assert!(String::from_utf8(output.stdout)?.contains("1 passed"));
+        }
+        Ok(())
+    }
+
+    fn check_init_output(ansi: bool) -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let context = crate::tests::test_context(&directory);
+        let template_directory = tempfile::tempdir()?;
+        let mut output = Vec::new();
+        let init =
+            ["locket", "init", "--no-passkey", "--no-device", "--name", "app", "--recovery-code"];
+        let template = ["locket", "new", "--from-template", "basic"];
+        for (args, show_recovery) in [(&init[..], true), (&init[..], false), (&template[..], false)]
+        {
+            // Give the template flow its own project while using the same in-memory key store.
+            let path = if args[1] == "new" {
+                template_directory.path().to_path_buf()
+            } else {
+                directory.path().to_path_buf()
+            };
+            let context = crate::RuntimeContext { cwd: path, ..context.clone() };
+            output.clear();
+            crate::run_with_context(crate::Cli::try_parse_from(args)?, &context, &mut output)?;
+            let text = std::str::from_utf8(&output)?;
+            assert_eq!(text.contains("\x1b["), ansi);
+            assert!(text.contains("project"));
+            if ansi {
+                assert!(text.contains("\x1b[38;5;51m==[ locket ]==\x1b[0m"));
+                assert!(text.contains("\x1b[38;5;117mproject_id"));
+            }
+            let color = "\x1b[1;38;5;226m";
+            let codes = text
+                .lines()
+                .filter(|line| {
+                    let candidate = line
+                        .trim()
+                        .strip_prefix(color)
+                        .and_then(|line| line.strip_suffix("\x1b[0m"))
+                        .unwrap_or(line);
+                    locket_crypto::recovery_code_decode(candidate).is_ok()
+                })
+                .count();
+            assert_eq!(codes, usize::from(show_recovery));
+        }
+        let mut output = Vec::new();
+        super::write_banner(&mut output, "status", "ready")?;
+        super::write_kv(&mut output, "metadata_only", "yes")?;
+        if !ansi {
+            assert_eq!(String::from_utf8(output)?, "status: ready\nmetadata_only: yes\n");
+        }
+        Ok(())
+    }
+}

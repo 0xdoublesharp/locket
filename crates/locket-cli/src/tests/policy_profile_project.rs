@@ -1652,3 +1652,68 @@ fn use_non_dangerous_profile_requires_no_confirmation() -> Result<(), Box<dyn st
     assert!(output.contains("active profile: staging"));
     Ok(())
 }
+
+#[test]
+fn policy_refresh_refuses_changed_source_even_after_correct_confirmation()
+-> Result<(), Box<dyn std::error::Error>> {
+    struct ChangeWhileConfirming {
+        path: PathBuf,
+        replacement: String,
+    }
+
+    impl crate::ConfirmationReader for ChangeWhileConfirming {
+        fn read_confirmation(&self, prompt: &str) -> Result<String, crate::CliError> {
+            assert_eq!(prompt, "policy refresh");
+            fs::write(&self.path, &self.replacement)?;
+            Ok("dev\n".to_owned())
+        }
+    }
+
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    let path = context.cwd.join("locket.toml");
+    for args in [
+        vec!["locket", "init", "--name", "app", "--no-device", "--no-passkey"],
+        vec!["locket", "policy", "add", "dev", "--", test_true()],
+    ] {
+        run_with_context(Cli::try_parse_from(args)?, &context, &mut Vec::new())?;
+    }
+    let original = fs::read_to_string(&path)?;
+    let store = crate::open_store(&context)?;
+    let before: String = store.connection().query_row(
+        "SELECT normalized_json FROM command_policies WHERE name='dev'",
+        [],
+        |row| row.get(0),
+    )?;
+    let proposed = format!("{original}\nshared_secrets=['NEW_ACCESS']\n");
+    fs::write(&path, &proposed)?;
+    let replacement = proposed.replace("NEW_ACCESS", "UNREVIEWED_ACCESS");
+    let approving = RuntimeContext {
+        confirmation_reader: Arc::new(ChangeWhileConfirming {
+            path: path.clone(),
+            replacement: replacement.clone(),
+        }),
+        ..context
+    };
+
+    let mut output = Vec::new();
+    let result = run_with_context(
+        Cli::try_parse_from(["locket", "policy", "refresh", "dev"])?,
+        &approving,
+        &mut output,
+    );
+    assert!(matches!(result, Err(crate::CliError::Typed {
+        kind: locket_core::LocketError::MetadataInvalid, ref message
+    }) if message == "command configuration changed during approval; retry policy refresh"));
+    let review = String::from_utf8(output)?;
+    assert!(review.contains("shared_secret_names: NEW_ACCESS"));
+    assert!(!review.contains("UNREVIEWED_ACCESS"));
+    let after: String = store.connection().query_row(
+        "SELECT normalized_json FROM command_policies WHERE name='dev'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(before, after);
+    assert_eq!(fs::read_to_string(path)?, replacement);
+    Ok(())
+}

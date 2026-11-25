@@ -402,3 +402,34 @@ fn copy_dangerous_profile_with_flag_succeeds() -> Result<(), Box<dyn std::error:
     assert!(output.contains("metadata_only=yes"));
     Ok(())
 }
+
+#[test]
+fn reveal_and_clipboard_aliases_enforce_dangerous_scope_before_value_access()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context_with_secret_value(&directory, "alias-synthetic-canary");
+    for args in [
+        vec!["locket", "init", "--name", "app", "--no-device", "--no-passkey"],
+        vec!["locket", "set", "DATABASE_URL"],
+    ] {
+        run_with_context(Cli::try_parse_from(args)?, &context, &mut Vec::new())?;
+    }
+    mark_default_profile_dangerous(&directory)?;
+    for (args, audit_action, access_mode) in [
+        (vec!["locket", "reveal", "DATABASE_URL", "--force"], "REVEAL", "stdout"),
+        (vec!["locket", "cp", "DATABASE_URL"], "COPY", "clipboard"),
+    ] {
+        let mut output = Vec::new();
+        let error = run_with_context(Cli::try_parse_from(args)?, &context, &mut output)
+            .err()
+            .ok_or("alias bypassed dangerous profile confirmation")?;
+        assert_eq!(
+            error.exit_code(),
+            locket_core::LocketError::DangerousProfileConfirmationRequired.exit_code(),
+        );
+        assert_eq!(output, b"");
+        assert!(!error.to_string().contains("alias-synthetic-canary"));
+        assert_dangerous_denial_audit_row(&directory, audit_action, access_mode)?;
+    }
+    Ok(())
+}
