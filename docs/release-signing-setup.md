@@ -143,8 +143,7 @@ Calendar membership renewal and each certificate's actual expiration, with an
 owner and advance reminders. Issue replacements before the next signed release
 needs them. Existing apps may continue after certificate expiry; revocation can
 prevent signed apps from installing or launching. Treat Installer certificate
-expiry as a package re-signing and requalification gate rather than relying on
-old downloads remaining usable. See
+expiry as a package re-signing and requalification gate. See
 [Apple's expiry guidance](https://developer.apple.com/help/account/certificates/create-developer-id-certificates/).
 
 If a private key may be compromised, stop releases, isolate the signing host, and
@@ -165,7 +164,7 @@ does not revoke its certificate.
 | Direct-download VSIX and release manifests | Confirm possession and operation of the offline release quorum described in the existing release-key documents. Apple and Windows certificates do not satisfy that trust requirement. |
 
 Microsoft documents SignTool's certificate selection, SHA-256 signing,
-timestamping and verification in its [SignTool reference](https://learn.microsoft.com/en-us/windows/win32/seccrypto/signtool).
+timestamping, and verification in its [SignTool reference](https://learn.microsoft.com/en-us/windows/win32/seccrypto/signtool).
 The current script signs the MSI container; separately verify the signature
 coverage required for its installed executables before calling Windows signing
 complete.
@@ -184,11 +183,11 @@ private material off build runners.
 From the release commit, run `make reproducible-check` with the pinned Rust
 toolchain, the native compiler and SDK used for the target, and the locked Cargo
 dependencies already cached. The release workflow runs this check on Linux and
-macOS after fetching the locked dependencies. On a local Mac, use the shared
-compute broker.
+macOS after fetching the locked dependencies. On macOS, set `TMPDIR` to a short
+writable path:
 
 ```sh
-TMPDIR=/Volumes/Scratch/locket/t compute run --class heavy --where local --sync "$PWD" -- make reproducible-check
+TMPDIR=/Volumes/Scratch/locket/t make reproducible-check
 ```
 
 The check builds the release-profile `locket` CLI offline in two fresh build
@@ -210,7 +209,7 @@ for the current dependency graph. Replace those exemptions with review records
 as audits are completed. Use `safe-to-deploy` for shipped dependencies and
 `safe-to-run` for test-only dependencies. For the dependencies below, require
 `safe-to-deploy` coverage for every version used by a shipped target before
-approving the release. [Cargo Vet setup](https://mozilla.github.io/cargo-vet/setup.html).
+approving the release; see [Cargo Vet setup](https://mozilla.github.io/cargo-vet/setup.html).
 
 | Dependency | Review scope |
 | --- | --- |
@@ -224,8 +223,8 @@ safe-to-deploy` after reviewing the published source. Review the diff from the
 last audited version when upgrading. Import third-party audits only after
 verifying the audit publisher, review criteria, and version coverage. Require
 version-specific audits for the four dependencies above and keep any other
-temporary exemptions scoped to a version with an owner, reason, and expiry.
-[Cargo Vet audit commands](https://mozilla.github.io/cargo-vet/commands.html#cargo-vet-certify).
+temporary exemptions scoped to a version with an owner, reason, and expiry;
+see [Cargo Vet audit commands](https://mozilla.github.io/cargo-vet/commands.html#cargo-vet-certify).
 
 Commit the vetted `supply-chain/` records with the lockfile and run
 `cargo vet --locked --frozen` against the cached graph and recorded audits.
