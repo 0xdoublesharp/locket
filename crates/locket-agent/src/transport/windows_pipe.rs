@@ -5,11 +5,14 @@
 //! and Unix transports expose the same unary RPC surface.
 
 use std::io;
+use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tokio::net::windows::named_pipe::{NamedPipeClient, NamedPipeServer, ServerOptions};
 use tokio::time::sleep;
+
+use crate::peer_cred::PeerIdentity;
 
 /// Windows error code returned when all pipe instances are busy.
 const ERROR_PIPE_BUSY: i32 = 231;
@@ -131,6 +134,25 @@ async fn connect_named_pipe_client_with_timeout(
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "agent pipe connection timed out"))?
 }
 
+#[allow(unsafe_code)]
+fn connected_pipe_peer(stream: &NamedPipeServer, connection_id: u64) -> io::Result<PeerIdentity> {
+    // https://learn.microsoft.com/windows/win32/api/winbase/nf-winbase-getnamedpipeclientprocessid
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetNamedPipeClientProcessId(pipe: RawHandle, client_process_id: *mut u32) -> i32;
+    }
+
+    let mut pid = 0;
+    // SAFETY: Tokio owns the connected pipe handle for this call, and the output
+    // points to a writable Windows ULONG.
+    if unsafe { GetNamedPipeClientProcessId(stream.as_raw_handle(), &raw mut pid) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let binding = locket_platform::process_binding_for_pid(pid).map_err(io::Error::other)?;
+    let creation_time = binding.process_start_time.parse::<u64>().map_err(io::Error::other)?;
+    Ok(PeerIdentity::for_windows_pipe(pid, creation_time, connection_id))
+}
+
 /// Handles one connected named-pipe client with the shared unary
 /// request dispatcher.
 ///
@@ -140,20 +162,24 @@ async fn connect_named_pipe_client_with_timeout(
 ///
 /// # Errors
 ///
-/// Returns I/O errors from pipe reads/writes or frame encoding.
+/// Returns errors from peer identification, pipe I/O, or frame encoding.
 pub async fn handle_named_pipe_connection(
     mut stream: NamedPipeServer,
     state: crate::server::AgentSocketState,
 ) -> io::Result<()> {
     use tokio::io::AsyncWriteExt;
 
+    let connection_id = state
+        .next_connection_id()
+        .ok_or_else(|| io::Error::other("agent connection IDs exhausted"))?;
+    let peer = connected_pipe_peer(&stream, connection_id)?;
     let mut buffer =
         zeroize::Zeroizing::new(Vec::with_capacity(super::server::FRAME_READ_CHUNK_SIZE));
     loop {
         let Some(request) = super::server::read_one_frame(&mut stream, &mut buffer).await? else {
             return Ok(());
         };
-        let response = crate::server::dispatch(&request, &state).await;
+        let response = crate::server::dispatch_with_peer(&request, &state, Some(peer)).await;
         let frame = crate::framing::encode_frame(&response, crate::DEFAULT_MAX_MESSAGE_SIZE)
             .map_err(|error| io::Error::other(error.to_string()))?;
         let frame = zeroize::Zeroizing::new(frame);
@@ -166,6 +192,23 @@ pub async fn handle_named_pipe_connection(
 mod tests {
     use super::{AgentPipeConfig, ERROR_PIPE_BUSY};
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn connected_client_has_a_process_binding() -> Result<(), Box<dyn std::error::Error>> {
+        let path = PathBuf::from(format!(r"\\.\pipe\locket-peer-test-{}", std::process::id()));
+        let server =
+            super::bind_named_pipe_listener(&AgentPipeConfig::current_user(path.clone())?)?;
+        let _client = super::connect_named_pipe_client(&path).await?;
+        server.connect().await?;
+
+        let live = locket_platform::current_process_binding()?;
+        let binding = crate::GrantBinding::new(live.pid, live.process_start_time);
+        let peer = super::connected_pipe_peer(&server, 1)?;
+        assert!(peer.matches_binding(&binding));
+        let stale_peer = crate::PeerIdentity::for_windows_pipe(live.pid, 0, 1);
+        assert!(!stale_peer.matches_binding(&binding));
+        Ok(())
+    }
 
     #[test]
     fn pipe_config_preserves_resolved_pipe_name() {

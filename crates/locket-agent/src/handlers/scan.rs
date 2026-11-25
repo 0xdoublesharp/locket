@@ -991,6 +991,7 @@ mod tests {
     mod automation_scope {
         use super::*;
         use crate::server::{current_unix_nanos, dispatch};
+        use crate::tests::{dispatch_as_current_process, test_process_binding};
         use ed25519_dalek::{Signer, SigningKey};
         use serde_json::Value;
         use sha2::{Digest, Sha256};
@@ -1031,16 +1032,18 @@ mod tests {
                     UnlockMethod::Passphrase,
                 ),
             );
-            state.grants.lock().await.insert(GrantRecord::new(GrantRecordFields {
+            let mut grant = GrantRecord::new(GrantRecordFields {
                 grant_id: GRANT_ID.to_owned(),
                 project_id: PROJECT_ID.to_owned(),
                 profile_id: PROFILE_ID.to_owned(),
                 action: GrantAction::ScanKnownValues,
-                binding: GrantBinding::new(std::process::id(), "0"),
+                binding: test_process_binding(),
                 issued_at_unix_nanos: now,
                 ttl_seconds: 60,
                 expires_at_unix_nanos: now + 60_000_000_000,
-            }));
+            });
+            grant.observed_peer_pid = Some(grant.binding.pid);
+            state.grants.lock().await.insert(grant);
             Ok((fixture, state))
         }
 
@@ -1058,6 +1061,7 @@ mod tests {
 
         fn request(fixture: &ScanFixture, action: &str) -> RequestEnvelope {
             let mut request = scan_envelope(&scan_request(fixture, true, false));
+            request.payload["binding"] = json!(test_process_binding());
             request.payload["policy_name"] = json!(POLICY);
             request.payload["requested_action"] = json!(action);
             // Neither a caller-provided allow-list nor a replacement policy is authoritative.
@@ -1120,7 +1124,7 @@ mod tests {
             for action in ["scan-known-values", "redact"] {
                 let (fixture, state) = fixture().await?;
                 let request = sign(&state, request(&fixture, action)).await?;
-                let response = dispatch(&request, &state).await;
+                let response = dispatch_as_current_process(&request, &state).await;
                 assert_eq!(audit_count(&fixture, "CLIENT_AUTH")?, 1);
                 assert_no_values(&response, &fixture)?;
                 let payload = scan_payload(response)?;
@@ -1146,11 +1150,17 @@ mod tests {
                 [GRACE_SECRET_ID],
             )?;
             let signed = sign(&state, request(&fixture, "scan-known-values")).await?;
-            assert_eq!(scan_payload(dispatch(&signed, &state).await)?.findings.len(), 1);
+            assert_eq!(
+                scan_payload(dispatch_as_current_process(&signed, &state).await)?.findings.len(),
+                1
+            );
             // This corrupt blob really is unreadable if the saved policy authorizes it.
             save_policy(&mut store, PROJECT_ID, &json!({"allowed_secrets": [GRACE_SECRET_NAME]}))?;
             let signed = sign(&state, request(&fixture, "scan-known-values")).await?;
-            assert_eq!(error_code(dispatch(&signed, &state).await)?, "CorruptDb");
+            assert_eq!(
+                error_code(dispatch_as_current_process(&signed, &state).await)?,
+                "CorruptDb"
+            );
             assert_eq!(audit_count(&fixture, "SCAN")?, 1);
             Ok(())
         }
@@ -1164,7 +1174,7 @@ mod tests {
                 &json!({"allowed_secrets": []}),
             )?;
             let signed = sign(&state, request(&fixture, "scan-known-values")).await?;
-            let payload = scan_payload(dispatch(&signed, &state).await)?;
+            let payload = scan_payload(dispatch_as_current_process(&signed, &state).await)?;
             assert!(!payload.locked);
             assert_eq!(payload.findings.len(), 0);
             assert_eq!(audit_count(&fixture, "SCAN")?, 1);
@@ -1175,8 +1185,9 @@ mod tests {
         #[tokio::test(flavor = "current_thread")]
         async fn unsigned_scan_preserves_full_profile_even_with_policy_metadata() -> TestResult {
             let (fixture, state) = fixture().await?;
-            let payload =
-                scan_payload(dispatch(&request(&fixture, "scan-known-values"), &state).await)?;
+            let payload = scan_payload(
+                dispatch_as_current_process(&request(&fixture, "scan-known-values"), &state).await,
+            )?;
             assert_eq!(payload.findings.len(), 2);
             assert_eq!(audit_count(&fixture, "CLIENT_AUTH")?, 0);
             assert_eq!(scan_audit_metadata(&fixture)?["finding_counts"]["known_secret_value"], 2);
@@ -1198,7 +1209,7 @@ mod tests {
                     )?;
                 }
                 let signed = sign(&state, request(&fixture, "scan-known-values")).await?;
-                let response = dispatch(&signed, &state).await;
+                let response = dispatch_as_current_process(&signed, &state).await;
                 assert_no_values(&response, &fixture)?;
                 assert_eq!(error_code(response)?, "PolicyNotFound");
                 assert_eq!(audit_count(&fixture, "CLIENT_AUTH")?, 1);
@@ -1217,7 +1228,7 @@ mod tests {
                 let (fixture, state) = fixture().await?;
                 save_policy(&mut Store::open(&fixture.store_path)?, PROJECT_ID, &normalized)?;
                 let signed = sign(&state, request(&fixture, "scan-known-values")).await?;
-                let response = dispatch(&signed, &state).await;
+                let response = dispatch_as_current_process(&signed, &state).await;
                 assert_no_values(&response, &fixture)?;
                 assert_eq!(error_code(response)?, "CorruptDb");
                 assert_eq!(audit_count(&fixture, "SCAN")?, 0);
@@ -1242,12 +1253,13 @@ mod tests {
                     "ProtocolError"
                 };
                 if let Some(policy) = policy {
+                    request.payload["binding"] = json!(test_process_binding());
                     request.payload["policy_name"] = policy;
                 } else {
                     request.payload.as_object_mut().ok_or("payload")?.remove("policy_name");
                 }
                 let signed = sign(&state, request).await?;
-                let response = dispatch(&signed, &state).await;
+                let response = dispatch_as_current_process(&signed, &state).await;
                 assert_no_values(&response, &fixture)?;
                 assert_eq!(error_code(response)?, expected);
                 assert_eq!(audit_count(&fixture, "SCAN")?, 0);
@@ -1274,7 +1286,7 @@ mod tests {
                     }),
                 )?;
                 let signed = sign(&state, request(&fixture, "scan-known-values")).await?;
-                scan_payload(dispatch(&signed, &state).await)?;
+                scan_payload(dispatch_as_current_process(&signed, &state).await)?;
                 match change {
                     "deleted" => std::fs::remove_file(&path)?,
                     "foreign" => {
@@ -1283,7 +1295,10 @@ mod tests {
                     _ => std::fs::write(&path, source.replace(SECRET_NAME, GRACE_SECRET_NAME))?,
                 }
                 let signed = sign(&state, request(&fixture, "scan-known-values")).await?;
-                assert_eq!(error_code(dispatch(&signed, &state).await)?, "AccessDenied");
+                assert_eq!(
+                    error_code(dispatch_as_current_process(&signed, &state).await)?,
+                    "AccessDenied"
+                );
                 assert_eq!(audit_count(&fixture, "SCAN")?, 1);
             }
             Ok(())

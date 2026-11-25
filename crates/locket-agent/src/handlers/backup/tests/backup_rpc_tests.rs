@@ -38,13 +38,18 @@ impl BackupVault {
     }
 
     async fn rpc(&self, method: AgentMethod, payload: serde_json::Value) -> ResponseEnvelope {
-        dispatch(&RequestEnvelope::new("backup", method, payload), &self.state).await
+        let request = RequestEnvelope::new("backup", method, payload);
+        if request.payload["grant_id"].is_string() {
+            crate::tests::dispatch_as_current_process(&request, &self.state).await
+        } else {
+            dispatch(&request, &self.state).await
+        }
     }
 
     async fn grant(&self, action: GrantAction, scope: &str) -> TestResult<(String, GrantBinding)> {
-        let binding = GrantBinding::new(std::process::id(), "backup client");
+        let binding = crate::tests::test_process_binding();
         let now = current_unix_nanos();
-        let grant = self.state.grants.lock().await.issue(
+        let grant = self.state.grants.lock().await.issue_with_peer(
             crate::RequestGrantPayload {
                 project_id: PROJECT_ID.to_owned(),
                 profile_id: scope.to_owned(),
@@ -56,6 +61,8 @@ impl BackupVault {
             },
             now,
             now + 60_000_000_000,
+            crate::tests::test_peer(&self.state),
+            None,
         )?;
         Ok((grant.grant_id, binding))
     }

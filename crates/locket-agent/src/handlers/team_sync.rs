@@ -559,16 +559,18 @@ mod tests {
                 });
             }
             state.unlock_cache.lock().await.insert(project.into(), entry);
-            state.grants.lock().await.insert(GrantRecord::new(GrantRecordFields {
+            let mut record = GrantRecord::new(GrantRecordFields {
                 grant_id: project.into(),
                 project_id: project.into(),
                 profile_id: "profile".into(),
                 action: GrantAction::TeamSync,
-                binding: GrantBinding::new(42, "start"),
+                binding: crate::tests::test_process_binding(),
                 issued_at_unix_nanos: now,
                 ttl_seconds: 60,
                 expires_at_unix_nanos: now + 60_000_000_000,
-            }));
+            });
+            record.observed_peer_pid = Some(record.binding.pid);
+            state.grants.lock().await.insert(record);
         }
         state
     }
@@ -624,11 +626,17 @@ mod tests {
         let rpc = |method, payload| {
             let request = RequestEnvelope::new("sync", method, payload);
             let state = &state;
-            async move { dispatch(&request, state).await }
+            async move {
+                if method == AgentMethod::TeamSyncStatus {
+                    dispatch(&request, state).await
+                } else {
+                    crate::tests::dispatch_as_current_process(&request, state).await
+                }
+            }
         };
         let mut request = json!({
             "project_id": "project", "store_path": path, "profile_id":"profile",
-            "binding": GrantBinding::new(42, "start"), "folder": share,
+            "binding": crate::tests::test_process_binding(), "folder": share,
             "incoming_profile_id":"incoming",
             "action":{"kind":"preserve_override","local_secret_id":"local"}
         });

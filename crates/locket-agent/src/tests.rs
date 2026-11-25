@@ -14,17 +14,35 @@ use super::{
 };
 use serde_json::json;
 
+pub fn test_process_binding() -> crate::GrantBinding {
+    let live = locket_platform::current_process_binding().expect("test process identity");
+    crate::GrantBinding::new(live.pid, live.process_start_time)
+}
+
+pub async fn dispatch_as_current_process(
+    request: &RequestEnvelope,
+    state: &crate::AgentSocketState,
+) -> ResponseEnvelope {
+    crate::dispatch_with_peer(request, state, Some(test_peer(state))).await
+}
+
+pub fn test_peer(state: &crate::AgentSocketState) -> crate::PeerIdentity {
+    crate::PeerIdentity::new(state.daemon_uid, Some(std::process::id()), 1)
+}
+
 fn test_grant_record(grant_id: &str, expires_at_unix_nanos: i128) -> crate::grant::GrantRecord {
-    crate::grant::GrantRecord::new(crate::grant::GrantRecordFields {
+    let mut record = crate::grant::GrantRecord::new(crate::grant::GrantRecordFields {
         grant_id: grant_id.to_owned(),
         project_id: "p-1".to_owned(),
         profile_id: "prof-1".to_owned(),
         action: crate::grant::GrantAction::RunPolicy,
-        binding: crate::grant::GrantBinding::new(std::process::id(), "0"),
+        binding: test_process_binding(),
         issued_at_unix_nanos: 0,
         ttl_seconds: 30,
         expires_at_unix_nanos,
-    })
+    });
+    record.observed_peer_pid = Some(record.binding.pid);
+    record
 }
 
 #[test]
@@ -1440,7 +1458,7 @@ async fn native_session_gate_rejects_unlock_and_grants_until_resume() {
         "grant",
         crate::AgentMethod::RequestGrant,
         serde_json::json!({"project_id":"project", "profile_id":"profile", "action":"ResolveReference", "ttl_seconds":60,
-            "binding":{"pid":123,"process_start_time":"start"}}),
+            "binding":test_process_binding()}),
     );
     state
         .lock_for_native_session_event(
@@ -1490,7 +1508,10 @@ async fn native_session_gate_rejects_unlock_and_grants_until_resume() {
         .await
         .unwrap();
     assert!(matches!(crate::dispatch(&unlock, &state).await, crate::ResponseEnvelope::Success(_)));
-    assert!(matches!(crate::dispatch(&grant, &state).await, crate::ResponseEnvelope::Success(_)));
+    assert!(matches!(
+        dispatch_as_current_process(&grant, &state).await,
+        crate::ResponseEnvelope::Success(_)
+    ));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1986,8 +2007,7 @@ async fn daemon_verification_gates_unlock_grants_and_client_registration()
         rejected.clone().with_user_verifier(Arc::new(MemoryLocalUserVerifier::allowing()));
     approved.seed_master_key("p", &[42; 32])?;
     let binding = locket_platform::current_process_binding()?;
-    let peer =
-        crate::PeerIdentity { uid: approved.daemon_uid, pid: Some(binding.pid), connection_id: 77 };
+    let peer = crate::PeerIdentity::new(approved.daemon_uid, Some(binding.pid), 77);
     let make = |method, payload| RequestEnvelope::new("approval", method, payload);
     let unlock = make(AgentMethod::Unlock, json!({"project_id":"p", "ttl_seconds":120}));
     let grant = |action, profile, confirm_dangerous| {
@@ -2144,8 +2164,7 @@ async fn daemon_verification_gates_resolve_and_prepare_exec_and_binds_policy()
         .await;
 
     let binding = locket_platform::current_process_binding()?;
-    let peer =
-        crate::PeerIdentity { uid: approved.daemon_uid, pid: Some(binding.pid), connection_id: 91 };
+    let peer = crate::PeerIdentity::new(approved.daemon_uid, Some(binding.pid), 91);
     let unlock = RequestEnvelope::new(
         "unlock",
         AgentMethod::Unlock,
@@ -2407,7 +2426,7 @@ fn verified_store_rejects_database_and_sidecar_symlinks() -> Result<(), Box<dyn 
 async fn request_grant_returns_id_bound_to_caller_process() {
     use crate::envelope::{RequestEnvelope, ResponseEnvelope};
     use crate::method::AgentMethod;
-    use crate::server::{AgentSocketState, dispatch};
+    use crate::server::AgentSocketState;
     use serde_json::json;
 
     let state = AgentSocketState::locked("test-version");
@@ -2419,13 +2438,10 @@ async fn request_grant_returns_id_bound_to_caller_process() {
             "profile_id": "prof-1",
             "action": "RunPolicy",
             "ttl_seconds": 30,
-            "binding": {
-                "pid": std::process::id(),
-                "process_start_time": "0"
-            }
+            "binding": test_process_binding()
         }),
     );
-    let response = dispatch(&request, &state).await;
+    let response = dispatch_as_current_process(&request, &state).await;
 
     let ResponseEnvelope::Success(success) = response else {
         unreachable!("expected success envelope");
@@ -2441,7 +2457,7 @@ async fn request_grant_returns_id_bound_to_caller_process() {
     assert_eq!(record.profile_id, "prof-1");
     assert_eq!(record.action, crate::grant::GrantAction::RunPolicy);
     assert_eq!(record.ttl_seconds, 30);
-    assert_eq!(record.binding.process_start_time, "0");
+    assert_eq!(record.binding, test_process_binding());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2449,7 +2465,7 @@ async fn request_grant_uses_saved_policy_ttl_when_policy_name_is_present() {
     use crate::CommandPolicySnapshot;
     use crate::envelope::{RequestEnvelope, ResponseEnvelope};
     use crate::method::AgentMethod;
-    use crate::server::{AgentSocketState, dispatch};
+    use crate::server::AgentSocketState;
     use serde_json::json;
 
     let state = AgentSocketState::locked("test-version");
@@ -2481,13 +2497,11 @@ async fn request_grant_uses_saved_policy_ttl_when_policy_name_is_present() {
             "policy_name": "deploy",
             "action": "RunPolicy",
             "ttl_seconds": 1,
-            "binding": {
-                "pid": std::process::id(),
-                "process_start_time": "0"
-            }
+            "binding": test_process_binding()
         }),
     );
-    let ResponseEnvelope::Success(success) = dispatch(&request, &state).await else {
+    let ResponseEnvelope::Success(success) = dispatch_as_current_process(&request, &state).await
+    else {
         unreachable!("policy-backed grant should succeed");
     };
     let grant_id = success.payload.get("grant_id").and_then(|v| v.as_str()).unwrap_or_default();
@@ -2506,7 +2520,7 @@ async fn request_grant_uses_saved_policy_ttl_when_policy_name_is_present() {
 async fn request_grant_fails_closed_when_policy_name_is_missing() {
     use crate::envelope::{RequestEnvelope, ResponseEnvelope};
     use crate::method::AgentMethod;
-    use crate::server::{AgentSocketState, dispatch};
+    use crate::server::AgentSocketState;
     use serde_json::json;
 
     let state = AgentSocketState::locked("test-version");
@@ -2519,13 +2533,10 @@ async fn request_grant_fails_closed_when_policy_name_is_missing() {
             "policy_name": "deploy",
             "action": "RunPolicy",
             "ttl_seconds": 30,
-            "binding": {
-                "pid": std::process::id(),
-                "process_start_time": "0"
-            }
+            "binding": test_process_binding()
         }),
     );
-    let ResponseEnvelope::Error(error) = dispatch(&request, &state).await else {
+    let ResponseEnvelope::Error(error) = dispatch_as_current_process(&request, &state).await else {
         unreachable!("missing policy must fail");
     };
     assert_eq!(error.error, "PolicyNotFound");
@@ -2536,7 +2547,7 @@ async fn request_grant_fails_closed_when_policy_name_is_missing() {
 async fn revoke_grant_drops_record_and_unknown_returns_grant_required() {
     use crate::envelope::{RequestEnvelope, ResponseEnvelope};
     use crate::method::AgentMethod;
-    use crate::server::{AgentSocketState, dispatch};
+    use crate::server::AgentSocketState;
     use serde_json::json;
 
     let state = AgentSocketState::locked("test-version");
@@ -2544,13 +2555,13 @@ async fn revoke_grant_drops_record_and_unknown_returns_grant_required() {
 
     let revoke =
         RequestEnvelope::new("r-1", AgentMethod::RevokeGrant, json!({ "grant_id": "g-1" }));
-    let response = dispatch(&revoke, &state).await;
+    let response = dispatch_as_current_process(&revoke, &state).await;
     assert!(matches!(response, ResponseEnvelope::Success(_)));
     assert!(state.grants.lock().await.is_empty());
 
     let revoke_missing =
         RequestEnvelope::new("r-2", AgentMethod::RevokeGrant, json!({ "grant_id": "missing" }));
-    let response = dispatch(&revoke_missing, &state).await;
+    let response = dispatch_as_current_process(&revoke_missing, &state).await;
     let ResponseEnvelope::Error(error) = response else {
         unreachable!("expected error envelope for unknown grant");
     };
@@ -2561,7 +2572,7 @@ async fn revoke_grant_drops_record_and_unknown_returns_grant_required() {
 async fn expire_grant_drops_already_expired_record() {
     use crate::envelope::{RequestEnvelope, ResponseEnvelope};
     use crate::method::AgentMethod;
-    use crate::server::{AgentSocketState, dispatch};
+    use crate::server::AgentSocketState;
     use serde_json::json;
 
     let state = AgentSocketState::locked("test-version");
@@ -2569,7 +2580,7 @@ async fn expire_grant_drops_already_expired_record() {
 
     let request =
         RequestEnvelope::new("r-1", AgentMethod::ExpireGrant, json!({ "grant_id": "g-2" }));
-    let response = dispatch(&request, &state).await;
+    let response = dispatch_as_current_process(&request, &state).await;
     assert!(matches!(response, ResponseEnvelope::Success(_)));
     assert!(state.grants.lock().await.is_empty());
 }
@@ -2578,7 +2589,7 @@ async fn expire_grant_drops_already_expired_record() {
 async fn expire_grant_leaves_live_grant_intact() {
     use crate::envelope::{RequestEnvelope, ResponseEnvelope};
     use crate::method::AgentMethod;
-    use crate::server::{AgentSocketState, dispatch};
+    use crate::server::AgentSocketState;
     use serde_json::json;
 
     let state = AgentSocketState::locked("test-version");
@@ -2586,7 +2597,7 @@ async fn expire_grant_leaves_live_grant_intact() {
 
     let request =
         RequestEnvelope::new("r-1", AgentMethod::ExpireGrant, json!({ "grant_id": "g-live" }));
-    let response = dispatch(&request, &state).await;
+    let response = dispatch_as_current_process(&request, &state).await;
 
     let ResponseEnvelope::Error(error) = response else {
         unreachable!("ExpireGrant on a live grant must return an error envelope");
@@ -2842,7 +2853,7 @@ fn automation_grant_request(store_path: &std::path::Path, action: &str) -> Reque
             "policy_name": "deploy",
             "action": action,
             "ttl_seconds": 30,
-            "binding": { "pid": std::process::id(), "process_start_time": "auth-test" }
+            "binding": test_process_binding()
         }),
     )
 }
@@ -2882,7 +2893,7 @@ async fn automation_client_auth_rejects_reveal_grant_hidden_as_run_policy()
             request.payload.as_object_mut().ok_or("payload")?.remove("policy_name");
         }
         let signed = sign_automation_request(&state, request).await?;
-        let response = crate::server::dispatch(&signed, &state).await;
+        let response = dispatch_as_current_process(&signed, &state).await;
         assert!(state.grants.lock().await.is_empty(), "unauthorized Reveal grant was issued");
         assert!(matches!(response, ResponseEnvelope::Error(_)), "{response:?}");
         assert_no_successful_automation_auth(&store)?;
@@ -2906,7 +2917,7 @@ async fn automation_client_auth_rejects_method_mismatch_before_mutation()
     let mut request = automation_grant_request(&store_path, "RunPolicy");
     request.kind = "Lock".to_owned();
     let signed = sign_automation_request(&state, request).await?;
-    let response = crate::server::dispatch(&signed, &state).await;
+    let response = dispatch_as_current_process(&signed, &state).await;
     assert_eq!(*state.grants.lock().await, grants_before, "denied RPC mutated grants");
     assert!(
         state
@@ -2940,7 +2951,7 @@ async fn automation_client_auth_requires_policy_scope() -> Result<(), Box<dyn st
             request.payload.as_object_mut().ok_or("payload")?.remove("policy_name");
         }
         let signed = sign_automation_request(&state, request).await?;
-        let response = crate::server::dispatch(&signed, &state).await;
+        let response = dispatch_as_current_process(&signed, &state).await;
         assert!(state.grants.lock().await.is_empty(), "unscoped grant was issued");
         assert!(matches!(response, ResponseEnvelope::Error(_)), "{response:?}");
         assert_no_successful_automation_auth(&store)?;
@@ -2977,7 +2988,7 @@ async fn automation_client_auth_rejects_unknown_method_and_actions()
         request.kind = method.to_owned();
         request.payload["requested_action"] = json!(requested_action);
         let signed = sign_automation_request(&state, request).await?;
-        let response = crate::server::dispatch(&signed, &state).await;
+        let response = dispatch_as_current_process(&signed, &state).await;
         assert!(matches!(response, ResponseEnvelope::Error(_)), "{response:?}");
         assert!(state.grants.lock().await.is_empty());
         assert_no_successful_automation_auth(&store)?;
@@ -3013,7 +3024,7 @@ async fn automation_client_auth_accepts_permitted_grant_flows()
         let mut request = automation_grant_request(&store_path, action);
         request.payload["requested_action"] = json!(requested_action);
         let signed = sign_automation_request(&state, request).await?;
-        let response = crate::server::dispatch(&signed, &state).await;
+        let response = dispatch_as_current_process(&signed, &state).await;
         let ResponseEnvelope::Success(success) = response else {
             return Err(format!("{requested_action} / {action}: {response:?}").into());
         };
@@ -3056,7 +3067,7 @@ async fn automation_client_auth_allows_resolution_and_scanning_but_requires_gran
             }),
         );
         let signed = sign_automation_request(&state, request).await?;
-        let response = crate::server::dispatch(&signed, &state).await;
+        let response = dispatch_as_current_process(&signed, &state).await;
         let ResponseEnvelope::Error(error) = response else {
             return Err("signed operation should still require a grant".into());
         };
@@ -3118,12 +3129,13 @@ async fn automation_client_auth_accepts_signed_request_and_audits()
         )?,
     );
     let signed = RequestEnvelope::new("signed-1", AgentMethod::PrepareExec, signed_payload);
-    let ResponseEnvelope::Success(_) = dispatch(&signed, &state).await else {
+    let ResponseEnvelope::Success(_) = dispatch_as_current_process(&signed, &state).await else {
         return Err("signed request should authenticate and dispatch".into());
     };
     let grants_before_replay = state.grants.lock().await.clone();
     assert_eq!(grants_before_replay.len(), 1);
-    let ResponseEnvelope::Error(replay_error) = dispatch(&signed, &state).await else {
+    let ResponseEnvelope::Error(replay_error) = dispatch_as_current_process(&signed, &state).await
+    else {
         return Err("reusing a signed challenge must fail".into());
     };
     assert_eq!(replay_error.error, "AutomationClientNotTrusted");
@@ -4572,10 +4584,12 @@ async fn register_command_policies_replaces_project_snapshot_and_runs_prepare_ex
             "project_id": "p-pump",
             "profile_id": "prof-1",
             "policy_name": "deploy",
-            "binding": { "pid": std::process::id(), "process_start_time": "0" }
+            "binding": test_process_binding()
         }),
     );
-    let ResponseEnvelope::Success(success) = dispatch(&prepare_request, &state).await else {
+    let ResponseEnvelope::Success(success) =
+        dispatch_as_current_process(&prepare_request, &state).await
+    else {
         unreachable!("PrepareExec for pumped policy must succeed");
     };
     let decoded: crate::prepare_exec::PrepareExecResponse =
@@ -5371,11 +5385,11 @@ async fn unlock_and_grant_reject_invalid_ttls() -> Result<(), Box<dyn std::error
                     "project_id": "ttl-project",
                     "profile_id": "ttl-profile",
                     "action": "Reveal",
-                    "binding": {"pid": 42, "process_start_time": "test"},
+                    "binding": test_process_binding(),
                     "ttl_seconds": ttl,
                 }),
             );
-            let response = crate::dispatch(&request, &state).await;
+            let response = dispatch_as_current_process(&request, &state).await;
             if ttl == maximum {
                 assert!(matches!(response, ResponseEnvelope::Success(_)), "{response:?}");
             } else {
@@ -5389,10 +5403,12 @@ async fn unlock_and_grant_reject_invalid_ttls() -> Result<(), Box<dyn std::error
         "single-use-desktop",
         AgentMethod::RequestGrant,
         json!({"project_id":"ttl-project", "profile_id":"ttl-profile", "action":"CreateProfile",
-            "binding": {"pid":42, "process_start_time":"test"}, "ttl_seconds":3600}),
+            "binding": test_process_binding(), "ttl_seconds":3600}),
     );
-    assert!(matches!(crate::dispatch(&desktop, &state).await, ResponseEnvelope::Success(success)
-        if success.payload["ttl_seconds"] == 30));
+    assert!(
+        matches!(dispatch_as_current_process(&desktop, &state).await, ResponseEnvelope::Success(success)
+        if success.payload["ttl_seconds"] == 30)
+    );
     let document = locket_core::PolicyDocument::from_toml_str(
         "schema_version = 1\n[commands.deploy]\nargv = ['deploy']\n",
     )?;
@@ -5404,8 +5420,10 @@ async fn unlock_and_grant_reject_invalid_ttls() -> Result<(), Box<dyn std::error
     run.payload["action"] = json!("RunPolicy");
     run.payload["policy_name"] = json!("deploy");
     let prior_grants = state.grants.lock().await.len();
-    assert!(matches!(crate::dispatch(&run, &state).await, ResponseEnvelope::Error(error)
-        if error.error == "MetadataInvalid" && error.message.contains("policy grant TTL")));
+    assert!(
+        matches!(dispatch_as_current_process(&run, &state).await, ResponseEnvelope::Error(error)
+        if error.error == "MetadataInvalid" && error.message.contains("policy grant TTL"))
+    );
     assert_eq!(state.grants.lock().await.len(), prior_grants);
     Ok(())
 }
@@ -5421,7 +5439,7 @@ async fn audit_rpcs_share_the_wrapped_project_audit_key() -> Result<(), Box<dyn 
     )?;
     let signed_grant = fixture.signed_grant(&client.client_id).await?;
     assert!(matches!(
-        crate::dispatch(&signed_grant, &fixture.state).await,
+        dispatch_as_current_process(&signed_grant, &fixture.state).await,
         ResponseEnvelope::Success(_)
     ));
     fixture.success(AgentMethod::RevokeClient, json!({"client": client.client_id})).await;
@@ -5566,7 +5584,10 @@ async fn automation_auth_reports_audit_storage_error_without_misclassifying_repl
     unlock_auth_project(&state).await;
     let first_request =
         sign_automation_request(&state, automation_grant_request(&store_path, "RunPolicy")).await?;
-    assert!(matches!(crate::dispatch(&first_request, &state).await, ResponseEnvelope::Success(_)));
+    assert!(matches!(
+        dispatch_as_current_process(&first_request, &state).await,
+        ResponseEnvelope::Success(_)
+    ));
     let first_used = store
         .get_automation_client("lk_proj_auth", "lk_client_auth")?
         .ok_or("missing client fixture")?

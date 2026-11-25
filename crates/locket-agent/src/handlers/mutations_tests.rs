@@ -1,5 +1,21 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::too_many_lines)]
 use super::*;
+
+#[cfg(unix)]
+#[test]
+fn dotenv_import_rejects_symlinked_source() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = Fixture::new()?;
+    let mut request = fixture.import("TOKEN=value\n", false);
+    let source = request.env_path.canonicalize()?;
+    request.env_path = source.with_file_name(".env.link");
+    std::os::unix::fs::symlink(&source, &request.env_path)?;
+
+    assert_eq!(
+        import_dotenv_with_master(&request, &MASTER, 1).unwrap_err().code,
+        "MetadataInvalid"
+    );
+    Ok(())
+}
 use crate::{GrantRecord, GrantRecordFields, UnlockEntry, UnlockMethod};
 use locket_crypto::{
     HkdfWrapInfo, KeyPurpose, KeyWrapAad, KeyWrapPurpose, derive_wrapping_key_v1, key_wrap_aad_v1,
@@ -351,10 +367,13 @@ async fn real_passphrase_unlock_then_dispatch_import_and_policy_without_keychain
             action,
             confirm_dangerous: false,
             ttl_seconds: 30,
-            binding: fixture.scope.binding.clone().unwrap(),
+            binding: crate::tests::test_process_binding(),
         };
-        let ResponseEnvelope::Success(grant) =
-            crate::dispatch(&envelope(crate::AgentMethod::RequestGrant, &request), &state).await
+        let ResponseEnvelope::Success(grant) = crate::tests::dispatch_as_current_process(
+            &envelope(crate::AgentMethod::RequestGrant, &request),
+            &state,
+        )
+        .await
         else {
             panic!("grant failed")
         };
@@ -362,13 +381,15 @@ async fn real_passphrase_unlock_then_dispatch_import_and_policy_without_keychain
         let request = if action == GrantAction::ImportDotenv {
             let mut request = fixture.import(&format!("TOKEN={CANARY}\n"), false);
             request.scope.grant_id = Some(id);
+            request.scope.binding = Some(crate::tests::test_process_binding());
             envelope(crate::AgentMethod::ImportDotenv, &request)
         } else {
             let mut request = fixture.policy();
             request.scope.grant_id = Some(id);
+            request.scope.binding = Some(crate::tests::test_process_binding());
             envelope(crate::AgentMethod::ApplyPolicy, &request)
         };
-        let response = crate::dispatch(&request, &state).await;
+        let response = crate::tests::dispatch_as_current_process(&request, &state).await;
         assert!(matches!(response, ResponseEnvelope::Success(_)), "{response:?}");
         assert!(!serde_json::to_string(&response)?.contains(CANARY));
     }

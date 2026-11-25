@@ -859,8 +859,7 @@ mod tests {
         let local = locket_platform::current_process_binding()?;
         let binding = GrantBinding::new(local.pid, local.process_start_time)
             .with_execution(POLICY_NAME, fixture.directory.path().canonicalize()?);
-        let peer =
-            crate::PeerIdentity { uid: state.daemon_uid, pid: Some(binding.pid), connection_id: 1 };
+        let peer = crate::PeerIdentity::new(state.daemon_uid, Some(binding.pid), 1);
         let mut request = RequestEnvelope::new(
             "run",
             AgentMethod::RequestGrant,
@@ -1549,6 +1548,7 @@ mod tests {
                 crate::dispatch(&pathless_unlock, &state).await,
                 ResponseEnvelope::Success(_)
             ));
+            let binding = crate::tests::test_process_binding();
             {
                 let mut grants = state.grants.lock().await;
                 for (id, action) in [
@@ -1559,17 +1559,23 @@ mod tests {
                     let mut grant = test_grant_record(i128::MAX);
                     grant.grant_id = id.to_owned();
                     grant.action = action;
+                    grant.binding = binding.clone();
+                    grant.observed_peer_pid = Some(binding.pid);
                     grants.insert(grant);
                 }
             }
             let mut reference = resolve_request(&fixture);
+            reference.binding = Some(binding);
             let original = RequestEnvelope::new(
                 "resolve",
                 AgentMethod::ResolveReference,
                 serde_json::to_value(&reference)?,
             );
             assert_eq!(
-                resolve_payload(crate::dispatch(&original, &state).await)?.value,
+                resolve_payload(
+                    crate::tests::dispatch_as_current_process(&original, &state).await
+                )?
+                .value,
                 fixture.expected_value
             );
             reference.store_path = Some(copied.display().to_string());
@@ -1596,7 +1602,10 @@ mod tests {
                 }),
             );
             for request in [resolve_clone, reveal_clone, export_clone] {
-                assert_eq!(error_code(crate::dispatch(&request, &state).await)?, "AccessDenied");
+                assert_eq!(
+                    error_code(crate::tests::dispatch_as_current_process(&request, &state).await)?,
+                    "AccessDenied"
+                );
             }
         }
         let rows = Store::open(&copied)?.list_exportable_audit_rows(PROJECT_ID)?;
@@ -1618,8 +1627,9 @@ mod tests {
         assert!(matches!(crate::dispatch(&unlock, &state).await, ResponseEnvelope::Success(_)));
         let binding = locket_platform::current_process_binding()?;
         let pid = binding.pid;
-        let peer = crate::PeerIdentity { uid: state.daemon_uid, pid: Some(pid), connection_id: 1 };
-        let other = crate::PeerIdentity { pid: Some(pid ^ 1), connection_id: 2, ..peer };
+        let peer = crate::PeerIdentity::new(state.daemon_uid, Some(pid), 1);
+        let other = crate::PeerIdentity::new(state.daemon_uid, Some(pid ^ 1), 2);
+        let no_pid = crate::PeerIdentity::new(state.daemon_uid, None, 3);
         let mint = RequestEnvelope::new(
             "mint",
             AgentMethod::RequestGrant,
@@ -1628,10 +1638,19 @@ mod tests {
                 "ttl_seconds": 30, "binding": {"pid": pid, "process_start_time": binding.process_start_time},
             }),
         );
+        for denied in [None, Some(no_pid), Some(other)] {
+            assert_eq!(
+                error_code(crate::dispatch_with_peer(&mint, &state, denied).await)?,
+                "AccessDenied"
+            );
+        }
+        let mut stale_mint = mint.clone();
+        stale_mint.payload["binding"]["process_start_time"] = json!("wrong-start");
         assert_eq!(
-            error_code(crate::dispatch_with_peer(&mint, &state, Some(other)).await)?,
+            error_code(crate::dispatch_with_peer(&stale_mint, &state, Some(peer)).await)?,
             "AccessDenied"
         );
+        assert!(state.grants.lock().await.is_empty());
         let ResponseEnvelope::Success(grant) =
             crate::dispatch_with_peer(&mint, &state, Some(peer)).await
         else {
@@ -1645,11 +1664,19 @@ mod tests {
             AgentMethod::ResolveReference,
             serde_json::to_value(&request)?,
         );
+        for denied in [None, Some(no_pid), Some(other)] {
+            assert_eq!(
+                error_code(crate::dispatch_with_peer(&resolve, &state, denied).await)?,
+                "GrantRequired"
+            );
+        }
+        let mut stale_resolve = resolve.clone();
+        stale_resolve.payload["binding"]["process_start_time"] = json!("wrong-start");
         assert_eq!(
-            error_code(crate::dispatch_with_peer(&resolve, &state, Some(other)).await)?,
+            error_code(crate::dispatch_with_peer(&stale_resolve, &state, Some(peer)).await)?,
             "GrantRequired"
         );
-        let new_connection = crate::PeerIdentity { connection_id: 3, ..peer };
+        let new_connection = crate::PeerIdentity::new(state.daemon_uid, Some(pid), 4);
         assert_eq!(
             resolve_payload(
                 crate::dispatch_with_peer(&resolve, &state, Some(new_connection)).await
@@ -1692,12 +1719,8 @@ mod tests {
             let live = locket_platform::process_binding_for_pid(child_pid)?;
             let binding = GrantBinding::new(child_pid, live.process_start_time)
                 .with_execution(POLICY_NAME, fixture.directory.path().canonicalize()?);
-            let issuer = crate::PeerIdentity {
-                uid: state.daemon_uid,
-                pid: Some(std::process::id()),
-                connection_id: 1,
-            };
-            let delegate = crate::PeerIdentity { pid: Some(child_pid), connection_id: 2, ..issuer };
+            let issuer = crate::PeerIdentity::new(state.daemon_uid, Some(std::process::id()), 1);
+            let delegate = crate::PeerIdentity::new(state.daemon_uid, Some(child_pid), 2);
             let prepare = RequestEnvelope::new(
                 "prepare",
                 AgentMethod::PrepareExec,
@@ -1740,6 +1763,18 @@ mod tests {
             let value =
                 resolve_payload(crate::dispatch_with_peer(&request, &state, Some(delegate)).await)?;
             assert_eq!(value.value, fixture.expected_value);
+
+            let revoke = RequestEnvelope::new(
+                "parent-revoke",
+                AgentMethod::RevokeGrant,
+                json!({"grant_id": prepared.payload["grant_id"]}),
+            );
+            let reconnected = crate::PeerIdentity::new(state.daemon_uid, issuer.pid, 3);
+            assert!(matches!(
+                crate::dispatch_with_peer(&revoke, &state, Some(reconnected)).await,
+                ResponseEnvelope::Success(_)
+            ));
+            assert!(state.grants.lock().await.is_empty());
             Ok(())
         }
         .await;
@@ -1930,19 +1965,21 @@ mod tests {
             }])
             .await;
 
+        let binding = crate::tests::test_process_binding();
         let prepare_request = PrepareExecRequest {
             policy_name: POLICY_NAME.to_owned(),
             profile_id: PROFILE_ID.to_owned(),
             project_id: PROJECT_ID.to_owned(),
             confirm_dangerous: false,
-            binding: Some(GrantBinding::new(std::process::id(), "0")),
+            binding: Some(binding.clone()),
         };
         let prepare_envelope = RequestEnvelope::new(
             "req-prepare-resolve",
             AgentMethod::PrepareExec,
             serde_json::to_value(&prepare_request)?,
         );
-        let prepare_response = handle_prepare_exec(&prepare_envelope, &state, 1, None).await;
+        let prepare_response =
+            handle_prepare_exec(&prepare_envelope, &state, 1, Some(binding.pid)).await;
         let ResponseEnvelope::Success(prepare_success) = prepare_response else {
             return Err("PrepareExec must succeed for the test fixture".into());
         };
@@ -1957,6 +1994,7 @@ mod tests {
         assert_eq!(state.grants.lock().await.len(), 1);
 
         let mut resolve_req = resolve_request(&fixture);
+        resolve_req.binding = Some(binding);
         resolve_req.grant_id = Some(prepare_decoded.grant_id.clone());
         let resolve_envelope = RequestEnvelope::new(
             "req-resolve-with-prepare-grant",

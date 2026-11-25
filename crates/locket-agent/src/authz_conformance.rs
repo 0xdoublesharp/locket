@@ -195,7 +195,7 @@ impl Fixture {
     ) -> ResponseEnvelope {
         let state = if allow { &self.allow } else { &self.deny };
         let pid = if binding == Binding::OtherPeer { self.owner.pid ^ 1 } else { self.owner.pid };
-        let peer = PeerIdentity { uid: state.daemon_uid, pid: Some(pid), connection_id: 77 };
+        let peer = PeerIdentity::new(state.daemon_uid, Some(pid), 77);
         dispatch_with_peer(request, state, Some(peer)).await
     }
 

@@ -2509,8 +2509,8 @@ mod tests {
         assert!(matches!(crate::dispatch(&import, &state).await,
             ResponseEnvelope::Error(error) if error.error == "GrantRequired"));
         let now = current_unix_nanos();
-        let binding = GrantBinding::new(std::process::id(), "fixture");
-        let grant = state.grants.lock().await.issue(
+        let binding = crate::tests::test_process_binding();
+        let grant = state.grants.lock().await.issue_with_peer(
             crate::RequestGrantPayload {
                 project_id: PROJECT_ID.to_owned(),
                 profile_id: BUNDLE_PROJECT_GRANT_SCOPE.to_owned(),
@@ -2522,10 +2522,12 @@ mod tests {
             },
             now,
             now + 30_000_000_000,
+            crate::tests::test_peer(&state),
+            None,
         )?;
         import.payload["grant_id"] = json!(grant.grant_id);
         import.payload["binding"] = json!(binding);
-        assert!(matches!(crate::dispatch(&import, &state).await,
+        assert!(matches!(crate::tests::dispatch_as_current_process(&import, &state).await,
             ResponseEnvelope::Success(result) if result.payload["status"] == "review"));
         Ok(())
     }

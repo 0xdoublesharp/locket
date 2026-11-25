@@ -29,21 +29,43 @@ mod unix {
         fs::set_permissions(&public, fs::Permissions::from_mode(0o755))?;
         let alias = directory.path().join("alias");
         symlink(&public, &alias)?;
-        for parent in [&public, &alias] {
-            let config = AgentSocketConfig::new(parent.join("s"), "test");
-            assert!(matches!(
-                bind_socket_listener(&config),
-                Err(SocketServerError::SocketPathTooWide { .. })
-            ));
-        }
+        assert!(matches!(
+            bind_socket_listener(&AgentSocketConfig::new(public.join("s"), "test")),
+            Err(SocketServerError::SocketPathTooWide { .. })
+        ));
+        assert_symlink_rejected(alias.join("s"));
         assert_eq!(fs::read_dir(public)?.count(), 0);
 
         let link = private.join("link");
         symlink(&socket, &link)?;
-        assert!(bind_socket_listener(&AgentSocketConfig::new(link.clone(), "test")).is_err());
+        assert_symlink_rejected(link.clone());
         assert_eq!(fs::read_link(link)?, socket);
         assert_eq!(socket_permission_mode(&socket), Some(0o600));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn socket_bind_rejects_symlinks_to_private_directories() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().canonicalize()?;
+        let private = root.join("private");
+        fs::create_dir(&private)?;
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700))?;
+        let alias = root.join("alias");
+        symlink(&private, &alias)?;
+
+        for path in [alias.join("s"), alias.join("nested/s")] {
+            assert_symlink_rejected(path);
+        }
+        assert_eq!(fs::read_dir(private)?.count(), 0);
+        Ok(())
+    }
+
+    fn assert_symlink_rejected(path: std::path::PathBuf) {
+        assert!(matches!(
+            bind_socket_listener(&AgentSocketConfig::new(path, "test")),
+            Err(SocketServerError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidInput
+        ));
     }
 
     #[tokio::test]

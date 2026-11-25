@@ -10,7 +10,7 @@ use std::io;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "windows"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -215,6 +215,7 @@ pub fn bind_socket_listener(config: &AgentSocketConfig) -> Result<UnixListener, 
     {
         prepare_parent_directory(parent)?;
     }
+    reject_socket_symlink(&config.path)?;
 
     let listener = match UnixListener::bind(&config.path) {
         Ok(listener) => listener,
@@ -247,7 +248,12 @@ pub fn bind_socket_listener(config: &AgentSocketConfig) -> Result<UnixListener, 
 /// be intentional (or hostile).
 #[cfg(unix)]
 fn prepare_parent_directory(parent: &Path) -> Result<(), SocketServerError> {
-    match std::fs::metadata(parent) {
+    let mut prefix = PathBuf::new();
+    for component in parent.components() {
+        prefix.push(component);
+        reject_socket_symlink(&prefix)?;
+    }
+    match std::fs::symlink_metadata(parent) {
         Ok(metadata) => {
             let mode = metadata.permissions().mode() & 0o777;
             if mode & !SOCKET_PARENT_PERMISSIONS_MODE != 0 {
@@ -268,6 +274,19 @@ fn prepare_parent_directory(parent: &Path) -> Result<(), SocketServerError> {
         Err(error) => return Err(error.into()),
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn reject_socket_symlink(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("agent socket path contains a symlink: {}", path.display()),
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -300,7 +319,7 @@ pub struct AgentSocketState {
     /// UID of the running daemon process, used to validate peer
     /// credentials on every accept.
     pub daemon_uid: u32,
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "windows"))]
     connections: Arc<AtomicU64>,
     canonical_store_path: Option<PathBuf>,
     canonical_store_identity: Arc<OnceLock<StoreFileIdentity>>,
@@ -400,7 +419,7 @@ impl AgentSocketState {
         Self {
             agent_version,
             daemon_uid,
-            #[cfg(unix)]
+            #[cfg(any(unix, target_os = "windows"))]
             connections: Arc::new(AtomicU64::new(1)),
             canonical_store_path: None,
             canonical_store_identity: Arc::new(OnceLock::new()),
@@ -445,7 +464,7 @@ impl AgentSocketState {
         Self {
             agent_version,
             daemon_uid,
-            #[cfg(unix)]
+            #[cfg(any(unix, target_os = "windows"))]
             connections: Arc::new(AtomicU64::new(1)),
             canonical_store_path: None,
             canonical_store_identity: Arc::new(OnceLock::new()),
@@ -612,7 +631,7 @@ impl AgentSocketState {
     pub fn with_test_peer_uid(mut self, peer_uid: u32) -> Self {
         self.peer_credential_validator = Arc::new(move |_stream, daemon_uid, connection_id| {
             crate::peer_cred::validate_peer_uid(peer_uid, daemon_uid)?;
-            Ok(PeerIdentity { uid: peer_uid, pid: None, connection_id })
+            Ok(PeerIdentity::new(peer_uid, None, connection_id))
         });
         self
     }
@@ -1014,9 +1033,7 @@ pub async fn handle_connection(
     mut stream: UnixStream,
     state: AgentSocketState,
 ) -> ConnectionOutcome {
-    let Ok(connection_id) =
-        state.connections.try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-    else {
+    let Some(connection_id) = state.next_connection_id() else {
         return ConnectionOutcome::Errored;
     };
     let peer = match validate_connection_peer(&stream, &state, connection_id) {
@@ -1038,6 +1055,15 @@ pub async fn handle_connection(
             }
             Err(_) => return ConnectionOutcome::Errored,
         }
+    }
+}
+
+#[cfg(any(unix, target_os = "windows"))]
+impl AgentSocketState {
+    pub(crate) fn next_connection_id(&self) -> Option<u64> {
+        self.connections
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .ok()
     }
 }
 
@@ -1271,12 +1297,13 @@ pub async fn dispatch_with_peer(
     } else {
         None
     };
-    let observed_pid = peer.and_then(|peer| peer.pid);
     let grant_id = envelope.payload.get("grant_id").and_then(serde_json::Value::as_str);
-    if let (Some(pid), Some(grant_id)) = (observed_pid, grant_id) {
+    if let Some(grant_id) = grant_id
+        && !matches!(method, Ok(AgentMethod::TeamSyncStatus))
+    {
         let revoking = matches!(method, Ok(AgentMethod::RevokeGrant | AgentMethod::ExpireGrant));
         let grants = state.grants.lock().await;
-        if grants.get(grant_id).is_some_and(|grant| !grant.permits_peer(pid, revoking)) {
+        if !grants.permits_peer(grant_id, peer, revoking) {
             return error_response(
                 envelope,
                 "GrantRequired",
@@ -2057,16 +2084,13 @@ async fn handle_request_grant(
             "grant TTL must be between 1 and 3600 seconds",
         );
     }
-    let observed_pid = peer.and_then(|peer| peer.pid);
-    if observed_pid
-        .is_some_and(|pid| pid != payload.binding.pid || !payload.binding.matches_live_process())
-    {
+    let Some(peer) = peer.filter(|peer| peer.matches_binding(&payload.binding)) else {
         return error_response(
             envelope,
             "AccessDenied",
             "grant binding does not match the connecting process",
         );
-    }
+    };
     if let (Some(policy_name), Some(scope)) =
         (payload.policy_name.as_deref(), payload.binding.execution.as_ref())
         && policy_name != scope.policy_name
@@ -2144,14 +2168,7 @@ async fn handle_request_grant(
     let ttl_nanos = i128::from(payload.ttl_seconds).saturating_mul(1_000_000_000);
     let record = {
         let mut grants = state.grants.lock().await;
-        let connection_id = peer.filter(|peer| peer.pid.is_some()).map(|peer| peer.connection_id);
-        match grants.issue_with_peer(
-            payload,
-            now,
-            now.saturating_add(ttl_nanos),
-            observed_pid,
-            connection_id,
-        ) {
+        match grants.issue_with_peer(payload, now, now.saturating_add(ttl_nanos), peer, None) {
             Ok(record) => {
                 if let Some(mut audit) = grant_audit
                     && append_grant_verification_audit(&mut audit, &record, now).is_err()
@@ -2554,7 +2571,7 @@ mod team_sync_lock_tests {
         let grants = state.grants.lock().await;
         let preparing_state = state.clone();
         let preparing = tokio::spawn(async move {
-            dispatch(&RequestEnvelope::new("prepare", AgentMethod::PrepareExec,
+            crate::tests::dispatch_as_current_process(&RequestEnvelope::new("prepare", AgentMethod::PrepareExec,
                 serde_json::json!({"project_id":"project", "profile_id":"profile", "policy_name":"dev"})), &preparing_state).await
         });
         tokio::task::yield_now().await;
@@ -2654,7 +2671,7 @@ mod cache_status_tests {
         let grants = state.grants.lock().await;
         let preparing_state = state.clone();
         let preparing = tokio::spawn(async move {
-            dispatch(&RequestEnvelope::new("prepare", AgentMethod::PrepareExec,
+            crate::tests::dispatch_as_current_process(&RequestEnvelope::new("prepare", AgentMethod::PrepareExec,
                 serde_json::json!({"project_id":"project", "profile_id":"profile", "policy_name":"dev"})), &preparing_state).await
         });
         tokio::task::yield_now().await;

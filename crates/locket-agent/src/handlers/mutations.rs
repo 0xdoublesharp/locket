@@ -416,19 +416,34 @@ fn read_dotenv(
     path: &Path,
     literal: bool,
 ) -> Result<locket_core::dotenv::DotenvDocument, MutationError> {
-    if !std::fs::metadata(path).map_err(|_| metadata())?.is_file() {
+    if !std::fs::symlink_metadata(path).map_err(|_| metadata())?.file_type().is_file() {
         return Err(metadata());
     }
     #[cfg(unix)]
     let file = std::fs::File::from(
         rustix::fs::open(
             path,
-            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::NONBLOCK
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW,
             rustix::fs::Mode::empty(),
         )
         .map_err(|_| metadata())?,
     );
-    #[cfg(not(unix))]
+    #[cfg(target_os = "windows")]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        // Open a reparse point itself if the path was replaced after inspection.
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        std::fs::File::options()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|_| metadata())?
+    };
+    #[cfg(not(any(unix, target_os = "windows")))]
     let file = std::fs::File::open(path).map_err(|_| metadata())?;
     if !file.metadata().map_err(|_| metadata())?.is_file() {
         return Err(metadata());

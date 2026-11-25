@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::peer_cred::PeerIdentity;
+
 const MAX_GRANT_TTL_SECONDS: u32 = 3_600;
 
 /// Returns whether the requested live-grant lifetime is permitted.
@@ -168,22 +170,6 @@ impl GrantRecord {
             expires_at_unix_nanos: fields.expires_at_unix_nanos,
         }
     }
-
-    pub(crate) fn permits_peer(&self, pid: u32, revoking: bool) -> bool {
-        let Some(issuer) = self.observed_peer_pid else {
-            return true;
-        };
-        if revoking && pid == issuer {
-            return true;
-        }
-        if self.action == GrantAction::PrepareExec && self.binding.pid != issuer {
-            return pid == self.binding.pid && self.binding.matches_live_process();
-        }
-        // Local clients reconnect between RPCs. Require the original kernel
-        // process identity on subsequent connections, including PID reuse.
-        pid == issuer
-            && (self.observed_connection_id.is_none() || self.binding.matches_live_process())
-    }
 }
 
 impl GrantBinding {
@@ -194,12 +180,12 @@ impl GrantBinding {
 }
 
 /// Checks the sole exception to issuing a grant for the connecting process.
-pub fn constrain_peer_grant(payload: &mut RequestGrantPayload, observed_pid: Option<u32>) -> bool {
-    let Some(observed_pid) = observed_pid else {
-        return true;
+pub fn constrain_peer_grant(payload: &mut RequestGrantPayload, peer: PeerIdentity) -> bool {
+    let Some(observed_pid) = peer.pid else {
+        return false;
     };
     if observed_pid == payload.binding.pid {
-        return payload.binding.matches_live_process();
+        return peer.matches_binding(&payload.binding);
     }
     let Some(scope) = &payload.binding.execution else {
         return false;
@@ -256,18 +242,25 @@ pub enum GrantValidation {
 /// In-memory live grant table.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GrantTable {
-    grants: BTreeMap<String, GrantRecord>,
+    grants: BTreeMap<String, LiveGrant>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LiveGrant {
+    record: GrantRecord,
+    // A PrepareExec handoff permits the issuing parent to revoke the child's grant.
+    delegated_by: Option<GrantBinding>,
 }
 
 impl GrantTable {
     /// Insert or replace a live grant.
     pub fn insert(&mut self, grant: GrantRecord) {
-        self.grants.insert(grant.grant_id.clone(), grant);
+        self.grants.insert(grant.grant_id.clone(), LiveGrant { record: grant, delegated_by: None });
     }
 
     /// Remove a live grant.
     pub fn revoke(&mut self, grant_id: &str) -> Option<GrantRecord> {
-        self.grants.remove(grant_id)
+        self.grants.remove(grant_id).map(|grant| grant.record)
     }
 
     /// Remove every live grant record.
@@ -280,7 +273,7 @@ impl GrantTable {
     /// Returns the number of grant records removed without exposing grant ids.
     pub fn revoke_for_project(&mut self, project_id: &str) -> usize {
         let before = self.grants.len();
-        self.grants.retain(|_, grant| grant.project_id != project_id);
+        self.grants.retain(|_, grant| grant.record.project_id != project_id);
         before.saturating_sub(self.grants.len())
     }
 
@@ -293,7 +286,7 @@ impl GrantTable {
     /// Count live grant records scoped to a project without exposing grant ids.
     #[must_use]
     pub fn count_for_project(&self, project_id: &str) -> usize {
-        self.grants.values().filter(|grant| grant.project_id == project_id).count()
+        self.grants.values().filter(|grant| grant.record.project_id == project_id).count()
     }
 
     /// Return whether the grant table is empty.
@@ -340,7 +333,7 @@ impl GrantTable {
         now_unix_nanos: i128,
         current_binding: Option<&GrantBinding>,
     ) -> GrantValidation {
-        let Some(grant) = self.grants.get(grant_id) else {
+        let Some(grant) = self.get(grant_id) else {
             return GrantValidation::Unknown;
         };
         if now_unix_nanos >= grant.expires_at_unix_nanos {
@@ -388,7 +381,7 @@ impl GrantTable {
         if !matches!(validation, GrantValidation::Valid) {
             return validation;
         }
-        if let Some(grant) = self.grants.get(grant_id)
+        if let Some(grant) = self.get(grant_id)
             && let Some(bound_policy) = grant.policy_name.as_deref()
             && bound_policy != policy_name
         {
@@ -400,7 +393,29 @@ impl GrantTable {
     /// Returns the grant record for a given id without mutating the table.
     #[must_use]
     pub fn get(&self, grant_id: &str) -> Option<&GrantRecord> {
-        self.grants.get(grant_id)
+        self.grants.get(grant_id).map(|grant| &grant.record)
+    }
+
+    pub(crate) fn permits_peer(
+        &self,
+        grant_id: &str,
+        peer: Option<PeerIdentity>,
+        revoking: bool,
+    ) -> bool {
+        let Some(grant) = self.grants.get(grant_id) else {
+            // Leave unknown IDs to the method's usual handling.
+            return true;
+        };
+        let (Some(peer), Some(issuer)) = (peer, grant.record.observed_peer_pid) else {
+            return false;
+        };
+        let binding = &grant.record.binding;
+        if (issuer == binding.pid || grant.record.action == GrantAction::PrepareExec)
+            && peer.matches_binding(binding)
+        {
+            return true;
+        }
+        revoking && grant.delegated_by.as_ref().is_some_and(|parent| peer.matches_binding(parent))
     }
 
     /// Issues a fresh grant. The id is a typed opaque `GrantId` (`lk_grant_<32 hex>`).
@@ -415,7 +430,9 @@ impl GrantTable {
         issued_at_unix_nanos: i128,
         expires_at_unix_nanos: i128,
     ) -> Result<GrantRecord, locket_core::id::IdGenerationError> {
-        self.issue_with_peer(payload, issued_at_unix_nanos, expires_at_unix_nanos, None, None)
+        let record = Self::allocate(payload, issued_at_unix_nanos, expires_at_unix_nanos)?;
+        self.insert(record.clone());
+        Ok(record)
     }
 
     pub(crate) fn issue_with_peer(
@@ -423,8 +440,21 @@ impl GrantTable {
         payload: RequestGrantPayload,
         issued_at_unix_nanos: i128,
         expires_at_unix_nanos: i128,
-        observed_peer_pid: Option<u32>,
-        observed_connection_id: Option<u64>,
+        peer: PeerIdentity,
+        delegated_by: Option<GrantBinding>,
+    ) -> Result<GrantRecord, locket_core::id::IdGenerationError> {
+        let mut record = Self::allocate(payload, issued_at_unix_nanos, expires_at_unix_nanos)?;
+        record.observed_peer_pid = peer.pid;
+        record.observed_connection_id = Some(peer.connection_id);
+        self.grants
+            .insert(record.grant_id.clone(), LiveGrant { record: record.clone(), delegated_by });
+        Ok(record)
+    }
+
+    fn allocate(
+        payload: RequestGrantPayload,
+        issued_at_unix_nanos: i128,
+        expires_at_unix_nanos: i128,
     ) -> Result<GrantRecord, locket_core::id::IdGenerationError> {
         let grant_id = locket_core::id::GrantId::generate()?;
         let mut record = GrantRecord::new(GrantRecordFields {
@@ -440,9 +470,6 @@ impl GrantTable {
         record.policy_name = payload
             .policy_name
             .or_else(|| record.binding.execution.as_ref().map(|scope| scope.policy_name.clone()));
-        record.observed_peer_pid = observed_peer_pid;
-        record.observed_connection_id = observed_connection_id;
-        self.insert(record.clone());
         Ok(record)
     }
 }

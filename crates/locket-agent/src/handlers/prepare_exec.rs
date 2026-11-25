@@ -21,8 +21,6 @@
 //! at the eventual `RUN`/`EXEC` step. The audit ledger therefore
 //! intentionally remains untouched here.
 
-use std::process;
-
 use locket_core::LocketError;
 use serde::{Deserialize, Serialize};
 
@@ -107,11 +105,7 @@ pub async fn handle_prepare_exec(
     now_unix_nanos: i128,
     observed_pid: Option<u32>,
 ) -> ResponseEnvelope {
-    let peer = observed_pid.map(|pid| crate::peer_cred::PeerIdentity {
-        uid: state.daemon_uid,
-        pid: Some(pid),
-        connection_id: 0,
-    });
+    let peer = observed_pid.map(|pid| crate::PeerIdentity::new(state.daemon_uid, Some(pid), 0));
     handle_prepare_exec_with_auth(request, state, now_unix_nanos, peer, false).await
 }
 
@@ -124,7 +118,6 @@ pub async fn handle_prepare_exec_with_auth(
     authenticated_automation: bool,
 ) -> ResponseEnvelope {
     let observed_pid = peer.and_then(|peer| peer.pid);
-    let connection_id = peer.filter(|peer| peer.pid.is_some()).map(|peer| peer.connection_id);
     let Ok(typed) = serde_json::from_value::<PrepareExecRequest>(request.payload.clone()) else {
         return protocol_error(request, "invalid PrepareExec payload");
     };
@@ -190,7 +183,23 @@ pub async fn handle_prepare_exec_with_auth(
         ttl_seconds,
         binding,
     };
-    if !crate::grant::constrain_peer_grant(&mut grant_payload, observed_pid) {
+    let Some(peer) = peer.filter(|peer| peer.pid.is_some()) else {
+        return typed_error(
+            request,
+            "AccessDenied",
+            "connecting process identity is unavailable",
+            LocketError::AccessDenied,
+        );
+    };
+    let delegated = peer.pid != Some(grant_payload.binding.pid);
+    let delegated_by = if delegated {
+        prepare_binding(peer.pid).filter(|binding| peer.matches_binding(binding))
+    } else {
+        None
+    };
+    if !crate::grant::constrain_peer_grant(&mut grant_payload, peer)
+        || (delegated && delegated_by.is_none())
+    {
         return typed_error(
             request,
             "AccessDenied",
@@ -230,8 +239,8 @@ pub async fn handle_prepare_exec_with_auth(
             grant_payload,
             issue_now,
             issue_now.saturating_add(ttl_nanos),
-            observed_pid,
-            connection_id,
+            peer,
+            delegated_by,
         ) {
             if let Some(mut audit) = grant_audit
                 && crate::server::append_grant_verification_audit(&mut audit, &record, issue_now)
@@ -272,9 +281,7 @@ pub async fn handle_prepare_exec_with_auth(
 }
 
 fn prepare_binding(observed_pid: Option<u32>) -> Option<GrantBinding> {
-    let Some(pid) = observed_pid else {
-        return Some(GrantBinding::new(process::id(), "0"));
-    };
+    let pid = observed_pid?;
     let live = locket_platform::process_binding_for_pid(pid).ok()?;
     Some(GrantBinding::new(pid, live.process_start_time))
 }
@@ -364,7 +371,6 @@ mod tests {
         let mut payload = json!({
             "policy_name": POLICY_NAME,
             "profile_id": PROFILE_ID,
-            "binding": GrantBinding::new(std::process::id(), "0"),
         });
         if let Some(project_id) = project_id {
             payload.as_object_mut().unwrap().insert("project_id".to_owned(), json!(project_id));
@@ -422,7 +428,7 @@ mod tests {
             request_payload(Some(PROJECT_ID)),
         );
 
-        let response = handle_prepare_exec(&envelope, &state, 1, None).await;
+        let response = handle_prepare_exec(&envelope, &state, 1, Some(std::process::id())).await;
         let ResponseEnvelope::Success(success) = response else {
             return Err("expected success envelope".into());
         };
@@ -467,7 +473,7 @@ mod tests {
             request_payload(Some(PROJECT_ID)),
         );
 
-        let response = handle_prepare_exec(&envelope, &state, 1, None).await;
+        let response = handle_prepare_exec(&envelope, &state, 1, Some(std::process::id())).await;
         let ResponseEnvelope::Success(success) = response else {
             return Err("expected success envelope".into());
         };
@@ -488,7 +494,7 @@ mod tests {
             request_payload(Some(PROJECT_ID)),
         );
 
-        let response = handle_prepare_exec(&envelope, &state, 1, None).await;
+        let response = handle_prepare_exec(&envelope, &state, 1, Some(std::process::id())).await;
         let ResponseEnvelope::Success(success) = response else {
             return Err("expected success envelope".into());
         };

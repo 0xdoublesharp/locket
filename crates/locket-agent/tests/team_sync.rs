@@ -2095,7 +2095,9 @@ impl ReconciliationAgent {
             locket_agent::dispatch(&unlock, &state).await,
             locket_agent::ResponseEnvelope::Success(_)
         ));
-        let binding = GrantBinding::new(std::process::id(), "test client");
+        let live = locket_platform::current_process_binding()?;
+        let binding = GrantBinding::new(live.pid, live.process_start_time);
+        let peer = locket_agent::PeerIdentity::new(state.daemon_uid, Some(binding.pid), 1);
         let grant = locket_agent::RequestEnvelope::new(
             "grant",
             AgentMethod::RequestGrant,
@@ -2103,7 +2105,7 @@ impl ReconciliationAgent {
                 "binding": binding, "ttl_seconds": 60, "confirm_dangerous": true}),
         );
         let locket_agent::ResponseEnvelope::Success(grant) =
-            locket_agent::dispatch(&grant, &state).await
+            locket_agent::dispatch_with_peer(&grant, &state, Some(peer)).await
         else {
             return Err("team sync grant rejected".into());
         };
@@ -2121,7 +2123,10 @@ impl ReconciliationAgent {
     }
 
     async fn status(&self) -> Result<team_sync::SyncStatus, Box<dyn std::error::Error>> {
-        self.sync_rpc(locket_agent::AgentMethod::TeamSyncStatus, &self.scope).await
+        let mut scope = self.scope.clone();
+        scope.grant_id = None;
+        scope.binding = None;
+        self.sync_rpc(locket_agent::AgentMethod::TeamSyncStatus, &scope).await
     }
 
     async fn reconcile(
@@ -2151,7 +2156,10 @@ impl ReconciliationAgent {
     ) -> Result<team_sync::SyncStatus, Box<dyn std::error::Error>> {
         let request =
             locket_agent::RequestEnvelope::new("sync", method, serde_json::to_value(payload)?);
-        match locket_agent::dispatch(&request, &self.state).await {
+        let peer = request.payload["grant_id"].as_str().map(|_| {
+            locket_agent::PeerIdentity::new(self.state.daemon_uid, Some(std::process::id()), 1)
+        });
+        match locket_agent::dispatch_with_peer(&request, &self.state, peer).await {
             locket_agent::ResponseEnvelope::Success(success) => {
                 Ok(serde_json::from_value(success.payload)?)
             }

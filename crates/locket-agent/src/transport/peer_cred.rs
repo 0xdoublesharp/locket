@@ -26,6 +26,31 @@ pub struct PeerIdentity {
     pub pid: Option<u32>,
     /// Monotonic ID assigned by the daemon to this connection.
     pub connection_id: u64,
+    windows_creation_time: Option<u64>,
+}
+
+impl PeerIdentity {
+    /// Creates a peer from the operating system's Unix credentials.
+    #[must_use]
+    pub const fn new(uid: u32, pid: Option<u32>, connection_id: u64) -> Self {
+        Self { uid, pid, connection_id, windows_creation_time: None }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) const fn for_windows_pipe(pid: u32, creation_time: u64, connection_id: u64) -> Self {
+        Self {
+            windows_creation_time: Some(creation_time),
+            ..Self::new(current_process_uid(), Some(pid), connection_id)
+        }
+    }
+
+    pub(crate) fn matches_binding(self, binding: &crate::GrantBinding) -> bool {
+        self.pid == Some(binding.pid)
+            && self
+                .windows_creation_time
+                .is_none_or(|time| binding.process_start_time.parse::<u64>() == Ok(time))
+            && binding.matches_live_process()
+    }
 }
 
 /// Returns the effective UID of the running process.
@@ -65,11 +90,11 @@ pub fn validate_peer_stream(
 ) -> Result<PeerIdentity, SocketServerError> {
     let cred = stream.peer_cred()?;
     validate_peer_uid(cred.uid(), daemon_uid)?;
-    Ok(PeerIdentity {
-        uid: cred.uid(),
-        pid: cred.pid().and_then(|pid| u32::try_from(pid).ok()),
+    Ok(PeerIdentity::new(
+        cred.uid(),
+        cred.pid().and_then(|pid| u32::try_from(pid).ok()),
         connection_id,
-    })
+    ))
 }
 
 /// Pure validator: returns `Ok(())` when `peer_uid == daemon_uid` and a
@@ -102,10 +127,7 @@ mod tests {
         let (server, _client) = UnixStream::pair()?;
         let uid = current_process_uid();
         let identity = validate_peer_stream(&server, uid, 42)?;
-        assert_eq!(
-            identity,
-            PeerIdentity { uid, pid: Some(std::process::id()), connection_id: 42 }
-        );
+        assert_eq!(identity, PeerIdentity::new(uid, Some(std::process::id()), 42));
         Ok(())
     }
 

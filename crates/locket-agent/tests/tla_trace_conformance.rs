@@ -80,7 +80,8 @@ impl Fixture {
         for &(project, dangerous) in projects {
             seed_project(&mut store, dir.path(), project, dangerous);
         }
-        Self { dir, path, state, binding: GrantBinding::new(std::process::id(), "trace") }
+        let live = locket_platform::current_process_binding().unwrap();
+        Self { dir, path, state, binding: GrantBinding::new(live.pid, live.process_start_time) }
     }
 
     fn store(&self) -> Store {
@@ -92,7 +93,16 @@ impl Fixture {
     }
 
     async fn rpc(&self, method: AgentMethod, payload: Value) -> ResponseEnvelope {
-        dispatch(&RequestEnvelope::new("tla-trace", method, payload), &self.state).await
+        let request = RequestEnvelope::new("tla-trace", method, payload);
+        if method == AgentMethod::RequestGrant || request.payload["grant_id"].is_string() {
+            locket_agent::dispatch_with_peer(&request, &self.state, Some(self.peer())).await
+        } else {
+            dispatch(&request, &self.state).await
+        }
+    }
+
+    const fn peer(&self) -> locket_agent::PeerIdentity {
+        locket_agent::PeerIdentity::new(self.state.daemon_uid, Some(self.binding.pid), 1)
     }
 
     async fn unlock(&self, project: Project, seconds: u64) -> ResponseEnvelope {
@@ -1244,7 +1254,7 @@ async fn agent_authorization_protocol() {
         fixture.state.clone().with_user_verifier(Arc::new(MemoryLocalUserVerifier::denying()));
     fixture.state.master_key_store.store_master_key(A.id, &MASTER).unwrap();
     let live = locket_platform::current_process_binding().unwrap();
-    let peer = PeerIdentity { uid: current_process_uid(), pid: Some(live.pid), connection_id: 77 };
+    let peer = PeerIdentity::new(current_process_uid(), Some(live.pid), 77);
     let binding = GrantBinding::new(live.pid, live.process_start_time);
 
     let mut trace = Trace::default();
@@ -1462,7 +1472,8 @@ async fn automation_client_authentication() {
         let other = SigningKey::from_bytes(&[24; 32]);
         let signer = if expected == "Denied" { &other } else { &signing };
         let request = signed_prepare(&fixture, &challenge, signer);
-        let response = dispatch(&request, &fixture.state).await;
+        let response =
+            locket_agent::dispatch_with_peer(&request, &fixture.state, Some(fixture.peer())).await;
         let granted = expected == "Authenticated";
         if granted {
             let id = grant_id(response);

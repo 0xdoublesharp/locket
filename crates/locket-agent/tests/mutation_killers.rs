@@ -147,7 +147,7 @@ async fn a_peer_can_revoke_only_its_own_grant_or_a_prepare_exec_handoff()
     let live = locket_platform::process_binding_for_pid(pid)?;
     let binding = GrantBinding::new(pid, live.process_start_time);
     let issuer = pid.wrapping_add(1);
-    let peer = PeerIdentity { uid: current_process_uid(), pid: Some(pid), connection_id: 2 };
+    let peer = PeerIdentity::new(current_process_uid(), Some(pid), 2);
     for (id, action, issued_by, allowed) in [
         ("owned", GrantAction::ResolveReference, pid, true),
         ("unrelated", GrantAction::ResolveReference, issuer, false),
@@ -205,7 +205,9 @@ async fn authenticated_prepare_records_nonce_through_the_documented_retention_wi
     let nonce = BASE64URL_NOPAD.decode(
         request.payload["auth"]["nonce"].as_str().ok_or("missing challenge nonce")?.as_bytes(),
     )?;
-    let prepared = success_payload(dispatch(&request, &state).await)?;
+    let peer = locket_agent::PeerIdentity::new(state.daemon_uid, Some(std::process::id()), 1);
+    let prepared =
+        success_payload(locket_agent::dispatch_with_peer(&request, &state, Some(peer)).await)?;
     assert!(prepared["grant_id"].is_string());
     let persisted: (Vec<u8>, i64, i64) = store.connection().query_row(
         "SELECT nonce, request_timestamp, expires_at FROM automation_client_nonces WHERE client_id = ?1",
@@ -442,7 +444,10 @@ async fn prepare_exec_selects_both_the_project_and_named_policy()
             json!({"project_id": project, "policy_name": policy, "profile_id": "dev"}),
         )
     };
-    let payload = success_payload(dispatch(&request("app", "deploy"), &state).await)?;
+    let peer = locket_agent::PeerIdentity::new(state.daemon_uid, Some(std::process::id()), 1);
+    let payload = success_payload(
+        locket_agent::dispatch_with_peer(&request("app", "deploy"), &state, Some(peer)).await,
+    )?;
     assert_eq!(payload["command_kind"], "argv");
     assert_eq!(payload["ttl_seconds"], 900);
     assert_eq!(payload["allowed_env_names"], json!(["DEPLOY_TOKEN"]));
