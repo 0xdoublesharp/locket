@@ -1194,19 +1194,27 @@ export function createMockRuntime(params: URLSearchParams) {
       case 'agent_reveal': {
         requireUnlocked();
         requireDangerousConfirmation(request);
+        const visibleLink = links.find(
+          (entry) => entry.link_id === request.secret_id && entry.profile_id === request.profile_id,
+        );
+        const name = request.secret_id
+          ? (projectSecrets.find((secret) => secret.id === request.secret_id)?.name ??
+            visibleLink?.local_name)
+          : request.secret_name;
         const row = projectSecrets
-          .filter((secret) => secret.name === request.secret_name)
+          .filter((secret) => secret.name === name)
           .sort((left, right) => right.source_precedence - left.source_precedence)[0];
         const link = links.find(
-          (entry) =>
-            entry.profile_id === request.profile_id && entry.local_name === request.secret_name,
+          (entry) => entry.profile_id === request.profile_id && entry.local_name === name,
         );
         const effectiveId =
           link && (!row || row.source_precedence < precedence['shared-link'])
             ? link.target_secret_id
             : row?.id;
+        if (!effectiveId)
+          fail('SecretNotFound', 'The secret was not found.', 'Refresh the secret list.');
         return {
-          value: (effectiveId && values.get(effectiveId)) ?? 'preview-only-value',
+          value: values.get(effectiveId) ?? 'preview-only-value',
           ttl_seconds: 20,
         };
       }

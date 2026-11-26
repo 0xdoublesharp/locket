@@ -422,3 +422,137 @@ it('creates and removes live links while keeping version history persisted-only'
     'MAIL_TOKEN',
   );
 });
+
+it('returns explicit delivery errors and preserves the other projects when delivery is cleared', async () => {
+  const invoke = createMockRuntime(new URLSearchParams());
+  const request = (command: string, payload: Record<string, unknown> = {}) =>
+    invoke(command, { request: { project_id: 'acme-api', ...payload } });
+  for (const transport of [
+    { kind: 's3', bucket: '', region: 'auto', credential_mode: 'env' },
+    {
+      kind: 's3',
+      bucket: 'fixture',
+      region: 'auto',
+      endpoint: 'http://remote.test',
+      credential_mode: 'env',
+    },
+    { kind: 's3', bucket: 'fixture', region: 'auto', credential_mode: 'vault' },
+    { kind: 'webdav', url: 'https://remote.test', auth_kind: 'basic', credential_mode: 'vault' },
+  ]) {
+    await expect(request('desktop_team_sync_configure', { transport })).rejects.toMatchObject({
+      code: 'InvalidTransport',
+    });
+  }
+  await request('desktop_team_sync_clear');
+  await expect(request('desktop_team_sync_test_remote')).rejects.toMatchObject({
+    code: 'TeamSyncRejected',
+  });
+  await expect(
+    request('desktop_team_sync_status', { project_id: 'web-app' }),
+  ).resolves.toMatchObject({
+    transport_kind: 'folder',
+  });
+});
+
+it('requires current link inventory and removes usages when deleting a Global Vault secret', async () => {
+  const invoke = createMockRuntime(new URLSearchParams());
+  const request = (command: string, payload: Record<string, unknown>) =>
+    invoke(command, { request: payload });
+  const acme = { project_id: 'acme-api', profile_id: 'acme-api-dev' };
+  await expect(
+    request('desktop_link_secret', {
+      ...acme,
+      local_name: 'ALIAS',
+      target_secret_name: 'ABSENT',
+    }),
+  ).rejects.toMatchObject({ code: 'SecretNotFound' });
+  const shared = (await invoke('desktop_open_shared_vault', {})) as DesktopProjectContext;
+  const target = {
+    project_id: shared.project_id,
+    profile_id: shared.profile_id,
+    secret_name: 'POSTMARK_TOKEN',
+    source: 'user-local',
+  };
+  await expect(
+    request('desktop_link_secret', {
+      project_id: shared.project_id,
+      profile_id: shared.profile_id,
+      local_name: 'ALIAS',
+      target_secret_name: target.secret_name,
+    }),
+  ).rejects.toMatchObject({ code: 'InvalidReference' });
+  await expect(
+    request('desktop_delete_secret', { ...target, unlink_all: true, expected_link_ids: [] }),
+  ).rejects.toMatchObject({ code: 'LinkSetChanged' });
+  await expect(request('desktop_delete_secret', target)).rejects.toMatchObject({
+    code: 'LinkedSecretInUse',
+  });
+  await expect(
+    request('desktop_delete_secret', {
+      ...target,
+      unlink_all: true,
+      expected_link_ids: ['link-notifications'],
+    }),
+  ).resolves.toMatchObject({ deleted: true, unlinked_count: 1 });
+  await expect(
+    request('desktop_list_shared_usages', { target_secret_id: 'variable-shared-email' }),
+  ).resolves.toEqual({ usages: [] });
+});
+
+it.each([false, true])(
+  'promotes a visible value and applies duplicate consolidation when allowed (dangerous=%s)',
+  async (dangerous) => {
+    const invoke = createMockRuntime(new URLSearchParams());
+    const request = (command: string, payload: Record<string, unknown>) =>
+      invoke(command, { request: payload });
+    const projects = (await invoke('desktop_list_projects', {})) as DesktopProjectContext[];
+    const acme = projects.find(({ project_id }) => project_id === 'acme-api')!;
+    const web = projects.find(({ project_id }) => project_id === 'web-app')!;
+    if (dangerous) {
+      await request('desktop_open_project', { path: web.root });
+      await request('agent_write_config', {
+        project_id: web.project_id,
+        profile_name: web.profile_name,
+        changes: { dangerous_profile: true },
+      });
+      await request('desktop_open_project', { path: acme.root });
+    }
+    await expect(
+      request('desktop_copy_secret_to_shared', {
+        from_project_id: acme.project_id,
+        from_profile_id: acme.profile_id,
+        secret_name: 'SENTRY_DSN',
+        target_name: 'SHARED_SENTRY_DSN',
+        replace_with_link: true,
+        consolidate_duplicates: true,
+      }),
+    ).resolves.toMatchObject({
+      linked: true,
+      ...(dangerous ? { skipped_locked_count: 1 } : { consolidated_count: 1 }),
+    });
+    await expect(
+      request('desktop_list_shared_usages', {
+        target_secret_id: (
+          (await request('agent_list_secrets', { profile_id: acme.profile_id })) as {
+            rows: Array<{ name: string; linked_target_secret_id?: string }>;
+          }
+        ).rows.find(({ name }) => name === 'SENTRY_DSN')?.linked_target_secret_id,
+      }),
+    ).resolves.toMatchObject({
+      usages: Array.from({ length: dangerous ? 1 : 2 }, () => expect.any(Object)),
+    });
+    const { rows } = (await request('agent_list_secrets', {
+      profile_id: acme.profile_id,
+      redact_names: true,
+    })) as { rows: Array<{ id: string; name: string; linked_target_name?: string }> };
+    const linked = rows.find((row) => row.linked_target_name);
+    expect(linked).toBeDefined();
+    await expect(
+      request('agent_reveal', {
+        profile_id: acme.profile_id,
+        secret_name: linked!.name,
+        secret_id: linked!.id,
+      }),
+    ).resolves.toMatchObject({ value: 'preview-only-value' });
+  },
+);

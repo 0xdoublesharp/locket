@@ -6,7 +6,7 @@
 // invoke is a no-op so the same composable can power the dev surface
 // without crashing on the missing IPC bridge.
 
-import { watch, type Ref } from 'vue';
+import { onScopeDispose, watch, type Ref } from 'vue';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 
 import type { AgentClientError, AgentStatus } from '../agent/types';
@@ -66,30 +66,38 @@ export function useTray(
   error: Ref<AgentClientError | null>,
 ): void {
   let lastPushed: TrayState | null = null;
+  let desired: TrayState | null = null;
+  let pushing = false;
 
-  async function push(next: TrayState): Promise<void> {
-    if (!isTauri()) {
-      lastPushed = next;
-      return;
-    }
+  async function pushLatest(): Promise<void> {
+    if (pushing || !isTauri()) return;
+    pushing = true;
     try {
-      await invoke<void>('tray_set_state', { state: next });
-      lastPushed = next;
-    } catch {
-      // Tray rendering failures are local-only and must never block
-      // the rest of the app. The next state change will retry.
+      while (desired !== null && desired !== lastPushed) {
+        const next = desired;
+        try {
+          await invoke<void>('tray_set_state', { state: next });
+          lastPushed = next;
+        } catch {
+          // A native failure may have occurred after changing the icon.
+          lastPushed = null;
+          if (desired === next) break;
+        }
+      }
+    } finally {
+      pushing = false;
     }
   }
 
   watch(
     [status, error],
     ([nextStatus, nextError]) => {
-      const desired = deriveTrayState(nextStatus, nextError);
-      if (desired === lastPushed) {
-        return;
-      }
-      void push(desired);
+      desired = deriveTrayState(nextStatus, nextError);
+      void pushLatest();
     },
     { immediate: true },
   );
+  onScopeDispose(() => {
+    desired = null;
+  });
 }

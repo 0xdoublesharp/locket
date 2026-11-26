@@ -629,6 +629,13 @@ fn local_actions(ipc: &Ipc, vault: &Vault, home: &Path) {
     let readiness = ipc.ok("desktop_variable_readiness", json!({"project_id":vault.id}));
     assert_eq!(readiness["policies"][0]["policy_name"], "test");
     assert_eq!(
+        ipc.request(
+            "desktop_variable_readiness",
+            json!({"project_id":vault.id,"policy_name":"removed-command"})
+        ),
+        Err(json!("The selected command no longer exists. Refresh commands."))
+    );
+    assert_eq!(
         ipc.request("desktop_detect_commands", json!({"project_id":"lk_proj_previous"})),
         Err(json!("agent protocol error: The selected project changed. Refresh before retrying.")),
     );
@@ -823,6 +830,22 @@ fn live_crud(ipc: &Ipc, vault: &Vault, create: &Value, delete: &Value, copy: &Va
         imported["summary"],
         "Imported 1, overwritten 0, skipped 0. Original file preserved."
     );
+    let inventory = ipc.ok(
+        "agent_list_secrets",
+        json!({"project_id":vault.id,"profile_id":PROFILE,"redact_names":true}),
+    );
+    let redacted_row = &inventory["rows"][0];
+    assert_ne!(redacted_row["name"], "TOKEN");
+    assert_eq!(
+        ipc.ok(
+            "agent_reveal",
+            json!({
+                "project_id":vault.id,"profile_id":PROFILE,
+                "secret_id":redacted_row["id"],"secret_name":redacted_row["name"],
+            })
+        )["value"],
+        TOKEN
+    );
     let target_locked =
         ipc.rejected("desktop_copy_secret_to_shared", copy.clone(), "UnlockRequired");
     assert_eq!(
@@ -879,6 +902,12 @@ fn live_crud(ipc: &Ipc, vault: &Vault, create: &Value, delete: &Value, copy: &Va
     copy["overwrite"] = json!(true);
     assert_eq!(ipc.ok("desktop_copy_secret_to_shared", copy)["version"], 2);
 
+    let target = db
+        .get_active_secret(SHARED, SHARED_PROFILE, "TOKEN", "user-local")
+        .expect("destination lookup")
+        .expect("copied secret");
+    live_shared_links(ipc, vault, &db, &target.id);
+
     let mut delete = delete.clone();
     delete["confirmation"] = json!("dev");
     let deleted = ipc.ok("desktop_delete_secret", delete.clone());
@@ -889,6 +918,21 @@ fn live_crud(ipc: &Ipc, vault: &Vault, create: &Value, delete: &Value, copy: &Va
         })
     );
     ipc.rejected("desktop_delete_secret", delete, "SecretNotFound");
+    for command in ["agent_reveal", "agent_copy_secret"] {
+        assert_eq!(
+            ipc.request(
+                command,
+                json!({
+                    "project_id":vault.id,"profile_id":PROFILE,
+                    "secret_id":redacted_row["id"],"secret_name":redacted_row["name"],
+                })
+            ),
+            Err(json!({
+                "kind":"protocol",
+                "reason":"The selected secret changed. Refresh Secrets before retrying.",
+            }))
+        );
+    }
     assert!(
         db.get_active_secret(&vault.id, PROFILE, "TOKEN", "user-local")
             .expect("source lookup")
@@ -904,6 +948,46 @@ fn live_crud(ipc: &Ipc, vault: &Vault, create: &Value, delete: &Value, copy: &Va
     );
     assert!(db.verify_audit_chain_read_only(SHARED, &[7; 32]).expect("target audit chain").hmac_ok);
     vault.dangerous(false);
+}
+
+fn live_shared_links(ipc: &Ipc, vault: &Vault, db: &Store, target_id: &str) {
+    let local = json!({
+        "project_id":vault.id,"profile_id":PROFILE,"local_name":"LINKED_TOKEN",
+    });
+    let mut link = local.clone();
+    link["target_secret_name"] = json!("TOKEN");
+    ipc.rejected("desktop_link_secret", link.clone(), "ConfirmationFailed");
+    link["confirmation"] = json!("dev");
+    let linked = ipc.ok("desktop_link_secret", link);
+    assert_eq!(linked["target_secret_id"], target_id);
+    assert_eq!(linked["local_name"], "LINKED_TOKEN");
+
+    let request = json!({"target_secret_id":target_id,"redact_names":true});
+    let usages = ipc.ok("desktop_list_shared_usages", request);
+    assert_eq!(usages["usages"][0]["link_id"], linked["link_id"]);
+    assert_ne!(usages["usages"][0]["local_name"], "LINKED_TOKEN");
+    assert_ne!(usages["usages"][0]["target_secret_name"], "TOKEN");
+
+    let source = db
+        .get_active_secret(&vault.id, PROFILE, "TOKEN", "user-local")
+        .expect("source lookup")
+        .expect("source secret");
+    // Cross-vault dedup indexing depends on a system keyring key. Seed the
+    // two matching local indexes explicitly for this isolated store.
+    db.upsert_local_value_fingerprint(&source.id, 1, &[10; 32], 1).expect("source fingerprint");
+    db.upsert_local_value_fingerprint(target_id, 2, &[10; 32], 1).expect("target fingerprint");
+    let duplicates = ipc.invoke("desktop_list_duplicates", json!({})).expect("duplicate groups");
+    assert_eq!(duplicates["groups"][0]["members"].as_array().expect("duplicate members").len(), 2);
+    let redacted = ipc.ok("desktop_list_duplicates", json!({"redact_names":true}));
+    assert!(!redacted.to_string().contains("TOKEN"));
+
+    let mut unlink = local.clone();
+    unlink["confirmation"] = json!("dev");
+    assert_eq!(ipc.ok("desktop_unlink_secret", unlink)["unlinked"], true);
+    assert_eq!(
+        ipc.ok("desktop_list_shared_usages", json!({"target_secret_id":target_id})),
+        json!({"usages":[]})
+    );
 }
 
 enum Reply {

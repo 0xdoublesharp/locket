@@ -66,6 +66,17 @@ const revokeForm = ref<TeamInviteRevokeFormState>(defaultRevokeForm());
 
 const searchQuery = ref<string>('');
 
+watch([() => props.projectId, () => props.privacyMode], () => {
+  issueForm.value = { ...defaultIssueForm(), dangerousProfiles: props.dangerousProfiles };
+  issueDangerousConfirmation.value = '';
+  acceptForm.value = {
+    ...defaultAcceptForm(),
+    requireUserVerification: props.requireAcceptUserVerification,
+  };
+  revokeForm.value = defaultRevokeForm();
+  searchQuery.value = '';
+});
+
 watch(
   () => props.dangerousProfiles,
   (next) => {

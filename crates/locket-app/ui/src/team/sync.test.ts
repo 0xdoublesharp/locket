@@ -64,3 +64,16 @@ describe('authenticated team sharing guidance', () => {
     expect(syncMessage({ state: 'active', conflicts: 0, waiting: 0 })).toContain('last verified');
   });
 });
+
+it('distinguishes delivery failure from an untrusted join and handles invalid URLs', () => {
+  expect(syncMessage({ state: 'delivery-error', conflicts: 0, waiting: 0 })).toContain(
+    'Delivery needs attention',
+  );
+  expect(syncMessage({ state: 'unanchored', conflicts: 0, waiting: 0 })).toContain(
+    'independently verified owner fingerprint',
+  );
+  expect(validDeliveryUrl('https://server.test:65536/team')).toBe(false);
+  expect(joinCommand('', 'A'.repeat(64), 'webdav', 'windows')).toBe(
+    `locket team join --remote --owner "${'a'.repeat(64)}"`,
+  );
+});

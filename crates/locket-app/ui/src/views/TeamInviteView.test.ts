@@ -153,3 +153,23 @@ it('requires fingerprint and user verification before accept, and matching invit
     'locket team revoke-invite lk_invite_fixture',
   );
 });
+
+it.each([{ projectId: 'next-vault' }, { privacyMode: true }])(
+  'clears invite drafts when entering a new context %j',
+  async (change) => {
+    const { root, setProps } = teamInvites({ projectId: 'first-vault' });
+    const field = (suffix: string) => byProp(root, 'data-testid', 'team-invite-' + suffix);
+    await input(field('recipient'), 'First vault recipient');
+    await input(field('accept-text'), 'opaque-fixture-invite-'.repeat(5));
+    await input(field('revoke-id'), 'lk_invite_first_vault');
+    await input(byProp(root, 'type', 'search'), 'first vault');
+    setProps(change);
+    await settle();
+    setProps({ privacyMode: false });
+    await settle();
+    for (const suffix of ['recipient', 'accept-text', 'revoke-id']) {
+      expect(field(suffix).value).toBe('');
+    }
+    expect(byProp(root, 'type', 'search').value).toBe('');
+  },
+);

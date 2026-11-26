@@ -138,3 +138,10 @@ describe('trayActionEnablement', () => {
     }
   });
 });
+
+it('ignores a tray event outside the routed menu actions', () => {
+  const action = 'quit-app' as TrayMenuAction;
+  expect(trayActionToView(action)).toBeNull();
+  expect(trayActionSideEffect(action)).toBe('none');
+  expect(trayActionAgentCommand(action)).toBeNull();
+});

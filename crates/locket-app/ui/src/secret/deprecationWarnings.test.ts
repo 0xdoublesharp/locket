@@ -136,3 +136,33 @@ describe('secretRowsWithDeprecationWarnings', () => {
     expect(rows[0]?.deprecatedReferenceWarnings).toEqual([]);
   });
 });
+
+it('sorts multiple pinned versions by expiry and then by version', () => {
+  const [row] = secretRowsWithDeprecationWarnings(
+    [secret({})],
+    [
+      version({ version: 1, graceUntil: '2026-04-30T00:00:00.000Z' }),
+      version({ version: 2, graceUntil: '2026-05-03T00:00:00.000Z' }),
+      version({ version: 3, graceUntil: '2026-05-04T00:00:00.000Z' }),
+    ],
+    [
+      policy({
+        requiredSecrets: [
+          'DATABASE_URL',
+          'lk://dev/DATABASE_URL@v3',
+          'DATABASE_URL@v2',
+          'DATABASE_URL@v1',
+          'DATABASE_URL@v9007199254740992',
+        ],
+      }),
+    ],
+    NOW,
+  );
+  expect(row?.deprecatedReferenceWarnings?.map(({ version, status }) => [version, status])).toEqual(
+    [
+      [1, 'expired-grace'],
+      [2, 'active-grace'],
+      [3, 'active-grace'],
+    ],
+  );
+});

@@ -109,6 +109,8 @@ it('keeps review, import, verification and recovery requests distinct', async ()
   expect(control(importPanel, 'To import into dangerous').value).toBe('');
   await input(control(importPanel, 'To import into dangerous'), 'development');
   await check(control(importPanel, 'Import audit evidence'));
+  expect(control(importPanel, 'To import into dangerous').value).toBe('');
+  await input(control(importPanel, 'To import into dangerous'), 'development');
   await click(button(root, 'Apply import'));
   expect(onAction).toHaveBeenLastCalledWith(
     expect.objectContaining({
@@ -150,6 +152,16 @@ it('keeps review, import, verification and recovery requests distinct', async ()
       },
     }),
   );
+  expect(button(root, 'Rotate').props.disabled).toBe(true);
+});
+
+it('requires fresh recovery acknowledgement when the active vault changes', async () => {
+  const { root, setProps } = backup();
+  await check(control(root, 'One-time display acknowledged'));
+  expect(button(root, 'Rotate').props.disabled).toBe(false);
+  setProps({ contextKey: 'next-vault' });
+  await settle();
+  expect(button(root, 'Rotate').props.disabled).toBe(true);
 });
 
 it('blocks verification and code rotation while another backup operation is running', async () => {

@@ -237,6 +237,13 @@ function clearImportPreview(): void {
   importSelections.value = {};
 }
 watch([envPath, importLiteral, importOverwrite], clearImportPreview, { flush: 'sync' });
+watch(
+  importSelections,
+  () => {
+    importTargetConfirmation.value = '';
+  },
+  { flush: 'sync' },
+);
 const envPathReady = computed(() => {
   const path = envPath.value.trim();
   return path !== '' && (!selectedIsShared.value || /^(?:\/|[a-z]:[\\/]|\\\\)/i.test(path));
@@ -244,6 +251,7 @@ const envPathReady = computed(() => {
 const commandRunning = ref(false);
 const commandRunError = ref<string | null>(null);
 const commandRunNotice = ref<string | null>(null);
+const commandRunRequests = createRequestLifetime();
 useTray(status, error);
 
 const agentOnline = computed(
@@ -301,6 +309,7 @@ const copyError = ref<string | null>(null);
 const revealError = ref<string | null>(null);
 const revealRequests = createRequestLifetime();
 let unlistenTrayMenu: UnlistenFn | null = null;
+let trayMenuDisposed = false;
 
 type TrayMenuAction =
   | 'open-app'
@@ -766,7 +775,7 @@ async function copyPaletteText(text: string | Promise<string>, label: string): P
 
 type RunnablePaletteAction = PaletteAction & { run: () => void | Promise<void> };
 const paletteActions = computed<RunnablePaletteAction[]>(() => {
-  const redact = settings.value.privacyRedactNames;
+  const redact = !settingsReady.value || settings.value.privacyRedactNames;
   const views = [
     ...primaryItems,
     { key: 'discover' as const, label: 'Discover', icon: 'compass' as const },
@@ -1110,6 +1119,7 @@ async function handleRevealSelectedSecret(): Promise<void> {
   if (approved === undefined || !isCurrent()) return;
   const result = await revealAgent({
     secret_name: target.name,
+    ...(settings.value.privacyRedactNames && { secret_id: target.id }),
     profile_id: profileId,
     ...(approved && { confirm_dangerous_profile: approved }),
   });
@@ -1158,6 +1168,7 @@ async function handleCopySelectedSecret(): Promise<void> {
   if (approved === undefined || !isCurrent()) return;
   const result = await copySecret({
     secret_name: target.name,
+    ...(settings.value.privacyRedactNames && { secret_id: target.id }),
     ...(approved && { confirm_dangerous_profile: approved }),
     profile_id: profileId,
     project_id: status.value?.project_id ?? undefined,
@@ -1199,7 +1210,7 @@ const secretsRequest = computed<ListSecretsRequest | null>(() => {
   return {
     project_id: context.project_id,
     profile_id: context.profile_id,
-    redact_names: settings.value.privacyRedactNames,
+    redact_names: !settingsReady.value || settings.value.privacyRedactNames,
   };
 });
 
@@ -1267,7 +1278,10 @@ async function refreshSecrets(): Promise<void> {
   }
   if (result.ok) {
     secretsLoadError.value = null;
-    secrets.value = result.value.rows.map(secretRow);
+    secrets.value = result.value.rows.map((row) => ({
+      ...secretRow(row),
+      ...(request.redact_names && { alias: row.name }),
+    }));
     secretsLastRefreshed.value = new Date().toISOString();
   } else {
     secrets.value = [];
@@ -1899,7 +1913,9 @@ function backupErrorLabel(error: AgentClientError): string {
     case 'unavailable':
       return 'Agent unavailable.';
     case 'protocol':
-      return 'Backup request failed.';
+      return error.reason.startsWith('request timed out; outcome is unknown.')
+        ? 'Backup request timed out. Check whether it completed before retrying.'
+        : 'Backup request failed.';
     case 'rejected':
       return error.code === 'ConfirmationFailed' ? error.message : error.code;
     default:
@@ -1922,10 +1938,11 @@ async function triggerBackupAction(action: BundleAction): Promise<void> {
   try {
     switch (action.kind) {
       case 'export': {
-        if (
-          !action.request.previewOnly &&
-          backupPreviewKey.value !== exportSelectionKey(action.request)
-        ) {
+        const selectionKey = exportSelectionKey(action.request);
+        if (action.request.previewOnly) {
+          backupPreviewKey.value = null;
+          backupPreviewMessage.value = null;
+        } else if (backupPreviewKey.value !== selectionKey) {
           backupError.value = 'Preview the current export scope before exporting.';
           return;
         }
@@ -1944,7 +1961,7 @@ async function triggerBackupAction(action: BundleAction): Promise<void> {
         if (!isCurrent()) return;
         if (result.ok) {
           if (action.request.previewOnly && result.value.status === 'preview') {
-            backupPreviewKey.value = exportSelectionKey(action.request);
+            backupPreviewKey.value = selectionKey;
             backupPreviewMessage.value = result.value.message;
           }
           backupNotice.value = `${result.value.status}: ${result.value.message}`;
@@ -2400,9 +2417,9 @@ async function handleListCopy(row: SecretRowMeta): Promise<void> {
 async function refreshProjectConnections(): Promise<void> {
   const generation = selectionGeneration.value;
   const result = await desktopListProjects();
+  if (generation !== selectionGeneration.value) return;
   if (result.ok) {
     knownProjects.value = result.value;
-    if (generation !== selectionGeneration.value) return;
     const initial = previewParams
       ? (result.value.find((project) => !project.is_shared) ?? result.value[0])
       : initialProjectSelection(result.value, selectedProject.value);
@@ -2413,8 +2430,7 @@ async function refreshProjectConnections(): Promise<void> {
         await connectProject(false, initial.root);
       }
     }
-  } else if (generation === selectionGeneration.value && desktopAvailable)
-    desktopError.value = actionError(result.error);
+  } else if (desktopAvailable) desktopError.value = actionError(result.error);
 }
 
 async function openSharedVault({
@@ -2759,11 +2775,20 @@ async function runEnvImport(dryRun: boolean): Promise<void> {
 }
 async function runCommand(row: CommandPolicyRow): Promise<void> {
   const projectId = activeContext.value?.project_id;
-  if (!policyAccess.value.enabled || !projectId || commandRunning.value) return;
+  if (
+    !policyAccess.value.enabled ||
+    !projectId ||
+    commandRunning.value ||
+    desktopBusy.value ||
+    profileSwitchInProgress.value
+  )
+    return;
+  const isCurrent = commandRunRequests.begin();
   commandRunning.value = true;
   commandRunError.value = null;
   commandRunNotice.value = null;
   const result = await desktopRunPolicy({ project_id: projectId, policy_name: row.name });
+  if (!isCurrent()) return;
   if (!result.ok) commandRunError.value = actionError(result.error);
   else if (!result.value.launched)
     commandRunError.value =
@@ -2772,8 +2797,19 @@ async function runCommand(row: CommandPolicyRow): Promise<void> {
     commandRunNotice.value = 'Opened in your terminal. Complete any approval there.';
     await refreshRuntimeSessions();
   }
-  commandRunning.value = false;
+  if (isCurrent()) commandRunning.value = false;
 }
+
+watch(
+  [settingsContextKey, profileSwitchInProgress, () => settings.value.privacyRedactNames],
+  () => {
+    commandRunRequests.invalidate();
+    commandRunning.value = false;
+    commandRunError.value = null;
+    commandRunNotice.value = null;
+  },
+  { flush: 'sync' },
+);
 function handleNextAction(target: StartHereTarget): void {
   if (target === 'connect') {
     document.getElementById('project-path')?.focus();
@@ -2826,9 +2862,17 @@ onMounted(() => {
     return;
   }
   void listen<TrayMenuAction>('tray-menu-action', (event) => {
-    void handleTrayMenuAction(event.payload);
+    if (trayMenuDisposed) return;
+    if (event.payload === 'lock-vault') {
+      // The native tray already sent Lock before emitting this event.
+      invalidateReveal();
+      void refresh();
+    } else {
+      void handleTrayMenuAction(event.payload);
+    }
   })
     .then((unlisten) => {
+      if (trayMenuDisposed) return unlisten();
       unlistenTrayMenu = unlisten;
     })
     .catch(() => {});
@@ -2839,6 +2883,7 @@ onBeforeUnmount(() => {
   clearTimeout(desktopNoticeTimer);
   metadataClipboardRequests.dispose();
   backupRequests.dispose();
+  commandRunRequests.dispose();
   copyRequests.dispose();
   settingsRequests.dispose();
   profileCreateRequests.dispose();
@@ -2857,7 +2902,8 @@ onBeforeUnmount(() => {
 });
 
 onUnmounted(() => {
-  unlistenTrayMenu?.();
+  trayMenuDisposed = true;
+  void Promise.resolve(unlistenTrayMenu?.()).catch(() => {});
   unlistenTrayMenu = null;
 });
 </script>
@@ -3478,7 +3524,7 @@ onUnmounted(() => {
         :duplicates-error="duplicatesError"
         :profile-name="activeContext?.profile_name"
         :profile-label="profileLabel"
-        :can-access-values="secretAccess.enabled"
+        :can-access-values="settingsReady && secretAccess.enabled"
         :connected="agentOnline"
         :can-start="desktopAvailable && !agentOnline"
         :starting="desktopBusy"

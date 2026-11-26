@@ -850,7 +850,7 @@ fn readiness_scope_and_acl_use_verified_command_directory() -> Result<(), Box<dy
     fs::write(
         &path,
         format!(
-            "{text}\n[paths.services]\nprofile='scoped'\nrequired_secrets=['NESTED']\n[secrets.NESTED]\nallow_commands=['test']\nallow_paths=['services/**']\n"
+            "{text}\n[paths.services]\nprofile='scoped'\nrequired_secrets=['NESTED']\noptional_secrets=['OPTIONAL']\n[secrets.NESTED]\nallow_commands=['test']\nallow_paths=['services/**']\n"
         ),
     )?;
     let context = open_project_at(&fixture.store, &fixture.root)?;
@@ -866,6 +866,8 @@ fn readiness_scope_and_acl_use_verified_command_directory() -> Result<(), Box<dy
     )?)?;
     assert_eq!(nested["policies"][0]["profile_id"], "lk_prof_scoped");
     assert_eq!(nested["policies"][0]["rows"][0]["name"], "NESTED");
+    assert_eq!(nested["policies"][0]["rows"][1]["name"], "OPTIONAL");
+    assert_eq!(nested["policies"][0]["rows"][1]["required"], false);
     assert!(nested["policies"][0].get("error").is_none());
     let root = serde_json::to_value(variable_readiness_at(&fixture.store, &request)?)?;
     assert_eq!(root["policies"][0]["profile_id"], "lk_prof_fixture");
@@ -1402,6 +1404,35 @@ fn detection_refuses_global_vault_and_ignores_malformed_and_large_manifests()
 }
 
 #[test]
+fn command_detection_suggests_explicit_cargo_bins_and_poetry_entry_points()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let context = open_project_at(&fixture.store, &fixture.root)?;
+    fs::write(
+        fixture.root.join("Cargo.toml"),
+        "[package]\nname = 'example'\nautobins = false\n[[bin]]\nname = 'example'\n",
+    )?;
+    fs::write(
+        fixture.root.join("pyproject.toml"),
+        "[project.scripts]\ncheck = 'example:check'\n[tool.poetry.scripts]\ncheck = 'example:old'\n",
+    )?;
+    fs::write(fixture.root.join("poetry.lock"), "")?;
+    let rows = serde_json::to_value(detect_commands_for_context(&context)?)?;
+    let rows = rows.as_array().ok_or("expected command suggestions")?;
+    let command = |name| rows.iter().find(|row| row["name"] == name);
+    assert_eq!(
+        command("cargo-run").ok_or("cargo run suggestion")?["argv"],
+        serde_json::json!(["cargo", "run"])
+    );
+    assert_eq!(
+        command("check").ok_or("Poetry suggestion")?["argv"],
+        serde_json::json!(["poetry", "run", "check"])
+    );
+    assert_eq!(rows.iter().filter(|row| row["name"] == "check").count(), 1);
+    Ok(())
+}
+
+#[test]
 #[cfg(unix)]
 fn detection_refuses_symlinked_manifests() -> Result<(), Box<dyn Error>> {
     let fixture = Fixture::new()?;
@@ -1786,5 +1817,39 @@ async fn dotenv_promotion_acquires_and_revokes_both_profile_grants() -> Result<(
     let result = invoke_import_env_at(&socket, &fixture.store, &context, request).await?;
     assert_eq!(result.promoted, 1);
     server.await?.map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn dotenv_promotion_requires_a_registered_vault_and_its_exact_confirmation()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let context = open_project_at(&fixture.store, &fixture.root)?;
+    let socket = fixture.directory.path().join("unused.sock");
+    let request = || DesktopImportEnvRequest {
+        project_id: context.project_id.clone(),
+        path: ".env".into(),
+        overwrite: false,
+        literal: false,
+        confirmation: None,
+        target_confirmation: Some("Default".into()),
+        dry_run: false,
+        link_to_shared: Default::default(),
+        promote_to_shared: [("TOKEN".into(), "TOKEN".into())].into(),
+    };
+    let result = invoke_import_env_at(&socket, &fixture.store, &context, request()).await;
+    assert!(
+        matches!(result, Err(AgentClientError::Protocol { reason }) if reason.contains("Set up the Global Vault"))
+    );
+
+    let db = Store::open(&fixture.store)?;
+    let shared_id = "lk_proj_shared_unconfirmed";
+    db.insert_project_if_absent(shared_id, "@shared", 2)?;
+    db.insert_profile_if_absent("shared-default", shared_id, "default", true, 2)?;
+    let result = invoke_import_env_at(&socket, &fixture.store, &context, request()).await;
+    assert!(matches!(
+        result,
+        Err(AgentClientError::Rejected { code, retryable: false, .. }) if code == "ConfirmationFailed"
+    ));
     Ok(())
 }

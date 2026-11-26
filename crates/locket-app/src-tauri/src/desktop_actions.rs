@@ -1790,6 +1790,32 @@ fn granted_project_context(
     Ok(context)
 }
 
+/// A privacy alias is a display label, so resolve it against the exact
+/// metadata row in the selected vault before sending a value request.
+pub(crate) fn resolve_value_name(
+    store: &Path,
+    project_id: &str,
+    profile_id: &str,
+    name: String,
+    secret_id: Option<&str>,
+) -> Result<String, AgentClientError> {
+    let Some(secret_id) = secret_id else {
+        return Ok(name);
+    };
+    let context = granted_project_context(store, project_id, Some(profile_id))?;
+    Store::open_read_only(store)
+        .and_then(|store| {
+            store.list_active_secret_metadata_by_profile(&context.project_id, &context.profile_id)
+        })
+        .map_err(|error| AgentClientError::Protocol { reason: metadata_error(error) })?
+        .into_iter()
+        .find(|row| row.id == secret_id && locket_core::privacy_alias("secret", &row.name) == name)
+        .map(|row| row.name)
+        .ok_or_else(|| AgentClientError::Protocol {
+            reason: "The selected secret changed. Refresh Secrets before retrying.".into(),
+        })
+}
+
 pub(crate) async fn export_bundle(
     store: &Path,
     mut request: locket_agent::ExportBundleRequest,

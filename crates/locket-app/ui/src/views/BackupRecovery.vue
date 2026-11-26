@@ -86,11 +86,19 @@ watch(
   () => [
     importDraft.value.bundlePath,
     importDraft.value.conflictMode,
+    importDraft.value.includeAudit,
     props.contextKey,
     props.profileName,
   ],
   () => {
     importDraft.value.confirmDangerousProfile = '';
+  },
+  { flush: 'sync' },
+);
+watch(
+  () => props.contextKey,
+  () => {
+    rotateDraft.value.acknowledgedOneTimeDisplay = false;
   },
   { flush: 'sync' },
 );
@@ -125,12 +133,13 @@ function verifyAction(): void {
 }
 
 function rotateAction(): void {
-  if (props.busy) return;
+  if (props.busy || !canRotate.value) return;
   emit('action', {
     kind: 'rotate',
     label: 'rotate recovery code',
     request: { ...rotateDraft.value },
   });
+  rotateDraft.value.acknowledgedOneTimeDisplay = false;
 }
 </script>
 

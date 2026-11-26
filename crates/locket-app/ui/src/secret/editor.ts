@@ -44,6 +44,7 @@ const SECRET_NAME_PATTERN = /^[A-Z_][A-Z0-9_]*$/;
 const VALUE_MAX_LENGTH = 65_536;
 const DESCRIPTION_MAX_LENGTH = 512;
 const NUL_BYTE = '\0';
+const textEncoder = new TextEncoder();
 
 export function isValidSecretName(name: string): boolean {
   return name.length <= 128 && SECRET_NAME_PATTERN.test(name);
@@ -76,7 +77,7 @@ export function validateSetForm(state: SecretSetFormState): FormValidation<Secre
 
   if (state.value.length === 0) {
     errors.value = 'Value is required.';
-  } else if (state.value.length > VALUE_MAX_LENGTH) {
+  } else if (textEncoder.encode(state.value).length > VALUE_MAX_LENGTH) {
     errors.value = `Value is too long (max ${VALUE_MAX_LENGTH.toString()} bytes).`;
   } else if (state.value.includes(NUL_BYTE)) {
     errors.value = 'Value must not contain NUL bytes.';
@@ -105,13 +106,13 @@ export function validateRotateForm(
   const name = state.name.trim();
   if (name.length === 0) {
     errors.name = 'Pick the secret to rotate.';
-  } else if (!SECRET_NAME_PATTERN.test(name)) {
+  } else if (!isValidSecretName(name)) {
     errors.name = 'Name must match KEY_FORMAT.';
   }
 
   if (state.value.length === 0) {
     errors.value = 'New value is required.';
-  } else if (state.value.length > VALUE_MAX_LENGTH) {
+  } else if (textEncoder.encode(state.value).length > VALUE_MAX_LENGTH) {
     errors.value = `Value is too long (max ${VALUE_MAX_LENGTH.toString()} bytes).`;
   } else if (state.value.includes(NUL_BYTE)) {
     errors.value = 'Value must not contain NUL bytes.';
@@ -137,7 +138,7 @@ export function validateDeleteForm(
   const name = state.name.trim();
   if (name.length === 0) {
     errors.name = 'Pick the secret to delete.';
-  } else if (!SECRET_NAME_PATTERN.test(name)) {
+  } else if (!isValidSecretName(name)) {
     errors.name = 'Name must match KEY_FORMAT.';
   }
 

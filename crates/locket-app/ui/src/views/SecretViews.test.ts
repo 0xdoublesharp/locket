@@ -509,3 +509,89 @@ it('blocks editing a linked name and directs rotation to Global Vault', async ()
   await submit(rotate);
   expect(onRotateSecret).not.toHaveBeenCalled();
 });
+
+it('can create a link and clears the completed link draft when metadata refreshes', async () => {
+  const onLink = vi.fn();
+  const { root, setProps } = mount(SecretMetadataList, {
+    rows: [secret],
+    versions: [],
+    profileLabel: 'Dev',
+    connected: true,
+    canStart: false,
+    starting: false,
+    privacyMode: false,
+    loading: false,
+    canAccessValues: true,
+    metadataLoaded: true,
+    onLink,
+  });
+  await click(button(root, 'Link from Global Vault'));
+  const local = control(root, 'Local variable name');
+  const target = control(root, 'Global Vault secret name');
+  await input(local, '  ALIAS  ');
+  await input(target, 'GLOBAL_TOKEN');
+  await submit(root);
+  expect(onLink).toHaveBeenCalledExactlyOnceWith('ALIAS', 'GLOBAL_TOKEN');
+  setProps({ rows: [secret, { ...secret, id: 'new-link', name: 'ALIAS', source: 'shared-link' }] });
+  await settle();
+  expect(findNode(root, (node) => node.tag === 'form')).toBeUndefined();
+  await click(button(root, 'Link from Global Vault'));
+  expect(control(root, 'Local variable name').value).toBe('');
+  await click(button(root, 'Link from Global Vault'));
+  expect(findNode(root, (node) => node.tag === 'form')).toBeUndefined();
+});
+
+it('preserves the inspector after a linked-project lookup failure and retries', async () => {
+  vi.mocked(invoke).mockRejectedValueOnce('offline').mockResolvedValueOnce({ usages: [] });
+  const { root } = mount(SecretMetadataList, {
+    rows: [override],
+    versions: [],
+    profileLabel: 'Default',
+    isShared: true,
+    connected: true,
+    canStart: false,
+    starting: false,
+    privacyMode: false,
+    loading: false,
+    canAccessValues: true,
+    metadataLoaded: true,
+  });
+  await click(button(root, 'Details for PERSONAL_SETTING'));
+  const inspector = byProp(root, 'id', 'variable-inspector');
+  expect(nodeText(inspector)).toContain('Could not load linked projects.');
+  await click(button(inspector, 'Retry'));
+  expect(nodeText(inspector)).toContain('No linked projects.');
+  expect(invoke).toHaveBeenCalledTimes(2);
+});
+
+it('scrolls opened secret details into view on a narrow screen', async () => {
+  Object.assign(window, { matchMedia: () => ({ matches: true }) });
+  const { root } = mount(SecretMetadataList, {
+    rows: [secret],
+    versions: [],
+    profileLabel: 'Dev',
+    connected: true,
+    canStart: false,
+    starting: false,
+    privacyMode: false,
+    loading: false,
+    canAccessValues: true,
+    metadataLoaded: true,
+  });
+  const details = button(root, 'Details for PRIVATE_TOKEN');
+  const scrollIntoView = vi.fn();
+  Object.assign(details, {
+    closest: (selector: string) => {
+      expect(selector).toBe('li');
+      return {
+        querySelector: (target: string) => {
+          expect(target).toBe('.variable-inspector');
+          expect(byProp(root, 'id', 'variable-inspector')).toBeDefined();
+          return { scrollIntoView };
+        },
+      };
+    },
+  });
+  await click(details);
+  expect(scrollIntoView).toHaveBeenCalledExactlyOnceWith({ block: 'nearest' });
+});

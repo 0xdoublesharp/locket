@@ -173,3 +173,35 @@ describe('defaults', () => {
     expect(defaultDeleteForm().confirmation).toBe('');
   });
 });
+
+it('applies secret-name limits consistently across create, rotation and deletion', () => {
+  const name = 'X'.repeat(129);
+  expect(validateSetForm({ ...defaultSetForm(), name, value: 'example' }).errors.name).toContain(
+    'too long',
+  );
+  expect(
+    validateRotateForm({ ...defaultRotateForm(), name, value: 'example' }).errors.name,
+  ).toBeDefined();
+  expect(validateDeleteForm({ name, confirmation: name }).errors.name).toBeDefined();
+  expect(validateDeleteForm(defaultDeleteForm()).errors.name).toBeDefined();
+});
+
+it('validates the UTF-8 value size and rejects invalid rotation fields', () => {
+  const value = 'λ'.repeat(32_769);
+  const name = 'TOKEN';
+  expect(validateSetForm({ ...defaultSetForm(), name, value }).errors.value).toContain('too long');
+  expect(validateRotateForm({ ...defaultRotateForm(), name, value }).errors.value).toContain(
+    'too long',
+  );
+  expect(
+    validateRotateForm({ name: 'invalid-name', value: 'with\0NUL', graceUntil: 'invalid' }).errors,
+  ).toEqual({
+    name: 'Name must match KEY_FORMAT.',
+    value: 'Value must not contain NUL bytes.',
+    graceUntil: 'Grace expiry must be a valid ISO 8601 datetime.',
+  });
+  expect(
+    validateSetForm({ name, value: 'value', description: '', source: 'unknown' as never }).errors
+      .source,
+  ).toBe('Unknown source.');
+});

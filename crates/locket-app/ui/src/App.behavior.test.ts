@@ -328,6 +328,52 @@ describe('desktop environment, secret, and command actions', () => {
     expect(app.state.activeContext).toEqual(a);
   });
 
+  it('keeps a failed environment draft available for correction', async () => {
+    const app = await connectedApp();
+    app.state.selectView('profiles');
+    await settle();
+    const field = byId(app, 'profile-create-name')!;
+    const form = byId(app, 'profile-create-form')!;
+    overrides.set('desktop_create_profile', () =>
+      Promise.reject({ kind: 'rejected', code: 'SecretAlreadyExists' }),
+    );
+    await input(field, 'existing');
+    await submit(form);
+    expect(nodeText(app.root)).toContain('An environment with this name already exists.');
+    expect(field.value).toBe('existing');
+    expect(button(app, 'Create environment')?.props.disabled).toBe(false);
+  });
+
+  it('allows retrying a rejected Global Vault link and refreshes its metadata', async () => {
+    const linked = { ...row, id: 'api-link', name: 'API_TOKEN', source: 'shared-link' };
+    let created = false;
+    overrides.set('agent_list_secrets', () => ({ rows: created ? [linked] : [] }));
+    const app = await connectedApp();
+    app.state.selectView('secrets');
+    await settle();
+    await clickRendered(renderedButton(app.root, 'Link from Global Vault'));
+    await input(control(app.root, 'Local variable name'), 'API_TOKEN');
+    await input(control(app.root, 'Global Vault secret name'), 'SHARED_TOKEN');
+    overrides.set('desktop_link_secret', () => Promise.reject('Global Vault secret was not found'));
+    await submit(app.root);
+    expect(nodeText(app.root)).toContain('Global Vault secret was not found.');
+    expect(control(app.root, 'Local variable name').value).toBe('API_TOKEN');
+    overrides.set('desktop_link_secret', () => {
+      created = true;
+      return { link_id: linked.id };
+    });
+    await submit(app.root);
+    expect(invoke).toHaveBeenCalledWith('desktop_link_secret', {
+      request: {
+        project_id: a.project_id,
+        profile_id: a.profile_id,
+        local_name: 'API_TOKEN',
+        target_secret_name: 'SHARED_TOKEN',
+      },
+    });
+    expect(nodeText(app.root)).toContain('Linked API_TOKEN to @shared/SHARED_TOKEN.');
+  });
+
   it('requires inline confirmation and the exact dangerous environment name before deleting', async () => {
     let deleted = false;
     overrides.set('agent_list_secrets', () => ({ rows: deleted ? [] : [row] }));
@@ -622,6 +668,81 @@ describe('desktop environment, secret, and command actions', () => {
     });
     expect(button(app, 'Add command')).toBeUndefined();
   });
+
+  it.each([
+    ['fixture IPC failure', 'Reveal request failed.'],
+    [{ kind: 'unavailable' }, 'Agent unavailable.'],
+    [{ kind: 'rejected', code: 'SecretNotFound' }, 'SecretNotFound'],
+    [
+      {
+        kind: 'rejected',
+        code: 'ConfirmationFailed',
+        message: 'Type the exact active profile name.',
+      },
+      'Type the exact active profile name.',
+    ],
+  ])('reports reveal and copy failures without presenting a value', async (error, message) => {
+    overrides.set('agent_list_secrets', () => ({ rows: [row] }));
+    overrides.set('agent_reveal', () => Promise.reject(error));
+    overrides.set('agent_copy_secret', () => Promise.reject(error));
+    const { root, state } = await connectedApp();
+    state.selectView('secrets');
+    await settle();
+    await clickRendered(renderedButton(root, 'Reveal'));
+    expect(nodeText(root)).toContain(message);
+    expect(findNode(root, (node) => node.props['data-testid'] === 'reveal-value')).toBeUndefined();
+    await clickRendered(renderedButton(root, 'Copy value'));
+    expect(nodeText(root)).toContain(message);
+    expect(nodeText(root)).not.toContain('Copied value temporarily.');
+  });
+
+  it('uses a redacted row identifier for value access and keeps the alias on reveal', async () => {
+    const settings = deferred<{ privacy_redact_names: boolean }>();
+    overrides.set('agent_read_config', () => settings.promise);
+    overrides.set('agent_list_secrets', (args) => ({
+      rows: [
+        (args as { request: { redact_names: boolean } }).request.redact_names
+          ? { ...row, name: 'secret-1234abcd' }
+          : row,
+      ],
+    }));
+    overrides.set('agent_copy_secret', () => ({ kind: 'copied', ttl_seconds: 10 }));
+    const { root, state } = await connectedApp();
+    state.selectView('secrets');
+    await settle();
+    expect(nodeText(root)).not.toContain('TOKEN');
+    settings.resolve({ privacy_redact_names: true });
+    await settle();
+    await clickRendered(renderedButton(root, 'Reveal'));
+    await clickRendered(renderedButton(root, 'Copy value'));
+    for (const command of ['agent_reveal', 'agent_copy_secret']) {
+      expect(invoke).toHaveBeenCalledWith(command, {
+        request: expect.objectContaining({ secret_name: 'secret-1234abcd', secret_id: row.id }),
+      });
+    }
+    expect(nodeText(root)).not.toContain('TOKEN');
+  });
+
+  it.each([
+    ['fixture transport failure', 'Profile switch failed.'],
+    [{ kind: 'unavailable' }, 'Agent unavailable.'],
+    [{ kind: 'rejected', code: 'ProfileNotFound' }, 'ProfileNotFound'],
+  ])(
+    'reports environment switch failure and keeps the previous environment',
+    async (error, message) => {
+      const { root, state } = await connectedApp();
+      state.selectView('profiles');
+      overrides.set('agent_set_active_profile', () => Promise.reject(error));
+      await state.handleProfileSwitch({
+        profileName: 'qa',
+        confirmation: undefined,
+        dangerous: false,
+      });
+      await settle();
+      expect(nodeText(root)).toContain(message);
+      expect(state.activeContext?.profile_name).toBe(a.profile_name);
+    },
+  );
 
   it('drops command suggestions that arrive after changing projects', async () => {
     const first = deferred<(typeof detected)[]>();
@@ -1180,6 +1301,26 @@ describe('reveal request lifetime in the mounted app', () => {
 });
 
 describe('startup native project selection', () => {
+  it('ignores an older vault listing that completes after a project is opened', async () => {
+    const old = deferred<DesktopProjectContext[]>();
+    overrides.set('desktop_list_projects', () => old.promise);
+    const { root, state } = mountApp();
+    await settle();
+    overrides.set('desktop_list_projects', () => [a, b]);
+    await state.connectProject(false, a.root);
+    await settle();
+    old.resolve([a]);
+    await settle();
+    const trigger = findNode(
+      root,
+      (node) =>
+        typeof node.props['aria-label'] === 'string' &&
+        node.props['aria-label'].startsWith('Switch vault or project'),
+    )!;
+    await clickRendered(trigger);
+    expect(nodeText(byProp(root, 'id', 'vault-switcher-menu'))).toContain('B /…/B');
+  });
+
   it('awaits native open of the sole known project before scoped status refresh', async () => {
     const opening = deferred<DesktopProjectContext>();
     overrides.set('desktop_list_projects', () => [a]);
@@ -1913,6 +2054,133 @@ describe('connected desktop journeys through the preview fixture agent', () => {
     expect(nodeText(root)).toContain('Linked → @shared/ERROR_TRACKING_DSN');
   });
 
+  it('opens a duplicate in another vault and focuses the requested row details', async () => {
+    const { root, state } = await openFixtureProject();
+    const focus = vi.fn();
+    vi.stubGlobal('document', {
+      getElementById: (id: string) => (id === 'variable-inspector-title' ? { focus } : null),
+    });
+    state.selectView('secrets');
+    await settle();
+    const global = renderedButton(root, 'View in Global Vault');
+    await clickRendered(global);
+    expect(state.activeContext?.is_shared).toBe(true);
+    await vi.waitFor(() => {
+      expect(nodeText(byProp(root, 'id', 'variable-inspector'))).toContain('Secret details');
+    });
+    expect(focus).toHaveBeenCalledOnce();
+  });
+
+  it('requires a trusted folder before opening a duplicate from another project', async () => {
+    const { root, state } = await openFixtureProject();
+    state.selectView('settings');
+    await settle();
+    overrides.set('desktop_list_duplicates', () => ({
+      groups: [
+        {
+          group_id: 'fixture',
+          members: [
+            {
+              secret_id: 'remote-variable',
+              name: 'FIXTURE_TOKEN',
+              project_id: 'remote',
+              project_name: 'Remote',
+              profile_id: 'remote-profile',
+              profile_name: 'qa',
+            },
+          ],
+        },
+      ],
+    }));
+    state.selectView('secrets');
+    await settle();
+    await clickRendered(renderedButton(root, 'Open secret'));
+    expect(nodeText(root)).toContain(
+      'Open the matching project from a trusted folder to review this secret.',
+    );
+    expect(state.activeContext?.project_id).toBe('acme-api');
+  });
+
+  it.each([
+    ['acme-api-staging', 'staging', false],
+    ['acme-api-prod', 'prod', true],
+  ] as const)(
+    'routes another environment’s duplicate through its switch flow (%s)',
+    async (profile_id, profile_name, profile_dangerous) => {
+      const { root, state } = await openFixtureProject();
+      state.selectView('settings');
+      await settle();
+      overrides.set('desktop_list_duplicates', () => ({
+        groups: [
+          {
+            group_id: 'fixture',
+            members: [
+              {
+                secret_id: 'other-env-variable',
+                name: 'FIXTURE_TOKEN',
+                project_id: 'acme-api',
+                project_name: 'acme-api',
+                profile_id,
+                profile_name,
+                profile_dangerous,
+              },
+            ],
+          },
+        ],
+      }));
+      state.selectView('secrets');
+      await settle();
+      await clickRendered(renderedButton(root, 'Open secret'));
+      if (profile_dangerous) {
+        expect(nodeText(root)).toContain('Switch environment');
+        expect(calls).not.toContain('agent_set_active_profile');
+      } else {
+        await vi.waitFor(() => expect(state.activeContext?.profile_id).toBe(profile_id));
+        expect(invoke).toHaveBeenCalledWith('agent_set_active_profile', {
+          request: expect.objectContaining({ profile_name }),
+        });
+      }
+    },
+  );
+
+  it('requires fresh Global Vault confirmation when import choices change', async () => {
+    const { root, state } = await openFixtureProject();
+    state.selectView('secrets');
+    await settle();
+    await clickRendered(
+      renderedButton(
+        byProp(root, 'aria-labelledby', 'secret-metadata-list-heading'),
+        'Import .env',
+      ),
+    );
+    const panel = byProp(root, 'aria-labelledby', 'import-heading');
+    await clickRendered(renderedButton(panel, 'Check for duplicates'));
+    const choices = byProp(panel, 'aria-label', 'Duplicate check results');
+    await check(control(choices, 'Promote to @shared/ERROR_TRACKING_DSN'));
+    overrides.set('desktop_import_env', (args) => {
+      const request = (args as { request: { target_confirmation?: string } }).request;
+      if (request.target_confirmation !== 'default') {
+        return Promise.reject({
+          kind: 'rejected',
+          code: 'ConfirmationFailed',
+          message: 'Type default to confirm promotion into the Global Vault.',
+        });
+      }
+      return { summary: 'Imported and promoted.' };
+    });
+    await submit(panel);
+    const confirmation = control(panel, 'Type default');
+    await input(confirmation, 'default');
+    await check(control(choices, 'Link to @shared/POSTMARK_TOKEN'));
+    expect(confirmation.value).toBe('');
+    await input(confirmation, 'default');
+    await submit(panel);
+    expect(invoke).toHaveBeenCalledWith('desktop_import_env', {
+      request: expect.objectContaining({ target_confirmation: 'default' }),
+    });
+    expect(nodeText(root)).toContain('Imported and promoted.');
+  });
+
   it('connects monitoring, device, audit and version views to project-scoped metadata', async () => {
     const app = await openFixtureProject();
     const { root } = app;
@@ -2090,6 +2358,45 @@ describe('connected desktop journeys through the preview fixture agent', () => {
       request: { project_id: 'acme-api', policy_name: 'db-migrate' },
     });
     expect(nodeText(root)).toContain('Opened in your terminal. Complete any approval there.');
+  });
+
+  it('drops pending command launch feedback after switching to another project', async () => {
+    const { root, state } = await openFixtureProject();
+    const pending = deferred<{ launched: boolean }>();
+    overrides.set('desktop_run_policy', () => pending.promise);
+    state.selectView('policies');
+    await settle();
+    await clickRendered(renderedButton(root, 'Run in terminal'));
+    expect(invoke).toHaveBeenCalledWith('desktop_run_policy', {
+      request: { project_id: 'acme-api', policy_name: 'db-migrate' },
+    });
+    const next = (await createMockRuntime(new URLSearchParams())(
+      'desktop_list_projects',
+      {},
+    )) as DesktopProjectContext[];
+    await state.connectProject(
+      false,
+      next.find(({ project_id }) => project_id === 'web-app')!.root,
+    );
+    await settle();
+    expect(state.activeContext?.project_id).toBe('web-app');
+    pending.reject('Old project terminal refused launch');
+    await settle();
+    expect(nodeText(root)).not.toContain('Old project terminal refused launch');
+  });
+
+  it('requires a fresh export preview after a repeated preview fails', async () => {
+    const { root, state } = await openFixtureProject();
+    state.selectView('recovery');
+    await settle();
+    await input(control(root, 'Recipient descriptor', 'textarea'), 'lkdev2_fixture');
+    await clickRendered(renderedButton(root, 'Preview scope'));
+    expect(renderedButton(root, 'Export').props.disabled).toBe(false);
+
+    overrides.set('agent_export_bundle', () => Promise.reject('preview failed'));
+    await clickRendered(renderedButton(root, 'Preview scope'));
+    expect(nodeText(root)).toContain('Backup request failed.');
+    expect(renderedButton(root, 'Export').props.disabled).toBe(true);
   });
 
   it('opens the selected secret for rotation with its source and focuses the new value', async () => {
@@ -2564,11 +2871,21 @@ describe('desktop recovery feedback', () => {
     await clickRendered(renderedButton(importPanel, 'Review bundle'));
     expect(nodeText(root)).toContain('RecoveryDenied');
     expect(nodeText(root)).not.toContain('fixture-recovery-detail');
+    overrides.set('agent_import_bundle', () =>
+      Promise.reject({
+        kind: 'protocol',
+        reason: 'request timed out; outcome is unknown. Refresh before retrying',
+      }),
+    );
+    await clickRendered(renderedButton(importPanel, 'Review bundle'));
+    expect(nodeText(root)).toContain('Check whether it completed before retrying.');
     overrides.set('agent_recovery_rotate', () => Promise.reject(denied));
     await check(control(root, 'One-time display acknowledged'));
     await clickRendered(renderedButton(root, 'Rotate'));
     expect(nodeText(root)).toContain('RecoveryDenied');
     expect(nodeText(root)).not.toContain('Backup action running');
+    expect(renderedButton(root, 'Rotate').props.disabled).toBe(true);
+    await check(control(root, 'One-time display acknowledged'));
     expect(renderedButton(root, 'Rotate').props.disabled).toBe(false);
   });
 
@@ -2794,4 +3111,95 @@ it('requires fresh dangerous approval for saving and rotation, and drops approva
   expect(prompt.open).toBe(false);
   expect(calls).not.toContain('agent_rotate_secret');
   expect(byProp(root, 'data-testid', 'secret-editor-rotate-value').value).toBe('');
+});
+
+it('releases the tray listener if registration finishes after unmount', async () => {
+  const pending = deferred<() => void>();
+  const unlisten = vi.fn();
+  vi.mocked(listen).mockImplementation((event) =>
+    event === 'tray-menu-action' ? pending.promise : Promise.resolve(() => {}),
+  );
+  const app = mountApp();
+  await settle();
+  expect(listen).toHaveBeenCalledWith('tray-menu-action', expect.any(Function));
+  app.unmount();
+  pending.resolve(unlisten);
+  await settle();
+  expect(unlisten).toHaveBeenCalledOnce();
+});
+
+it('refreshes after a native tray lock without locking the agent again', async () => {
+  const { state } = await connectedApp();
+  const registration = vi.mocked(listen).mock.calls.find(([event]) => event === 'tray-menu-action');
+  expect(registration).toBeDefined();
+  lockState = 'locked';
+  registration![1]({ event: 'tray-menu-action', id: 1, payload: 'lock-vault' });
+  await settle();
+  expect(state.status?.lock_state).toBe('locked');
+  expect(calls).not.toContain('agent_lock');
+});
+
+it.each([
+  ['agent_read_config', 'settings', { kind: 'unavailable' }, 'Agent unavailable.'],
+  ['agent_read_config', 'settings', 'config transport failed', 'Settings request failed.'],
+  [
+    'agent_list_device_members',
+    'devices',
+    { kind: 'rejected', code: 'AccessDenied' },
+    'AccessDenied',
+  ],
+  ['agent_list_device_members', 'devices', { kind: 'unavailable' }, 'Agent unavailable.'],
+  ['agent_list_versions', 'versions', { kind: 'rejected', code: 'AccessDenied' }, 'AccessDenied'],
+  ['agent_list_versions', 'versions', { kind: 'unavailable' }, 'Agent unavailable.'],
+] as const)('shows scoped metadata errors for %s on %s', async (command, view, error, label) => {
+  overrides.set(command, () => Promise.reject(error));
+  const { root, state } = await connectedApp();
+  state.selectView(view);
+  await settle();
+  expect(nodeText(root)).toContain(label);
+});
+
+it('offers useful picker and clipboard feedback in desktop quick actions', async () => {
+  usePreviewFixtures();
+  const { root, state } = mountApp();
+  await settle();
+  const choose = async (label: string) => {
+    const action = findNode(
+      root,
+      (node) =>
+        node.props.role === 'option' && !!findNode(node, (content) => content.text === label),
+    )!;
+    expect(action).toBeDefined();
+    await clickRendered(action);
+  };
+  const projects = await invoke<DesktopProjectContext[]>('desktop_list_projects');
+  const selected = projects.find((project) => project.project_id === 'acme-api')!;
+  await state.connectProject(false, selected.root);
+  await settle();
+  await choose('Commands');
+  expect(nodeText(root)).toContain('Run in terminal');
+  overrides.set('desktop_copy_text_plain', () => undefined);
+  overrides.set('desktop_mcp_config_snippet', () =>
+    Promise.reject('native MCP snippet unavailable'),
+  );
+  await choose('Copy MCP config JSON');
+  expect(invoke).toHaveBeenCalledWith('desktop_copy_text_plain', {
+    text: expect.stringContaining('"command": "locket"'),
+  });
+  overrides.set('desktop_copy_text_plain', () => Promise.reject('clipboard unavailable'));
+  await choose('Copy lk://dev/DATABASE_URL');
+  expect(nodeText(root)).toContain('Could not copy reference.');
+  overrides.set('desktop_copy_text_plain', () => undefined);
+  await choose('Copy lk://dev/DATABASE_URL');
+  expect(nodeText(root)).toContain('Copied lk://dev/DATABASE_URL');
+  overrides.set('desktop_open_shared_vault', () => Promise.reject('Vault open unavailable'));
+  await choose('Global Vault (@shared)');
+  expect(nodeText(root)).toContain('Vault open unavailable.');
+  overrides.delete('desktop_open_shared_vault');
+  await choose('Global Vault (@shared)');
+  await vi.waitFor(() => expect(state.activeContext?.is_shared).toBe(true));
+  await choose('acme-api');
+  await vi.waitFor(() => expect(state.activeContext?.project_id).toBe('acme-api'));
+  await choose('Lock vault');
+  await vi.waitFor(() => expect(state.status?.lock_state).toBe('locked'));
 });

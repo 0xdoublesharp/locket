@@ -315,7 +315,7 @@ async function copyMigrationPrompt(): Promise<void> {
 
 function displayName(row: SecretRowMeta): string {
   if (props.privacyMode) {
-    return row.alias ?? row.name;
+    return row.alias ?? 'Secret';
   }
   return row.name;
 }

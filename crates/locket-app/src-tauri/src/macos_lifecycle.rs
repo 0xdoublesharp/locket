@@ -162,6 +162,7 @@ mod tests {
             callback_count.fetch_add(1, Ordering::SeqCst);
             true
         })?;
+        assert!(owner.start(|| false).is_err());
         assert!(DesktopInstance::acquire(directory.path())?.is_none());
         assert_eq!(shows.load(Ordering::SeqCst), 1);
         drop(owner);
@@ -181,6 +182,19 @@ mod tests {
         fs::write(&path, b"keep")?;
         assert!(DesktopInstance::acquire(directory.path()).is_err());
         assert_eq!(fs::read(&path)?, b"keep");
+        Ok(())
+    }
+
+    #[test]
+    fn a_symlink_cannot_be_used_as_the_desktop_data_directory() -> io::Result<()> {
+        let directory = socket_directory()?;
+        let actual = directory.path().join("actual");
+        let alias = directory.path().join("alias");
+        fs::create_dir(&actual)?;
+        std::os::unix::fs::symlink(&actual, &alias)?;
+        let result = DesktopInstance::acquire(&alias);
+        assert!(matches!(result, Err(error) if error.kind() == ErrorKind::InvalidInput));
+        assert!(!actual.join(SOCKET_NAME).exists());
         Ok(())
     }
 

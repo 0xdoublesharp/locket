@@ -207,3 +207,21 @@ describe('policy security boundaries', () => {
 it('accepts core-valid underscore-prefixed variable names', () => {
   expect(validatePolicyForm(validForm({ requiredSecrets: '_TOKEN' })).valid).toBe(true);
 });
+
+it('limits policy labels and command previews before building a snapshot', () => {
+  const result = validatePolicyForm(
+    validForm({
+      name: 'x'.repeat(129),
+      commandPreview: 'x'.repeat(100_000),
+    }),
+  );
+  expect(result.errors.name).toContain('too long');
+  expect(result.errors.commandPreview).toContain('too long');
+});
+
+it('keeps the original list when the mutation kind is unrecognized', () => {
+  const original = [snapshot('project-123', 'deploy')];
+  expect(
+    applyPolicyMutation(original, 'unknown' as never, snapshot('project-123', 'new-name')),
+  ).toBe(original);
+});

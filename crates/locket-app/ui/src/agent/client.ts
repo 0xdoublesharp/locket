@@ -102,7 +102,7 @@ const AGENT_STATUS_EVENT = 'agent-status';
 const AGENT_STATUS_ERROR_EVENT = 'agent-status-error';
 const AGENT_STATUS_DISCONNECTED_EVENT = 'agent-status-disconnected';
 
-function tauriUnavailableError(): AgentClientError {
+function tauriUnavailableError(): Extract<AgentClientError, { kind: 'unavailable' }> {
   return {
     kind: 'unavailable',
     reason: 'desktop shell not running inside a Tauri webview',
@@ -171,8 +171,8 @@ export async function subscribeStatus(
       }),
     );
     listeners.push(
-      await listen<AgentClientError>(AGENT_STATUS_ERROR_EVENT, (event) => {
-        onError(event.payload);
+      await listen<unknown>(AGENT_STATUS_ERROR_EVENT, (event) => {
+        onError(normalizeError(event.payload));
       }),
     );
     listeners.push(
@@ -213,7 +213,34 @@ export function handleStatusEvent(
 
 function normalizeError(raw: unknown): AgentClientError {
   if (raw && typeof raw === 'object' && 'kind' in raw) {
-    return raw as AgentClientError;
+    const fields = raw as Record<string, unknown>;
+    const stringField = (key: string, fallback = ''): string => {
+      const value = fields[key];
+      return typeof value === 'string' ? value : fallback;
+    };
+    if (raw.kind === 'unavailable') {
+      const fallback = tauriUnavailableError();
+      return {
+        kind: 'unavailable',
+        reason: stringField('reason', fallback.reason),
+        display_reason: stringField('display_reason', fallback.display_reason),
+        next_action: stringField('next_action', fallback.next_action),
+        socket_path: stringField('socket_path'),
+      };
+    }
+    if (raw.kind === 'rejected' && typeof fields.code === 'string') {
+      return {
+        kind: 'rejected',
+        code: fields.code,
+        message: stringField('message'),
+        display_reason: stringField('display_reason'),
+        next_action: stringField('next_action'),
+        retryable: fields.retryable === true,
+      };
+    }
+    if (raw.kind === 'protocol' && typeof fields.reason === 'string') {
+      return { kind: 'protocol', reason: fields.reason };
+    }
   }
   return {
     kind: 'protocol',

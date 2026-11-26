@@ -515,6 +515,7 @@ struct DesktopValueAccess<T> {
     #[serde(flatten)]
     request: T,
     confirm_dangerous_profile: Option<String>,
+    secret_id: Option<String>,
 }
 
 fn value_access_payload(
@@ -536,11 +537,17 @@ fn value_access_payload(
 async fn agent_reveal(
     request: DesktopValueAccess<locket_agent::RevealRequest>,
 ) -> Result<locket_agent::RevealResponse, AgentClientError> {
-    let DesktopValueAccess { request, confirm_dangerous_profile } = request;
+    let DesktopValueAccess { mut request, confirm_dangerous_profile, secret_id } = request;
     let store = resolve_path(request.store_path.clone(), default_store_path)?;
     let project =
         request.project_id.clone().map(Ok).unwrap_or_else(desktop_actions::selected_project_id)?;
-    let mut request = request;
+    request.secret_name = desktop_actions::resolve_value_name(
+        &store,
+        &project,
+        &request.profile_id,
+        request.secret_name,
+        secret_id.as_deref(),
+    )?;
     request.store_path = Some(store.clone());
     request.project_id = Some(project.clone());
     desktop_actions::invoke_granted(
@@ -1013,6 +1020,7 @@ async fn agent_list_versions(
 #[derive(Debug, Deserialize)]
 struct DesktopClipboardCopyRequest {
     secret_name: String,
+    secret_id: Option<String>,
     profile_id: String,
     project_id: Option<String>,
     store_path: Option<PathBuf>,
@@ -1045,7 +1053,13 @@ async fn agent_copy_secret(
     let project =
         request.project_id.clone().map(Ok).unwrap_or_else(desktop_actions::selected_project_id)?;
     let agent_request = locket_agent::CopyRequest {
-        secret_name: request.secret_name,
+        secret_name: desktop_actions::resolve_value_name(
+            &store,
+            &project,
+            &request.profile_id,
+            request.secret_name,
+            request.secret_id.as_deref(),
+        )?,
         profile_id: request.profile_id,
         project_id: Some(project.clone()),
         store_path: Some(store.clone()),

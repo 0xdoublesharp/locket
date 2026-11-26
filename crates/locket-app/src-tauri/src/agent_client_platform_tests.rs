@@ -594,3 +594,24 @@ async fn stale_socket_is_reported_as_unavailable_with_the_attempted_path()
     }) if reason.starts_with("connect failed:") && socket_path == socket.to_string_lossy()));
     Ok(())
 }
+
+#[test]
+fn desktop_deadlines_leave_time_for_remote_team_sync_and_report_uncertain_writes() {
+    use locket_agent::AgentMethod::*;
+
+    let status = super::request_deadline(Status);
+    assert_eq!(status, (Duration::from_secs(3), false));
+    assert_eq!(super::request_deadline(RequestGrant).0, super::GRANT_APPROVAL_TIMEOUT);
+    for method in
+        [WriteConfig, ExportBundle, ImportBundle, RecoveryRotate, TeamSyncClear, TeamSyncReconcile]
+    {
+        let (timeout, mutation) = super::request_deadline(method);
+        assert!(timeout > status.0, "{method:?} can take longer than a metadata read");
+        assert!(mutation, "{method:?} can commit before the response arrives");
+    }
+    for method in [TeamSyncConfigure, TeamSyncNow, TeamSyncTestRemote] {
+        let (timeout, mutation) = super::request_deadline(method);
+        assert!(timeout > Duration::from_secs(40), "{method:?} must allow remote I/O");
+        assert_eq!(mutation, method != TeamSyncTestRemote);
+    }
+}

@@ -450,3 +450,49 @@ describe('defaults', () => {
     expect(defaultRevokeForm().inviteId).toBe('');
   });
 });
+
+it('rejects malformed invite fields without constructing an expired command', () => {
+  const state = {
+    ...defaultIssueForm(),
+    recipientLabel: 'Z'.repeat(129),
+    deviceDescriptor: 'lkdev2_short',
+    profiles: 'invalid profile, dev',
+    expiresAt: 'invalid date',
+  };
+  const validation = validateIssueForm(state);
+  expect(validation.errors).toEqual({
+    recipientLabel: 'Label is too long (max 128).',
+    deviceDescriptor: 'Descriptor body is too short to be valid.',
+    profiles: 'Invalid profile name: invalid profile',
+    expiresAt: 'Expiry must be an ISO 8601 datetime.',
+  });
+  expect(issueDangerousConfirmationMatches(validation, '')).toBe(true);
+  expect(
+    validateAcceptForm({ ...defaultAcceptForm(), inviteText: 'short' }).errors.inviteText,
+  ).toBe('Invite payload is too short to be valid.');
+  expect(expiresAtToDurationArgument('invalid date', 0)).toBeNull();
+});
+
+it.each([null, 'null', '{invalid', 'team invite'])(
+  'displays a safe fallback for missing structured invite metadata %j',
+  (command) => {
+    const [result] = teamInviteRowsFromAudit([
+      {
+        sequence: 55,
+        timestamp: Number.NaN,
+        action: 'TEAM_INVITE',
+        status: 'UNKNOWN',
+        profile_id: null,
+        secret_name: null,
+        command,
+      },
+    ]);
+    expect(result).toMatchObject({
+      id: 'seq-55',
+      createdAt: 'Invalid timestamp',
+      direction: 'unknown',
+      status: 'unknown',
+      profiles: [],
+    });
+  },
+);

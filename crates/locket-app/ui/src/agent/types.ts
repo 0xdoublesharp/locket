@@ -76,6 +76,8 @@ export function isRejected(
 
 export interface RevealRequest {
   secret_name: string;
+  /** Identifies the displayed row when secret_name is a privacy alias. */
+  secret_id?: string;
   profile_id: string;
   confirm_dangerous_profile?: string;
 }

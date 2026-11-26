@@ -37,6 +37,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Round-trip request timeout once a connection is established.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+// Remote Team Sync allows 10s to connect and 30s each for writing and reading.
+const REMOTE_SYNC_TIMEOUT: Duration = Duration::from_secs(75);
 
 /// Allows the local user to finish the OS verification prompt before a grant is issued.
 const GRANT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(125);
@@ -393,23 +396,41 @@ async fn round_trip(
     method: AgentMethod,
     frame: Zeroizing<Vec<u8>>,
 ) -> Result<ResponseEnvelope, AgentClientError> {
+    let (timeout, mutation) = request_deadline(method);
+    exchange_with_deadline(stream, frame, timeout, mutation).await
+}
+
+fn request_deadline(method: AgentMethod) -> (Duration, bool) {
     let mutation = matches!(
         method,
         AgentMethod::ImportDotenv
             | AgentMethod::ApplyPolicy
+            | AgentMethod::WriteConfig
+            | AgentMethod::SetActiveProfile
+            | AgentMethod::RegisterCommandPolicies
             | AgentMethod::SetSecret
             | AgentMethod::CreateProfile
             | AgentMethod::DeleteSecret
             | AgentMethod::CopySecretToShared
             | AgentMethod::LinkSecret
             | AgentMethod::UnlinkSecret
+            | AgentMethod::ImportBundle
+            | AgentMethod::ExportBundle
+            | AgentMethod::RecoveryRotate
+            | AgentMethod::TeamSyncConfigure
+            | AgentMethod::TeamSyncClear
+            | AgentMethod::TeamSyncNow
+            | AgentMethod::TeamSyncReconcile
     );
     let timeout = match method {
         AgentMethod::RequestGrant => GRANT_APPROVAL_TIMEOUT,
-        _ if mutation => Duration::from_secs(30),
+        AgentMethod::TeamSyncConfigure
+        | AgentMethod::TeamSyncNow
+        | AgentMethod::TeamSyncTestRemote => REMOTE_SYNC_TIMEOUT,
+        _ if mutation => WRITE_TIMEOUT,
         _ => REQUEST_TIMEOUT,
     };
-    exchange_with_deadline(stream, frame, timeout, mutation).await
+    (timeout, mutation)
 }
 
 async fn exchange_with_deadline(
