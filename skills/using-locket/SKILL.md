@@ -31,19 +31,8 @@ locket env scan
 
 ## Importing `.env` files and linking `@shared` secrets
 
-Always preview imports before writing, keep the source `.env` file until the user chooses to archive or delete it, and reuse `@shared` for repeated credentials such as RPC URLs or provider keys:
-
-```sh
-locket env keys .env
-locket import .env --dry-run --link-shared --json
-locket import .env --link-shared --keep
-locket parity
-```
-
 - Pass `--link-shared` to link exact matches already stored in `@shared`, or `--promote-duplicates` to promote repeated values across projects into `@shared` and link them back. Both flags fail closed if `@shared` is unavailable or locked.
 - `--dry-run` uses the same classification planner as real execution and reports `would_link`, `would_promote`, `linked_names`, `promoted_names`, and `duplicate_matches`.
-- When the user chooses to archive the source, use `locket import .env --archive <DIR>` in place of `--keep`. Locket writes a private plaintext backup and removes the source after importing every key. Use a directory outside the project or one ignored by Git.
-- Add `--archive-if-matching` to archive an already imported file when every skipped value matches its active vault value. If the running agent reports the project vault is locked, use `locket unlock` before verifying. For shared links, also use `locket unlock --shared`. Filtered keys block archiving. Add `--dry-run` to check eligibility without writing. A blocked preview reports `delete_env: kept` and gives the reason in `archive_blocked` in text or `archive_blocked_reason` in JSON.
 - To promote, link, or unlink individual secrets after import:
 
 ```sh
@@ -56,6 +45,16 @@ locket shared usages ALCHEMY_MAINNET_RPC
 
 - Shared links stay local in SQLite and never modify `locket.toml`, Team Sync packages, or CI bundles. Before removing a linked `@shared` secret, inspect `locket shared usages <KEY>` and confirm with the user before passing `--unlink-all`.
 
+### Staged cutover
+
+1. Preview with `locket import .env --dry-run --link-shared --json`. If the preview returns `UnlockRequired`, follow the unlock instructions below before retrying.
+2. Import and keep the source with `locket import .env --link-shared --keep`.
+3. Ask the user to run `locket unlock` once from a desktop terminal, adding `--shared` if the app uses shared links. They can also unlock the vaults in Locket Desktop. Complete verification and archiving within the default 15-minute unlock window.
+4. Verify the target app or command with `locket run <POLICY>` or a scoped `locket exec` invocation.
+5. When the user chooses to archive, run `locket import .env --archive <PRIVATE_DIR> --archive-if-matching --dry-run --json`. Review `archive_consumer_warnings`, and check Makefiles and framework configuration for direct reads of `.env`. Once the preview reports `delete_env: would-archive` and you've addressed file consumers, repeat the command without `--dry-run`. Use a private directory outside the project or ignored by Git for the plaintext backup.
+
+`--archive-if-matching` compares skipped values with the values the app receives under runtime precedence. Filtered keys block archiving. If the preview reports `delete_env: kept`, check `archive_blocked_reason`.
+
 ## Running commands safely
 
 - Prefer a narrow saved command policy in `locket.toml` via `locket run <POLICY>`. Use `locket exec` only when an ad-hoc scoped command is appropriate; both `run` and `exec` resolve `shared-link` aliases under the project's local variable name.
@@ -66,6 +65,6 @@ locket shared usages ALCHEMY_MAINNET_RPC
 
 Stop and ask the user whenever any of these are required:
 
-- **Vault unlock**: If a command returns `UnlockRequired`, report the locked vault and exact command (`locket unlock` for the project vault, `locket unlock --shared` or `locket shared unlock` for `@shared`, or the Locket desktop app). Never pipe passphrases or loop on unlock.
+- **On `UnlockRequired`**, stop and ask the user to unlock once from a desktop terminal or Locket Desktop. Give the command for the locked vault, `locket unlock` for the project or `locket unlock --shared` for `@shared`. Agents must never run an unlock command. Never bypass the lock by stopping the daemon, passing `--overwrite`, or moving `.env` manually.
 - **Dangerous or privileged flags**: Policy approval, `--confirm-dangerous`, `--use-dangerous`, `--force`, `--allow-insecure-argv`, `--allow-uncontained-egress`, `--unlink-all`, `--replace`, and deleting `.env` files.
 - **Interactive prompts**: Passphrases, Touch ID, OS keychain dialogs, and recovery codes.

@@ -890,6 +890,7 @@ fn import_promotes_with_matching_preview_and_audits_both_vaults()
 
 #[cfg(unix)]
 #[test]
+#[allow(clippy::too_many_lines, reason = "Keep unlock transitions on one live agent fixture")]
 fn agent_unlocks_each_vault_and_exec_delivers_the_local_alias()
 -> Result<(), Box<dyn std::error::Error>> {
     use std::os::unix::net::UnixListener;
@@ -941,10 +942,29 @@ fn agent_unlocks_each_vault_and_exec_delivers_the_local_alias()
         let status = |project: &str| {
             crate::commands::agent::request_project_status_snapshot(&endpoint, project)
         };
+        let source = workspace.path().join(".env");
+        fs::write(&source, "RPC_URL=linked-fixture-value\n")?;
+        let archive = [
+            "import",
+            ".env",
+            "--archive",
+            "backup",
+            "--archive-if-matching",
+            "--dry-run",
+            "--json",
+        ];
+        let locked = LocketError::UnlockRequired.exit_code();
+        let report = cli_json(&context, &archive, locked)?;
+        assert_eq!(report["error"]["code"], "UnlockRequired");
+        assert!(report["error"]["message"].as_str().is_some_and(|s| s.contains("project vault")));
+
         let unlocked = run_cli_args(&context, &["unlock", "--ttl", "90"])?;
         assert!(unlocked.contains("agent: unlocked\ncached_keys: yes\nttl_seconds: 90"));
         assert_eq!(status(&local)?["lock_state"], "unlocked");
         assert_eq!(status(&shared.id)?["lock_state"], "locked");
+        let report = cli_json(&context, &archive, locked)?;
+        assert_eq!(report["error"]["code"], "UnlockRequired");
+        assert!(report["error"]["message"].as_str().is_some_and(|s| s.contains("Global Vault")));
 
         let exec = &[
             "exec",
@@ -966,6 +986,11 @@ fn agent_unlocks_each_vault_and_exec_delivers_the_local_alias()
         let unlocked = run_cli_args(&context, &["unlock", "--shared", "--ttl", "120"])?;
         assert_eq!(unlocked.matches("cached_keys: yes").count(), 2);
         assert_eq!(unlocked.matches("ttl_seconds: 120").count(), 2);
+        let report = cli_json(&context, &archive, 0)?;
+        assert_eq!(report["verified_matching_names"], json!(["RPC_URL"]));
+        assert_eq!(report["delete_env"], "would-archive");
+        assert!(source.is_file());
+        assert!(!workspace.path().join("backup").exists());
         run_cli_args(&context, exec)?;
         assert_eq!(fs::read_to_string(workspace.path().join("received"))?, "linked-fixture-value");
 

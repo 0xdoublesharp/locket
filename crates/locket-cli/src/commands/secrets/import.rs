@@ -1,5 +1,7 @@
 //! Dotenv import and discovery for the CLI and MCP.
 
+#[path = "consumers.rs"]
+mod consumers;
 #[path = "env_files.rs"]
 mod env_files;
 
@@ -19,6 +21,7 @@ use serde::Serialize;
 use serde_json::Value;
 use zeroize::Zeroizing;
 
+use self::consumers::detect_archive_consumers;
 use self::env_files::{
     Diagnostic, ParsedEnvFile, open_env_file, read_env_file, write_env_keys, write_env_scan,
     write_warnings,
@@ -179,7 +182,9 @@ fn import_cli(
             confirmed_profiles.push(target.profile.name.clone());
         }
     }
-    let root = if selection.dry_run || target.project.id.starts_with("lk_proj_shared_") {
+    let root = if (selection.dry_run && selection.archive.is_none())
+        || target.project.id.starts_with("lk_proj_shared_")
+    {
         None
     } else if let Some(resolved) = resolved {
         Some(resolved.root)
@@ -216,7 +221,9 @@ fn import_cli(
         run_import(context, &mut store, &target, file, &options, |warnings, errors| {
             if selection.json { Ok(()) } else { write_import_diagnostics(output, warnings, errors) }
         })?;
-    refresh_import_project_files(context, root.as_deref())?;
+    if !selection.dry_run {
+        refresh_import_project_files(context, root.as_deref())?;
+    }
     if let Some(policy) = options.archive {
         finalize_archive_action(
             &mut report,
@@ -277,6 +284,7 @@ fn finalize_archive_action(
     path: &Path,
     root: Option<&Path>,
 ) -> Result<(), CliError> {
+    report.archive_consumer_warnings = detect_archive_consumers(path, root);
     report.archive_blocked_reason = report.archive_blocker(policy);
     if report.archive_blocked_reason.is_none() {
         if let Some((dir, file, original)) = archive_source {
@@ -287,52 +295,9 @@ fn finalize_archive_action(
                 "checks vault values only; confirm no Docker/Compose files or other tools still read this file before archiving"
                     .to_owned(),
             );
-            report.archive_consumer_warnings = detect_compose_dotenv_consumers(path, root);
         }
     }
     Ok(())
-}
-
-fn detect_compose_dotenv_consumers(source: &Path, root: Option<&Path>) -> Vec<String> {
-    const COMPOSE_FILES: [&str; 4] =
-        ["compose.yml", "compose.yaml", "docker-compose.yml", "docker-compose.yaml"];
-    const MAX_COMPOSE_BYTES: u64 = 256 * 1024;
-    let Some(source_name) = source.file_name().and_then(|name| name.to_str()) else {
-        return Vec::new();
-    };
-    let mut dirs = Vec::new();
-    if let Some(parent) = source.parent() {
-        dirs.push(parent.to_path_buf());
-    }
-    if let Some(root) = root
-        && !dirs.iter().any(|existing| existing == root)
-    {
-        dirs.push(root.to_path_buf());
-    }
-    let mut seen = BTreeSet::new();
-    let mut warnings = Vec::new();
-    for dir in dirs {
-        for compose_name in COMPOSE_FILES {
-            let candidate = dir.join(compose_name);
-            let Ok(meta) = fs::symlink_metadata(&candidate) else {
-                continue;
-            };
-            if !meta.file_type().is_file() || meta.len() > MAX_COMPOSE_BYTES {
-                continue;
-            }
-            let Ok(text) = fs::read_to_string(&candidate) else {
-                continue;
-            };
-            let references_source =
-                text.contains(source_name) || (source_name == ".env" && text.contains("env_file:"));
-            if references_source && seen.insert(candidate) {
-                warnings.push(format!(
-                    "{compose_name} may still read {source_name}; confirm Docker/Compose cutover before archiving"
-                ));
-            }
-        }
-    }
-    warnings
 }
 
 fn write_import_diagnostics(
@@ -663,14 +628,9 @@ struct ImportNames {
 enum ImportAction {
     Import,
     Overwrite(Box<SecretRecord>),
-    Skip(SkipTarget),
+    Skip,
     Link { target: Box<SecretRecord>, shadowing: Vec<SecretRecord> },
     Promote { shadowing: Vec<SecretRecord> },
-}
-
-enum SkipTarget {
-    Source(Box<SecretRecord>),
-    Effective,
 }
 
 struct ImportPlan {
@@ -741,7 +701,7 @@ impl<'a> ImportPlanner<'a> {
                 (None, Some(secret)) if self.options.overwrite => {
                     ImportAction::Overwrite(Box::new(secret))
                 }
-                (None, Some(secret)) => ImportAction::Skip(SkipTarget::Source(Box::new(secret))),
+                (None, Some(_)) => ImportAction::Skip,
                 (None, None)
                     if self.options.archive.is_some()
                         && !self.options.overwrite
@@ -749,7 +709,7 @@ impl<'a> ImportPlanner<'a> {
                             .resolve_active_secret_link(project_id, profile_id, name)?
                             .is_some() =>
                 {
-                    ImportAction::Skip(SkipTarget::Effective)
+                    ImportAction::Skip
                 }
                 (None, None) => ImportAction::Import,
             });
@@ -854,7 +814,7 @@ impl<'a> ImportPlanner<'a> {
         });
         let keeps_link = link.is_some() && !retargets_link && self.options.archive.is_some();
         if !self.options.overwrite && (!shadowing.is_empty() || retargets_link || keeps_link) {
-            return Ok(Some(ImportAction::Skip(SkipTarget::Effective)));
+            return Ok(Some(ImportAction::Skip));
         }
         Ok(Some(match target {
             Some(target) => ImportAction::Link { target: Box::new(target), shadowing },
@@ -877,7 +837,7 @@ impl<'a> ImportPlanner<'a> {
             match action {
                 ImportAction::Import => &mut names.imported,
                 ImportAction::Overwrite(_) => &mut names.overwritten,
-                ImportAction::Skip(target) => {
+                ImportAction::Skip => {
                     if verify_skipped {
                         let consumer = &self.target.profile;
                         let unlock_verified = if let Some(verified) = consumer_unlock_verified {
@@ -888,21 +848,10 @@ impl<'a> ImportPlanner<'a> {
                             consumer_unlock_verified = Some(verified);
                             verified
                         };
-                        let resolved;
-                        let secret = match target {
-                            SkipTarget::Source(secret) => secret.as_ref(),
-                            SkipTarget::Effective => {
-                                let name = SecretName::new(name.as_str()).map_err(|_| {
-                                    invalid_secret_name_error("invalid key in import plan")
-                                })?;
-                                resolved = resolve_active_secret_in_profile(
-                                    store,
-                                    &self.target.profile,
-                                    &name,
-                                )?;
-                                &resolved
-                            }
-                        };
+                        let secret_name = SecretName::new(name.as_str())
+                            .map_err(|_| invalid_secret_name_error("invalid key in import plan"))?;
+                        let secret =
+                            resolve_active_secret_in_profile(store, consumer, &secret_name)?;
                         if secret.project_id != consumer.project_id
                             && checked_shared_projects.insert(secret.project_id.clone())
                         {
@@ -910,7 +859,7 @@ impl<'a> ImportPlanner<'a> {
                                 context,
                                 store,
                                 consumer,
-                                secret,
+                                &secret,
                                 unlock_verified,
                             )
                             .map_err(import_verification_key_error)?;
@@ -920,7 +869,7 @@ impl<'a> ImportPlanner<'a> {
                             store,
                             &secret.project_id,
                             &secret.profile_id,
-                            secret,
+                            &secret,
                             secret.current_version,
                         )
                         .map_err(import_verification_key_error)?;
@@ -1037,7 +986,7 @@ fn apply_import(
     let mut keys = None;
     for ((name, value), action) in values.into_iter().zip(actions) {
         match action {
-            ImportAction::Skip(_) => {}
+            ImportAction::Skip => {}
             ImportAction::Link { target, shadowing } => {
                 link_import(
                     context,

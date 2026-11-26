@@ -1017,6 +1017,176 @@ fn import_archive_dry_run_leaves_source_and_destination_untouched()
 }
 
 #[test]
+fn import_archive_warns_about_file_consumers_in_preview_and_execution()
+-> Result<(), Box<dyn std::error::Error>> {
+    let workspace = tempdir()?;
+    let root = workspace.path().join("project");
+    let web = root.join("apps/web");
+    let archive = workspace.path().join("backups");
+    let archive_arg = archive.to_str().ok_or("archive path must be UTF-8")?;
+    fs::create_dir_all(&web)?;
+    let context = RuntimeContext { cwd: root.clone(), ..test_context(&workspace) };
+    run_env_command(&context, &["init", "--no-device", "--no-passkey"], &[])?;
+    let canaries = ["dotenv-value-fixture", "compose-value-fixture", "script-value-fixture"];
+    let source = web.join(".env");
+    fs::write(&source, format!("TOKEN={}\n", canaries[0]))?;
+    fs::write(
+        root.join("docker-compose.yml"),
+        "services:\n  web:\n    env_file:\n      - path: './apps/web/.env' # compose-value-fixture\n",
+    )?;
+    fs::write(
+        root.join("docker-compose.dev.yml"),
+        "services:\n  web:\n    env_file: [./apps/web/.env.other, ./apps/web/../web/.env]\n",
+    )?;
+    fs::write(
+        root.join("apps/compose.override.YAML"),
+        "services:\n  web:\n    env_file:\n    - ./web/.env # keep the literal\n",
+    )?;
+    fs::write(web.join("compose.yml"), "services: {}\n")?;
+    fs::write(
+        workspace.path().join("docker-compose.outside.yaml"),
+        "services:\n  web:\n    env_file: ./project/apps/web/.env\n",
+    )?;
+    fs::write(
+        root.join("compose.unrelated.yml"),
+        "services:\n  web:\n    # env_file: ./apps/web/.env\n    env_file:\n      - ./apps/web/.env.other\n      - path: ./apps/web/.env.example\n      - ./apps/web/.env.local\n    command: |\n      env_file: ./apps/web/.env\n",
+    )?;
+    fs::write(
+        root.join("package.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "scripts": {
+                "dev": "node --env-file ./apps/web/.env app.js # script-value-fixture",
+                "dotenv": "dotenv -e './apps/web/.env' -- node app.js",
+                "example": "node --env-file=./apps/web/.env.example app.js",
+                "comment": "node app.js # --env-file=./apps/web/.env",
+                "inline": "node -e 'console.log(\"node --env-file=./apps/web/.env\")'"
+            }
+        }))?,
+    )?;
+    fs::write(
+        web.join("package.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "scripts": {
+                "start": "node --env-file=.env app.js",
+                "envcmd": "env-cmd -f ./.env node app.js",
+                "unrelated": "node --env-file=.env.local app.js"
+            }
+        }))?,
+    )?;
+    let args = ["import", "apps/web/.env", "--archive", archive_arg];
+    let categories = [
+        "apps/compose.override.YAML",
+        "apps/web/compose.yml",
+        "apps/web/package.json script \"envcmd\"",
+        "apps/web/package.json script \"start\"",
+        "docker-compose.dev.yml",
+        "docker-compose.yml",
+        "package.json script \"dev\"",
+        "package.json script \"dotenv\"",
+    ];
+    let mut preview = args.to_vec();
+    preview.push("--dry-run");
+    let (code, output) = run_env_command(&context, &preview, &canaries)?;
+    assert_eq!(code, 0);
+    let text_warnings = output
+        .lines()
+        .filter_map(|line| line.strip_prefix("archive_warning: "))
+        .collect::<Vec<_>>();
+    assert_eq!(text_warnings.len(), categories.len());
+    for category in categories {
+        assert!(text_warnings.iter().any(|warning| warning.starts_with(category)));
+    }
+    preview.push("--json");
+    let (code, report) = run_env_json(&context, &preview, &canaries)?;
+    assert_eq!(code, 0);
+    assert_eq!(report["delete_env"], "would-archive");
+    assert_eq!(report["archive_consumer_warnings"], serde_json::json!(text_warnings));
+    assert!(source.is_file());
+    assert!(!archive.exists());
+
+    let (code, report) =
+        run_env_json(&context, &[args.as_slice(), &["--json"]].concat(), &canaries)?;
+    assert_eq!(code, 0);
+    assert_eq!(report["delete_env"], "archived");
+    assert_eq!(report["archive_consumer_warnings"], serde_json::json!(text_warnings));
+    assert!(!source.exists());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn import_archive_ignores_symlinked_and_oversize_consumers_at_git_boundaries()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::symlink;
+
+    let root = tempdir()?;
+    let workspace = root.path().join("worktree");
+    let app = workspace.join("app");
+    fs::create_dir_all(&app)?;
+    // A Git worktree's marker is a file, not a directory.
+    fs::write(workspace.join(".git"), "gitdir: elsewhere\n")?;
+    let context = test_context(&root);
+    run_env_command(&context, &["init", "--no-device", "--no-passkey"], &[])?;
+    fs::write(app.join(".env"), "TOKEN=boundary-value-fixture\n")?;
+    fs::write(root.path().join("compose.yml"), "env_file: ./worktree/app/.env\n")?;
+    fs::write(workspace.join("other-compose.yml"), "env_file: ./app/.env\n")?;
+    fs::write(workspace.join("manifest.json"), r#"{"scripts":{"start":"node --env-file=.env"}}"#)?;
+    symlink(workspace.join("other-compose.yml"), app.join("compose.yml"))?;
+    symlink(workspace.join("manifest.json"), app.join("package.json"))?;
+    let oversized = fs::File::create(app.join("compose.extra.yml"))?;
+    oversized.set_len(256 * 1024 + 1)?;
+    let args = ["import", "worktree/app/.env", "--archive", "backups", "--dry-run", "--json"];
+    for git_directory in [false, true] {
+        if git_directory {
+            fs::remove_file(workspace.join(".git"))?;
+            fs::create_dir(workspace.join(".git"))?;
+        }
+        let (code, report) = run_env_json(&context, &args, &["boundary-value-fixture"])?;
+        assert_eq!(code, 0);
+        assert_eq!(report["delete_env"], "would-archive");
+        assert!(report.get("archive_consumer_warnings").is_none());
+    }
+    Ok(())
+}
+
+#[test]
+fn import_archive_only_checks_the_source_directory_outside_the_project()
+-> Result<(), Box<dyn std::error::Error>> {
+    let workspace = tempdir()?;
+    let root = workspace.path().join("project");
+    let outside = workspace.path().join("other");
+    let source = outside.join(".env");
+    fs::create_dir(&root)?;
+    fs::create_dir(&outside)?;
+    let context = RuntimeContext { cwd: root.clone(), ..test_context(&workspace) };
+    run_env_command(&context, &["init", "--name", "consumer", "--no-device", "--no-passkey"], &[])?;
+    fs::write(&source, "TOKEN=outside-value-fixture\n")?;
+    fs::write(workspace.path().join("compose.yml"), "env_file: ./other/.env\n")?;
+    fs::write(root.join("compose.yml"), "env_file: ../other/.env\n")?;
+    fs::write(outside.join("compose.override.yaml"), "services: {}\n")?;
+    let args = [
+        "import",
+        "../other/.env",
+        "--project",
+        "consumer",
+        "--archive",
+        "backups",
+        "--dry-run",
+        "--json",
+    ];
+    let (code, report) = run_env_json(&context, &args, &["outside-value-fixture"])?;
+    assert_eq!(code, 0);
+    assert_eq!(report["delete_env"], "would-archive");
+    assert_eq!(
+        report["archive_consumer_warnings"],
+        serde_json::json!([
+            "../other/compose.override.yaml may still read .env through Docker Compose"
+        ])
+    );
+    Ok(())
+}
+
+#[test]
 fn import_archive_keeps_source_when_keys_are_skipped_or_filtered()
 -> Result<(), Box<dyn std::error::Error>> {
     let project = tempdir()?;
@@ -1103,11 +1273,7 @@ fn import_archive_if_matching_previews_and_archives_an_already_imported_file()
     let archive = outside.path().join("backups");
     let archive_arg = archive.to_str().ok_or("archive path must be UTF-8")?;
     let source = project.path().join(".env");
-    let canaries = [
-        "archive-match-token-fixture",
-        "archive-match-zeta-fixture",
-        "archive-higher-precedence-fixture",
-    ];
+    let canaries = ["archive-match-token-fixture", "archive-match-zeta-fixture"];
     let contents = format!(
         "# preserve comment and line endings\r\nZETA=\"{}\"\r\nTOKEN='{}'\r\n",
         canaries[1], canaries[0]
@@ -1122,7 +1288,7 @@ fn import_archive_if_matching_previews_and_archives_an_already_imported_file()
     crate::set_secret_value(
         &context,
         &test_secret_write_args_for_source("TOKEN", crate::SecretSourceArg::MachineLocal),
-        canaries[2],
+        canaries[0],
         "manual",
         1000,
     )?;
@@ -1163,31 +1329,25 @@ fn import_archive_if_matching_previews_and_archives_an_already_imported_file()
         "missing archive_scope_note: {report}"
     );
     assert!(report.get("archive_consumer_warnings").is_none());
-    fs::write(
-        project.path().join("docker-compose.yml"),
-        "services:\n  web:\n    env_file:\n      - .env\n",
-    )?;
-    let (code, compose_report) = run_env_json(&context, &preview, &canaries)?;
-    assert_eq!(code, 0);
-    assert!(
-        compose_report["archive_consumer_warnings"].as_array().is_some_and(|items| items
-            .iter()
-            .any(|item| item.as_str().is_some_and(|s| s.contains("docker-compose.yml")))),
-        "expected docker-compose warning: {compose_report}"
-    );
-    fs::remove_file(project.path().join("docker-compose.yml"))?;
     assert!(report.get("archive_blocked_reason").is_none());
     assert!(report.get("mismatched_names").is_none());
     assert!(report.get("archived_to").is_none());
     assert!(fs::read(&source)?.as_slice().eq(contents.as_bytes()), "source changed");
     assert!(!archive.exists());
 
+    fs::write(
+        project.path().join("package.json"),
+        r#"{"scripts":{"start":"node --env-file=.env app.js"}}"#,
+    )?;
     let (code, output) = run_env_command(&context, &args, &canaries)?;
     assert_eq!(code, 0);
     assert!(output.contains("imported: 0\n"));
     assert!(output.contains("skipped: 2\n"));
     assert!(output.contains("verified_matching: 2\n"));
     assert!(output.contains("delete_env: archived\n"));
+    assert!(
+        output.contains("archive_warning: package.json script \"start\" may still read .env\n")
+    );
     let archived = output
         .lines()
         .find_map(|line| line.strip_prefix("archived_to: "))
@@ -1367,6 +1527,39 @@ fn import_archive_if_matching_keeps_the_source_if_any_skipped_values_differ()
         assert_eq!(report["archive_blocked_reason"], reason);
         assert_eq!(report["delete_env"], "kept");
         assert!(report.get("archived_to").is_none());
+        assert!(fs::read(&source)?.as_slice().eq(contents.as_bytes()), "source changed");
+        assert!(!project.path().join("backups").exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn import_archive_if_matching_checks_the_machine_local_winner()
+-> Result<(), Box<dyn std::error::Error>> {
+    let project = tempdir()?;
+    let context = test_context(&project);
+    let source = project.path().join(".env");
+    let canaries = ["archive-user-local-fixture", "archive-machine-local-fixture"];
+    let contents = format!("TOKEN={}\n", canaries[0]);
+    fs::write(&source, &contents)?;
+    run_env_command(&context, &["init", "--no-device", "--no-passkey"], &canaries)?;
+    run_env_command(&context, &["import", ".env", "--keep"], &canaries)?;
+    crate::set_secret_value(
+        &context,
+        &test_secret_write_args_for_source("TOKEN", crate::SecretSourceArg::MachineLocal),
+        canaries[1],
+        "manual",
+        1000,
+    )?;
+
+    let args = ["import", ".env", "--archive", "backups", "--archive-if-matching", "--json"];
+    for extra in [&["--dry-run"][..], &[]] {
+        let (code, report) = run_env_json(&context, &[args.as_slice(), extra].concat(), &canaries)?;
+        assert_eq!(code, 0);
+        assert_eq!(report["skipped_names"], serde_json::json!(["TOKEN"]));
+        assert_eq!(report["mismatched_names"], serde_json::json!(["TOKEN"]));
+        assert_eq!(report["archive_blocked_reason"], "skipped keys differ from the vault: TOKEN");
+        assert_eq!(report["delete_env"], "kept");
         assert!(fs::read(&source)?.as_slice().eq(contents.as_bytes()), "source changed");
         assert!(!project.path().join("backups").exists());
     }

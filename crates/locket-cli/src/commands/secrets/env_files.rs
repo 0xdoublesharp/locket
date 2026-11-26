@@ -284,7 +284,11 @@ impl InputDirectory {
         self.child_directory(OsStr::new(directory)).is_ok_and(|dir| dir.is_regular(name))
     }
 
-    fn names(&self) -> io::Result<Vec<OsString>> {
+    pub(super) fn has_git_boundary(&self) -> bool {
+        matches!(self.entry_kind(OsStr::new(".git")), Ok(EntryKind::Directory | EntryKind::File))
+    }
+
+    pub(super) fn names(&self) -> io::Result<Vec<OsString>> {
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
