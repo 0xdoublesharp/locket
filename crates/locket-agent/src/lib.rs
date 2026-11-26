@@ -122,7 +122,9 @@ pub use mutations::{
 
 pub mod team_sync;
 
-pub use handlers::team_sync::{TeamSyncConfigureRequest, TeamSyncRequest, spawn_team_sync_poll};
+pub use handlers::team_sync::{
+    TeamSyncConfigureRequest, TeamSyncRequest, TeamSyncTestRemoteRequest, spawn_team_sync_poll,
+};
 
 #[cfg(test)]
 use x25519_dalek as _;

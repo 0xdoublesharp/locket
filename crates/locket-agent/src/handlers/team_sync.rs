@@ -31,6 +31,13 @@ pub struct TeamSyncConfigureRequest {
     #[serde(default)]
     pub allow_dangerous: bool,
 }
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TeamSyncTestRemoteRequest {
+    #[serde(flatten)]
+    pub scope: TeamSyncRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<TeamSyncTransportConfigureInput>,
+}
 #[cfg(test)]
 fn open_sync_store(path: impl AsRef<std::path::Path>) -> team_sync::Result<locket_store::Store> {
     let mut store = locket_store::Store::open(path)?;
@@ -226,10 +233,10 @@ pub async fn handle_team_sync_test_remote(
     request: &RequestEnvelope,
     state: &AgentSocketState,
 ) -> ResponseEnvelope {
-    let Ok(typed) = TeamSyncRequest::deserialize(&request.payload) else {
+    let Ok(typed) = TeamSyncTestRemoteRequest::deserialize(&request.payload) else {
         return error(request, "ProtocolError", "invalid remote test request");
     };
-    if !granted(&typed, state).await {
+    if !granted(&typed.scope, state).await {
         return error(request, "GrantRequired", "explicit local grant required for team sync");
     }
     match test_cached_remote(state, typed).await {
@@ -240,26 +247,31 @@ pub async fn handle_team_sync_test_remote(
 
 async fn test_cached_remote(
     state: &AgentSocketState,
-    request: TeamSyncRequest,
+    request: TeamSyncTestRemoteRequest,
 ) -> team_sync::Result<team_sync::RemoteTestResult> {
-    let project = request.project_id.clone();
+    let project = request.scope.project_id.clone();
     let (key, context, expiry, pin) = cached_sync_context(state, &project).await?;
     let authorization = granted_commit_authorization(
         state,
-        &request,
+        &request.scope,
         commit_authorization(state, &project, &context.store_path, expiry, &key),
     );
     tokio::task::spawn_blocking({
         let state = state.clone();
         move || {
-            check_selected_store(request.store_path.as_deref(), &context.store_path)?;
+            check_selected_store(request.scope.store_path.as_deref(), &context.store_path)?;
             let (store, _) = state
                 .open_store(&context.store_path, pin.as_ref(), true)
                 .map_err(locket_store::StoreError::from)?;
             // Recheck authorization after opening the store, without holding a
             // live unlock guard during network I/O.
             drop(authorization()?);
-            team_sync::test_configured_transport(&store, &project, Some(&key))
+            if let Some(transport) = request.transport {
+                let (config, credentials) = transport.into_parts()?;
+                team_sync::test_transport(&config, credentials)
+            } else {
+                team_sync::test_configured_transport(&store, &project, Some(&key))
+            }
         }
     })
     .await

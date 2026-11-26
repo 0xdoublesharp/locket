@@ -74,6 +74,7 @@ pub enum TransportConfig {
         path_style: bool,
         credential_mode: CredentialMode,
     },
+    #[serde(rename = "webdav")]
     WebDav {
         url: String,
         #[serde(default)]

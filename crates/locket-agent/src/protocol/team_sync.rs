@@ -136,6 +136,23 @@ mod tests {
             "team_sync.test_remote".parse::<AgentMethod>()?,
             AgentMethod::TeamSyncTestRemote
         );
+
+        let webdav_payload = json!({
+            "project_id": "p",
+            "transport": {
+                "kind": "webdav",
+                "url": "http://127.0.0.1:8080/team",
+                "credential_mode": "vault",
+                "auth_kind": "bearer",
+                "secret": "webdav-bearer-to-redact"
+            }
+        });
+        let webdav_req: TeamSyncConfigureRequest = serde_json::from_value(webdav_payload)?;
+        assert!(!format!("{webdav_req:?}").contains("webdav-bearer-to-redact"));
+        let (webdav_cfg, webdav_creds) =
+            webdav_req.transport.ok_or("webdav transport missing")?.into_parts()?;
+        assert_eq!(serde_json::to_value(&webdav_cfg)?["kind"], "webdav");
+        assert!(webdav_creds.is_some());
         Ok(())
     }
 }
@@ -167,6 +184,7 @@ pub enum TeamSyncTransportConfigureInput {
         #[serde(default, with = "secret_option")]
         session_token: Option<zeroize::Zeroizing<String>>,
     },
+    #[serde(rename = "webdav")]
     WebDav {
         url: String,
         credential_mode: crate::team_sync::CredentialMode,
