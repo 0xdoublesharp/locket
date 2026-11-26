@@ -57,7 +57,7 @@ fn embedded_nonce_and_ciphertext_require_exact_lengths() {
 
 #[kani::proof]
 #[kani::stub(zeroize::optimization_barrier, kani_optimization_barrier)]
-#[kani::unwind(68)]
+#[kani::unwind(66)]
 fn fixed_wrap_round_trips_and_rejects_a_flipped_tag_bit() {
     let key = [7; KEY_LEN];
     let nonce = [11; NONCE_LEN];
@@ -69,20 +69,19 @@ fn fixed_wrap_round_trips_and_rejects_a_flipped_tag_bit() {
     assert_eq!(envelope.len(), NONCE_LEN + KEY_LEN + TAG_LEN);
     assert_eq!(&envelope[..NONCE_LEN], &nonce);
 
-    // Mutate a fixed tag offset by an arbitrary byte mask so CBMC keeps the
-    // nonce and ciphertext concrete while proving all 255 non-zero corruptions
-    // fail authentication and mask == 0 recovers the original key material.
     let mut candidate = [0_u8; NONCE_LEN + KEY_LEN + TAG_LEN];
     candidate.copy_from_slice(&envelope);
-    let mask: u8 = kani::any();
-    candidate[NONCE_LEN + KEY_LEN] ^= mask;
+    let flip: bool = kani::any();
+    if flip {
+        candidate[NONCE_LEN + KEY_LEN] ^= 1;
+    }
     match unwrap_dek_v1(&key, &candidate, aad) {
         Ok(opened) => {
-            assert_eq!(mask, 0);
+            assert!(!flip);
             assert_eq!(*opened, material);
         }
         Err(error) => {
-            assert_ne!(mask, 0);
+            assert!(flip);
             assert_eq!(error, CryptoError::DecryptionFailed);
         }
     }

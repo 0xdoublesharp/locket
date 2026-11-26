@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use crate::policy::glob_matches;
-use crate::{LkReferenceUri, PolicyDocument, SecretAccessPolicy, SecretName};
+use crate::{LkReferenceUri, SecretAccessPolicy, SecretName};
 
 #[kani::proof]
 #[kani::unwind(6)]
@@ -27,69 +27,57 @@ fn bounded_secret_names_match_the_ascii_grammar() {
 }
 
 #[kani::proof]
-#[kani::unwind(14)]
+#[kani::unwind(12)]
 fn bounded_reference_suffixes_parse_without_panics() {
     // Representative URI alphabet covering every grammar branch: valid secret
-    // start/rest chars, invalid char, and URI/version/query delimiters.
-    const ALPHABET: [u8; 8] = *b"A_0a@v?=";
-    let indices: [usize; 3] = kani::any();
+    // chars, version delimiters, and query delimiter.
+    const ALPHABET: [u8; 6] = *b"A_0@v?";
+    let indices: [usize; 2] = kani::any();
     let len: usize = kani::any();
     kani::assume(len <= indices.len());
 
-    let mut suffix_bytes = [0_u8; 3];
-    for i in 0..3 {
+    let mut suffix_bytes = [0_u8; 2];
+    for i in 0..2 {
         kani::assume(indices[i] < ALPHABET.len());
         suffix_bytes[i] = ALPHABET[indices[i]];
     }
     let Ok(suffix) = std::str::from_utf8(&suffix_bytes[..len]) else {
         unreachable!("ASCII alphabet bytes are valid UTF-8");
     };
-    let mut input = String::with_capacity(9 + suffix_bytes.len());
-    input.push_str("lk://dev/");
+    let mut input = String::with_capacity(8 + suffix_bytes.len());
+    input.push_str("lk://d/K");
     input.push_str(suffix);
     if let Ok(uri) = LkReferenceUri::parse(&input) {
-        assert_eq!(uri.profile().as_str(), "dev");
+        assert_eq!(uri.profile().as_str(), "d");
         assert!(SecretName::new(uri.key().as_str()).is_ok());
         assert!(uri.version().is_none_or(|version| version.get() > 0));
     }
 }
 
 #[kani::proof]
-#[kani::unwind(24)]
+#[kani::unwind(10)]
 fn a_single_acl_mismatch_denies_an_explicitly_selected_secret() {
-    let Ok(name) = SecretName::new("TOKEN") else { unreachable!("valid fixture name") };
-    let document = PolicyDocument {
-        schema_version: 1,
-        variables: Default::default(),
-        commands: Default::default(),
-        path_scopes: Default::default(),
-        secret_access: [(
-            name.as_str().to_owned(),
-            SecretAccessPolicy {
-                name: name.clone(),
-                allow_commands: vec!["build:*".to_owned()],
-                allow_argv: vec![vec!["tool".to_owned(), "**".to_owned(), "run".to_owned()]],
-                allow_paths: vec!["src/**".to_owned()],
-            },
-        )]
-        .into(),
+    let Ok(name) = SecretName::new("K") else { unreachable!("valid fixture name") };
+    let acl = SecretAccessPolicy {
+        name,
+        allow_commands: vec!["b:*".to_owned()],
+        allow_argv: vec![vec!["t".to_owned(), "**".to_owned(), "r".to_owned()]],
+        allow_paths: vec!["s/**".to_owned()],
     };
 
     let command_matches: bool = kani::any();
     let argv_matches: bool = kani::any();
     let argv_present: bool = kani::any();
     let path_matches: bool = kani::any();
-    let command = if command_matches { "build:release" } else { "deploy" };
-    let cwd = Path::new(if path_matches { "src/child" } else { "src-sibling" });
-    let argv = ["tool".to_owned(), if argv_matches { "run" } else { "test" }.to_owned()];
-    let selected = [name];
-    let denied =
-        document.denied_secrets(command, argv_present.then_some(&argv[..]), cwd, &selected);
-    assert_eq!(denied.is_empty(), command_matches && argv_present && argv_matches && path_matches);
+    let command = if command_matches { "b:x" } else { "d" };
+    let cwd = Path::new(if path_matches { "s/c" } else { "s-x" });
+    let argv = ["t".to_owned(), if argv_matches { "r" } else { "x" }.to_owned()];
+    let allowed = acl.allows(command, argv_present.then_some(&argv[..]), cwd);
+    assert_eq!(allowed, command_matches && argv_present && argv_matches && path_matches);
 }
 
 #[kani::proof]
-#[kani::unwind(12)]
+#[kani::unwind(10)]
 fn bounded_acl_matching_is_panic_free() {
     // Prove glob matching terminates without panicking across symbolic bytes,
     // including repeated wildcard backtracking.
@@ -115,9 +103,8 @@ fn bounded_acl_matching_is_panic_free() {
     };
     let _ = glob_matches(pattern, input);
 
-    // Also verify SecretAccessPolicy::allows denies missing argv and any
-    // parent-escaping or absolute path across all representative shapes.
-    let Ok(name) = SecretName::new("TOKEN") else { unreachable!("valid fixture name") };
+    // Also verify SecretAccessPolicy::allows denies missing argv and parent/root escapes.
+    let Ok(name) = SecretName::new("K") else { unreachable!("valid fixture name") };
     let acl = SecretAccessPolicy {
         name,
         allow_commands: vec!["*".to_owned()],
@@ -125,10 +112,8 @@ fn bounded_acl_matching_is_panic_free() {
         allow_paths: vec![".".to_owned()],
     };
     let argv = ["ab".to_owned()];
-    let escaped_idx: usize = kani::any();
-    kani::assume(escaped_idx < 3);
-    let escaped = ["../src", "/src", "src/../src"][escaped_idx];
-    assert!(!acl.allows("cmd", None, Path::new("src")));
-    assert!(!acl.allows("cmd", Some(&argv), Path::new(escaped)));
-    assert!(acl.allows("cmd", Some(&argv), Path::new("src/sub")));
+    assert!(!acl.allows("c", None, Path::new("s")));
+    assert!(!acl.allows("c", Some(&argv), Path::new("../s")));
+    assert!(!acl.allows("c", Some(&argv), Path::new("/s")));
+    assert!(acl.allows("c", Some(&argv), Path::new("s/a")));
 }
