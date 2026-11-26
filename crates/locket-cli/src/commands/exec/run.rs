@@ -364,26 +364,68 @@ pub fn run_command_with_diagnostics(
     run_args: &RunArgs,
 ) -> Result<(), CliError> {
     let resolved = require_project(context)?;
-    let mut store = open_store(context)?;
-    ensure_trusted_project_root(&store, &resolved)?;
-    let approved = resolve_run_policy(context, output, &mut store, &resolved, run_args)?;
-    let policy = &approved.effective.policy;
-    let profile = effective_policy_profile(&store, &resolved, &approved.effective)?;
-    let insecure_argv = match argv_reference_access(&policy.command, run_args.allow_insecure_argv) {
-        Ok(allowed) => allowed,
-        Err(error) => {
-            let _ignored = write_runtime_policy_denial_audit_if_available(
-                context,
-                &mut store,
-                &resolved,
-                Some(&profile),
-                Some(policy),
-                &policy.name,
-                "insecure_argv_denied",
-            );
-            return Err(error);
-        }
+    let status =
+        run_policy_status(context, output, diagnostics, &resolved, run_args, io::stdout(), false)?;
+    if status.success() {
+        return Ok(());
+    }
+    writeln!(output, "child exited with status {status}")?;
+    Err(child_exit_error(status))
+}
+
+/// Runs a saved policy for import verification, keeping child output off stdout.
+pub(in crate::commands) fn run_verification_policy(
+    context: &RuntimeContext,
+    resolved: &ResolvedProject,
+    policy_name: &str,
+) -> Result<ExitStatus, CliError> {
+    let args = RunArgs {
+        policy: policy_name.to_owned(),
+        output_redaction: crate::OutputRedactionArgs { redact_output: true, ..Default::default() },
+        ..Default::default()
     };
+    run_policy_status(
+        context,
+        &mut io::stderr(),
+        &mut io::stderr(),
+        resolved,
+        &args,
+        io::stderr(),
+        true,
+    )
+}
+
+fn run_policy_status(
+    context: &RuntimeContext,
+    output: &mut impl Write,
+    diagnostics: &mut impl Write,
+    resolved: &ResolvedProject,
+    run_args: &RunArgs,
+    child_stdout: impl Write + Send,
+    verification: bool,
+) -> Result<ExitStatus, CliError> {
+    let mut store = open_store(context)?;
+    ensure_trusted_project_root(&store, resolved)?;
+    let approved = if verification {
+        load_command_policy_or_audit_denial(context, &mut store, resolved, &run_args.policy)?
+    } else {
+        resolve_run_policy(context, output, &mut store, resolved, run_args)?
+    };
+    let policy = &approved.effective.policy;
+    let profile = effective_policy_profile(&store, resolved, &approved.effective)?;
+    let audit_denial = |store: &mut Store, failure_reason| {
+        let _ignored = write_runtime_policy_denial_audit_if_available(
+            context,
+            store,
+            resolved,
+            Some(&profile),
+            Some(policy),
+            &policy.name,
+            failure_reason,
+        );
+    };
+    let insecure_argv = argv_reference_access(&policy.command, run_args.allow_insecure_argv)
+        .inspect_err(|_| audit_denial(&mut store, "insecure_argv_denied"))?;
 
     let (confirmation_source, user_verification) =
         authorize_run_invocation(context, output, policy, &profile)?;
@@ -399,30 +441,24 @@ pub fn run_command_with_diagnostics(
         approved.source.document.output_redaction,
         !run_args.egress_host.is_empty(),
     )?;
-    let mut prepared_policy = match prepare_policy_execution(
-        context,
-        output,
-        &store,
-        &resolved,
-        &profile,
-        &approved,
-        redaction.is_some(),
-    ) {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            let failure_reason = denial_failure_reason(&error);
-            let _ignored = write_runtime_policy_denial_audit_if_available(
-                context,
-                &mut store,
-                &resolved,
-                Some(&profile),
-                Some(policy),
-                &policy.name,
-                failure_reason,
-            );
-            return Err(error);
-        }
+    let vault_access = if verification {
+        require_verification_vault_unlocked(context, &profile.project_id)
+    } else {
+        Ok(())
     };
+    let mut prepared_policy = vault_access
+        .and_then(|()| {
+            prepare_policy_execution(
+                context,
+                output,
+                &store,
+                resolved,
+                &profile,
+                &approved,
+                redaction.is_some(),
+            )
+        })
+        .inspect_err(|error| audit_denial(&mut store, denial_failure_reason(error)))?;
     let protection = RunProtection::configure(run_args, &mut prepared_policy, redaction)?;
     let outcome = execute_runtime_child(
         context,
@@ -434,20 +470,21 @@ pub fn run_command_with_diagnostics(
             prepared: &prepared_policy.prepared,
             current_dir: Some(&context.cwd),
             run_policy_grant: Some(RunPolicyGrantRequest {
-                resolved: &resolved,
+                resolved,
                 source: &approved.source,
                 ttl_seconds: policy.ttl.as_secs(),
             }),
             shared_projects: shared_projects(&prepared_policy.selections),
         },
         protection,
+        child_stdout,
     )?;
     let status = outcome.status;
     let audit_status = if status.success() { "SUCCESS" } else { "FAILED" };
     write_runtime_policy_audit_if_available(
         context,
         &mut store,
-        &resolved,
+        resolved,
         &profile,
         policy,
         audit_status,
@@ -459,12 +496,7 @@ pub fn run_command_with_diagnostics(
         outcome.run_policy_grant.as_ref(),
         insecure_argv,
     )?;
-    if status.success() {
-        return Ok(());
-    }
-
-    writeln!(output, "child exited with status {status}")?;
-    Err(child_exit_error(status))
+    Ok(status)
 }
 
 fn authorize_run_invocation(
@@ -1102,6 +1134,19 @@ pub(super) fn require_shared_vault_unlocked(
     project_id: &str,
 ) -> Result<(), CliError> {
     require_vault_unlocked(context, project_id, "the Global Vault", "executing with shared secrets")
+}
+
+fn require_verification_vault_unlocked(
+    context: &RuntimeContext,
+    project_id: &str,
+) -> Result<(), CliError> {
+    ensure_agent_running_for_execution(context)?;
+    require_vault_unlocked(
+        context,
+        project_id,
+        "the policy's project vault",
+        "verifying the dotenv import",
+    )
 }
 
 pub(super) fn require_vault_unlocked(
@@ -2086,7 +2131,8 @@ pub(super) fn execute_exec_child(
 ) -> Result<ExitStatus, CliError> {
     if !request.secret_names.is_empty() {
         let protection = redactor.map(|redactor| RunProtection { redactor, broker: None });
-        return execute_runtime_child(context, request, protection).map(|outcome| outcome.status);
+        return execute_runtime_child(context, request, protection, io::stdout())
+            .map(|outcome| outcome.status);
     }
     let mut command = request.prepared.command();
     if let Some(current_dir) = request.current_dir {
@@ -2107,6 +2153,7 @@ fn execute_runtime_child(
     context: &RuntimeContext,
     request: &RuntimeExecutionRequest<'_>,
     protection: Option<RunProtection>,
+    child_stdout: impl Write + Send,
 ) -> Result<RuntimeExecutionOutcome, CliError> {
     let started_at = now_unix_nanos()?;
     let session_id = SessionId::generate()
@@ -2162,7 +2209,7 @@ fn execute_runtime_child(
 
     let (redaction, broker) = protection.map_or((Ok(()), None), |protection| {
         (
-            redact_child_output(&mut child, io::stdout(), io::stderr(), protection.redactor)
+            redact_child_output(&mut child, child_stdout, io::stderr(), protection.redactor)
                 .map(|_| ()),
             protection.broker,
         )

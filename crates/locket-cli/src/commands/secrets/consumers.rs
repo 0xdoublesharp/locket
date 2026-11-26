@@ -20,10 +20,15 @@ const MAX_ANCESTORS: usize = 8;
 const MAX_SUBDIR_DEPTH: usize = 2;
 const MAX_SUBDIRS: usize = 64;
 const MAX_SUBDIR_COMPOSE_FILES: usize = 32;
+const MAX_INTERPOLATION_KEYS: usize = 12;
 const MAX_STATIC_WORD_BYTES: usize = 4096;
 const MAX_SUBST_DEPTH: usize = 4;
 
-pub(super) fn detect_archive_consumers(source: &Path, root: Option<&Path>) -> Vec<String> {
+pub(super) fn detect_archive_consumers(
+    source: &Path,
+    root: Option<&Path>,
+    env_names: &BTreeSet<String>,
+) -> Vec<String> {
     let (Some(parent), Some(name)) = (source.parent(), source.file_name()) else {
         return Vec::new();
     };
@@ -37,6 +42,7 @@ pub(super) fn detect_archive_consumers(source: &Path, root: Option<&Path>) -> Ve
     let boundary = git_root.or(in_project).unwrap_or(&parent);
     let mut scan = ConsumerScan {
         source: &source,
+        env_names,
         root: git_root.or(project_root.as_deref()).unwrap_or(&parent),
         git_root,
         warnings: Vec::new(),
@@ -83,6 +89,7 @@ pub(super) fn detect_archive_consumers(source: &Path, root: Option<&Path>) -> Ve
 
 struct ConsumerScan<'a> {
     source: &'a Path,
+    env_names: &'a BTreeSet<String>,
     root: &'a Path,
     git_root: Option<&'a Path>,
     warnings: Vec<String>,
@@ -112,9 +119,11 @@ impl ConsumerScan<'_> {
                 self.warnings.push(format!(
                     "{path} references {source_name} in Docker Compose env_file; replace with environment: pass-through or mark required: false"
                 ));
-            } else if implicit {
+            } else if implicit
+                && let Some(keys) = compose_interpolation_overlap(&text, self.env_names)
+            {
                 self.warnings.push(format!(
-                    "{path} may interpolate {source_name} (${{VAR}}) through Docker Compose; run via `locket compose run --policy <name> -- ...`"
+                    "{path} interpolates {keys} from {source_name} through Docker Compose; run via `locket compose run --policy <name> -- ...`"
                 ));
             }
         }
@@ -468,6 +477,49 @@ fn compose_references(text: &str, matches_source: impl Fn(&str) -> bool) -> bool
         }
     }
     false
+}
+
+fn compose_interpolation_overlap(text: &str, env_names: &BTreeSet<String>) -> Option<String> {
+    if env_names.is_empty() {
+        return None;
+    }
+    let mut overlap = BTreeSet::new();
+    for mut line in text.lines().map(strip_yaml_comment) {
+        let trailing_bytes = line.rsplit_once('}').map_or(line.len(), |(_, after)| after.len());
+        while let Some((_, after_dollar)) = line.split_once('$') {
+            line = after_dollar;
+            if let Some(after_escape) = line.strip_prefix('$') {
+                line = after_escape;
+                continue;
+            }
+            let expression = line.strip_prefix('{');
+            let variable = expression.unwrap_or(line);
+            let suffix =
+                variable.trim_start_matches(|ch: char| ch.is_ascii_alphanumeric() || ch == '_');
+            let name = &variable[..variable.len() - suffix.len()];
+            if is_shell_variable_name(name)
+                && (expression.is_none()
+                    || suffix.starts_with('}')
+                    || (suffix.len() > trailing_bytes
+                        && suffix.strip_prefix(':').unwrap_or(suffix).starts_with(['-', '?', '+'])))
+                && env_names.contains(name)
+            {
+                overlap.insert(name);
+            }
+            line = suffix;
+        }
+    }
+    if overlap.is_empty() {
+        return None;
+    }
+    let mut keys =
+        overlap.iter().copied().take(MAX_INTERPOLATION_KEYS).collect::<Vec<_>>().join(", ");
+    let extra = overlap.len().saturating_sub(MAX_INTERPOLATION_KEYS);
+    if extra > 0 {
+        use std::fmt::Write as _;
+        let _ = write!(keys, " (+{extra} more)");
+    }
+    Some(keys)
 }
 
 fn yaml_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
@@ -1026,6 +1078,89 @@ mod tests {
     use super::*;
 
     #[test]
+    fn consumer_scan_ignores_compose_without_key_overlap() -> io::Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path();
+        fs::write(root.join("docker-compose.dev.yml"), "services: {app: {image: '${IMAGE}'}}\n")?;
+        let names = BTreeSet::from(["TOKEN".to_owned()]);
+        let warnings = detect_archive_consumers(&root.join(".env"), Some(root), &names);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn consumer_scan_ignores_optional_node_env_file() -> io::Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path();
+        let manifest = root.join("package.json");
+        let source = root.join(".env");
+        fs::write(
+            &manifest,
+            r#"{"scripts":{"start":"node --env-file-if-exists=.env server.js"}}"#,
+        )?;
+        assert_eq!(
+            detect_archive_consumers(&source, Some(root), &BTreeSet::new()),
+            Vec::<String>::new()
+        );
+        fs::write(&manifest, r#"{"scripts":{"start":"node --env-file=.env server.js"}}"#)?;
+        assert_eq!(
+            detect_archive_consumers(&source, Some(root), &BTreeSet::new()),
+            ["package.json script \"start\" may still read .env"],
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn consumer_scan_reports_only_sorted_compose_key_overlap() -> io::Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path();
+        let source = root.join(".env");
+        fs::write(
+            root.join("compose.production.yaml"),
+            concat!(
+                "services:\n  app:\n    environment:\n",
+                "      REDIS: $REDIS_URL # ${COMMENTED}\n",
+                "      POSTGRES: \"prefix # ${POSTGRES_PASSWORD:-dev}\"\n",
+                "      ESCAPED: $$ESCAPED_VAR $${ESCAPED_VAR}\n",
+                "      IMAGE: ${IMAGE}\n",
+            ),
+        )?;
+        let names = ["REDIS_URL", "POSTGRES_PASSWORD", "ESCAPED_VAR", "COMMENTED"]
+            .map(str::to_owned)
+            .into_iter()
+            .collect();
+        assert_eq!(
+            detect_archive_consumers(&source, Some(root), &names),
+            [
+                "compose.production.yaml interpolates POSTGRES_PASSWORD, REDIS_URL from .env through Docker Compose; run via `locket compose run --policy <name> -- ...`"
+            ],
+        );
+        assert_eq!(
+            detect_archive_consumers(&source, Some(root), &BTreeSet::new()),
+            Vec::<String>::new()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compose_interpolation_overlap_supports_operators_and_limits_display() {
+        let names = (0..14).map(|i| format!("KEY_{i:02}")).collect();
+        let text = concat!(
+            "${KEY_00} ${KEY_01:-dev} ${KEY_02-dev} ${KEY_03:?error} ${KEY_04?error}\n",
+            "${KEY_05:+alt} ${KEY_06+alt} ${KEY_07:-${KEY_08}} $KEY_09 $KEY_10 $KEY_11 $KEY_12 $KEY_13\n",
+        );
+        assert_eq!(
+            compose_interpolation_overlap(text, &names).as_deref(),
+            Some(
+                "KEY_00, KEY_01, KEY_02, KEY_03, KEY_04, KEY_05, KEY_06, KEY_07, KEY_08, KEY_09, KEY_10, KEY_11 (+2 more)"
+            ),
+        );
+        assert!(
+            compose_interpolation_overlap("${KEY_00/invalid} ${KEY_01:-unclosed", &names).is_none()
+        );
+    }
+
+    #[test]
     fn templates_resolve_only_literal_or_statically_assigned_destinations() {
         let cwd = Path::new("/repo");
         let script_dir = Path::new("/repo/scripts");
@@ -1110,7 +1245,7 @@ mod tests {
             "[package]\nname = \"demo\"\n[dependencies]\ndotenvy = \"0.15\"\n",
         )?;
 
-        let warnings = detect_archive_consumers(&root.join(".env"), Some(root));
+        let warnings = detect_archive_consumers(&root.join(".env"), Some(root), &BTreeSet::new());
         assert!(
             warnings.iter().any(|w| w.starts_with("deploy/compose.yaml references .env")),
             "{warnings:?}"
@@ -1173,7 +1308,7 @@ mod tests {
             format!("env_file: {}/.env\n", deepest.trim_start_matches("one/")),
         )?;
         let source = root.join(deepest).join(".env");
-        let warnings = detect_archive_consumers(&source, Some(root));
+        let warnings = detect_archive_consumers(&source, Some(root), &BTreeSet::new());
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].starts_with("one/compose.yml"));
         Ok(())
@@ -1191,7 +1326,7 @@ mod tests {
             scripts.insert(name.clone(), format!("sh ./{name}"));
         }
         fs::write(root.join("package.json"), serde_json::json!({"scripts": scripts}).to_string())?;
-        let warnings = detect_archive_consumers(&root.join(".env"), Some(root));
+        let warnings = detect_archive_consumers(&root.join(".env"), Some(root), &BTreeSet::new());
         assert_eq!(warnings.len(), MAX_SCRIPTS);
         assert!(warnings[0].starts_with("dev-00"));
         assert!(warnings[MAX_SCRIPTS - 1].starts_with("dev-15"));

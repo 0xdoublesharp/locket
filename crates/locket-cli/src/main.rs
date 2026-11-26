@@ -553,6 +553,9 @@ struct ImportSelectionArgs {
     /// Archive even when keys are skipped, if their values match the vault.
     #[arg(long, requires = "archive")]
     archive_if_matching: bool,
+    /// Run an approved saved command policy with vault values before archiving the dotenv source.
+    #[arg(long, value_name = "POLICY", requires = "archive")]
+    pub verify_policy: Option<String>,
     /// Plan the import without writing. Shared deduplication needs the Global Vault fingerprint key.
     #[arg(long)]
     dry_run: bool,
@@ -780,6 +783,9 @@ pub enum EnvFileCommand {
         /// Maximum depth, counting the scan root as level zero.
         #[arg(long, default_value_t = 5)]
         depth: usize,
+        /// Omit the list of migrated projects from the report.
+        #[arg(long)]
+        remaining: bool,
         /// Accept dollar expressions as literal values.
         #[arg(long)]
         literal: bool,

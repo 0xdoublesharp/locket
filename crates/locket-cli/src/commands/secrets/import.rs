@@ -43,11 +43,13 @@ use crate::commands::agent::request_project_status_snapshot;
 use crate::commands::discovery::{
     error_json, require_metadata_store, trusted_project_configs, write_json_result,
 };
-use crate::commands::exec::run::require_linked_secret_access;
+use crate::commands::exec::run::{require_linked_secret_access, run_verification_policy};
+use crate::commands::policy::require_approved_policy_source;
 use crate::runtime::RuntimeContext;
 use crate::runtime::error::{
-    CliError, confirmation_failed_error, invalid_profile_name_error, invalid_secret_name_error,
-    metadata_invalid_error, profile_not_found_error, secret_not_found_error, typed_cli_error,
+    CliError, child_exit_error, confirmation_failed_error, invalid_profile_name_error,
+    invalid_secret_name_error, metadata_invalid_error, profile_not_found_error,
+    secret_not_found_error, typed_cli_error,
 };
 use crate::runtime::prompts::ConfirmationReader;
 use crate::support::project_files::{ensure_gitignore, refresh_example_for_project_if_enabled};
@@ -56,8 +58,8 @@ use crate::{
     EnvFileCommand, ImportArgs, ImportSelectionArgs, NANOS_PER_SECOND, ResolvedProject,
     SecretMetadataFlags, SecretSourceArg, absolutize, active_profile_secret_names,
     ensure_trusted_project_root, load_project_key, now_unix_nanos, open_store,
-    project_not_found_error, require_project, secret_audit_metadata, secret_deleted_error,
-    source_arg_to_str,
+    project_not_found_error, require_project, resolve_project, secret_audit_metadata,
+    secret_deleted_error, source_arg_to_str,
 };
 
 /// Key selection and write policy for a dotenv import.
@@ -98,12 +100,15 @@ pub fn env_file_command(
             }
             write_env_keys(output, &path, literal)?;
         }
-        EnvFileCommand::Scan { path, depth, literal, json } => {
+        EnvFileCommand::Scan { path, depth, literal, remaining, json } => {
             let root = absolutize(cwd, path.as_deref().unwrap_or_else(|| Path::new(".")));
             if json {
-                return write_json_result(output, scan_workspace_env_files(&root, depth, literal));
+                return write_json_result(
+                    output,
+                    scan_workspace_env_files(&root, depth, literal, remaining),
+                );
             }
-            write_env_scan(output, &root, depth, literal)?;
+            write_env_scan(output, &root, depth, literal, remaining)?;
         }
     }
     Ok(0)
@@ -243,6 +248,11 @@ fn import_cli(
                 &absolutize(&context.cwd, destination),
                 &path,
                 root.as_deref(),
+                selection.verify_policy.as_deref().map(|name| ArchiveVerification {
+                    context,
+                    store: &store,
+                    name,
+                }),
             )
             .err()
         });
@@ -292,14 +302,15 @@ fn finalize_archive_action(
     destination: &Path,
     path: &Path,
     root: Option<&Path>,
+    verification: Option<ArchiveVerification<'_>>,
 ) -> Result<(), CliError> {
-    report.archive_consumer_warnings = detect_archive_consumers(path, root);
+    report.archive_consumer_warnings = detect_archive_consumers(path, root, &report.env_names);
     report.archive_directory = Some(destination.display().to_string());
     report.archive_blocked_reason = report.archive_blocker(policy);
     if !report.dry_run && report.archive_blocked_reason.is_some() {
         return Ok(());
     }
-    let archive = || -> Result<Option<PathBuf>, CliError> {
+    let mut prepare_archive = || {
         let directory = validate_archive_directory(destination)?;
         report.archive_directory = Some(directory.display().to_string());
         let (_, source_name) = input_parent(path)?;
@@ -308,40 +319,107 @@ fn finalize_archive_action(
         let seconds = now_unix_nanos()?.div_euclid(NANOS_PER_SECOND);
         let prefix = format!("{project}-{seconds}-");
         let suffix = format!("-{source_name}");
-        if let Some((file, original)) = archive_source {
-            archive_env_source(path, file, &original, &directory, &prefix, &suffix).map(Some)
-        } else {
+        if report.dry_run || verification.is_some() {
             require_archive_git_ignore(&directory.join(format!("{prefix}000000000000{suffix}")))?;
-            Ok(None)
         }
+        Ok::<_, CliError>((directory, prefix, suffix))
     };
-    match archive() {
-        Ok(Some(archived)) => {
-            report.delete_env = "archived";
-            report.archived_to = Some(archived.display().to_string());
+    let prepared = prepare_archive();
+    let Some((file, original)) = archive_source else {
+        if let Err(error) = prepared {
+            report.block_archive(&error);
         }
-        Ok(None) if report.archive_blocked_reason.is_none() => {
+        if let Some(verification) = verification {
+            let approval =
+                ArchiveVerification::project(root, &report.project_id).and_then(|project| {
+                    require_approved_policy_source(verification.store, &project, verification.name)
+                });
+            if let Err(error) = approval {
+                report.block_archive(&error);
+            } else if report.archive_blocked_reason.is_none() {
+                report.verify_policy = Some(verification.name.to_owned());
+                report.verify_policy_status = Some("would-run");
+            }
+        }
+        if report.archive_blocked_reason.is_none() {
             report.delete_env = "would-archive";
             report.archive_scope_note = Some(
                 "review framework and dotenv loaders such as dotenv/config, Vite, Next.js, and Prisma before archiving, and run your application through locket run <policy>"
                     .to_owned(),
             );
         }
-        Ok(None) => {}
-        Err(error) if report.dry_run => {
-            if let Some(reason) = &mut report.archive_blocked_reason {
-                *reason = format!("{reason}. {error}");
-            } else {
-                report.archive_blocked_reason = Some(error.to_string());
+        return Ok(());
+    };
+
+    let archive_failure = |error| {
+        metadata_invalid_error(format!(
+            "Import succeeded. Could not archive the dotenv source ({error})."
+        ))
+    };
+    let (directory, prefix, suffix) = prepared.map_err(archive_failure)?;
+    if let Some(verification) = verification {
+        report.verify_policy = Some(verification.name.to_owned());
+        match verification.run(root, &report.project_id) {
+            Ok(status) if status.success() => report.verify_policy_status = Some("passed"),
+            Ok(status) => {
+                report.verify_policy_status = Some("failed");
+                report.verify_policy_exit_code =
+                    status.code().and_then(|code| u8::try_from(code).ok());
+                return Err(child_exit_error(status));
+            }
+            Err(error) => {
+                report.verify_policy_status = Some("failed");
+                return Err(error);
             }
         }
-        Err(error) => {
-            return Err(metadata_invalid_error(format!(
-                "Import succeeded. Could not archive the dotenv source ({error})."
-            )));
-        }
     }
+    let archived = archive_env_source(path, file, &original, &directory, &prefix, &suffix)
+        .map_err(archive_failure)?;
+    report.delete_env = "archived";
+    report.archived_to = Some(archived.display().to_string());
     Ok(())
+}
+
+struct ArchiveVerification<'a> {
+    context: &'a RuntimeContext,
+    store: &'a Store,
+    name: &'a str,
+}
+
+impl ArchiveVerification<'_> {
+    fn project(root: Option<&Path>, project_id: &str) -> Result<ResolvedProject, CliError> {
+        let Some(root) = root else {
+            return Err(metadata_invalid_error(
+                "--verify-policy requires a trusted locket.toml for the import target",
+            ));
+        };
+        resolve_project(root)?
+            .filter(|project| {
+                project.root == root && project.config.project_id.as_str() == project_id
+            })
+            .ok_or_else(|| {
+                metadata_invalid_error(
+                    "--verify-policy could not load the import target's locket.toml",
+                )
+            })
+    }
+
+    fn run(
+        self,
+        root: Option<&Path>,
+        project_id: &str,
+    ) -> Result<std::process::ExitStatus, CliError> {
+        let project = Self::project(root, project_id)?;
+        let cwd = if resolve_project(&self.context.cwd)
+            .is_ok_and(|current| current.is_some_and(|current| current.root == project.root))
+        {
+            self.context.cwd.canonicalize()?
+        } else {
+            project.root.clone()
+        };
+        let run_context = RuntimeContext { cwd, ..self.context.clone() };
+        run_verification_policy(&run_context, &project, self.name)
+    }
 }
 
 fn write_import_diagnostics(
@@ -435,6 +513,9 @@ fn write_import_report(
         if let Some(directory) = &report.archive_directory {
             writeln!(output, "archive_directory: {directory}")?;
         }
+        if let (Some(name), Some(status)) = (&report.verify_policy, report.verify_policy_status) {
+            writeln!(output, "verify_policy: {name} ({status})")?;
+        }
         if let Some(error) = &report.archive_error {
             writeln!(output, "archive_error: {error}")?;
         }
@@ -494,6 +575,12 @@ struct ImportReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     archive_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    verify_policy: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verify_policy_status: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verify_policy_exit_code: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     archived_to: Option<String>,
     metadata_only: bool,
     #[serde(skip)]
@@ -501,6 +588,14 @@ struct ImportReport {
 }
 
 impl ImportReport {
+    fn block_archive(&mut self, error: &CliError) {
+        self.archive_blocked_reason = Some(
+            self.archive_blocked_reason
+                .as_deref()
+                .map_or_else(|| error.to_string(), |reason| format!("{reason}. {error}")),
+        );
+    }
+
     const fn completed_cleanly(&self) -> bool {
         self.filtered_out == 0
             && self.skipped == 0
@@ -634,6 +729,9 @@ fn run_import(
         archive_blocked_reason: None,
         archive_directory: None,
         archive_error: None,
+        verify_policy: None,
+        verify_policy_status: None,
+        verify_policy_exit_code: None,
         archived_to: None,
         metadata_only: true,
         profile_name_count: profile_names.len(),

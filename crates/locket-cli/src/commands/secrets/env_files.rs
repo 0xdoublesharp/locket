@@ -424,7 +424,18 @@ struct EnvScanReport {
     shared_candidates: Vec<SharedCandidate>,
     total_files: usize,
     total_keys: usize,
+    migrated_projects: usize,
+    staged_projects: usize,
+    uninitialized_projects: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    migrated_project_roots: Vec<String>,
     metadata_only: bool,
+}
+
+#[derive(Default)]
+struct ScanEntries {
+    files: Vec<ScannedEnvFile>,
+    configured_projects: BTreeSet<PathBuf>,
 }
 
 /// Discover dotenv metadata and shared-key candidates without opening a vault.
@@ -432,11 +443,17 @@ pub fn scan_workspace_env_files(
     root: &Path,
     max_depth: usize,
     literal: bool,
+    remaining: bool,
 ) -> Result<Value, CliError> {
-    Ok(serde_json::to_value(scan_env_files(root, max_depth, literal)?)?)
+    Ok(serde_json::to_value(scan_env_files(root, max_depth, literal, remaining)?)?)
 }
 
-fn scan_env_files(root: &Path, max_depth: usize, literal: bool) -> Result<EnvScanReport, CliError> {
+fn scan_env_files(
+    root: &Path,
+    max_depth: usize,
+    literal: bool,
+    remaining: bool,
+) -> Result<EnvScanReport, CliError> {
     // Resolve a trailing "." before screening the root so "symlink/." cannot bypass it.
     let root = root.components().collect::<PathBuf>();
     if !std::fs::symlink_metadata(&root)?.is_dir() {
@@ -447,7 +464,7 @@ fn scan_env_files(root: &Path, max_depth: usize, literal: bool) -> Result<EnvSca
         (Some(parent), Some(name)) => parent.join(name),
         _ => root.canonicalize()?,
     };
-    build_scan_report(&InputDirectory::open(&root)?, max_depth, literal)
+    build_scan_report(&InputDirectory::open(&root)?, max_depth, literal, remaining)
 }
 
 pub fn scan_open_workspace(
@@ -455,7 +472,7 @@ pub fn scan_open_workspace(
     max_depth: usize,
     literal: bool,
 ) -> Result<Value, CliError> {
-    Ok(serde_json::to_value(build_scan_report(root, max_depth, literal)?)?)
+    Ok(serde_json::to_value(build_scan_report(root, max_depth, literal, false)?)?)
 }
 
 fn scan_directory(
@@ -464,12 +481,15 @@ fn scan_directory(
     inherited_config: bool,
     remaining_depth: usize,
     literal: bool,
-    files: &mut Vec<ScannedEnvFile>,
+    found: &mut ScanEntries,
 ) -> Result<(), CliError> {
     if remaining_depth == 0 {
         return Ok(());
     }
     let has_config = directory.is_regular(crate::LOCKET_TOML);
+    if has_config {
+        found.configured_projects.insert(directory.path.clone());
+    }
     let has_git =
         directory.entry_kind(OsStr::new(".git")).is_ok_and(|kind| kind != EntryKind::Other);
     let (project_root, has_locket_config) = if has_config || has_git {
@@ -493,7 +513,7 @@ fn scan_directory(
                         has_locket_config,
                         remaining_depth - 1,
                         literal,
-                        files,
+                        found,
                     )?;
                 }
             }
@@ -504,7 +524,7 @@ fn scan_directory(
                         Ok(report) => (report.keys, report.warnings.len(), report.invalid, None),
                         Err(error) => (BTreeSet::new(), 0, 1, Some(error.to_string())),
                     };
-                files.push(ScannedEnvFile {
+                found.files.push(ScannedEnvFile {
                     suggested_profile: suggested_profile(&path),
                     path,
                     project_root: project_root.to_owned(),
@@ -527,12 +547,21 @@ fn build_scan_report(
     root: &InputDirectory,
     max_depth: usize,
     literal: bool,
+    remaining: bool,
 ) -> Result<EnvScanReport, CliError> {
     let mut locations = BTreeMap::<String, KeyLocations>::new();
-    let mut files = Vec::new();
-    scan_directory(root, &root.path, false, max_depth, literal, &mut files)?;
+    let mut found = ScanEntries::default();
+    scan_directory(root, &root.path, false, max_depth, literal, &mut found)?;
+    let ScanEntries { mut files, configured_projects } = found;
     files.sort_by(|left, right| left.path.cmp(&right.path));
+    let mut staged_roots = BTreeSet::new();
+    let mut uninitialized_roots = BTreeSet::new();
     for file in &files {
+        if file.has_locket_config {
+            staged_roots.insert(file.project_root.as_path());
+        } else {
+            uninitialized_roots.insert(file.project_root.as_path());
+        }
         for key in &file.keys {
             let found = locations.entry(key.clone()).or_default();
             found.files.insert(file.path.clone());
@@ -550,10 +579,26 @@ fn build_scan_report(
             projects: found.projects.iter().map(|path| path.display().to_string()).collect(),
         })
         .collect();
+    let staged_projects = staged_roots.len();
+    let uninitialized_projects = uninitialized_roots.len();
+    let mut migrated_projects = 0;
+    let mut migrated_project_roots = Vec::new();
+    for project in &configured_projects {
+        if !staged_roots.contains(project.as_path()) {
+            migrated_projects += 1;
+            if !remaining {
+                migrated_project_roots.push(project.display().to_string());
+            }
+        }
+    }
     Ok(EnvScanReport {
         root: root.path.display().to_string(),
         total_files: files.len(),
         total_keys: files.iter().map(|file| file.key_count).sum(),
+        migrated_projects,
+        staged_projects,
+        uninitialized_projects,
+        migrated_project_roots,
         files,
         shared_candidates,
         metadata_only: true,
@@ -582,10 +627,22 @@ pub(super) fn write_env_scan(
     root: &Path,
     max_depth: usize,
     literal: bool,
+    remaining: bool,
 ) -> Result<(), CliError> {
-    let report = scan_env_files(root, max_depth, literal)?;
+    let report = scan_env_files(root, max_depth, literal, remaining)?;
     writeln!(output, "root: {:?}", report.root)?;
     writeln!(output, "total_files: {}  total_keys: {}", report.total_files, report.total_keys)?;
+    writeln!(
+        output,
+        "projects: {} migrated, {} staged, {} uninitialized",
+        report.migrated_projects, report.staged_projects, report.uninitialized_projects,
+    )?;
+    if !report.migrated_project_roots.is_empty() {
+        writeln!(output, "migrated_projects:")?;
+        for root in report.migrated_project_roots {
+            writeln!(output, "  {root:?}")?;
+        }
+    }
     for file in report.files {
         writeln!(
             output,
@@ -614,8 +671,30 @@ pub(super) fn write_env_scan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
     use std::fs;
+
+    #[test]
+    fn scan_reports_migration_progress_by_project() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().canonicalize()?;
+        for project in ["migrated", "staged", "uninitialized"] {
+            fs::create_dir(root.join(project))?;
+        }
+        fs::write(root.join("migrated/locket.toml"), "")?;
+        fs::write(root.join("migrated/.env.example"), "KEY=\n")?;
+        fs::write(root.join("staged/locket.toml"), "")?;
+        fs::write(root.join("staged/.env"), "KEY=fixture\n")?;
+        fs::write(root.join("staged/.env.local"), "KEY=fixture\n")?;
+        fs::write(root.join("uninitialized/.env"), "KEY=fixture\n")?;
+
+        let report = scan_open_workspace(&InputDirectory::open(&root)?, 2, false)?;
+        assert_eq!(report["total_files"], 3);
+        assert_eq!(report["migrated_projects"], 1);
+        assert_eq!(report["staged_projects"], 1);
+        assert_eq!(report["uninitialized_projects"], 1);
+        assert_eq!(report["migrated_project_roots"], serde_json::json!([root.join("migrated")]));
+        Ok(())
+    }
 
     #[test]
     fn scan_filename_filter_excludes_final_template_and_non_dotenv_extensions() {

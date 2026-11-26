@@ -1044,7 +1044,7 @@ fn import_archive_warns_about_file_consumers_in_preview_and_execution()
         root.join("apps/compose.override.YAML"),
         "services:\n  web:\n    env_file:\n    - ./web/.env # keep the literal\n",
     )?;
-    fs::write(web.join("compose.yml"), "services: {}\n")?;
+    fs::write(web.join("compose.yml"), "services: {app: {image: '${TOKEN}'}}\n")?;
     fs::write(
         workspace.path().join("docker-compose.outside.yaml"),
         "services:\n  web:\n    env_file: ./project/apps/web/.env\n",
@@ -1102,7 +1102,7 @@ fn import_archive_warns_about_file_consumers_in_preview_and_execution()
         &"docker-compose.yml references .env in Docker Compose env_file; replace with environment: pass-through or mark required: false"
     ));
     assert!(text_warnings.contains(
-        &"apps/web/compose.yml may interpolate .env (${VAR}) through Docker Compose; run via `locket compose run --policy <name> -- ...`"
+        &"apps/web/compose.yml interpolates TOKEN from .env through Docker Compose; run via `locket compose run --policy <name> -- ...`"
     ));
     preview.push("--json");
     let (code, report) = run_env_json(&context, &preview, &canaries)?;
@@ -1323,7 +1323,7 @@ fn import_archive_only_checks_the_source_directory_outside_the_project()
     fs::write(&source, "TOKEN=outside-value-fixture\n")?;
     fs::write(workspace.path().join("compose.yml"), "env_file: ./other/.env\n")?;
     fs::write(root.join("compose.yml"), "env_file: ../other/.env\n")?;
-    fs::write(outside.join("compose.override.yaml"), "services: {}\n")?;
+    fs::write(outside.join("compose.override.yaml"), "services: {app: {image: '${TOKEN}'}}\n")?;
     let args = [
         "import",
         "../other/.env",
@@ -1340,7 +1340,7 @@ fn import_archive_only_checks_the_source_directory_outside_the_project()
     assert_eq!(
         report["archive_consumer_warnings"],
         serde_json::json!([
-            "../other/compose.override.yaml may interpolate .env (${VAR}) through Docker Compose; run via `locket compose run --policy <name> -- ...`"
+            "../other/compose.override.yaml interpolates TOKEN from .env through Docker Compose; run via `locket compose run --policy <name> -- ...`"
         ])
     );
     Ok(())
@@ -1735,6 +1735,216 @@ fn import_archive_if_matching_requires_archive() {
 }
 
 #[test]
+fn import_verify_policy_requires_archive() {
+    let args = ["locket", "import", ".env", "--verify-policy", "check"];
+    assert!(matches!(
+        Cli::try_parse_from(args),
+        Err(error) if error.kind() == clap::error::ErrorKind::MissingRequiredArgument
+            && error.to_string().contains("--archive <DIR>")
+    ));
+    assert!(Cli::try_parse_from(args.into_iter().chain(["--archive", "backups"])).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn import_verify_policy_dry_run_checks_approval_without_running()
+-> Result<(), Box<dyn std::error::Error>> {
+    let project = tempdir()?;
+    let context = test_context(&project);
+    let canary = "verify-policy-dry-run-fixture";
+    run_env_command(&context, &["init", "--no-device", "--no-passkey"], &[])?;
+    fs::write(project.path().join(".env"), format!("TOKEN={canary}\n"))?;
+    run_env_command(
+        &context,
+        &["policy", "add", "check", "--", "/bin/sh", "-c", "touch verification-ran"],
+        &[],
+    )?;
+    let preview = |policy| {
+        run_env_json(
+            &context,
+            &[
+                "import",
+                ".env",
+                "--archive",
+                "backups",
+                "--dry-run",
+                "--json",
+                "--verify-policy",
+                policy,
+            ],
+            &[canary],
+        )
+    };
+    let (code, report) = preview("check")?;
+    assert_eq!(code, 0);
+    assert_eq!(report["delete_env"], "would-archive");
+    assert_eq!(report["verify_policy"], "check");
+    assert_eq!(report["verify_policy_status"], "would-run");
+
+    let (code, missing) = preview("missing")?;
+    assert_eq!(code, 0);
+    assert_eq!(missing["delete_env"], "kept");
+    assert!(
+        missing["archive_blocked_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("command policy not found: missing"))
+    );
+    assert!(missing.get("verify_policy_status").is_none());
+
+    let policy_path = project.path().join("locket.toml");
+    let config = fs::read_to_string(&policy_path)?;
+    fs::write(&policy_path, config.replace("touch verification-ran", "touch changed-command-ran"))?;
+    let (code, unapproved) = preview("check")?;
+    assert_eq!(code, 0);
+    assert_eq!(unapproved["delete_env"], "kept");
+    assert!(
+        unapproved["archive_blocked_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("locket policy refresh check"))
+    );
+    assert!(unapproved.get("verify_policy_status").is_none());
+    for path in ["verification-ran", "changed-command-ran", "backups"] {
+        assert!(!project.path().join(path).exists());
+    }
+    assert!(project.path().join(".env").is_file());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn import_verify_policy_runs_before_archiving() -> Result<(), Box<dyn std::error::Error>> {
+    for expected_exit in [0, 1] {
+        let project = tempdir()?;
+        let context = test_context(&project);
+        let canary = "verify-policy-delivery-fixture";
+        let contents = format!("TOKEN={canary}\n");
+        let source = project.path().join(".env");
+        fs::write(&source, &contents)?;
+        run_env_command(&context, &["init", "--no-device", "--no-passkey"], &[])?;
+        let script = format!(
+            "test -f .env && test -n \"$TOKEN\" || exit 2; printf 'verification-child-stdout\\n%s\\n' \"$TOKEN\"; touch checked; exit {expected_exit}"
+        );
+        run_env_command(
+            &context,
+            &["policy", "add", "check", "--", "/bin/sh", "-c", &script],
+            &[],
+        )?;
+        run_env_command(&context, &["policy", "require", "check", "TOKEN"], &[])?;
+        let (code, report) = run_env_json(
+            &context,
+            &["import", ".env", "--archive", "backups", "--json", "--verify-policy", "check"],
+            &[canary],
+        )?;
+        assert_eq!(code, expected_exit);
+        assert_eq!(report["imported_names"], serde_json::json!(["TOKEN"]));
+        assert_eq!(report["verify_policy"], "check");
+        assert!(project.path().join("checked").is_file());
+        if expected_exit == 0 {
+            assert_eq!(report["verify_policy_status"], "passed");
+            assert_eq!(report["delete_env"], "archived");
+            assert!(report.get("verify_policy_exit_code").is_none());
+            assert!(!source.exists());
+            let backup = report["archived_to"].as_str().ok_or("missing backup path")?;
+            assert!(fs::read(backup)?.as_slice().eq(contents.as_bytes()), "backup changed");
+        } else {
+            assert_eq!(report["verify_policy_status"], "failed");
+            assert_eq!(report["verify_policy_exit_code"], expected_exit);
+            assert_eq!(report["delete_env"], "kept");
+            assert!(report["archive_error"].is_string());
+            assert!(fs::read(source)?.as_slice().eq(contents.as_bytes()), "source changed");
+            assert!(!project.path().join("backups").exists());
+        }
+        let store = crate::open_store(&context)?;
+        let status: String = store.connection().query_row(
+            "SELECT status FROM audit_log WHERE action = 'RUN_POLICY' ORDER BY sequence DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(status, if expected_exit == 0 { "SUCCESS" } else { "FAILED" });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn import_verify_policy_keeps_child_output_off_json_stdout()
+-> Result<(), Box<dyn std::error::Error>> {
+    let output = std::process::Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "tests::history_purge_import::import_verify_policy_runs_before_archiving",
+            "--nocapture",
+        ])
+        .output()?;
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stdout.contains("1 passed"), "verification fixture did not run");
+    assert!(!stdout.contains("verification-child-stdout"));
+    assert!(stderr.contains("verification-child-stdout"));
+    assert!(!stderr.contains("verify-policy-delivery-fixture"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn import_verify_policy_refuses_a_locked_vault()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    let project = tempdir()?;
+    let context = test_context(&project);
+    let source = project.path().join(".env");
+    let contents = b"TOKEN=verify-policy-locked-fixture\n";
+    fs::write(&source, contents)?;
+    for args in [
+        &["locket", "init", "--no-device", "--no-passkey"][..],
+        &["locket", "policy", "add", "check", "--", "/bin/sh", "-c", "touch checked"],
+    ] {
+        run_with_context(Cli::try_parse_from(args)?, &context, &mut Vec::new())?;
+    }
+
+    let agent = tempfile::Builder::new().prefix("a").rand_bytes(4).tempdir()?;
+    fs::set_permissions(agent.path(), fs::Permissions::from_mode(0o700))?;
+    let context = RuntimeContext { agent_data_dir: Some(agent.path().into()), ..context };
+    let socket = crate::agent_socket_path(&context);
+    let server =
+        super::agent_lifecycle::serve_status_requests(socket.clone(), env!("CARGO_PKG_VERSION"), 1);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !socket.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut output = Vec::new();
+    let code = run_with_context(
+        Cli::try_parse_from([
+            "locket",
+            "import",
+            ".env",
+            "--archive",
+            "backups",
+            "--verify-policy",
+            "check",
+            "--json",
+        ])?,
+        &context,
+        &mut output,
+    )?;
+    assert_eq!(code, locket_core::LocketError::UnlockRequired.exit_code());
+    let report: serde_json::Value = serde_json::from_slice(&output)?;
+    assert_eq!(report["error"]["code"], "UnlockRequired");
+    assert_eq!(report["verify_policy_status"], "failed");
+    assert_eq!(report["delete_env"], "kept");
+    assert_eq!(report["imported"], 1);
+    assert!(report.get("verify_policy_exit_code").is_none());
+    assert!(fs::read(&source)?.as_slice().eq(contents), "source changed");
+    assert!(!project.path().join("backups").exists());
+    assert!(!project.path().join("checked").exists());
+    server.join().map_err(|_| "serve thread panicked")??;
+    Ok(())
+}
+
+#[test]
 fn import_archive_requires_git_ignore_inside_project() -> Result<(), Box<dyn std::error::Error>> {
     let project = tempdir()?;
     run_git(project.path(), &["init", "-q"])?;
@@ -2111,7 +2321,9 @@ fn env_scan_groups_keys_across_repos_and_ignores_templates()
     std::fs::create_dir_all(root.join("one/src"))?;
     std::fs::create_dir_all(root.join("one/node_modules/package"))?;
     std::fs::create_dir_all(root.join("two"))?;
+    std::fs::create_dir_all(root.join("three"))?;
     std::fs::write(root.join("two/locket.toml"), "")?;
+    std::fs::write(root.join("three/locket.toml"), "")?;
     std::fs::write(
         root.join("one/src/.env.production"),
         format!(
@@ -2143,6 +2355,19 @@ fn env_scan_groups_keys_across_repos_and_ignores_templates()
     assert_eq!(report["metadata_only"], true);
     assert_eq!(report["total_files"], 3);
     assert_eq!(report["total_keys"], 5);
+    for field in ["migrated_projects", "staged_projects", "uninitialized_projects"] {
+        assert_eq!(report[field], 1);
+    }
+    assert_eq!(
+        report["migrated_project_roots"],
+        serde_json::json!([root.join("three").canonicalize()?]),
+    );
+    let (_, remaining) =
+        run_env_json(&context, &["env", "scan", "--remaining", "--json"], &canaries)?;
+    assert!(remaining.get("migrated_project_roots").is_none());
+    for field in ["migrated_projects", "staged_projects", "uninitialized_projects", "files"] {
+        assert_eq!(remaining[field], report[field]);
+    }
     let files = report["files"].as_array().ok_or("missing files")?;
     assert_eq!(files[0]["suggested_profile"], "dev");
     assert_eq!(files[0]["suggested_source"], "user-local");
@@ -2162,10 +2387,17 @@ fn env_scan_groups_keys_across_repos_and_ignores_templates()
     assert_eq!(shallow["total_files"], 2);
     let (code, text) = run_env_command(&context, &["env", "scan"], &canaries)?;
     assert_eq!(code, 0);
+    assert!(text.contains(
+        "total_files: 3  total_keys: 5\nprojects: 1 migrated, 1 staged, 1 uninitialized\n"
+    ));
+    assert!(text.contains("migrated_projects:\n"));
     assert!(text.lines().any(|line| line.contains(".env.local\"") && line.contains("locket=no")));
     assert!(
         text.lines().any(|line| line.contains(".env.staging\"") && line.contains("locket=yes"))
     );
+    let (_, text) = run_env_command(&context, &["env", "scan", "--remaining"], &canaries)?;
+    assert!(text.contains("projects: 1 migrated, 1 staged, 1 uninitialized\n"));
+    assert!(!text.contains("migrated_projects:\n"));
     let (_, explicit) =
         run_env_json(&context, &["env", "keys", "two/.env.json", "--json"], &canaries)?;
     assert_eq!(explicit["keys"], serde_json::json!(["IGNORED"]));
