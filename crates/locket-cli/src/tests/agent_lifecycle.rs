@@ -32,9 +32,9 @@ pub(super) fn serve_status_requests(
             let state = AgentSocketState::locked(version);
             for _ in 0..count {
                 let (stream, _) =
-                    tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
+                    tokio::time::timeout(Duration::from_secs(15), listener.accept()).await??;
                 let _outcome = tokio::time::timeout(
-                    Duration::from_secs(5),
+                    Duration::from_secs(15),
                     handle_connection(stream, state.clone()),
                 )
                 .await?;

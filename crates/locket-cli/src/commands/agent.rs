@@ -532,6 +532,10 @@ fn agent_stop_command(context: &RuntimeContext, output: &mut impl Write) -> Resu
         // the paths by the time this command observes the old process exit.
         "daemon stopped"
     } else {
+        let lease = match lease {
+            Some(lease) => Some(lease),
+            None => acquire_endpoint_lease_briefly(&socket)?,
+        };
         let Some(_lease) = lease else {
             return Err(io::Error::other("the daemon endpoint is changing").into());
         };
@@ -882,7 +886,7 @@ fn request_agent_endpoint(
     use locket_agent::{RequestEnvelope, ResponseEnvelope};
 
     let request = RequestEnvelope::new("cli-request-1", method, payload);
-    match exchange_agent_request(endpoint, request, Some(std::time::Duration::from_secs(2)))? {
+    match exchange_agent_request(endpoint, request, Some(std::time::Duration::from_secs(5)))? {
         ResponseEnvelope::Success(success) => Ok(success.payload),
         ResponseEnvelope::Error(error) => {
             Err(io::Error::other(format!("agent error: {} ({})", error.error, error.message)))
@@ -893,6 +897,20 @@ fn request_agent_endpoint(
 #[cfg(not(any(unix, target_os = "windows")))]
 pub fn request_status_snapshot(_socket_path: &Path) -> Result<Value, io::Error> {
     Err(io::Error::other("agent daemon is only supported on Unix targets"))
+}
+
+#[cfg(unix)]
+fn acquire_endpoint_lease_briefly(socket: &Path) -> io::Result<Option<fs::File>> {
+    let deadline = Instant::now() + StdDuration::from_millis(250);
+    loop {
+        if let Some(lease) = try_acquire_endpoint_lease(socket)? {
+            return Ok(Some(lease));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(StdDuration::from_millis(10));
+    }
 }
 
 #[cfg(unix)]
