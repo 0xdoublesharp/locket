@@ -63,6 +63,10 @@ import {
   desktopCreateProfile,
   desktopDeleteSecret,
   desktopCopySecretToShared,
+  linkSecret,
+  unlinkSecret,
+  listSharedUsages,
+  listDuplicates,
   desktopDetectCommands,
   desktopSavePolicy,
   unlockVault,
@@ -87,6 +91,7 @@ import { secretRow, secretSourceWire } from './agent/secrets';
 import { versionHistoryRow } from './agent/versions';
 import { useAgent } from './composables/useAgent';
 import { useTray } from './composables/useTray';
+import { unlinkAllConfirmation } from './secret/sharedLinks';
 import { secretRowsWithDeprecationWarnings } from './secret/deprecationWarnings';
 import AuditLog from './views/AuditLog.vue';
 import BackupRecovery from './views/BackupRecovery.vue';
@@ -99,6 +104,7 @@ import WelcomeView from './views/WelcomeView.vue';
 import ScanResults from './views/ScanResults.vue';
 import SecretEditorView from './views/SecretEditorView.vue';
 import SecretMetadataList from './views/SecretMetadataList.vue';
+import ImportDuplicateOptions from './views/ImportDuplicateOptions.vue';
 import SecretVersionHistory from './views/SecretVersionHistory.vue';
 import Settings from './views/Settings.vue';
 import TeamInviteView from './views/TeamInviteView.vue';
@@ -118,6 +124,10 @@ import type {
   AgentConfigSettings,
   DetectedCommandRow,
   DiscoveredSecretWire,
+  DesktopImportEnvResponse,
+  DuplicateGroupRow,
+  DuplicateMemberRow,
+  SharedUsageRow,
   AuditChainStatus,
   AuditWireRow,
   ListAuditRequest,
@@ -217,6 +227,14 @@ const envPickerRequests = createRequestLifetime();
 const importOverwrite = ref(false);
 const importConfirmation = ref('');
 const importLiteral = ref(false);
+const importPreview = ref<DesktopImportEnvResponse | null>(null);
+const importSelections = ref<Record<string, { kind: 'link' | 'promote'; target: string }>>({});
+const checkingImport = ref(false);
+function clearImportPreview(): void {
+  importPreview.value = null;
+  importSelections.value = {};
+}
+watch([envPath, importLiteral, importOverwrite], clearImportPreview, { flush: 'sync' });
 const envPathReady = computed(() => {
   const path = envPath.value.trim();
   return path !== '' && (!selectedIsShared.value || /^(?:\/|[a-z]:[\\/]|\\\\)/i.test(path));
@@ -307,7 +325,9 @@ const secondaryItems = computed<Array<{ key: ViewKey; label: string }>>(() => {
       { key: 'secrets', label: 'Secrets' },
       { key: 'secret-editor', label: 'Add or rotate' },
       { key: 'discover', label: 'Discover' },
-      ...(selectedSecret.value ? [{ key: 'versions' as const, label: 'Secret history' }] : []),
+      ...(selectedSecret.value && selectedSecret.value.source !== 'shared-link'
+        ? [{ key: 'versions' as const, label: 'Secret history' }]
+        : []),
     ];
   if (['execution', 'audit', 'scan'].includes(currentView.value))
     return [
@@ -665,7 +685,7 @@ async function addSecret(): Promise<void> {
 }
 
 async function rotateListedSecret(row: SecretRowMeta): Promise<void> {
-  if (!secretMutationAvailable.value) return;
+  if (!secretMutationAvailable.value || row.source === 'shared-link') return;
   selectView('secret-editor');
   rotationTarget.value = row;
   await nextTick();
@@ -838,7 +858,7 @@ const paletteActions = computed<RunnablePaletteAction[]>(() => {
       icon: 'key',
       badge: 'Secret',
       label: name,
-      run: () => selectSecret(row),
+      run: () => (row.source === 'shared-link' ? selectView('secrets') : selectSecret(row)),
     });
     const reference = secretReference(activeContext.value?.profile_name, row.name, redact);
     if (reference) {
@@ -910,6 +930,7 @@ function switchDiscoveredEnvironment(row: DiscoveredSecretWire): void {
 
 function selectSecret(row?: SecretRowMeta): void {
   if (row !== undefined) {
+    if (row.source === 'shared-link') return;
     selectedSecret.value = row;
   }
   currentView.value = 'versions';
@@ -1989,6 +2010,14 @@ async function triggerBackupAction(action: BundleAction): Promise<void> {
 async function handleSetSecret(
   payload: SetSecretRequest,
 ): Promise<{ ok: true; value: SetSecretResponse } | { ok: false; error: AgentClientError }> {
+  if (
+    secrets.value.some((row) => row.source === 'shared-link' && row.name === payload.secret_name)
+  ) {
+    return {
+      ok: false,
+      error: { kind: 'protocol', reason: 'Edit linked secrets in Global Vault.' },
+    };
+  }
   const context = settingsContextKey.value;
   const approved = settings.value.dangerousProfileFlag
     ? await confirmDangerousAction('Save secret')
@@ -2048,22 +2077,134 @@ watch(
   { flush: 'sync' },
 );
 
-async function handleDeleteSecret(row: SecretRowMeta, confirmation?: string): Promise<void> {
+const duplicateGroups = ref<DuplicateGroupRow[]>([]);
+const duplicatesError = ref(false);
+watch(
+  [
+    currentView,
+    activeContext,
+    settingsReady,
+    () => settings.value.privacyRedactNames,
+    agentOnline,
+    secretsLastRefreshed,
+  ],
+  async ([view, context, ready, privacy, online], _, onCleanup) => {
+    duplicateGroups.value = [];
+    duplicatesError.value = false;
+    if (view !== 'secrets' || !context || !ready || privacy || !online || !desktopAvailable) return;
+    let active = true;
+    onCleanup(() => {
+      active = false;
+    });
+    const result = await listDuplicates({ redact_names: false });
+    if (!active) return;
+    if (result.ok) duplicateGroups.value = result.value.groups;
+    else duplicatesError.value = true;
+  },
+);
+
+async function openDuplicate(member: DuplicateMemberRow): Promise<void> {
+  if (!secretMutationAvailable.value) return;
+  const known = knownProjects.value.find((project) => project.project_id === member.project_id);
+  if (member.project_id !== activeContext.value?.project_id) {
+    if (!known) {
+      desktopError.value = 'Open the matching project from a trusted folder to review this secret.';
+      return;
+    }
+    const opened = known.is_shared
+      ? await openSharedVault({ projectId: known.project_id })
+      : await connectProject(false, known.root);
+    if (!opened) return;
+  }
+  if (member.profile_id !== activeContext.value?.profile_id) {
+    if (member.profile_dangerous || !activeContext.value) {
+      discoverProfileTarget.value = {
+        name: member.profile_name,
+        dangerous: member.profile_dangerous,
+      };
+      selectView('profiles');
+      return;
+    }
+    await handleProfileSwitch({
+      profileName: member.profile_name,
+      confirmation: undefined,
+      dangerous: false,
+    });
+    if (member.profile_id !== activeContext.value?.profile_id) return;
+  }
+  selectView('secrets');
+  await refreshSecrets();
+  if (currentView.value === 'secrets' && member.profile_id === activeContext.value?.profile_id) {
+    requestedSecretId.value = member.secret_id;
+  }
+}
+
+const requestedSecretId = ref<string>();
+watch(
+  settingsContextKey,
+  () => {
+    requestedSecretId.value = undefined;
+  },
+  { flush: 'sync' },
+);
+
+function usageSnapshot(usages: SharedUsageRow[]): string {
+  return JSON.stringify(
+    [...usages]
+      .sort((a, b) => a.link_id.localeCompare(b.link_id))
+      .map((usage) => [
+        usage.link_id,
+        usage.project_name,
+        usage.profile_name,
+        usage.profile_dangerous,
+        usage.local_name,
+        usage.updated_at,
+      ]),
+  );
+}
+
+async function handleDeleteSecret(
+  row: SecretRowMeta,
+  confirmation?: string,
+  reviewedUsages?: SharedUsageRow[],
+): Promise<void> {
   const context = activeContext.value;
-  if (!context || !secretMutationAvailable.value) return;
-  const dangerous = settings.value.dangerousProfileFlag;
-  if (dangerous && confirmation !== context.profile_name) return;
+  if (!context || !secretMutationAvailable.value || row.source === 'shared-link') return;
+  const expectedConfirmation =
+    (reviewedUsages && unlinkAllConfirmation(reviewedUsages, row.name)) ??
+    (settings.value.dangerousProfileFlag ? context.profile_name : undefined);
+  if (confirmation !== expectedConfirmation) return;
 
   const isCurrent = secretMutationRequests.begin();
   secretMutationBusy.value = true;
   secretMutationError.value = null;
   desktopNotice.value = null;
+  if (selectedIsShared.value) {
+    const fresh = await listSharedUsages({ target_secret_id: row.id, redact_names: false });
+    if (!isCurrent()) return;
+    if (
+      !fresh.ok ||
+      !reviewedUsages ||
+      usageSnapshot(fresh.value.usages) !== usageSnapshot(reviewedUsages)
+    ) {
+      secretMutationBusy.value = false;
+      secretMutationError.value = {
+        id: row.id,
+        message: fresh.ok
+          ? 'Linked projects changed. Review the updated list before deleting.'
+          : 'Could not verify linked projects. Refresh Secrets and try again.',
+      };
+      await refreshSecrets();
+      return;
+    }
+  }
   const result = await desktopDeleteSecret({
     project_id: context.project_id,
     profile_id: context.profile_id,
     secret_name: row.name,
     source: secretSourceWire(row.source),
-    ...(dangerous && { confirmation: context.profile_name }),
+    ...(confirmation && { confirmation }),
+    ...(reviewedUsages?.length && { unlink_all: true }),
   });
   if (!isCurrent()) return;
   secretMutationBusy.value = false;
@@ -2075,7 +2216,9 @@ async function handleDeleteSecret(row: SecretRowMeta, confirmation?: string): Pr
     return;
   }
   if (selectedSecret.value?.id === row.id) selectedSecret.value = null;
-  desktopNotice.value = `Deleted ${row.name}.`;
+  const count = result.value.unlinked_count ?? 0;
+  desktopNotice.value =
+    `Deleted ${row.name}.` + (count ? ` Removed ${count} ${count === 1 ? 'link' : 'links'}.` : '');
   await Promise.all([refreshSecrets(), refreshVersions()]);
 }
 
@@ -2094,14 +2237,25 @@ function copyToSharedError(error: AgentClientError, name: string): string {
   return actionError(error);
 }
 
-async function handleCopyToShared(row: SecretRowMeta): Promise<void> {
+async function handleCopyToShared(
+  row: SecretRowMeta,
+  promotion?: { targetName?: string; consolidate: boolean },
+): Promise<void> {
   const context = activeContext.value;
-  if (!context || selectedIsShared.value || !secretMutationAvailable.value) return;
+  if (
+    !context ||
+    selectedIsShared.value ||
+    !secretMutationAvailable.value ||
+    row.source === 'shared-link'
+  )
+    return;
   const isCurrent = secretMutationRequests.begin();
   secretMutationBusy.value = true;
   secretMutationError.value = null;
   desktopNotice.value = null;
-  const approved = await confirmDangerousAction('Copy secret to Global Vault');
+  const approved = await confirmDangerousAction(
+    promotion ? 'Promote and link secret' : 'Copy secret to Global Vault',
+  );
   if (!isCurrent()) return;
   if (approved === undefined) {
     secretMutationBusy.value = false;
@@ -2112,15 +2266,102 @@ async function handleCopyToShared(row: SecretRowMeta): Promise<void> {
     from_profile_id: context.profile_id,
     secret_name: row.name,
     source: secretSourceWire(row.source),
+    ...(promotion && {
+      target_name: promotion.targetName,
+      replace_with_link: true,
+      consolidate_duplicates: promotion.consolidate,
+    }),
     ...(approved && { confirmation: approved }),
   });
   if (!isCurrent()) return;
   secretMutationBusy.value = false;
   if (!result.ok) {
-    secretMutationError.value = { id: row.id, message: copyToSharedError(result.error, row.name) };
+    secretMutationError.value = {
+      id: row.id,
+      message: copyToSharedError(result.error, promotion?.targetName ?? row.name),
+    };
     return;
   }
-  desktopNotice.value = `Copied ${row.name} to Global Vault.`;
+  if (result.value.linked) {
+    const consolidated = result.value.consolidated_count ?? 0;
+    const skipped = result.value.skipped_locked_count ?? 0;
+    const details = [
+      consolidated
+        ? `Linked ${consolidated} additional ${consolidated === 1 ? 'copy' : 'copies'}.`
+        : '',
+      skipped ? `Skipped ${skipped} locked or dangerous ${skipped === 1 ? 'copy' : 'copies'}.` : '',
+    ].filter(Boolean);
+    desktopNotice.value = [
+      `Linked ${row.name} to @shared/${result.value.secret_name}.`,
+      ...details,
+    ].join(' ');
+    if (selectedSecret.value?.id === row.id) selectedSecret.value = null;
+    await Promise.all([refreshSecrets(), refreshVersions()]);
+  } else {
+    desktopNotice.value = `Copied ${row.name} to Global Vault.`;
+    await refreshSecrets();
+  }
+}
+
+function handlePromote(
+  row: SecretRowMeta,
+  targetName: string | undefined,
+  consolidate: boolean,
+): Promise<void> {
+  return handleCopyToShared(row, { targetName, consolidate });
+}
+
+async function changeSecretLink(
+  localName: string,
+  link: { targetName: string } | { row: SecretRowMeta },
+): Promise<void> {
+  const context = activeContext.value;
+  if (!context || selectedIsShared.value || !secretMutationAvailable.value) return;
+  if ('targetName' in link && secrets.value.some((row) => row.name === localName)) return;
+  const isCurrent = secretMutationRequests.begin();
+  secretMutationBusy.value = true;
+  secretMutationError.value = null;
+  desktopError.value = null;
+  desktopNotice.value = null;
+  const linking = 'targetName' in link;
+  const approved = await confirmDangerousAction(
+    linking ? 'Link secret from Global Vault' : 'Unlink secret',
+  );
+  if (!isCurrent()) return;
+  if (approved === undefined) {
+    secretMutationBusy.value = false;
+    return;
+  }
+  const request = {
+    project_id: context.project_id,
+    profile_id: context.profile_id,
+    local_name: localName,
+    ...(approved && { confirmation: approved }),
+  };
+  const result = linking
+    ? await linkSecret({ ...request, target_secret_name: link.targetName })
+    : await unlinkSecret(request);
+  if (!isCurrent()) return;
+  secretMutationBusy.value = false;
+  if (!result.ok) {
+    const message = actionError(result.error);
+    if (linking) desktopError.value = message;
+    else secretMutationError.value = { id: link.row.id, message };
+    return;
+  }
+  if (!linking && selectedSecret.value?.id === link.row.id) selectedSecret.value = null;
+  desktopNotice.value = linking
+    ? `Linked ${localName} to @shared/${link.targetName}.`
+    : `Removed the Global Vault link for ${localName}.`;
+  await refreshSecrets();
+}
+
+function handleLink(localName: string, targetName: string): Promise<void> {
+  return changeSecretLink(localName, { targetName });
+}
+
+function handleUnlink(row: SecretRowMeta): Promise<void> {
+  return changeSecretLink(row.name, { row });
 }
 
 async function handleEditorReveal(row: SecretRowMeta): Promise<void> {
@@ -2374,6 +2615,7 @@ async function handleUnlock(
 }
 function resetEnvImport(): void {
   envPickerRequests.invalidate();
+  clearImportPreview();
   envPickerBusy.value = false;
   envPickerFailed.value = false;
   envImportOpen.value = false;
@@ -2392,13 +2634,21 @@ async function pickEnvForImport(): Promise<void> {
   envPickerBusy.value = false;
   if (result.ok && !result.value) return;
   envPickerFailed.value = !result.ok;
-  if (result.ok && result.value) envPath.value = result.value;
+  if (result.ok && result.value) {
+    clearImportPreview();
+    envPath.value = result.value;
+  }
   envImportOpen.value = true;
   await nextTick();
   envImportHeading.value?.focus?.();
 }
 
-const canSubmitEnvImport = computed(
+const importOverrideNames = computed(() =>
+  secrets.value
+    .filter((row) => row.source === 'user-local' || row.source === 'machine-local')
+    .map((row) => row.name),
+);
+const canCheckEnvImport = computed(
   () =>
     envImportOpen.value &&
     canImportEnv.value &&
@@ -2406,18 +2656,43 @@ const canSubmitEnvImport = computed(
     !envPickerBusy.value &&
     settingsReady.value &&
     secretAccess.value.enabled &&
-    envPathReady.value &&
+    envPathReady.value,
+);
+const canSubmitEnvImport = computed(
+  () =>
+    canCheckEnvImport.value &&
     (!settings.value.dangerousProfileFlag ||
       importConfirmation.value === activeContext.value?.profile_name),
 );
+watch(() => settings.value.privacyRedactNames, clearImportPreview, { flush: 'sync' });
 
-async function importEnv(): Promise<void> {
+async function runEnvImport(dryRun: boolean): Promise<void> {
   const projectId = activeContext.value?.project_id;
-  if (!projectId || !canSubmitEnvImport.value) return;
+  if (
+    !projectId ||
+    (dryRun
+      ? !canCheckEnvImport.value || settings.value.privacyRedactNames
+      : !canSubmitEnvImport.value)
+  )
+    return;
   desktopBusy.value = true;
+  checkingImport.value = dryRun;
   desktopError.value = null;
   desktopNotice.value = null;
   const context = settingsContextKey.value;
+  const selection =
+    settings.value.privacyRedactNames || selectedIsShared.value
+      ? []
+      : Object.entries(importSelections.value).filter(
+          ([name]) => !importOverrideNames.value.includes(name),
+        );
+  const choices = (kind: 'link' | 'promote') =>
+    Object.fromEntries(
+      selection
+        .filter(([, choice]) => choice.kind === kind)
+        .map(([name, choice]) => [name, choice.target]),
+    );
+  if (dryRun) clearImportPreview();
   try {
     const result = await desktopImportEnv({
       project_id: projectId,
@@ -2425,15 +2700,24 @@ async function importEnv(): Promise<void> {
       overwrite: importOverwrite.value,
       literal: importLiteral.value,
       confirmation: importConfirmation.value || undefined,
+      ...(dryRun
+        ? { dry_run: true }
+        : selection.length
+          ? { link_to_shared: choices('link'), promote_to_shared: choices('promote') }
+          : {}),
     });
     if (context !== settingsContextKey.value) return;
     if (!result.ok) desktopError.value = actionError(result.error);
-    else {
+    else if (dryRun) {
+      if (envImportOpen.value && !settings.value.privacyRedactNames)
+        importPreview.value = result.value;
+    } else {
       desktopNotice.value = result.value.summary;
       resetEnvImport();
       await refreshSecrets();
     }
   } finally {
+    checkingImport.value = false;
     desktopBusy.value = false;
   }
 }
@@ -2828,8 +3112,10 @@ onUnmounted(() => {
           Import .env · {{ profileLabel }}
         </h2>
         <p v-if="secretAccess.guidance" role="status">{{ secretAccess.guidance }}</p>
-        <p v-if="envPickerFailed" role="status">Could not open the picker. Enter a path manually.</p>
-        <form @submit.prevent="importEnv">
+        <p v-if="envPickerFailed" role="status">
+          Could not open the picker. Enter a path manually.
+        </p>
+        <form @submit.prevent="runEnvImport(false)">
           <label>
             File path
             <input
@@ -2857,10 +3143,11 @@ onUnmounted(() => {
           <details>
             <summary>Import options</summary>
             <label
-              ><input v-model="importOverwrite" type="checkbox" /> Replace existing values</label
+              ><input v-model="importOverwrite" type="checkbox" :disabled="desktopBusy" /> Replace
+              existing values</label
             ><label
-              ><input v-model="importLiteral" type="checkbox" /> Keep expansion syntax as literal
-              text</label
+              ><input v-model="importLiteral" type="checkbox" :disabled="desktopBusy" /> Keep
+              expansion syntax as literal text</label
             >
           </details>
           <label v-if="settings.dangerousProfileFlag">
@@ -2872,10 +3159,38 @@ onUnmounted(() => {
               :disabled="desktopBusy"
             />
           </label>
-          <button type="submit" :disabled="!canSubmitEnvImport">
-            {{ desktopBusy ? 'Importing…' : 'Import secrets' }}
+          <ImportDuplicateOptions
+            v-if="importPreview && !settings.privacyRedactNames"
+            v-model="importSelections"
+            :preview="importPreview"
+            :destination-is-shared="selectedIsShared"
+            :disabled="desktopBusy"
+            :overridden-names="importOverrideNames"
+          />
+          <p
+            v-if="
+              importOverwrite &&
+              Object.values(importSelections).some((choice) => choice.kind === 'promote')
+            "
+            role="note"
+          >
+            Replacing existing values can update Global Vault secrets selected for promotion.
+          </p>
+          <button
+            v-if="!settings.privacyRedactNames"
+            type="button"
+            class="companion-button"
+            :disabled="!canCheckEnvImport"
+            @click="runEnvImport(true)"
+          >
+            {{ checkingImport ? 'Checking…' : 'Check for duplicates' }}
           </button>
-          <button type="button" :disabled="desktopBusy" @click="resetEnvImport">Cancel import</button>
+          <button type="submit" :disabled="!canSubmitEnvImport">
+            {{ desktopBusy && !checkingImport ? 'Importing…' : 'Import secrets' }}
+          </button>
+          <button type="button" :disabled="desktopBusy" @click="resetEnvImport">
+            Cancel import
+          </button>
         </form>
       </section>
       <p v-if="desktopError" role="alert" class="shell__notice shell__notice--error">
@@ -3105,15 +3420,19 @@ onUnmounted(() => {
 
       <SecretMetadataList
         v-else-if="currentView === 'secrets'"
+        :key="settingsContextKey"
         :rows="secretRows"
         :versions="versions"
+        :requested-secret-id="requestedSecretId"
+        :duplicate-groups="duplicateGroups"
+        :duplicates-error="duplicatesError"
         :profile-name="activeContext?.profile_name"
         :profile-label="profileLabel"
         :can-access-values="secretAccess.enabled"
         :connected="agentOnline"
         :can-start="desktopAvailable && !agentOnline"
         :starting="desktopBusy"
-        :privacy-mode="settings.privacyRedactNames"
+        :privacy-mode="settings.privacyRedactNames || !settingsReady"
         :loading="secretsLoading || loading"
         :load-error="variableViewError"
         :copy-verification="settings.verification?.copy"
@@ -3126,10 +3445,15 @@ onUnmounted(() => {
         :mutation-disabled="!secretMutationAvailable"
         :mutation-error="secretMutationError"
         :action-guidance="secretAccess.guidance"
+        @inspected="requestedSecretId = undefined"
         @select="selectSecret"
         @copy-value="handleListCopy"
         @reveal-value="handleEditorReveal"
         @copy-to-shared="handleCopyToShared"
+        @promote="handlePromote"
+        @link="handleLink"
+        @unlink="handleUnlink"
+        @open-duplicate="openDuplicate"
         @delete-secret="handleDeleteSecret"
         @refresh="retryVariables"
         @retry="retryVariables"

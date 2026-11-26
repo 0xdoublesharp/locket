@@ -4,7 +4,9 @@
 // these helpers so dangerous-typed-confirmation, payload-construction,
 // and validation stay testable without spinning up jsdom.
 
-export type SecretSource = 'team-managed' | 'user-local' | 'machine-local';
+import type { VersionSourceWire } from '../agent/types';
+
+export type SecretSource = VersionSourceWire;
 
 export interface SecretSetFormState {
   /** Secret name in `KEY` form (uppercase letters, digits, underscores). */
@@ -42,6 +44,10 @@ const SECRET_NAME_PATTERN = /^[A-Z_][A-Z0-9_]*$/;
 const VALUE_MAX_LENGTH = 65_536;
 const DESCRIPTION_MAX_LENGTH = 512;
 const NUL_BYTE = '\0';
+
+export function isValidSecretName(name: string): boolean {
+  return name.length <= 128 && SECRET_NAME_PATTERN.test(name);
+}
 
 export function defaultSetForm(): SecretSetFormState {
   return { name: '', value: '', description: '', source: 'user-local' };

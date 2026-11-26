@@ -346,7 +346,7 @@ it('tracks preview session, config and desktop preference changes independently 
   );
   await expect(
     request('desktop_import_env', { project_id: 'acme-api', path: '.env' }),
-  ).resolves.toEqual({ summary: 'Imported 1 variable.' });
+  ).resolves.toMatchObject({ imported: 3, linked: 0, promoted: 0 });
   const metadata = await request('agent_list_secrets', {
     project_id: 'acme-api',
     profile_id: 'acme-api-dev',
@@ -381,5 +381,44 @@ it('tracks preview session, config and desktop preference changes independently 
   ).rejects.toMatchObject({ code: 'UnlockRequired' });
   await expect(invoke('fixture-unknown-command', {})).rejects.toThrow(
     'Unsupported preview command',
+  );
+});
+
+it('creates and removes live links while keeping version history persisted-only', async () => {
+  const invoke = createMockRuntime(new URLSearchParams());
+  const request = (command: string, payload: Record<string, unknown>) =>
+    invoke(command, { request: payload });
+  const context = { project_id: 'acme-api', profile_id: 'acme-api-dev' };
+  const link = {
+    ...context,
+    local_name: 'MAIL_TOKEN',
+    target_secret_name: 'POSTMARK_TOKEN',
+  };
+
+  await expect(request('desktop_link_secret', link)).resolves.toMatchObject({
+    local_name: link.local_name,
+    target_secret_id: 'variable-shared-email',
+    target_secret_name: link.target_secret_name,
+  });
+  const metadata = await request('agent_list_secrets', context);
+  expect(metadata).toMatchObject({
+    rows: expect.arrayContaining([
+      expect.objectContaining({ name: 'MAIL_TOKEN', source: 'shared-link' }),
+    ]),
+  });
+  const history = await request('agent_list_versions', context);
+  expect(JSON.stringify(history)).not.toContain('shared-link');
+  expect(JSON.stringify(history)).not.toContain('MAIL_TOKEN');
+  const usageQuery = { target_secret_id: 'variable-shared-email' };
+  await expect(request('desktop_list_shared_usages', usageQuery)).resolves.toMatchObject({
+    usages: expect.arrayContaining([
+      expect.objectContaining({ local_name: 'MAIL_TOKEN', profile_name: 'dev' }),
+    ]),
+  });
+  await expect(
+    request('desktop_unlink_secret', { ...context, local_name: 'MAIL_TOKEN' }),
+  ).resolves.toEqual({ local_name: 'MAIL_TOKEN', unlinked: true });
+  expect(JSON.stringify(await request('desktop_list_shared_usages', usageQuery))).not.toContain(
+    'MAIL_TOKEN',
   );
 });

@@ -1,5 +1,5 @@
-import type { SecretSourceWire, SecretWireRow } from './types';
-import type { SecretRowMeta } from '../types/views';
+import type { VersionSourceWire, SecretWireRow } from './types';
+import type { PersistedSecretSource, SecretRowMeta } from '../types/views';
 
 const NANOS_PER_MILLI = 1_000_000;
 
@@ -16,7 +16,7 @@ function sourceLabel(source: SecretWireRow['source']): SecretRowMeta['source'] {
   return source === 'team-managed' ? 'team' : source;
 }
 
-export function secretSourceWire(source: SecretRowMeta['source']): SecretSourceWire {
+export function secretSourceWire(source: PersistedSecretSource): VersionSourceWire {
   return source === 'team' ? 'team-managed' : source;
 }
 
@@ -34,5 +34,10 @@ export function secretRow(row: SecretWireRow): SecretRowMeta {
       typeof row.last_rotated_at === 'number' ? nanosToIso(row.last_rotated_at) : undefined,
     currentVersion: row.current_version,
     hasDeprecatedGrace: false,
+    ...(row.linked_target_secret_id != null && {
+      linkedTargetSecretId: row.linked_target_secret_id,
+    }),
+    ...(row.linked_target_name != null && { linkedTargetName: row.linked_target_name }),
+    ...(row.link_count !== undefined && { linkCount: row.link_count }),
   };
 }

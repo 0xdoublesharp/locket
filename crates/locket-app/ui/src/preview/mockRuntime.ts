@@ -11,6 +11,18 @@ import type {
   DesktopDeleteSecretRequest,
   DesktopDeleteSecretResponse,
   DesktopProjectContext,
+  DesktopImportEnvRequest,
+  DesktopImportEnvResponse,
+  DesktopLinkSecretRequest,
+  DesktopLinkSecretResponse,
+  DesktopUnlinkSecretRequest,
+  DesktopUnlinkSecretResponse,
+  DesktopListDuplicatesResponse,
+  DesktopListSharedUsagesResponse,
+  DuplicateMemberRow,
+  ImportDuplicateMatch,
+  SharedUsageRow,
+  VersionSourceWire,
   DesktopSavePolicyRequest,
   DetectedCommandRow,
   DeviceMemberWireRow,
@@ -30,10 +42,18 @@ import type {
 } from '../agent/types';
 import type { SetSecretRequest, SetSecretResponse } from '../agent/client';
 import { validDeliveryUrl } from '../team/sync';
+import { unlinkAllConfirmation } from '../secret/sharedLinks';
 
 const workspace = '/Users/justin/Workspaces';
 const mcp = { command: 'locket', args: ['mcp'] };
 const noResponse = new Promise<never>(() => {});
+type PersistedSecret = SecretWireRow & { source: VersionSourceWire };
+const precedence: Record<SecretWireRow['source'], number> = {
+  'team-managed': 1,
+  'shared-link': 2,
+  'user-local': 3,
+  'machine-local': 4,
+};
 type TeamDelivery =
   | { transport_kind: 'folder'; folder: string }
   | {
@@ -112,7 +132,7 @@ export function createMockRuntime(params: URLSearchParams) {
     ['POSTMARK_TOKEN', 'team-managed', 'Messaging', 'email'],
     ['SENTRY_DSN', 'user-local', 'Observability', 'monitoring'],
   ] as const;
-  const secrets: SecretWireRow[] =
+  const secrets: PersistedSecret[] =
     scenario === 'empty'
       ? []
       : names.map(([name, source, owner, tag], index) => ({
@@ -120,7 +140,7 @@ export function createMockRuntime(params: URLSearchParams) {
           profile_id: 'acme-api-dev',
           name,
           source,
-          source_precedence: source === 'team-managed' ? 1 : source === 'user-local' ? 2 : 3,
+          source_precedence: precedence[source],
           origin: 'local',
           current_version: index === 2 ? 3 : 1,
           state: 'active',
@@ -139,7 +159,7 @@ export function createMockRuntime(params: URLSearchParams) {
         id: 'variable-shared-email',
         profile_id: 'shared-default',
         source: 'user-local',
-        source_precedence: 2,
+        source_precedence: precedence['user-local'],
       },
       { ...secrets[5]!, id: 'variable-web-monitoring', profile_id: 'web-app-dev' },
       { ...secrets[0]!, id: 'variable-staging-database', profile_id: 'acme-api-staging' },
@@ -228,6 +248,37 @@ export function createMockRuntime(params: URLSearchParams) {
           },
         ];
   const values = new Map<string, string>();
+  const fixtureGroups = new Map([
+    ['variable-5', 'email'],
+    ['variable-shared-email', 'email'],
+    ['variable-6', 'monitoring'],
+    ['variable-web-monitoring', 'monitoring'],
+  ]);
+  const links: SharedUsageRow[] = [];
+  if (secrets.length) {
+    links.push({
+      link_id: 'link-notifications',
+      project_id: 'acme-api',
+      project_name: 'acme-api',
+      profile_id: 'acme-api-dev',
+      profile_name: 'dev',
+      profile_dangerous: false,
+      local_name: 'NOTIFICATION_TOKEN',
+      target_secret_id: 'variable-shared-email',
+      target_secret_name: 'POSTMARK_TOKEN',
+      created_at: now,
+      updated_at: now,
+    });
+  }
+
+  function dedupKey(row: PersistedSecret): string {
+    const value = values.get(row.id);
+    return fixtureGroups.has(row.id)
+      ? `fixture:${fixtureGroups.get(row.id)}`
+      : value === undefined
+        ? `id:${row.id}`
+        : `value:${value}`;
+  }
   const teamDeliveries = new Map<string, TeamDelivery | null>();
 
   function unlockTtl(): number | null {
@@ -352,7 +403,7 @@ export function createMockRuntime(params: URLSearchParams) {
 
   function saveSecret(request: SetSecretRequest, rotate: boolean): SetSecretResponse {
     requireUnlocked();
-    const source: SecretWireRow['source'] =
+    const source: VersionSourceWire =
       request.source === 'team-managed' || request.source === 'machine-local'
         ? request.source
         : 'user-local';
@@ -362,12 +413,12 @@ export function createMockRuntime(params: URLSearchParams) {
         row.profile_id === request.profile_id &&
         row.source === source,
     );
-    const row: SecretWireRow = existing ?? {
+    const row: PersistedSecret = existing ?? {
       id: `variable-new-${++sequence}`,
       profile_id: request.profile_id,
       name: request.secret_name,
       source,
-      source_precedence: source === 'team-managed' ? 1 : source === 'user-local' ? 2 : 3,
+      source_precedence: precedence[source],
       origin: 'local',
       current_version: 0,
       state: 'active',
@@ -380,6 +431,7 @@ export function createMockRuntime(params: URLSearchParams) {
     row.current_version++;
     if (rotate) row.last_rotated_at = now;
     values.set(row.id, request.value);
+    fixtureGroups.delete(row.id);
     return {
       action: rotate ? 'rotated' : 'set',
       secret_id: row.id,
@@ -441,23 +493,167 @@ export function createMockRuntime(params: URLSearchParams) {
     }
   }
 
+  function sharedProject(): DesktopProjectContext {
+    const target = projects.find((project) => project.is_shared);
+    if (!target) fail('ProjectNotFound', 'Set up the Global Vault first.', 'Open Global Vault.');
+    return target;
+  }
+
+  function findSharedSecret(name: string): PersistedSecret | undefined {
+    const target = sharedProject();
+    return secrets.find(
+      (row) =>
+        row.profile_id === target.profile_id && row.source === 'user-local' && row.name === name,
+    );
+  }
+
+  function linkToTarget(
+    profileId: string,
+    localName: string,
+    target: PersistedSecret,
+  ): SharedUsageRow {
+    const profile = profiles.get(profileId);
+    const project = projects.find((entry) => entry.project_id === profile?.project);
+    if (!profile || !project)
+      fail('ProfileNotFound', 'Environment not found.', 'Choose an environment.');
+    const existing = links.find(
+      (link) => link.profile_id === profileId && link.local_name === localName,
+    );
+    const link: SharedUsageRow = {
+      link_id: existing?.link_id ?? `link-${++sequence}`,
+      project_id: project.project_id,
+      project_name: project.project_name,
+      profile_id: profileId,
+      profile_name: profile.name,
+      profile_dangerous: profile.dangerous,
+      local_name: localName,
+      target_secret_id: target.id,
+      target_secret_name: target.name,
+      created_at: existing?.created_at ?? now,
+      updated_at: now,
+    };
+    if (existing) Object.assign(existing, link);
+    else links.push(link);
+    return link;
+  }
+
+  function sharedUsages(targetId: string, redact = false): DesktopListSharedUsagesResponse {
+    return {
+      usages: links
+        .filter((link) => link.target_secret_id === targetId)
+        .map((link, index) => ({
+          ...link,
+          profile_dangerous: profiles.get(link.profile_id)?.dangerous ?? false,
+          ...(redact && {
+            project_name: `Project ${index + 1}`,
+            profile_id: `Environment ${index + 1}`,
+            profile_name: `Environment ${index + 1}`,
+            local_name: `Variable ${index + 1}`,
+            target_secret_name: 'Shared variable',
+          }),
+        })),
+    };
+  }
+
+  function duplicates(redact: boolean): DesktopListDuplicatesResponse {
+    const groups = new Map<string, DuplicateMemberRow[]>();
+    secrets.forEach((row, index) => {
+      const profile = profiles.get(row.profile_id);
+      const project = projects.find((entry) => entry.project_id === profile?.project);
+      if (!profile || !project) return;
+      const key = dedupKey(row);
+      const members = groups.get(key) ?? [];
+      members.push({
+        secret_id: row.id,
+        project_id: project.project_id,
+        project_name: redact ? `Project ${projects.indexOf(project) + 1}` : project.project_name,
+        is_shared: project.is_shared === true,
+        profile_id: redact ? 'Environment' : row.profile_id,
+        profile_name: redact ? 'Environment' : profile.name,
+        profile_dangerous: profile.dangerous,
+        name: redact ? `Variable ${index + 1}` : row.name,
+        source: row.source,
+        current_version: row.current_version,
+        updated_at: row.updated_at,
+      });
+      groups.set(key, members);
+    });
+    return {
+      groups: [...groups.values()]
+        .filter((members) => members.length > 1)
+        .map((members, index) => ({ group_id: `dup-${index + 1}`, members })),
+    };
+  }
+
+  function linkSecret(request: DesktopLinkSecretRequest): DesktopLinkSecretResponse {
+    requireUnlocked();
+    if (requireSelectedProject().is_shared)
+      fail('InvalidReference', 'Choose a project to link this secret.', 'Open a project.');
+    requireProfileConfirmation(request.profile_id, request.confirmation);
+    const target = findSharedSecret(request.target_secret_name);
+    if (!target)
+      fail('SecretNotFound', 'The Global Vault secret was not found.', 'Check the target name.');
+    const link = linkToTarget(request.profile_id, request.local_name, target);
+    return {
+      link_id: link.link_id,
+      local_name: link.local_name,
+      target_project_id: sharedProject().project_id,
+      target_secret_id: target.id,
+      target_secret_name: target.name,
+    };
+  }
+
+  function unlinkSecret(request: DesktopUnlinkSecretRequest): DesktopUnlinkSecretResponse {
+    requireUnlocked();
+    requireProfileConfirmation(request.profile_id, request.confirmation);
+    const index = links.findIndex(
+      (link) => link.profile_id === request.profile_id && link.local_name === request.local_name,
+    );
+    if (index >= 0) links.splice(index, 1);
+    return { local_name: request.local_name, unlinked: index >= 0 };
+  }
+
+  function removeSecret(row: PersistedSecret): void {
+    secrets.splice(secrets.indexOf(row), 1);
+    values.delete(row.id);
+    fixtureGroups.delete(row.id);
+  }
+
   function deleteSecret(request: DesktopDeleteSecretRequest): DesktopDeleteSecretResponse {
     requireUnlocked();
     requireProfileConfirmation(request.profile_id, request.confirmation);
-    const index = secrets.findIndex(
+    const row = secrets.find(
       (row) =>
         row.profile_id === request.profile_id &&
         row.name === request.secret_name &&
         row.source === request.source,
     );
-    if (index < 0) fail('SecretNotFound', 'The secret was not found.', 'Refresh the secret list.');
-    const [row] = secrets.splice(index, 1);
-    values.delete(row!.id);
+    if (!row) fail('SecretNotFound', 'The secret was not found.', 'Refresh the secret list.');
+    const { usages } = sharedUsages(row.id);
+    if (usages.length && !request.unlink_all)
+      fail(
+        'LinkedSecretInUse',
+        'Projects are linked to this secret.',
+        'Review and unlink all usages.',
+      );
+    const confirmation = unlinkAllConfirmation(usages, row.name);
+    if (confirmation && request.confirmation !== confirmation)
+      fail(
+        'ConfirmationFailed',
+        'Confirm linked dangerous environments.',
+        'Enter the requested name.',
+      );
+    for (const usage of usages) {
+      const index = links.findIndex((link) => link.link_id === usage.link_id);
+      links.splice(index, 1);
+    }
+    removeSecret(row);
     return {
-      secret_name: row!.name,
-      source: row!.source,
-      version: row!.current_version,
+      secret_name: row.name,
+      source: row.source,
+      version: row.current_version,
       deleted: true,
+      ...(usages.length && { unlinked_count: usages.length }),
     };
   }
 
@@ -465,20 +661,13 @@ export function createMockRuntime(params: URLSearchParams) {
     request: DesktopCopySecretToSharedRequest,
   ): DesktopCopySecretToSharedResponse {
     requireUnlocked();
-    const target = projects.find((project) => project.is_shared);
-    if (!target)
-      fail(
-        'ProjectNotFound',
-        'Set up the Global Vault before copying the secret.',
-        'Open Global Vault.',
-      );
-    if (!unlockedProjects.has(target.project_id)) {
+    const target = sharedProject();
+    if (!unlockedProjects.has(target.project_id))
       fail(
         'UnlockRequired',
         'Unlock the Global Vault before copying the secret.',
         'Open Global Vault and unlock it.',
       );
-    }
     requireProfileConfirmation(request.from_profile_id, request.confirmation);
     requireProfileConfirmation(target.profile_id, request.confirmation);
     const source = secrets
@@ -490,35 +679,172 @@ export function createMockRuntime(params: URLSearchParams) {
       )
       .sort((left, right) => right.source_precedence - left.source_precedence)[0];
     if (!source) fail('SecretNotFound', 'The secret was not found.', 'Refresh the secret list.');
-    const targetSecret = secrets.find(
-      (row) =>
-        row.profile_id === target.profile_id &&
-        row.name === source.name &&
-        row.source === 'user-local',
+    const targetName = request.target_name ?? source.name;
+    const existing = findSharedSecret(targetName);
+    const reuse = Boolean(
+      existing && request.replace_with_link && dedupKey(existing) === dedupKey(source),
     );
-    if (targetSecret && !request.overwrite) {
+    if (existing && !request.overwrite && !reuse)
       fail(
         'SecretAlreadyExists',
         'The secret already exists in Global Vault.',
         'Review the existing secret in Global Vault.',
       );
+    const matching = secrets.filter((row) => row !== source && dedupKey(row) === dedupKey(source));
+    if (!reuse) {
+      const saved = saveSecret(
+        {
+          project_id: target.project_id,
+          profile_id: target.profile_id,
+          secret_name: targetName,
+          source: 'user-local',
+          value: values.get(source.id) ?? 'preview-only-value',
+        },
+        Boolean(existing),
+      );
+      const fixture = fixtureGroups.get(source.id);
+      if (fixture) fixtureGroups.set(saved.secret_id, fixture);
     }
-    const saved = saveSecret(
-      {
-        project_id: target.project_id,
-        profile_id: target.profile_id,
-        secret_name: source.name,
-        source: 'user-local',
-        value: values.get(source.id) ?? 'preview-only-value',
-      },
-      Boolean(targetSecret),
-    );
+    const targetSecret = findSharedSecret(targetName)!;
+    if (request.replace_with_link) {
+      linkToTarget(source.profile_id, source.name, targetSecret);
+      if (source.source === 'user-local') removeSecret(source);
+    }
+    let consolidated = 0;
+    let skipped = 0;
+    if (request.consolidate_duplicates) {
+      for (const row of matching) {
+        const profile = profiles.get(row.profile_id);
+        if (!profile || row.source !== 'user-local' || profile.project === target.project_id)
+          continue;
+        if (!unlockedProjects.has(profile.project) || profile.dangerous) {
+          skipped++;
+          continue;
+        }
+        linkToTarget(row.profile_id, row.name, targetSecret);
+        removeSecret(row);
+        consolidated++;
+      }
+    }
     return {
       target_project_id: target.project_id,
       target_profile_id: target.profile_id,
-      secret_name: source.name,
-      version: saved.version,
-      action: targetSecret ? 'rotate' : 'create',
+      secret_name: targetName,
+      version: targetSecret.current_version,
+      action: reuse ? 'reuse' : existing ? 'rotate' : 'create',
+      ...(request.replace_with_link && { linked: true }),
+      ...(consolidated && { consolidated_count: consolidated }),
+      ...(skipped && { skipped_locked_count: skipped }),
+    };
+  }
+
+  function importEnv(request: DesktopImportEnvRequest): DesktopImportEnvResponse {
+    requireUnlocked();
+    const project = requireSelectedProject();
+    const existing = (name: string) =>
+      secrets.find(
+        (row) =>
+          row.profile_id === project.profile_id && row.name === name && row.source === 'user-local',
+      );
+    const fixtures = [
+      { name: 'REDIS_URL', fixture: undefined },
+      { name: 'MAIL_TOKEN', fixture: 'email' },
+      { name: 'ERROR_TRACKING_DSN', fixture: 'monitoring' },
+    ];
+    const matches: ImportDuplicateMatch[] = [];
+    let imported = 0;
+    let overwritten = 0;
+    let skipped = 0;
+    let linked = 0;
+    let promoted = 0;
+    if (!request.dry_run) requireProfileConfirmation(project.profile_id, request.confirmation);
+    for (const { name, fixture } of fixtures) {
+      for (const row of secrets.filter((row) => fixture && fixtureGroups.get(row.id) === fixture)) {
+        const profile = profiles.get(row.profile_id);
+        const match = projects.find((entry) => entry.project_id === profile?.project);
+        if (!profile || !match || (row.profile_id === project.profile_id && row.name === name))
+          continue;
+        matches.push({
+          local_name: name,
+          match_kind: match.is_shared ? 'shared' : 'project',
+          matched_project_id: match.project_id,
+          matched_project_name: match.project_name,
+          matched_profile_name: profile.name,
+          matched_secret_id: row.id,
+          matched_secret_name: row.name,
+          is_shared: match.is_shared === true,
+        });
+      }
+      const linkName = !project.is_shared && request.link_to_shared?.[name];
+      const promoteName = !project.is_shared && request.promote_to_shared?.[name];
+      const useShared = !request.dry_run && (linkName || promoteName);
+      if (useShared) {
+        const shared = sharedProject();
+        let target = findSharedSecret(useShared);
+        if (!linkName && !unlockedProjects.has(shared.project_id))
+          fail(
+            'UnlockRequired',
+            'Unlock the Global Vault before promoting.',
+            'Open Global Vault and unlock it.',
+          );
+        if (!linkName && (!target || fixtureGroups.get(target.id) !== fixture)) {
+          if (target && !request.overwrite)
+            fail(
+              'SecretAlreadyExists',
+              'The secret already exists in Global Vault.',
+              'Review the target name.',
+            );
+          const saved = saveSecret(
+            {
+              project_id: shared.project_id,
+              profile_id: shared.profile_id,
+              secret_name: useShared,
+              value: 'preview-imported-value',
+            },
+            Boolean(target),
+          );
+          if (fixture) fixtureGroups.set(saved.secret_id, fixture);
+          target = findSharedSecret(useShared);
+        }
+        if (!target)
+          fail(
+            'SecretNotFound',
+            'The Global Vault secret was not found.',
+            'Check the target name.',
+          );
+        linkToTarget(project.profile_id, name, target);
+        if (linkName) linked++;
+        else promoted++;
+        continue;
+      }
+      const previous = existing(name);
+      if (previous && !request.overwrite) {
+        skipped++;
+        continue;
+      }
+      if (previous) overwritten++;
+      else imported++;
+      if (!request.dry_run) {
+        const saved = saveSecret(
+          {
+            project_id: project.project_id,
+            profile_id: project.profile_id,
+            secret_name: name,
+            value: 'preview-imported-value',
+          },
+          Boolean(previous),
+        );
+        if (fixture) fixtureGroups.set(saved.secret_id, fixture);
+      }
+    }
+    return {
+      summary: `Imported ${imported}, linked ${linked}, promoted ${promoted}, overwritten ${overwritten}, skipped ${skipped}. Original file preserved.`,
+      imported,
+      overwritten,
+      skipped,
+      linked,
+      promoted,
+      duplicate_matches: matches,
     };
   }
 
@@ -673,6 +999,14 @@ export function createMockRuntime(params: URLSearchParams) {
         return deleteSecret(request as unknown as DesktopDeleteSecretRequest);
       case 'desktop_copy_secret_to_shared':
         return copyToShared(request as unknown as DesktopCopySecretToSharedRequest);
+      case 'desktop_link_secret':
+        return linkSecret(request as unknown as DesktopLinkSecretRequest);
+      case 'desktop_unlink_secret':
+        return unlinkSecret(request as unknown as DesktopUnlinkSecretRequest);
+      case 'desktop_list_shared_usages':
+        return sharedUsages(String(request.target_secret_id), redact);
+      case 'desktop_list_duplicates':
+        return duplicates(redact);
       case 'agent_set_active_profile': {
         requireUnlocked();
         const project = requireSelectedProject();
@@ -709,12 +1043,42 @@ export function createMockRuntime(params: URLSearchParams) {
           live_grants_revoked: 0,
         } satisfies SetActiveProfileResponse;
       }
-      case 'agent_list_secrets':
+      case 'agent_list_secrets': {
+        const rows: SecretWireRow[] = projectSecrets.map((row) => ({
+          ...row,
+          link_count: links.filter((link) => link.target_secret_id === row.id).length,
+        }));
+        for (const link of links.filter((link) => link.profile_id === request.profile_id)) {
+          const target = secrets.find((row) => row.id === link.target_secret_id);
+          if (!target) continue;
+          rows.push({
+            ...target,
+            id: link.link_id,
+            profile_id: link.profile_id,
+            name: link.local_name,
+            source: 'shared-link',
+            source_precedence: precedence['shared-link'],
+            origin: 'shared-link',
+            linked_target_name: target.name,
+            linked_target_secret_id: target.id,
+            created_at: link.created_at,
+            link_count: 0,
+          });
+        }
         return {
-          rows: projectSecrets.map((row, index) =>
-            redact ? { ...row, name: `Variable ${index + 1}`, owner: undefined, tags: [] } : row,
+          rows: rows.map((row, index) =>
+            redact
+              ? {
+                  ...row,
+                  name: `Variable ${index + 1}`,
+                  owner: undefined,
+                  tags: [],
+                  linked_target_name: row.linked_target_name ? 'Shared variable' : undefined,
+                }
+              : row,
           ),
         };
+      }
       case 'agent_list_versions': {
         const rows: VersionWireRow[] = projectSecrets.flatMap((row, index) => {
           const current: VersionWireRow = {
@@ -807,8 +1171,16 @@ export function createMockRuntime(params: URLSearchParams) {
         const row = projectSecrets
           .filter((secret) => secret.name === request.secret_name)
           .sort((left, right) => right.source_precedence - left.source_precedence)[0];
+        const link = links.find(
+          (entry) =>
+            entry.profile_id === request.profile_id && entry.local_name === request.secret_name,
+        );
+        const effectiveId =
+          link && (!row || row.source_precedence < precedence['shared-link'])
+            ? link.target_secret_id
+            : row?.id;
         return {
-          value: (row && values.get(row.id)) ?? 'preview-only-value',
+          value: (effectiveId && values.get(effectiveId)) ?? 'preview-only-value',
           ttl_seconds: 20,
         };
       }
@@ -837,19 +1209,8 @@ export function createMockRuntime(params: URLSearchParams) {
             : '/Users/justin/Downloads/locket-backup.lkb';
       case 'desktop_mcp_config_snippet':
         return { ...mcp, json: JSON.stringify({ mcpServers: { locket: mcp } }, null, 2) };
-      case 'desktop_import_env': {
-        const project = requireSelectedProject();
-        saveSecret(
-          {
-            project_id: project.project_id,
-            profile_id: project.profile_id,
-            secret_name: 'REDIS_URL',
-            value: 'preview-imported-value',
-          },
-          false,
-        );
-        return { summary: 'Imported 1 variable.' };
-      }
+      case 'desktop_import_env':
+        return importEnv(request as unknown as DesktopImportEnvRequest);
       case 'desktop_run_policy':
         return { launched: true, command: `locket run ${request.policy_name}` };
       case 'desktop_scan_project':

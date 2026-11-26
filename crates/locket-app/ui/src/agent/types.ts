@@ -381,9 +381,10 @@ export interface ListSecretsRequest {
   redact_names: boolean;
 }
 
-export type SecretSourceWire = 'team-managed' | 'user-local' | 'machine-local';
+export type VersionSourceWire = 'team-managed' | 'user-local' | 'machine-local';
+export type SecretSourceWire = VersionSourceWire | 'shared-link';
 
-export interface SecretWireRow {
+export interface SecretMetadataRecord {
   id: string;
   profile_id: string;
   name: string;
@@ -399,7 +400,12 @@ export interface SecretWireRow {
   created_at: number;
   updated_at: number;
   last_rotated_at: number | null;
+  linked_target_secret_id?: string | null;
+  linked_target_name?: string | null;
+  link_count?: number;
 }
+
+export type SecretWireRow = SecretMetadataRecord;
 
 export interface ProjectListRequest {
   store_path?: string;
@@ -587,7 +593,6 @@ export interface ListVersionsRequest {
   redact_names: boolean;
 }
 
-export type VersionSourceWire = 'team-managed' | 'user-local' | 'machine-local';
 export type VersionStateWire = 'current' | 'deprecated' | 'purged';
 
 export interface VersionWireRow {
@@ -633,6 +638,30 @@ export interface DesktopImportEnvRequest {
   path: string;
   overwrite: boolean;
   literal: boolean;
+  dry_run?: boolean;
+  link_to_shared?: Record<string, string>;
+  promote_to_shared?: Record<string, string>;
+}
+
+export interface ImportDuplicateMatch {
+  local_name: string;
+  match_kind: 'shared' | 'project';
+  matched_project_id: string;
+  matched_project_name: string;
+  matched_profile_name: string;
+  matched_secret_id: string;
+  matched_secret_name: string;
+  is_shared: boolean;
+}
+
+export interface DesktopImportEnvResponse {
+  summary: string;
+  imported: number;
+  overwritten: number;
+  skipped: number;
+  linked: number;
+  promoted: number;
+  duplicate_matches: ImportDuplicateMatch[];
 }
 export interface DesktopCreateProfileRequest {
   project_id: string;
@@ -648,21 +677,26 @@ export interface DesktopDeleteSecretRequest {
   project_id: string;
   profile_id: string;
   secret_name: string;
-  source: SecretSourceWire;
+  source: VersionSourceWire;
   confirmation?: string;
+  unlink_all?: boolean;
 }
 export interface DesktopDeleteSecretResponse {
   secret_name: string;
-  source: SecretSourceWire;
+  source: VersionSourceWire;
   version: number;
   deleted: boolean;
+  unlinked_count?: number;
 }
 export interface DesktopCopySecretToSharedRequest {
   from_project_id: string;
   from_profile_id: string;
   secret_name: string;
-  source?: SecretSourceWire;
+  source?: VersionSourceWire;
   overwrite?: boolean;
+  target_name?: string;
+  replace_with_link?: boolean;
+  consolidate_duplicates?: boolean;
   confirmation?: string;
 }
 export interface DesktopCopySecretToSharedResponse {
@@ -670,8 +704,85 @@ export interface DesktopCopySecretToSharedResponse {
   target_profile_id: string;
   secret_name: string;
   version: number;
-  action: 'create' | 'rotate';
+  action: 'create' | 'rotate' | 'reuse';
+  linked?: boolean;
+  consolidated_count?: number;
+  skipped_locked_count?: number;
 }
+export interface DesktopUnlinkSecretRequest {
+  project_id: string;
+  profile_id: string;
+  local_name: string;
+  confirmation?: string;
+}
+
+export interface DesktopLinkSecretRequest extends DesktopUnlinkSecretRequest {
+  target_secret_name: string;
+}
+
+export interface DesktopLinkSecretResponse {
+  link_id: string;
+  local_name: string;
+  target_project_id: string;
+  target_secret_id: string;
+  target_secret_name: string;
+}
+
+export interface DesktopUnlinkSecretResponse {
+  local_name: string;
+  unlinked: boolean;
+}
+
+export interface DesktopListSharedUsagesRequest {
+  target_secret_id: string;
+  redact_names?: boolean;
+}
+
+export interface SharedUsageRow {
+  link_id: string;
+  project_id: string;
+  project_name: string;
+  profile_id: string;
+  profile_name: string;
+  profile_dangerous: boolean;
+  local_name: string;
+  target_secret_id: string;
+  target_secret_name: string;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface DesktopListSharedUsagesResponse {
+  usages: SharedUsageRow[];
+}
+
+export interface DesktopListDuplicatesRequest {
+  redact_names?: boolean;
+}
+
+export interface DuplicateMemberRow {
+  secret_id: string;
+  project_id: string;
+  project_name: string;
+  is_shared: boolean;
+  profile_id: string;
+  profile_name: string;
+  profile_dangerous: boolean;
+  name: string;
+  source: VersionSourceWire;
+  current_version: number;
+  updated_at: number;
+}
+
+export interface DuplicateGroupRow {
+  group_id: string;
+  members: DuplicateMemberRow[];
+}
+
+export interface DesktopListDuplicatesResponse {
+  groups: DuplicateGroupRow[];
+}
+
 export interface DesktopDetectCommandsRequest {
   project_id: string;
 }

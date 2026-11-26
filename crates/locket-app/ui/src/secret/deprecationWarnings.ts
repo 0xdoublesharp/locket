@@ -84,6 +84,7 @@ export function secretRowsWithDeprecationWarnings(
   }
 
   return rows.map((row) => {
+    if (row.source === 'shared-link') return row;
     const warnings = warningsBySecret.get(row.name) ?? [];
     if (warnings.length === 0) {
       return { ...row, deprecatedReferenceWarnings: [] };

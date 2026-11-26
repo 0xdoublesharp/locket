@@ -438,3 +438,74 @@ it('expands only the chosen version audit summary and supports loading, retry, a
   await settle();
   expect(nodeText(root)).toContain('No version history available.');
 });
+
+it('labels a live link and offers unlink instead of editing a local value', async () => {
+  const onUnlink = vi.fn();
+  const row: SecretRowMeta = {
+    ...secret,
+    source: 'shared-link',
+    linkedTargetName: 'GLOBAL_TOKEN',
+  };
+  const { root, setProps } = mount(SecretMetadataList, {
+    rows: [row],
+    versions: [],
+    profileLabel: 'Dev',
+    connected: true,
+    canStart: false,
+    starting: false,
+    privacyMode: false,
+    loading: false,
+    canAccessValues: true,
+    metadataLoaded: true,
+    onUnlink,
+  });
+  expect(byProp(root, 'data-tone', 'linked')).toBeDefined();
+  expect(nodeText(root)).toContain('Linked → @shared/GLOBAL_TOKEN');
+  await click(button(root, 'Details for PRIVATE_TOKEN'));
+  const inspector = byProp(root, 'id', 'variable-inspector');
+  expect(nodeText(inspector)).toContain('Rotate this secret in Global Vault');
+  expect(
+    findNode(inspector, (node) => node.tag === 'button' && nodeText(node) === 'Rotate'),
+  ).toBeUndefined();
+  await click(button(inspector, 'Unlink'));
+  expect(onUnlink).toHaveBeenCalledExactlyOnceWith(row);
+  setProps({ privacyMode: true });
+  await settle();
+  expect(nodeText(root)).not.toContain('GLOBAL_TOKEN');
+});
+
+it('blocks editing a linked name and directs rotation to Global Vault', async () => {
+  const onSetSecret = vi.fn();
+  const onRotateSecret = vi.fn();
+  const link: SecretRowMeta = {
+    ...secret,
+    source: 'shared-link',
+    linkedTargetName: 'GLOBAL_TOKEN',
+  };
+  const props = {
+    rows: [link],
+    privacyMode: false,
+    loading: false,
+    metadataLoaded: true,
+    projectId: 'project',
+    profileId: 'profile',
+    onSetSecret,
+    onRotateSecret,
+  };
+  const { root } = mount(SecretEditorView, props);
+  const set = byProp(root, 'aria-labelledby', 'secret-editor-set-heading');
+  await input(byProp(set, 'data-testid', 'secret-editor-set-value'), fixtureValue);
+  await input(byProp(set, 'data-testid', 'secret-editor-set-name'), link.name);
+  expect(button(set, 'Add secret').props.disabled).toBe(true);
+  expect(nodeText(set)).toContain('Edit the secret in Global Vault');
+  await submit(set);
+  expect(onSetSecret).not.toHaveBeenCalled();
+
+  const targeted = mount(SecretEditorView, { ...props, rotationTarget: link });
+  const rotate = byProp(targeted.root, 'aria-labelledby', 'secret-editor-rotate-heading');
+  expect(nodeText(rotate)).toContain('Rotate this secret in Global Vault');
+  await input(byProp(rotate, 'id', 'secret-editor-rotate-value'), fixtureValue);
+  expect(button(rotate, 'Rotate secret').props.disabled).toBe(true);
+  await submit(rotate);
+  expect(onRotateSecret).not.toHaveBeenCalled();
+});

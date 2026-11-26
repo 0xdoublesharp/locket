@@ -13,6 +13,15 @@ import type {
   ProjectListRequest,
   ProjectSummaryWire,
   DesktopImportEnvRequest,
+  DesktopImportEnvResponse,
+  DesktopLinkSecretRequest,
+  DesktopLinkSecretResponse,
+  DesktopUnlinkSecretRequest,
+  DesktopUnlinkSecretResponse,
+  DesktopListSharedUsagesRequest,
+  DesktopListSharedUsagesResponse,
+  DesktopListDuplicatesRequest,
+  DesktopListDuplicatesResponse,
   DesktopCreateProfileRequest,
   DesktopCreateProfileResponse,
   DesktopDeleteSecretRequest,
@@ -484,7 +493,7 @@ export async function desktopInitializeProject(request: {
 }
 export async function desktopImportEnv(
   request: DesktopImportEnvRequest,
-): Promise<AgentResult<{ summary: string }>> {
+): Promise<AgentResult<DesktopImportEnvResponse>> {
   return callTyped('desktop_import_env', { request });
 }
 export async function desktopStartAgent(request: {
@@ -517,6 +526,26 @@ export function desktopCopySecretToShared(
   request: DesktopCopySecretToSharedRequest,
 ): Promise<AgentResult<DesktopCopySecretToSharedResponse>> {
   return callTyped('desktop_copy_secret_to_shared', { request });
+}
+export function linkSecret(
+  request: DesktopLinkSecretRequest,
+): Promise<AgentResult<DesktopLinkSecretResponse>> {
+  return callTyped('desktop_link_secret', { request });
+}
+export function unlinkSecret(
+  request: DesktopUnlinkSecretRequest,
+): Promise<AgentResult<DesktopUnlinkSecretResponse>> {
+  return callTyped('desktop_unlink_secret', { request });
+}
+export function listSharedUsages(
+  request: DesktopListSharedUsagesRequest,
+): Promise<AgentResult<DesktopListSharedUsagesResponse>> {
+  return callTyped('desktop_list_shared_usages', { request });
+}
+export function listDuplicates(
+  request: DesktopListDuplicatesRequest = {},
+): Promise<AgentResult<DesktopListDuplicatesResponse>> {
+  return callTyped('desktop_list_duplicates', { request });
 }
 export function desktopDetectCommands(
   request: DesktopDetectCommandsRequest,

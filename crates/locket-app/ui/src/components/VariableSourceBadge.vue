@@ -8,6 +8,8 @@ const badge = computed(() => {
     case 'team-managed':
     case 'team':
       return { label: 'Shared', icon: 'cloud', tone: 'shared' } as const;
+    case 'shared-link':
+      return { label: 'Shared link', icon: 'link', tone: 'linked' } as const;
     case 'user-local':
       return { label: 'My override', icon: 'user', tone: 'override' } as const;
     case 'machine-local':
@@ -41,6 +43,10 @@ const badge = computed(() => {
 .source-badge[data-tone='shared'] {
   color: var(--info);
   background: var(--info-soft);
+}
+.source-badge[data-tone='linked'] {
+  color: var(--accent);
+  background: var(--accent-soft);
 }
 .source-badge[data-tone='override'] {
   color: var(--success);

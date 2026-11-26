@@ -15,7 +15,6 @@ import {
   validateSetForm,
   type SecretRotateFormState,
   type SecretSetFormState,
-  type SecretSource,
 } from '../secret/editor';
 import type { AgentClientError } from '../agent/types';
 import type { SetSecretRequest, SetSecretResponse } from '../agent/client';
@@ -77,22 +76,35 @@ const setValidation = computed(() => validateSetForm(setForm.value));
 const rotateValidation = computed(() => validateRotateForm(rotateForm.value));
 
 const canSubmitSet = computed<boolean>(
-  () => setValidation.value.valid && !setSubmitting.value && hasContext.value,
+  () => setValidation.value.valid && !setSubmitting.value && hasContext.value && !setLink.value,
 );
 const canSubmitRotate = computed<boolean>(
-  () => rotateValidation.value.valid && !rotateSubmitting.value && hasContext.value,
+  () =>
+    rotateValidation.value.valid &&
+    !rotateSubmitting.value &&
+    hasContext.value &&
+    !rotateLink.value,
 );
 
 const hasContext = computed<boolean>(
   () => props.metadataLoaded && Boolean(props.projectId) && Boolean(props.profileId),
 );
 
-function rotateSourceFor(name: string): SecretSource {
-  if (props.rotationTarget) return secretSourceWire(props.rotationTarget.source);
-  const trimmed = name.trim();
-  const row = props.rows.find((entry) => entry.name === trimmed);
-  return row ? secretSourceWire(row.source) : 'user-local';
+function linkedRow(name: string): SecretRowMeta | undefined {
+  return props.rows.find((row) => row.name === name.trim() && row.source === 'shared-link');
 }
+
+const setLink = computed(() => linkedRow(setForm.value.name));
+const rotationRow = computed(
+  () => props.rotationTarget ?? props.rows.find((row) => row.name === rotateForm.value.name.trim()),
+);
+const rotateLink = computed(() =>
+  props.rotationTarget?.source === 'shared-link'
+    ? props.rotationTarget
+    : props.rotationTarget
+      ? undefined
+      : linkedRow(rotateForm.value.name),
+);
 
 function refresh(): void {
   emit('refresh');
@@ -123,7 +135,8 @@ async function onSet(): Promise<void> {
 }
 
 async function onRotate(): Promise<void> {
-  if (!canSubmitRotate.value) {
+  const source = rotationRow.value?.source;
+  if (!canSubmitRotate.value || source === 'shared-link') {
     return;
   }
   rotateError.value = null;
@@ -133,7 +146,7 @@ async function onRotate(): Promise<void> {
     projectId: props.projectId ?? '',
     profileId: props.profileId ?? '',
     grantId: props.grantId ?? undefined,
-    source: rotateSourceFor(rotateForm.value.name),
+    source: source ? secretSourceWire(source) : 'user-local',
   });
   rotateForm.value.value = '';
   const result = await props.onRotateSecret(payload);
@@ -206,12 +219,15 @@ function errorLabel(error: AgentClientError): string {
             {{ setValidation.errors.name }}
           </span>
         </label>
+        <p v-if="setLink" class="view__notice">
+          This name is linked. Edit the secret in Global Vault or unlink it in Secrets.
+        </p>
         <SecretValueInput
           id="secret-editor-set-value"
           v-model="setForm.value"
           label="Value"
           :error="setValidation.errors.value"
-          :disabled="setSubmitting"
+          :disabled="setSubmitting || Boolean(setLink)"
         />
         <label class="view__field">
           <span>Description (metadata only)</span>
@@ -259,7 +275,11 @@ function errorLabel(error: AgentClientError): string {
             data-testid="secret-editor-rotate-name"
           />
           <datalist v-if="!privacyMode && !rotationTarget" id="secret-editor-known">
-            <option v-for="row in props.rows" :key="row.id" :value="row.name" />
+            <option
+              v-for="row in props.rows.filter((row) => row.source !== 'shared-link')"
+              :key="row.id"
+              :value="row.name"
+            />
           </datalist>
           <span v-if="rotateValidation.errors.name" class="view__error">
             {{ rotateValidation.errors.name }}
@@ -268,12 +288,15 @@ function errorLabel(error: AgentClientError): string {
         <div v-if="rotationTarget" class="view__source">
           Source <VariableSourceBadge :source="rotationTarget.source" />
         </div>
+        <p v-if="rotateLink" class="view__notice">
+          Rotate this secret in Global Vault to update every linked project.
+        </p>
         <SecretValueInput
           id="secret-editor-rotate-value"
           v-model="rotateForm.value"
           label="New value"
           :error="rotateValidation.errors.value"
-          :disabled="rotateSubmitting"
+          :disabled="rotateSubmitting || Boolean(rotateLink)"
         />
         <label class="view__field">
           <span>Grace expiry (optional)</span>

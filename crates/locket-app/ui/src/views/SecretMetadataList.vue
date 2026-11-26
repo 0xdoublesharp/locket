@@ -3,9 +3,16 @@ import { computed, nextTick, ref, watch } from 'vue';
 
 import AppIcon from '../components/AppIcon.vue';
 import AgentUnavailableBanner from '../components/AgentUnavailableBanner.vue';
-import { desktopActionsAvailable, desktopCopyTextPlain } from '../agent/client';
+import { desktopActionsAvailable, desktopCopyTextPlain, listSharedUsages } from '../agent/client';
+import { isValidSecretName } from '../secret/editor';
+import { unlinkAllConfirmation } from '../secret/sharedLinks';
 import { dotenvMigrationPrompt } from '../agent/agentPrompts';
-import type { AgentClientError } from '../agent/types';
+import type {
+  AgentClientError,
+  DuplicateGroupRow,
+  DuplicateMemberRow,
+  SharedUsageRow,
+} from '../agent/types';
 import { formatTime } from '../utils/formatTime';
 import CopyReference from '../components/CopyReference.vue';
 import VariableSourceBadge from '../components/VariableSourceBadge.vue';
@@ -28,6 +35,9 @@ interface Props {
   loading: boolean;
   metadataLoaded: boolean;
   isShared?: boolean;
+  duplicateGroups?: DuplicateGroupRow[];
+  duplicatesError?: boolean;
+  requestedSecretId?: string;
   canImportEnv?: boolean;
   importBusy?: boolean;
   dangerousProfile?: boolean;
@@ -43,20 +53,75 @@ const emit = defineEmits<{
   (e: 'select', row: SecretRowMeta): void;
   (e: 'refresh' | 'add' | 'retry' | 'start' | 'openAgentSetup' | 'importEnv'): void;
   (e: 'copyValue' | 'revealValue' | 'copyToShared' | 'rotate', row: SecretRowMeta): void;
-  (e: 'deleteSecret', row: SecretRowMeta, confirmation?: string): void;
+  (e: 'deleteSecret', row: SecretRowMeta, confirmation?: string, usages?: SharedUsageRow[]): void;
+  (e: 'unlink', row: SecretRowMeta): void;
+  (e: 'promote', row: SecretRowMeta, targetName: string | undefined, consolidate: boolean): void;
+  (e: 'openDuplicate', member: DuplicateMemberRow): void;
+  (e: 'link', localName: string, targetName: string): void;
+  (e: 'inspected'): void;
 }>();
 
 const searchQuery = ref<string>('');
 const filterState = ref<SecretFilterState>(defaultSecretFilter());
 const inspectedId = ref<string | null>(null);
+const inspectedRow = computed(() => props.rows.find(({ id }) => id === inspectedId.value));
+const canMutate = computed(
+  () => props.canAccessValues && !props.mutationDisabled && !props.privacyMode,
+);
+
+const usages = ref<SharedUsageRow[] | null>(null);
+const usagesError = ref(false);
+const usagesReload = ref(0);
+const usagesTarget = computed(() =>
+  props.isShared && !props.privacyMode && props.canAccessValues
+    ? inspectedRow.value?.id
+    : undefined,
+);
+watch([usagesTarget, () => props.lastRefreshedAt, usagesReload], async ([id], _, onCleanup) => {
+  usages.value = null;
+  usagesError.value = false;
+  if (!id) return;
+  let active = true;
+  onCleanup(() => {
+    active = false;
+  });
+  const result = await listSharedUsages({ target_secret_id: id, redact_names: false });
+  if (!active) return;
+  if (result.ok) usages.value = result.value.usages;
+  else usagesError.value = true;
+});
+
 const confirmingDelete = ref(false);
 const deleteConfirmation = ref('');
-const canMutate = computed(() => props.canAccessValues && !props.mutationDisabled);
+const profileConfirmation = computed(() =>
+  props.dangerousProfile ? props.profileName : undefined,
+);
+const linkedConfirmation = computed(() => {
+  const row = inspectedRow.value;
+  return row && usages.value ? unlinkAllConfirmation(usages.value, row.name) : undefined;
+});
+const expectedConfirmation = computed(() => linkedConfirmation.value ?? profileConfirmation.value);
+const conflictingConfirmation = computed(() =>
+  Boolean(
+    profileConfirmation.value &&
+    linkedConfirmation.value &&
+    profileConfirmation.value !== linkedConfirmation.value,
+  ),
+);
+const usagesMissing = computed(
+  () =>
+    props.isShared &&
+    (usages.value === null ||
+      (usages.value.length === 0 && (inspectedRow.value?.linkCount ?? 0) > 0)),
+);
 const canDelete = computed(
   () =>
     canMutate.value &&
-    (!props.dangerousProfile ||
-      Boolean(props.profileName && deleteConfirmation.value === props.profileName)),
+    !usagesMissing.value &&
+    !conflictingConfirmation.value &&
+    (expectedConfirmation.value
+      ? deleteConfirmation.value === expectedConfirmation.value
+      : !props.dangerousProfile),
 );
 
 function cancelDelete(): void {
@@ -64,15 +129,108 @@ function cancelDelete(): void {
   deleteConfirmation.value = '';
 }
 
-watch([inspectedId, () => props.canAccessValues, () => props.profileName], cancelDelete);
+watch(
+  [inspectedId, () => props.canAccessValues, () => props.profileName, () => props.privacyMode],
+  cancelDelete,
+);
+watch(usages, () => {
+  deleteConfirmation.value = '';
+});
 
 function confirmDelete(row: SecretRowMeta): void {
-  if (!confirmingDelete.value || !canDelete.value) return;
-  emit('deleteSecret', row, props.dangerousProfile ? deleteConfirmation.value : undefined);
+  if (!confirmingDelete.value || !canDelete.value || row.source === 'shared-link') return;
+  const confirmation = expectedConfirmation.value ? deleteConfirmation.value : undefined;
+  if (props.isShared && usages.value) emit('deleteSecret', row, confirmation, usages.value);
+  else emit('deleteSecret', row, confirmation);
   cancelDelete();
 }
 
-const inspectedRow = computed(() => props.rows.find(({ id }) => id === inspectedId.value));
+const promoting = ref(false);
+const promoteTarget = ref('');
+const consolidateDuplicates = ref(false);
+const canPromote = computed(
+  () =>
+    canMutate.value &&
+    (!promoteTarget.value.trim() || isValidSecretName(promoteTarget.value.trim())),
+);
+function startPromotion(targetName = ''): void {
+  cancelDelete();
+  promoteTarget.value = targetName;
+  consolidateDuplicates.value = false;
+  promoting.value = true;
+}
+function promote(row: SecretRowMeta): void {
+  if (!canPromote.value || row.source === 'shared-link') return;
+  emit('promote', row, promoteTarget.value.trim() || undefined, consolidateDuplicates.value);
+  promoting.value = false;
+}
+
+const linking = ref(false);
+const linkName = ref('');
+const linkTarget = ref('');
+const linkNameTaken = computed(() => props.rows.some((row) => row.name === linkName.value.trim()));
+const canLink = computed(
+  () =>
+    canMutate.value &&
+    isValidSecretName(linkName.value.trim()) &&
+    isValidSecretName(linkTarget.value.trim()) &&
+    !linkNameTaken.value,
+);
+function closeLink(): void {
+  linking.value = false;
+  linkName.value = '';
+  linkTarget.value = '';
+}
+function submitLink(): void {
+  if (!canLink.value) return;
+  emit('link', linkName.value.trim(), linkTarget.value.trim());
+}
+watch([() => props.profileName, () => props.privacyMode, () => props.canAccessValues], closeLink);
+watch(inspectedId, () => {
+  promoting.value = false;
+});
+watch(
+  () => props.rows,
+  () => {
+    if (
+      linking.value &&
+      props.rows.some((row) => row.source === 'shared-link' && row.name === linkName.value.trim())
+    ) {
+      closeLink();
+    }
+  },
+);
+watch(
+  () => props.requestedSecretId,
+  async (id) => {
+    if (!id) return;
+    emit('inspected');
+    if (!props.rows.some((row) => row.id === id)) return;
+    clearFilters();
+    inspectedId.value = id;
+    await nextTick();
+    document.getElementById('variable-inspector-title')?.focus();
+  },
+);
+
+async function reviewDuplicate(
+  member: DuplicateMemberRow,
+  group: DuplicateGroupRow,
+): Promise<void> {
+  const row = props.rows.find(({ id }) => id === member.secret_id);
+  if (!row) {
+    emit('openDuplicate', member);
+    return;
+  }
+  clearFilters();
+  inspectedId.value = row.id;
+  await nextTick();
+  if (inspectedId.value !== row.id) return;
+  const shared = group.members.find((entry) => entry.is_shared && entry.source === 'user-local');
+  if (!member.is_shared && canMutate.value) startPromotion(shared?.name);
+  document.getElementById('variable-inspector-title')?.focus();
+}
+
 const inspectedReference = computed(() =>
   secretReference(props.profileName, inspectedRow.value?.name ?? '', props.privacyMode),
 );
@@ -241,6 +399,16 @@ function graceDetails(row: SecretRowMeta): string {
           Import .env
         </button>
         <button
+          v-if="!isShared && canAccessValues && !privacyMode"
+          type="button"
+          class="companion-button icon-label"
+          :disabled="!canMutate"
+          :aria-expanded="linking"
+          @click="linking ? closeLink() : (linking = true)"
+        >
+          <AppIcon name="link" /> Link from Global Vault
+        </button>
+        <button
           v-if="!isEmpty || loadError || actionGuidance"
           class="companion-button icon-label"
           :class="{ 'companion-button--primary': connected }"
@@ -253,6 +421,72 @@ function graceDetails(row: SecretRowMeta): string {
         </button>
       </div>
     </header>
+
+    <form
+      v-if="linking && !privacyMode"
+      class="variable-inspector__management"
+      @submit.prevent="submitLink"
+    >
+      <label class="variable-inspector__confirmation">
+        Local variable name
+        <input v-model="linkName" class="companion-input" autocomplete="off" spellcheck="false" />
+      </label>
+      <label class="variable-inspector__confirmation">
+        Global Vault secret name
+        <input v-model="linkTarget" class="companion-input" autocomplete="off" spellcheck="false" />
+      </label>
+      <p v-if="linkNameTaken">
+        This name is already in use. Open its details to promote it or unlink it.
+      </p>
+      <div class="variable-inspector__actions">
+        <button
+          type="submit"
+          class="companion-button companion-button--primary"
+          :disabled="!canLink"
+        >
+          Create link
+        </button>
+        <button type="button" class="companion-button" @click="closeLink">Cancel</button>
+      </div>
+    </form>
+
+    <details v-if="!privacyMode && duplicateGroups?.length" class="variables__duplicates">
+      <summary>Duplicate values across projects · {{ duplicateGroups.length }}</summary>
+      <ul class="variables__duplicate-groups">
+        <li v-for="group in duplicateGroups" :key="group.group_id">
+          <strong>{{
+            group.members.some((member) => member.is_shared)
+              ? 'Global Vault match'
+              : 'Project copies'
+          }}</strong>
+          <ul class="variables__duplicate-members">
+            <li v-for="member in group.members" :key="member.secret_id">
+              <span
+                >{{ member.project_name }} / {{ member.profile_name }} /
+                <code>{{ member.name }}</code></span
+              >
+              <button
+                type="button"
+                class="companion-button"
+                :disabled="loading || mutationDisabled"
+                @click="reviewDuplicate(member, group)"
+              >
+                {{
+                  member.is_shared
+                    ? 'View in Global Vault'
+                    : rows.some((row) => row.id === member.secret_id)
+                      ? 'Review promotion'
+                      : 'Open secret'
+                }}
+              </button>
+            </li>
+          </ul>
+        </li>
+      </ul>
+    </details>
+    <p v-else-if="!privacyMode && duplicatesError" class="variables__updated" role="status">
+      Could not check for duplicate values. Refresh Secrets to try again.
+    </p>
 
     <AgentUnavailableBanner
       v-if="loadError"
@@ -338,6 +572,7 @@ function graceDetails(row: SecretRowMeta): string {
             <select v-model="filterState.source" aria-label="Filter by source">
               <option value="all">All sources</option>
               <option value="team">Shared</option>
+              <option value="shared-link">Shared link</option>
               <option value="user-local">My override</option>
               <option value="machine-local">This machine</option>
             </select>
@@ -384,7 +619,9 @@ function graceDetails(row: SecretRowMeta): string {
               class="variables__name"
               :title="displayName(row)"
               :aria-label="`Open metadata for ${displayName(row)}`"
-              @click="emit('select', row)"
+              @click="
+                row.source === 'shared-link' ? toggleDetails(row, $event) : emit('select', row)
+              "
             >
               {{ displayName(row) }}
             </button>
@@ -409,7 +646,15 @@ function graceDetails(row: SecretRowMeta): string {
             >
               {{ row.required ? 'Required' : 'Optional' }}
             </span>
-            <span class="variable-badge">v{{ row.currentVersion }}</span>
+            <span v-if="row.source !== 'shared-link'" class="variable-badge"
+              >v{{ row.currentVersion }}</span
+            >
+            <span v-else-if="!privacyMode && row.linkedTargetName" class="variable-badge">
+              Linked → <code>@shared/{{ row.linkedTargetName }}</code>
+            </span>
+            <span v-if="isShared && row.linkCount" class="variable-badge">
+              Used by {{ row.linkCount }} {{ row.linkCount === 1 ? 'project' : 'projects' }}
+            </span>
             <span
               v-if="row.hasDeprecatedGrace || row.deprecatedReferenceWarnings?.length"
               class="variable-badge variable-badge--grace"
@@ -495,10 +740,10 @@ function graceDetails(row: SecretRowMeta): string {
             aria-labelledby="variable-inspector-title"
           >
             <header class="variable-inspector__header">
-              <h3 id="variable-inspector-title">Secret details</h3>
+              <h3 id="variable-inspector-title" tabindex="-1">Secret details</h3>
               <div class="variables__actions">
                 <button
-                  v-if="canMutate && !privacyMode"
+                  v-if="canMutate && row.source !== 'shared-link'"
                   class="companion-button icon-label"
                   type="button"
                   @click="emit('rotate', row)"
@@ -506,6 +751,7 @@ function graceDetails(row: SecretRowMeta): string {
                   <AppIcon name="refresh" /> Rotate
                 </button>
                 <button
+                  v-if="row.source !== 'shared-link'"
                   class="companion-button icon-label"
                   type="button"
                   @click="emit('select', row)"
@@ -530,7 +776,7 @@ function graceDetails(row: SecretRowMeta): string {
                 </dd>
               </div>
               <div>
-                <dt>Rotated</dt>
+                <dt>{{ row.source === 'shared-link' ? 'Target rotated' : 'Rotated' }}</dt>
                 <dd>
                   <time v-if="row.rotatedAt" :datetime="row.rotatedAt" :title="row.rotatedAt">{{
                     formatTime(row.rotatedAt, 'utc')
@@ -566,8 +812,106 @@ function graceDetails(row: SecretRowMeta): string {
                 </li>
               </ul>
             </div>
+            <p v-if="row.source === 'shared-link'" class="variable-inspector__hint">
+              Rotate this secret in Global Vault to update every linked project.
+            </p>
+            <section
+              v-if="usagesTarget === row.id"
+              class="variable-inspector__usage"
+              aria-label="Linked projects"
+            >
+              <h4>Linked projects</h4>
+              <p v-if="usagesError" role="alert">
+                Could not load linked projects.
+                <button type="button" class="companion-button" @click="usagesReload++">
+                  Retry
+                </button>
+              </p>
+              <p v-else-if="usages === null" role="status">Loading linked projects…</p>
+              <ul v-else-if="usages.length">
+                <li v-for="usage in usages" :key="usage.link_id">
+                  {{ usage.project_name }} / {{ usage.profile_name }} →
+                  <code>{{ usage.local_name }}</code>
+                  <span v-if="usage.profile_dangerous" class="variable-badge variable-badge--grace"
+                    >Dangerous</span
+                  >
+                </li>
+              </ul>
+              <p v-else-if="usagesMissing">Link count changed. Refresh Secrets before deleting.</p>
+              <p v-else>No linked projects.</p>
+            </section>
             <div v-if="canAccessValues" class="variable-inspector__management">
-              <div v-if="!confirmingDelete" class="variable-inspector__actions">
+              <button
+                v-if="row.source === 'shared-link'"
+                type="button"
+                class="companion-button companion-button--danger"
+                :disabled="!canMutate"
+                @click="emit('unlink', row)"
+              >
+                Unlink
+              </button>
+              <form v-else-if="promoting && !privacyMode" @submit.prevent="promote(row)">
+                <p v-if="row.source === 'user-local'">
+                  Replace the local copy of <code>{{ row.name }}</code> with a live link to Global
+                  Vault.
+                </p>
+                <p v-else>
+                  Create a live link for <code>{{ row.name }}</code
+                  >. Locket keeps the
+                  {{ row.source === 'team' ? 'team-managed' : 'machine-local' }} copy.
+                </p>
+                <p
+                  v-if="
+                    rows.some(
+                      (entry) =>
+                        entry.name === row.name &&
+                        (entry.source === 'machine-local' ||
+                          (entry.source === 'user-local' && entry.id !== row.id)),
+                    )
+                  "
+                >
+                  A local override takes precedence over this link.
+                </p>
+                <p
+                  v-if="
+                    rows.some((entry) => entry.name === row.name && entry.source === 'shared-link')
+                  "
+                >
+                  This replaces the current link for <code>{{ row.name }}</code
+                  >.
+                </p>
+                <label class="variable-inspector__confirmation">
+                  Global Vault target name (optional)
+                  <input
+                    v-model="promoteTarget"
+                    class="companion-input"
+                    :placeholder="row.name"
+                    autocomplete="off"
+                    spellcheck="false"
+                  />
+                </label>
+                <p v-if="promoteTarget.trim() && !isValidSecretName(promoteTarget.trim())">
+                  Use up to 128 uppercase letters, digits, or underscores. Start with a letter or
+                  underscore.
+                </p>
+                <label>
+                  <input v-model="consolidateDuplicates" type="checkbox" />
+                  Also link matching duplicates in other unlocked projects
+                </label>
+                <div class="variable-inspector__actions">
+                  <button
+                    type="submit"
+                    class="companion-button companion-button--primary"
+                    :disabled="!canPromote"
+                  >
+                    Promote &amp; link
+                  </button>
+                  <button type="button" class="companion-button" @click="promoting = false">
+                    Cancel
+                  </button>
+                </div>
+              </form>
+              <div v-else-if="!confirmingDelete" class="variable-inspector__actions">
                 <button
                   v-if="!isShared"
                   type="button"
@@ -578,9 +922,18 @@ function graceDetails(row: SecretRowMeta): string {
                   Copy to Global Vault
                 </button>
                 <button
+                  v-if="!isShared"
+                  type="button"
+                  class="companion-button"
+                  :disabled="!canMutate"
+                  @click="startPromotion()"
+                >
+                  Promote &amp; link
+                </button>
+                <button
                   type="button"
                   class="companion-button companion-button--danger"
-                  :disabled="!canMutate"
+                  :disabled="!canMutate || usagesMissing"
                   @click="confirmingDelete = true"
                 >
                   Delete
@@ -591,8 +944,24 @@ function graceDetails(row: SecretRowMeta): string {
                   Delete <code>{{ displayName(row) }}</code
                   >?
                 </p>
-                <label v-if="dangerousProfile" class="variable-inspector__confirmation">
-                  <span>Type {{ profileLabel }} to confirm deletion.</span>
+                <template v-if="usages?.length">
+                  <p role="alert">
+                    Deleting this secret removes the live link from each variable below.
+                  </p>
+                  <ul class="variable-inspector__usage-list">
+                    <li v-for="usage in usages" :key="usage.link_id">
+                      {{ usage.project_name }} / {{ usage.profile_name }} →
+                      <code>{{ usage.local_name }}</code>
+                    </li>
+                  </ul>
+                </template>
+                <p v-if="conflictingConfirmation">
+                  Unlink the dangerous environments from their projects before deleting this secret.
+                </p>
+                <label v-else-if="expectedConfirmation" class="variable-inspector__confirmation">
+                  <span
+                    >Type <strong>{{ expectedConfirmation }}</strong> to confirm deletion.</span
+                  >
                   <input
                     v-model="deleteConfirmation"
                     class="companion-input"
@@ -609,7 +978,7 @@ function graceDetails(row: SecretRowMeta): string {
                     :disabled="!canDelete"
                     @click="confirmDelete(row)"
                   >
-                    Confirm delete
+                    {{ usages?.length ? 'Unlink all & delete' : 'Confirm delete' }}
                   </button>
                   <button type="button" class="companion-button" @click="cancelDelete">
                     Cancel
@@ -617,7 +986,7 @@ function graceDetails(row: SecretRowMeta): string {
                 </div>
               </template>
               <p v-if="privacyMode" class="variable-inspector__hint">
-                Turn off privacy mode to copy or delete a secret by name.
+                Turn off privacy mode to manage secrets by name.
               </p>
               <p v-if="mutationError?.id === row.id" class="variable-inspector__error" role="alert">
                 {{ mutationError.message }}
@@ -631,6 +1000,44 @@ function graceDetails(row: SecretRowMeta): string {
 </template>
 
 <style scoped>
+.variables__duplicates {
+  padding: 0.65rem 0.85rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+}
+.variables__duplicates summary {
+  cursor: pointer;
+  color: var(--accent);
+}
+.variables__duplicate-groups,
+.variables__duplicate-members {
+  display: grid;
+  gap: 0.4rem;
+  padding: 0;
+  list-style: none;
+}
+.variables__duplicate-members li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+.variable-inspector__usage h4,
+.variable-inspector__usage p {
+  margin: 0;
+}
+.variable-inspector__usage ul,
+.variable-inspector__usage-list {
+  padding-inline-start: 1.25rem;
+  margin: 0.35rem 0;
+  overflow-wrap: anywhere;
+}
+.variable-inspector__management form {
+  display: grid;
+  gap: 0.5rem;
+}
 .variables {
   display: grid;
   gap: 0.75rem;

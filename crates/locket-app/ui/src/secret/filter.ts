@@ -9,7 +9,7 @@
 
 import type { SecretRowMeta } from '../types/views';
 
-export type SecretSourceFilter = 'all' | 'team' | 'user-local' | 'machine-local';
+export type SecretSourceFilter = 'all' | SecretRowMeta['source'];
 export type SecretRequiredFilter = 'all' | 'required' | 'optional';
 export type SecretDeprecationFilter = 'all' | 'deprecated' | 'current';
 

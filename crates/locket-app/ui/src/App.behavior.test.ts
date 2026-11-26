@@ -162,6 +162,10 @@ async function nativeInvoke(command: string, args?: InvokeArgs): Promise<unknown
     case 'agent_list_policies':
     case 'agent_list_device_members':
       return { rows: [] };
+    case 'desktop_list_duplicates':
+      return { groups: [] };
+    case 'desktop_list_shared_usages':
+      return { usages: [] };
     case 'agent_list_audit':
       return {
         rows: [],
@@ -392,6 +396,162 @@ describe('desktop environment, secret, and command actions', () => {
     expect(
       findNode(app.root, (node) => node.text.trim() === 'Copied TOKEN to Global Vault.'),
     ).toBeDefined();
+  });
+
+  it('unlinks a project alias only after dangerous-profile approval', async () => {
+    let unlinked = false;
+    overrides.set('agent_list_secrets', () => ({
+      rows: unlinked
+        ? []
+        : [
+            {
+              ...row,
+              source: 'shared-link',
+              linked_target_secret_id: 'global',
+              linked_target_name: 'GLOBAL_TOKEN',
+            },
+          ],
+    }));
+    overrides.set('agent_read_config', () => ({
+      privacy_redact_names: false,
+      agent_unlock_ttl: '15m',
+      user_verification_required_for: {},
+      dangerous_profile: { dangerous: true },
+    }));
+    overrides.set('desktop_unlink_secret', () => {
+      unlinked = true;
+      return { local_name: 'TOKEN', unlinked };
+    });
+    const app = await connectedApp();
+    const dialog = byProp(app.root, 'aria-labelledby', 'dangerous-action-title');
+    Object.assign(dialog, {
+      open: false,
+      returnValue: '',
+      showModal() {
+        this.open = true;
+      },
+      close(result = '') {
+        this.open = false;
+        this.returnValue = result;
+        dialog.dispatchEvent(new Event('close'));
+      },
+    });
+    await inspectSecret(app);
+    expect(nodeText(app.root)).toContain('Linked → @shared/GLOBAL_TOKEN');
+    expect(button(app, 'Rotate')).toBeUndefined();
+    await clickRendered(renderedButton(app.root, 'Unlink'));
+    await clickRendered(renderedButton(dialog, 'Cancel'));
+    expect(calls).not.toContain('desktop_unlink_secret');
+    await clickRendered(renderedButton(app.root, 'Unlink'));
+    await input(byProp(dialog, 'id', 'dangerous-action-profile'), a.profile_name);
+    await submit(dialog);
+    expect(invoke).toHaveBeenCalledWith('desktop_unlink_secret', {
+      request: {
+        project_id: a.project_id,
+        profile_id: a.profile_id,
+        local_name: 'TOKEN',
+        confirmation: a.profile_name,
+      },
+    });
+    expect(nodeText(app.root)).toContain('Removed the Global Vault link for TOKEN.');
+    expect(nodeText(app.root)).not.toContain('Linked → @shared/GLOBAL_TOKEN');
+  });
+
+  it('promotes an alias and consolidates matching duplicates from the Secrets panel', async () => {
+    let promoted = false;
+    const local = { ...row, source: 'user-local' as const };
+    overrides.set('agent_list_secrets', () => ({
+      rows: [
+        promoted ? { ...row, source: 'shared-link', linked_target_name: 'GLOBAL_TOKEN' } : local,
+      ],
+    }));
+    const member = {
+      secret_id: row.id,
+      name: row.name,
+      source: local.source,
+      project_id: a.project_id,
+      project_name: a.project_name,
+      is_shared: false,
+      profile_id: a.profile_id,
+      profile_name: a.profile_name,
+      profile_dangerous: false,
+      current_version: 1,
+      updated_at: 0,
+    };
+    overrides.set('desktop_list_duplicates', () => ({
+      groups: promoted
+        ? []
+        : [
+            {
+              group_id: 'dup-1',
+              members: [
+                member,
+                {
+                  ...member,
+                  secret_id: 'global',
+                  name: 'GLOBAL_TOKEN',
+                  project_id: shared.project_id,
+                  project_name: shared.project_name,
+                  is_shared: true,
+                  profile_id: shared.profile_id,
+                  profile_name: shared.profile_name,
+                },
+                {
+                  ...member,
+                  secret_id: 'other',
+                  name: 'ALT_TOKEN',
+                  project_id: b.project_id,
+                  project_name: b.project_name,
+                  profile_id: b.profile_id,
+                },
+              ],
+            },
+          ],
+    }));
+    overrides.set('desktop_copy_secret_to_shared', () => {
+      promoted = true;
+      return {
+        target_project_id: shared.project_id,
+        target_profile_id: shared.profile_id,
+        secret_name: 'GLOBAL_TOKEN',
+        version: 1,
+        action: 'reuse',
+        linked: true,
+        consolidated_count: 1,
+        skipped_locked_count: 1,
+      };
+    });
+    vi.stubGlobal('document', { getElementById: () => null });
+    const { root, state } = await connectedApp();
+    state.selectView('secrets');
+    await settle();
+    expect(nodeText(root)).toContain('Duplicate values across projects');
+    expect(nodeText(root)).toContain('Global Vault match');
+    expect(nodeText(root)).toContain('B / development / ALT_TOKEN');
+    await clickRendered(renderedButton(root, 'Review promotion'));
+    const inspector = byProp(root, 'id', 'variable-inspector');
+    expect(control(inspector, 'Global Vault target name').value).toBe('GLOBAL_TOKEN');
+    await input(control(inspector, 'Global Vault target name'), 'invalid-alias');
+    expect(renderedButton(inspector, 'Promote & link').props.disabled).toBe(true);
+    await input(control(inspector, 'Global Vault target name'), 'GLOBAL_TOKEN');
+    await check(control(inspector, 'Also link matching duplicates'));
+    await submit(inspector);
+    expect(invoke).toHaveBeenCalledWith('desktop_copy_secret_to_shared', {
+      request: {
+        from_project_id: a.project_id,
+        from_profile_id: a.profile_id,
+        secret_name: 'TOKEN',
+        source: 'user-local',
+        target_name: 'GLOBAL_TOKEN',
+        replace_with_link: true,
+        consolidate_duplicates: true,
+      },
+    });
+    expect(nodeText(root)).toContain(
+      'Linked 1 additional copy. Skipped 1 locked or dangerous copy.',
+    );
+    expect(nodeText(root)).not.toContain('Duplicate values across projects');
+    expect(nodeText(root)).toContain('Linked → @shared/GLOBAL_TOKEN');
   });
 
   it.each([
@@ -1430,6 +1590,100 @@ describe('Global Vault workspace actions', () => {
     expect(app.state.activeContext).toEqual(shared);
   }
 
+  it('reviews each live usage and requires fresh approval before unlinking all and deleting', async () => {
+    const row = {
+      id: 'global-token',
+      profile_id: shared.profile_id,
+      source: 'user-local',
+      name: 'GLOBAL_TOKEN',
+      created_at: 0,
+      updated_at: 0,
+      current_version: 1,
+      link_count: 2,
+    };
+    const usage = {
+      link_id: 'link-dev',
+      project_id: a.project_id,
+      project_name: 'API',
+      profile_id: a.profile_id,
+      profile_name: 'development',
+      profile_dangerous: false,
+      local_name: 'API_TOKEN',
+      target_secret_id: row.id,
+      target_secret_name: row.name,
+      created_at: 0,
+      updated_at: 0,
+    };
+    const usages = [
+      usage,
+      {
+        ...usage,
+        link_id: 'link-prod',
+        project_name: 'Jobs',
+        profile_name: 'production',
+        profile_dangerous: true,
+        local_name: 'JOB_TOKEN',
+      },
+    ];
+    let deleted = false;
+    overrides.set('desktop_list_projects', () => [a, shared]);
+    overrides.set('agent_list_secrets', () => ({
+      rows: !deleted && nativeSelection?.project_id === shared.project_id ? [row] : [],
+    }));
+    overrides.set('desktop_list_shared_usages', () => ({ usages: [...usages] }));
+    overrides.set('desktop_delete_secret', () => {
+      deleted = true;
+      return { deleted, unlinked_count: usages.length };
+    });
+    Object.assign(windowEvents, { matchMedia: () => ({ matches: false }) });
+    const app = await connectedApp();
+    app.state.selectView('secrets');
+    await switchToShared(app);
+    await clickRendered(renderedButton(app.root, 'Details for GLOBAL_TOKEN'));
+    const inspector = byProp(app.root, 'id', 'variable-inspector');
+    expect(nodeText(app.root)).toContain('Used by 2 projects');
+    expect(nodeText(inspector)).toContain('Linked projects');
+    expect(nodeText(inspector)).toContain('API / development → API_TOKEN');
+    expect(nodeText(inspector)).toContain('Jobs / production → JOB_TOKEN');
+
+    await clickRendered(renderedButton(inspector, 'Delete'));
+    const warning = byProp(inspector, 'role', 'alert');
+    expect(nodeText(warning)).toContain('removes the live link');
+    expect(renderedButton(inspector, 'Unlink all & delete').props.disabled).toBe(true);
+    const confirmation = byProp(inspector, 'data-testid', 'secret-delete-confirmation');
+    await input(confirmation, 'production');
+    usages.push({
+      ...usage,
+      link_id: 'third',
+      project_name: 'Tasks',
+      profile_name: 'release',
+      profile_dangerous: true,
+      local_name: 'TASK_TOKEN',
+    });
+    await clickRendered(renderedButton(inspector, 'Unlink all & delete'));
+    expect(calls).not.toContain('desktop_delete_secret');
+    expect(nodeText(app.root)).toContain('Linked projects changed');
+    const refreshed = byProp(app.root, 'id', 'variable-inspector');
+    await clickRendered(renderedButton(refreshed, 'Delete'));
+    expect(nodeText(refreshed)).toContain('Tasks / release → TASK_TOKEN');
+    const renewed = byProp(refreshed, 'data-testid', 'secret-delete-confirmation');
+    await input(renewed, 'production');
+    expect(renderedButton(refreshed, 'Unlink all & delete').props.disabled).toBe(true);
+    await input(renewed, 'GLOBAL_TOKEN');
+    await clickRendered(renderedButton(refreshed, 'Unlink all & delete'));
+    expect(invoke).toHaveBeenCalledWith('desktop_delete_secret', {
+      request: {
+        project_id: shared.project_id,
+        profile_id: shared.profile_id,
+        secret_name: 'GLOBAL_TOKEN',
+        source: 'user-local',
+        unlink_all: true,
+        confirmation: 'GLOBAL_TOKEN',
+      },
+    });
+    expect(nodeText(app.root)).toContain('Removed 3 links.');
+  });
+
   it('clears a project import path and requires an absolute env path in Global Vault', async () => {
     overrides.set('desktop_list_projects', () => [a, shared]);
     const app = await connectedApp();
@@ -1593,6 +1847,54 @@ describe('connected desktop journeys through the preview fixture agent', () => {
     expect(app.state.activeContext?.project_id).toBe('acme-api');
     return app;
   }
+
+  it('checks .env duplicates without importing, then sends per-key link and promote choices', async () => {
+    const { root, state } = await openFixtureProject();
+    state.selectView('secrets');
+    await settle();
+    const view = byProp(root, 'aria-labelledby', 'secret-metadata-list-heading');
+    await clickRendered(renderedButton(view, 'Import .env'));
+    const panel = byProp(root, 'aria-labelledby', 'import-heading');
+    await clickRendered(renderedButton(panel, 'Check for duplicates'));
+    expect(invoke).toHaveBeenCalledWith('desktop_import_env', {
+      request: {
+        project_id: 'acme-api',
+        path: '/Users/justin/Workspaces/acme-api/.env',
+        overwrite: false,
+        literal: false,
+        confirmation: undefined,
+        dry_run: true,
+      },
+    });
+    let choices = byProp(panel, 'aria-label', 'Duplicate check results');
+    expect(nodeText(choices)).toContain('@shared / default / POSTMARK_TOKEN');
+    expect(nodeText(choices)).toContain('web-app / dev / SENTRY_DSN');
+    expect(nodeText(choices)).not.toContain('preview-imported-value');
+    expect(nodeText(view)).not.toContain('REDIS_URL');
+    await check(control(choices, 'Link to @shared/POSTMARK_TOKEN'));
+    await input(control(panel, 'File path'), 'service.env');
+    expect(
+      findNode(panel, (node) => node.props['aria-label'] === 'Duplicate check results'),
+    ).toBeUndefined();
+    await clickRendered(renderedButton(panel, 'Check for duplicates'));
+    choices = byProp(panel, 'aria-label', 'Duplicate check results');
+    await check(control(choices, 'Link to @shared/POSTMARK_TOKEN'));
+    await check(control(choices, 'Promote to @shared/ERROR_TRACKING_DSN'));
+    await submit(panel);
+    expect(invoke).toHaveBeenCalledWith('desktop_import_env', {
+      request: {
+        project_id: 'acme-api',
+        path: 'service.env',
+        overwrite: false,
+        literal: false,
+        confirmation: undefined,
+        link_to_shared: { MAIL_TOKEN: 'POSTMARK_TOKEN' },
+        promote_to_shared: { ERROR_TRACKING_DSN: 'ERROR_TRACKING_DSN' },
+      },
+    });
+    expect(nodeText(root)).toContain('Imported 1, linked 1, promoted 1');
+    expect(nodeText(root)).toContain('Linked → @shared/ERROR_TRACKING_DSN');
+  });
 
   it('connects monitoring, device, audit and version views to project-scoped metadata', async () => {
     const app = await openFixtureProject();
@@ -2021,7 +2323,7 @@ describe('connected desktop journeys through the preview fixture agent', () => {
     const dashboard = byProp(root, 'aria-labelledby', 'project-dashboard-heading');
     expect(nodeText(dashboard)).toContain('Setup complete');
     expect(nodeText(dashboard)).toContain('Failed or stale runs: 1');
-    expect(nodeText(dashboard)).toContain('Secrets 6 4 required');
+    expect(nodeText(dashboard)).toContain('Secrets 7 4 required');
     expect(nodeText(dashboard)).toContain('Recorded runs 3 1 failed/stale');
     const metric = (label: string) =>
       findNode(dashboard, (node) => node.tag === 'button' && nodeText(node).startsWith(label))!;

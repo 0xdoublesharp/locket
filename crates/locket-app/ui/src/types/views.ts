@@ -6,11 +6,16 @@ import type { DangerousProfileSetting, EffectiveUserVerificationSettings } from 
 
 export type LockState = 'locked' | 'unlocked' | 'unknown';
 
+export type PersistedSecretSource = 'team' | 'user-local' | 'machine-local';
+
 export interface SecretRowMeta {
   id: string;
   name: string;
   alias?: string;
-  source: 'team' | 'user-local' | 'machine-local';
+  source: PersistedSecretSource | 'shared-link';
+  linkedTargetSecretId?: string | null;
+  linkedTargetName?: string | null;
+  linkCount?: number;
   required: boolean;
   optional: boolean;
   ownerLabel?: string;
