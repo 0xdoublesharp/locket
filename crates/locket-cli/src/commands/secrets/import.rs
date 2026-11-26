@@ -218,28 +218,14 @@ fn import_cli(
         })?;
     refresh_import_project_files(context, root.as_deref())?;
     if let Some(policy) = options.archive {
-        report.archive_blocked_reason = report.archive_blocker(policy);
-        if report.archive_blocked_reason.is_none() {
-            match archive_source {
-                Some((dir, file, original)) => {
-                    report.archive_source(
-                        &path,
-                        file,
-                        &original,
-                        &absolutize(&context.cwd, dir),
-                    )?;
-                }
-                None => {
-                    report.delete_env = "would-archive";
-                    report.archive_scope_note = Some(
-                        "checks vault values only; confirm no Docker/Compose files or other tools still read this file before archiving"
-                            .to_owned(),
-                    );
-                    report.archive_consumer_warnings =
-                        detect_compose_dotenv_consumers(&path, root.as_deref());
-                }
-            }
-        }
+        finalize_archive_action(
+            &mut report,
+            policy,
+            archive_source,
+            &context.cwd,
+            &path,
+            root.as_deref(),
+        )?;
     }
     if selection.json {
         return Ok(serde_json::to_value(report)?);
@@ -279,6 +265,30 @@ fn refresh_import_project_files(
         let root_context = RuntimeContext { cwd: root.to_owned(), ..context.clone() };
         refresh_example_for_project_if_enabled(&root_context);
         ensure_gitignore(&root_context.cwd)?;
+    }
+    Ok(())
+}
+
+fn finalize_archive_action(
+    report: &mut ImportReport,
+    policy: ArchivePolicy,
+    archive_source: Option<(&PathBuf, fs::File, fs::Metadata)>,
+    cwd: &Path,
+    path: &Path,
+    root: Option<&Path>,
+) -> Result<(), CliError> {
+    report.archive_blocked_reason = report.archive_blocker(policy);
+    if report.archive_blocked_reason.is_none() {
+        if let Some((dir, file, original)) = archive_source {
+            report.archive_source(path, file, &original, &absolutize(cwd, dir))?;
+        } else {
+            report.delete_env = "would-archive";
+            report.archive_scope_note = Some(
+                "checks vault values only; confirm no Docker/Compose files or other tools still read this file before archiving"
+                    .to_owned(),
+            );
+            report.archive_consumer_warnings = detect_compose_dotenv_consumers(path, root);
+        }
     }
     Ok(())
 }

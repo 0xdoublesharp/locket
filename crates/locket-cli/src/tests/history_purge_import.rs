@@ -1094,6 +1094,7 @@ fn import_archive_keeps_empty_source() -> Result<(), Box<dyn std::error::Error>>
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn import_archive_if_matching_previews_and_archives_an_already_imported_file()
 -> Result<(), Box<dyn std::error::Error>> {
     let project = tempdir()?;
@@ -1163,7 +1164,7 @@ fn import_archive_if_matching_previews_and_archives_an_already_imported_file()
     );
     assert!(report.get("archive_consumer_warnings").is_none());
     fs::write(
-        dir.path().join("docker-compose.yml"),
+        project.path().join("docker-compose.yml"),
         "services:\n  web:\n    env_file:\n      - .env\n",
     )?;
     let (code, compose_report) = run_env_json(&context, &preview, &canaries)?;
@@ -1174,7 +1175,7 @@ fn import_archive_if_matching_previews_and_archives_an_already_imported_file()
             .any(|item| item.as_str().is_some_and(|s| s.contains("docker-compose.yml")))),
         "expected docker-compose warning: {compose_report}"
     );
-    fs::remove_file(dir.path().join("docker-compose.yml"))?;
+    fs::remove_file(project.path().join("docker-compose.yml"))?;
     assert!(report.get("archive_blocked_reason").is_none());
     assert!(report.get("mismatched_names").is_none());
     assert!(report.get("archived_to").is_none());
