@@ -464,22 +464,20 @@ mod tests {
     fn docker_canary_values_stay_out_of_argv_and_metadata() -> Result<(), DockerError> {
         let canary = "lk-canary-docker-value-1234567890abcdef";
         let argv = vec!["docker".to_owned(), "run".to_owned(), "--rm".to_owned(), "app".to_owned()];
+        let compose_argv = ["docker".to_owned(), "compose".to_owned(), "up".to_owned()];
         let locket_env = env(&[("DATABASE_URL", canary), ("API_TOKEN", "safe-value")]);
 
         let run_plan = prepare_docker_run(&argv, &EnvMap::new(), &locket_env, None, false)?;
-        let compose_plan = prepare_compose(
-            &["docker".to_owned(), "compose".to_owned(), "up".to_owned()],
-            &EnvMap::new(),
-            &locket_env,
-            None,
-            false,
-        )?;
+        let compose_plan =
+            prepare_compose(&compose_argv, &EnvMap::new(), &locket_env, None, false)?;
 
         let safe_surfaces = [
             run_plan.argv.join(" "),
             run_plan.injected_names.join(","),
             compose_plan.argv.join(" "),
             compose_plan.injected_names.join(","),
+            format!("{run_plan:?}"),
+            format!("{compose_plan:?}"),
         ];
         for surface in safe_surfaces {
             assert!(!surface.contains(canary));

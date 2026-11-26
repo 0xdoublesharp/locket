@@ -27,6 +27,33 @@ pub(crate) use secret_acl::glob_matches;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn run_redaction_accepts_the_documented_modes_and_rejects_unknown_config() {
+        use super::{OutputRedaction, PolicyDocument, PolicyParseError};
+
+        let expected = [OutputRedaction::Auto, OutputRedaction::Always, OutputRedaction::Never];
+        for (value, mode) in OutputRedaction::VALUES.iter().zip(expected) {
+            let source = format!("schema_version = 1\n[run]\nredact_output = \"{value}\"");
+            let policy = PolicyDocument::from_toml_str(&source);
+            assert_eq!(policy.map(|policy| policy.output_redaction).ok(), Some(Some(mode)));
+        }
+        for run in [
+            "run = true",
+            "[run]\nredact_output = 1",
+            "[run]\nredact_output = 'unknown'",
+            "[run]\nredact_ouput = 'always'",
+        ] {
+            assert!(matches!(
+                PolicyDocument::from_toml_str(&format!("schema_version = 1\n{run}")),
+                Err(PolicyParseError::InvalidRunRedaction)
+            ));
+        }
+        assert!(matches!(
+            PolicyDocument::from_toml_str("schema_version = 1\n[run]"),
+            Ok(policy) if policy.output_redaction.is_none()
+        ));
+    }
+
     use std::error::Error;
 
     use super::{

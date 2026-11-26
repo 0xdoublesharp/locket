@@ -92,6 +92,54 @@ fn discovery_returns_ordered_cross_project_metadata_without_values() -> Result<(
 }
 
 #[test]
+fn redacted_discovery_filters_only_by_public_metadata() -> Result<(), Box<dyn Error>> {
+    use locket_core::privacy_alias;
+
+    let fixture = open_initialized_store()?;
+    let store = &fixture.store;
+    seed_discovery(store)?;
+    let profile = privacy_alias("profile", "f1");
+    let secret = privacy_alias("secret", "API_KEY");
+    let filter = SecretDiscoveryFilter {
+        project: Some("p1".into()),
+        profile: Some(profile.clone()),
+        query: Some(profile.to_uppercase()),
+        name_glob: Some(secret.clone()),
+        limit: Some(1),
+        ..SecretDiscoveryFilter::default()
+    };
+    let matches = store.discover_redacted_secrets(&filter)?;
+    let [record] = matches.as_slice() else { return Err("expected one redacted result".into()) };
+    assert_eq!(record.secret_id, "machine");
+    assert_eq!(record.project_name, privacy_alias("project", "p1"));
+    assert_eq!(record.profile_name, profile);
+    assert_eq!(record.name, secret);
+    assert_eq!(
+        record.project_roots,
+        [privacy_alias("root", "/first"), privacy_alias("root", "/second"),]
+    );
+    assert_eq!((record.description.as_deref(), record.owner.as_deref()), (None, None));
+    assert_eq!(record.tags, Vec::<String>::new());
+
+    for hidden in [
+        SecretDiscoveryFilter { profile: Some("dev".into()), ..SecretDiscoveryFilter::default() },
+        SecretDiscoveryFilter { project: Some("Acme".into()), ..SecretDiscoveryFilter::default() },
+        SecretDiscoveryFilter {
+            query: Some("Équipe Infra".into()),
+            ..SecretDiscoveryFilter::default()
+        },
+        SecretDiscoveryFilter {
+            owner: Some("Équipe Infra".into()),
+            ..SecretDiscoveryFilter::default()
+        },
+        SecretDiscoveryFilter { tag: Some("OnCall".into()), ..SecretDiscoveryFilter::default() },
+    ] {
+        assert_eq!(store.discover_redacted_secrets(&hidden)?, []);
+    }
+    Ok(())
+}
+
+#[test]
 fn discovery_filters_exact_selectors_and_case_insensitive_text() -> Result<(), Box<dyn Error>> {
     let fixture = open_initialized_store()?;
     let store = &fixture.store;

@@ -586,7 +586,7 @@ impl Store {
              JOIN projects p ON p.id = s.project_id
              JOIN profiles pr ON pr.id = s.profile_id
              WHERE lvf.dedup_tag = ?1
-             ORDER BY CASE WHEN s.project_id LIKE 'lk_proj_shared_%' THEN 0 ELSE 1 END,
+             ORDER BY CASE WHEN s.project_id GLOB 'lk_proj_shared_*' THEN 0 ELSE 1 END,
                       p.name, pr.name, s.name, s.source",
         )?;
         let rows = statement
@@ -625,7 +625,7 @@ impl Store {
                HAVING COUNT(*) >= 2
              )
              ORDER BY lvf.dedup_tag,
-                      CASE WHEN s.project_id LIKE 'lk_proj_shared_%' THEN 0 ELSE 1 END,
+                      CASE WHEN s.project_id GLOB 'lk_proj_shared_*' THEN 0 ELSE 1 END,
                       p.name, pr.name, s.name, s.source",
         )?;
         let mut groups: BTreeMap<[u8; 32], Vec<DuplicateSecretMemberRecord>> = BTreeMap::new();

@@ -225,15 +225,17 @@ fn find_after<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
         let start = search_from + relative;
         let end = start + marker.len();
 
-        if !preceded_by_comment_prefix(line, start) {
+        let rest = &line[end..];
+        let incomplete_block_end = marker == SUPPRESS_BLOCK_END_MARKER
+            && !rest.is_empty()
+            && !rest.starts_with(char::is_whitespace)
+            && !rest.starts_with("-->");
+        if !preceded_by_comment_prefix(line, start) || incomplete_block_end {
             search_from = end;
             continue;
         }
 
-        // For block-end (no trailing reason) the next char may be EOL or whitespace;
-        // for the other markers ":" is part of the marker so the next char is the
-        // start of the reason. We do not need to enforce a delimiter beyond marker.
-        return Some(&line[end..]);
+        return Some(rest);
     }
     None
 }
@@ -344,6 +346,19 @@ mod tests {
             parse_suppression_map(text).err(),
             Some(SuppressionParseError::UnclosedBlock { line: 1 })
         );
+    }
+
+    #[test]
+    fn block_end_requires_a_complete_marker() -> Result<(), Box<dyn Error>> {
+        let source = "<!-- locket-suppress-block-start: documented fixture -->\n\
+                      # locket-suppress-block-ending\n\
+                      fixture data\n\
+                      <!-- locket-suppress-block-end-->\n\
+                      outside";
+        let map = parse_suppression_map(source)?;
+        assert_eq!(map.reason_for_line(3), Some("documented fixture"));
+        assert_eq!(map.reason_for_line(5), None);
+        Ok(())
     }
 
     #[test]

@@ -215,31 +215,29 @@ impl Store {
             let tags = tags.iter().map(|tag| Value::String(tag.clone())).collect::<Vec<_>>();
             canonical_json_string(Some(&Value::Array(tags)))
         });
-        let transaction = self.connection.unchecked_transaction()?;
-        transaction.execute(
-            "UPDATE secrets
+        self.with_atomic_connection_write(|connection| {
+            let changed = connection.execute(
+                "UPDATE secrets
              SET description = COALESCE(?2, description),
                  owner = COALESCE(?3, owner),
                  tags_json = COALESCE(?4, tags_json),
                  required = COALESCE(?5, required),
                  updated_at = COALESCE(?6, updated_at)
              WHERE id = ?1 AND state = 'active'",
-            params![
-                secret_id,
-                update.description,
-                update.owner,
-                tags_json.as_deref(),
-                update.required,
-                update.updated_at,
-            ],
-        )?;
-        let changed = transaction.changes() == 1;
-        if changed {
-            append_optional_audit(&transaction, update.audit)?;
-        }
-        transaction.commit()?;
-
-        Ok(changed)
+                params![
+                    secret_id,
+                    update.description,
+                    update.owner,
+                    tags_json.as_deref(),
+                    update.required,
+                    update.updated_at,
+                ],
+            )? == 1;
+            if changed {
+                append_optional_audit(connection, update.audit)?;
+            }
+            Ok(changed)
+        })
     }
 
     /// Rotates a secret by deprecating the current version and inserting the new current version.
@@ -635,11 +633,9 @@ impl Store {
         deleted_at: i64,
         audit: Option<AuditContext<'_>>,
     ) -> Result<(), StoreError> {
-        let transaction = self.connection.unchecked_transaction()?;
-        tombstone(&transaction, id, deleted_at, None, audit)?;
-        transaction.commit()?;
-
-        Ok(())
+        self.with_atomic_connection_write(|connection| {
+            tombstone(connection, id, deleted_at, None, audit)
+        })
     }
 
     /// Tombstones the selected active version and appends its audit row atomically.

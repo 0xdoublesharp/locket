@@ -91,3 +91,33 @@ fn recovery_container_rejects_corruption_and_profile_mismatch()
     assert_invalid(decode_recovery_state(&mismatched), "kdf profile mismatch");
     Ok(())
 }
+
+#[test]
+fn recovery_envelope_requires_canonical_field_names_and_no_trailing_bytes()
+-> Result<(), PlatformError> {
+    let valid = RecoveryEnvelope {
+        kdf_profile_id: "kdf_test".into(),
+        created_at_unix_nanos: -19,
+        entries: vec![RecoveryEnvelopeEntry {
+            entry_kind: "master_key".into(),
+            entry_id: "device".into(),
+            nonce: [3; NONCE_LEN],
+            ciphertext: vec![4; 48],
+        }],
+    }
+    .serialize()?;
+    for field in [b"kdf_profile_id".as_slice(), b"entry_kind", b"entry_id"] {
+        let Some(offset) = valid.windows(field.len()).position(|bytes| bytes == field) else {
+            return Err(PlatformError::InvalidRecoveryEnvelope(
+                "test fixture missing field".into(),
+            ));
+        };
+        let mut invalid = valid.clone();
+        invalid[offset] = b'X';
+        assert_invalid(RecoveryEnvelope::deserialize(&invalid), "unexpected field name");
+    }
+    let mut trailing = valid;
+    trailing.push(0);
+    assert_invalid(RecoveryEnvelope::deserialize(&trailing), "trailing envelope bytes");
+    Ok(())
+}

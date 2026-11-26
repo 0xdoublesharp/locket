@@ -7,7 +7,7 @@
 //! when dropped. The file is formatted as `KEY=VALUE\n` lines so it can be
 //! consumed by `docker run --env-file <path>` and equivalents.
 
-use std::fs;
+use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -61,6 +61,7 @@ pub const fn secure_erase_supported() -> bool {
 pub struct EphemeralEnvFile {
     parent: PathBuf,
     path: PathBuf,
+    file: Option<File>,
     cleaned: bool,
 }
 
@@ -92,14 +93,15 @@ impl EphemeralEnvFile {
         if self.cleaned {
             return Ok(());
         }
-        if secure_erase_supported() && self.path.exists() {
-            zero_fill_then_remove(&self.path)?;
-        } else if self.path.exists() {
-            fs::remove_file(&self.path)?;
-        }
-        if self.parent.exists() {
-            fs::remove_dir(&self.parent)?;
-        }
+        let file = self.file.take();
+        #[cfg(unix)]
+        let overwrite = file.map_or(Ok(()), |mut file| zero_fill(&mut file));
+        #[cfg(not(unix))]
+        drop(file);
+        ignore_not_found(fs::remove_file(&self.path))?;
+        #[cfg(unix)]
+        overwrite?;
+        ignore_not_found(fs::remove_dir(&self.parent))?;
         self.cleaned = true;
         Ok(())
     }
@@ -131,14 +133,17 @@ pub fn write_ephemeral_env_file(
 fn write_ephemeral_env_file_with(
     env: &EnvMap,
     parent_root: &Path,
-    write: impl FnOnce(&Path, &EnvMap) -> Result<(), EphemeralEnvFileError>,
+    write: impl FnOnce(&mut File, &EnvMap) -> Result<(), EphemeralEnvFileError>,
 ) -> Result<EphemeralEnvFile, EphemeralEnvFileError> {
     validate_env(env)?;
 
     let parent = create_parent_dir(parent_root)?;
     let path = parent.join("env");
-    let handle = EphemeralEnvFile { parent, path, cleaned: false };
-    write(&handle.path, env)?;
+    let mut handle = EphemeralEnvFile { parent, path, file: None, cleaned: false };
+    let file = create_env_file(&handle.path)?;
+    write(handle.file.insert(file), env)?;
+    #[cfg(not(unix))]
+    drop(handle.file.take());
     Ok(handle)
 }
 
@@ -190,11 +195,17 @@ fn unique_parent_path(root: &Path) -> PathBuf {
     root.join(format!("locket-env-{pid}-{nanos}-{count}"))
 }
 
-#[cfg(unix)]
-fn write_env_file(path: &Path, env: &EnvMap) -> Result<(), EphemeralEnvFileError> {
+fn create_env_file(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
-    let mut file =
-        fs::OpenOptions::new().create_new(true).write(true).mode(FILE_MODE).open(path)?;
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(FILE_MODE);
+    options.open(path)
+}
+
+fn write_env_file(file: &mut File, env: &EnvMap) -> Result<(), EphemeralEnvFileError> {
     for (name, value) in env {
         writeln!(file, "{name}={}", value.as_str())?;
     }
@@ -202,44 +213,24 @@ fn write_env_file(path: &Path, env: &EnvMap) -> Result<(), EphemeralEnvFileError
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn write_env_file(path: &Path, env: &EnvMap) -> Result<(), EphemeralEnvFileError> {
-    let mut file = fs::OpenOptions::new().create_new(true).write(true).open(path)?;
-    for (name, value) in env {
-        writeln!(file, "{name}={}", value.as_str())?;
+fn ignore_not_found(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
     }
-    file.flush()?;
-    Ok(())
 }
 
 #[cfg(unix)]
-fn zero_fill_then_remove(path: &Path) -> Result<(), EphemeralEnvFileError> {
-    use std::io::Read;
-    let len = match fs::metadata(path) {
-        Ok(metadata) => metadata.len(),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    let overwrite = (|| -> io::Result<()> {
-        if len == 0 {
-            return Ok(());
-        }
-        let mut file = fs::OpenOptions::new().write(true).open(path)?;
-        io::copy(&mut io::repeat(0).take(len), &mut file)?;
-        file.flush()?;
-        Ok(())
-    })();
-    // Overwriting is best effort. Even when it fails, attempt to unlink the
-    // plaintext and report the overwrite error after deletion has succeeded.
-    fs::remove_file(path)?;
-    overwrite?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn zero_fill_then_remove(path: &Path) -> Result<(), EphemeralEnvFileError> {
-    fs::remove_file(path)?;
-    Ok(())
+fn zero_fill(file: &mut File) -> io::Result<()> {
+    use std::io::{Read, Seek};
+    // Use the descriptor for the file we created. The child can replace the
+    // directory entry, which must never redirect this overwrite.
+    let len = file.metadata()?.len();
+    if len != 0 {
+        file.rewind()?;
+        io::copy(&mut io::repeat(0).take(len), file)?;
+    }
+    file.flush()
 }
 
 #[cfg(test)]
@@ -382,6 +373,30 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_preserves_unrelated_files_when_the_env_path_changes()
+    -> Result<(), EphemeralEnvFileError> {
+        use std::io::Read;
+
+        let directory = tempfile::tempdir()?;
+        let unrelated = directory.path().join("unrelated");
+        fs::write(&unrelated, b"existing content")?;
+        let mut handle =
+            write_ephemeral_env_file(&make_env(&[("KEY", "fixture")]), directory.path())?;
+        let mut original = File::open(handle.path())?;
+        fs::remove_file(handle.path())?;
+        std::os::unix::fs::symlink(&unrelated, handle.path())?;
+
+        handle.cleanup()?;
+        let mut wiped = Vec::new();
+        original.read_to_end(&mut wiped)?;
+        assert_eq!(wiped, vec![0; b"KEY=fixture\n".len()]);
+        assert_eq!(fs::read(unrelated)?, b"existing content");
+        assert!(!handle.parent_dir().exists());
+        Ok(())
+    }
+
     #[test]
     fn cleanup_removes_the_directory_after_empty_or_missing_file()
     -> Result<(), EphemeralEnvFileError> {
@@ -403,15 +418,14 @@ mod tests {
     fn secure_cleanup_distinguishes_absence_from_invalid_parent()
     -> Result<(), EphemeralEnvFileError> {
         let mut handle = write_ephemeral_env_file(&EnvMap::new(), &temp_root()?)?;
-        let absent = handle.parent_dir().join("missing");
-        zero_fill_then_remove(&absent)?;
-
-        let invalid = handle.path().join("cannot-have-a-child");
+        let path = handle.path().to_owned();
+        handle.path = path.join("cannot-have-a-child");
         assert!(matches!(
-            zero_fill_then_remove(&invalid),
+            handle.cleanup(),
             Err(EphemeralEnvFileError::Io(error)) if error.kind() == io::ErrorKind::NotADirectory
         ));
-        assert!(handle.path().is_file());
+        assert!(path.is_file());
+        handle.path = path;
         handle.cleanup()?;
         Ok(())
     }
@@ -419,16 +433,16 @@ mod tests {
     #[test]
     fn write_failure_removes_partial_plaintext_and_parent() -> Result<(), EphemeralEnvFileError> {
         let env = make_env(&[("KEY", "secret")]);
-        let mut attempted = None;
-        let result = write_ephemeral_env_file_with(&env, &temp_root()?, |path, _| {
-            attempted = Some(path.to_path_buf());
-            fs::write(path, "KEY=partial-secret")?;
+        let directory = tempfile::tempdir()?;
+        let mut attempted = false;
+        let result = write_ephemeral_env_file_with(&env, directory.path(), |file, _| {
+            file.write_all(b"KEY=partial-secret")?;
+            attempted = true;
             Err(io::Error::other("injected write failure").into())
         });
         assert!(result.is_err());
-        let path = attempted.ok_or_else(|| io::Error::other("writer was not called"))?;
-        assert!(!path.exists(), "failed write retained partial plaintext");
-        assert!(!path.parent().is_some_and(Path::exists), "failed write retained its directory");
+        assert!(attempted, "writer did not write the partial plaintext");
+        assert_eq!(fs::read_dir(directory.path())?.count(), 0, "failed write retained output");
         Ok(())
     }
 
@@ -449,10 +463,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn cleanup_unlinks_even_when_overwrite_fails() -> Result<(), EphemeralEnvFileError> {
-        use std::os::unix::fs::PermissionsExt;
         let mut handle = write_ephemeral_env_file(&make_env(&[("KEY", "secret")]), &temp_root()?)?;
-        fs::set_permissions(handle.path(), fs::Permissions::from_mode(0o400))?;
-        assert!(handle.cleanup().is_err(), "read-only file should reject overwrite");
+        handle.file = Some(File::open(handle.path())?);
+        assert!(handle.cleanup().is_err(), "read-only descriptor should reject overwrite");
         assert!(!handle.path().exists(), "overwrite failure prevented unlinking plaintext");
         handle.cleanup()?;
         assert!(!handle.parent_dir().exists());

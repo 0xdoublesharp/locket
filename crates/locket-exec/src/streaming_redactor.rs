@@ -30,7 +30,7 @@ pub struct StreamingRedactorConfig {
     pub label_replacements: bool,
     /// Match percent-encoded, Base64, and JSON-escaped variants as well.
     pub include_encoded_variants: bool,
-    /// Also apply provider-token detection to UTF-8 lines. Lines over 64 KiB
+    /// Also apply provider-token detection to valid UTF-8 spans. Lines over 64 KiB
     /// are replaced wholesale when this option is enabled.
     pub redact_generic_patterns: bool,
     /// Ignore known values shorter than this many bytes. Empty values are always ignored.
@@ -357,33 +357,26 @@ impl<W: Write> StreamingRedactor<W> {
             return Ok(());
         }
         let mut cursor = 0;
-        // Treat binary markers as spaces for provider scanning. Both are one
-        // byte, so scan offsets still refer to the original output buffer.
-        let scan_line = (marker == [BINARY_REPLACEMENT_BYTE]
-            && self.line.contains(&BINARY_REPLACEMENT_BYTE))
-        .then(|| {
-            Zeroizing::new(
-                self.line
-                    .iter()
-                    .map(|&byte| if byte == BINARY_REPLACEMENT_BYTE { b' ' } else { byte })
-                    .collect::<Vec<_>>(),
-            )
-        });
-        let scan_bytes = scan_line.as_deref().map_or(self.line.as_slice(), Vec::as_slice);
-        if let Ok(text) = std::str::from_utf8(scan_bytes) {
+        let mut offset = 0;
+        // Invalid bytes are token boundaries, including the binary replacement marker.
+        // Keep their original bytes while scanning valid text on either side.
+        for chunk in self.line.utf8_chunks() {
+            let text = chunk.valid();
             let mut chars = text.char_indices();
             let mut column = 1;
             for finding in scan_text("", text) {
                 if finding.kind != FindingKind::ProviderTokenPattern {
                     continue;
                 }
-                let Some((start, _)) = chars.nth(finding.column - column) else { break };
+                let Some((relative, _)) = chars.nth(finding.column - column) else { break };
+                let start = offset + relative;
                 column = finding.column + 1;
                 self.writer.write_all(&self.line[cursor..start])?;
                 self.writer.write_all(marker)?;
                 cursor = start + finding.token_length;
                 self.stats.redaction_count = self.stats.redaction_count.saturating_add(1);
             }
+            offset += text.len() + chunk.invalid().len();
         }
         self.writer.write_all(&self.line[cursor..])?;
         self.line.as_mut_slice().zeroize();

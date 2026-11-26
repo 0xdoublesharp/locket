@@ -28,15 +28,17 @@ pub fn configure_connection(
 ///
 /// Older stores, newer stores, and stores without a schema ledger are rejected.
 pub fn initialize_schema(connection: &mut Connection) -> Result<(), StoreError> {
-    match current_schema_version(connection)? {
+    // Inspect the ledger and catalog under the same write reservation used
+    // for bootstrap. Another initializer can otherwise commit between reads.
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    match current_schema_version(&transaction)? {
         Some(version) => require_supported_schema(version)?,
-        None if store_has_tables(connection)? => {
+        None if store_has_tables(&transaction)? => {
             return Err(StoreError::OutdatedSchema { found: 0, supported: SCHEMA_VERSION });
         }
         None => {}
     }
-    let transaction =
-        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     transaction.execute_batch(SCHEMA_SQL)?;
     // Existing vaults on this schema version retain their shared-folder rows.
     for (column, sql) in [

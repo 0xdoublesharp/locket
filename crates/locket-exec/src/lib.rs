@@ -235,11 +235,30 @@ pub fn resolve_parent_external_env<'a>(
 mod tests {
     use std::ffi::OsStr;
 
-    use super::{ExecError, ExecutionRequest, prepare_execution, resolve_parent_external_env};
+    use super::{
+        ExecError, ExecutionRequest, is_child_runtime_control, prepare_execution,
+        resolve_parent_external_env,
+    };
     use crate::{EnvMap, EnvMode, EnvOverrideMode};
 
     fn env(values: &[(&str, &str)]) -> EnvMap {
         values.iter().map(|(name, value)| ((*name).to_owned(), crate::env_value(*value))).collect()
+    }
+
+    #[test]
+    fn child_runtime_controls_include_code_loading_and_lookup_variables() {
+        for name in ["PATH", "NODE_OPTIONS", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES"] {
+            assert!(is_child_runtime_control(name), "{name}");
+        }
+        assert!(!is_child_runtime_control("API_TOKEN"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_child_search_path_falls_back_when_all_entries_are_relative() {
+        let mut env = env(&[("PATH", ".:bin::./scripts")]);
+        super::restrict_child_search_path(&mut env);
+        assert_eq!(env.get("PATH").map(|value| value.as_str()), Some("/usr/bin:/bin"));
     }
 
     #[test]

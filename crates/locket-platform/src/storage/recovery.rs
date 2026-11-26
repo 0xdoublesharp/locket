@@ -205,13 +205,11 @@ impl RecoveryEnvelope {
             return Err(PlatformError::RecoveryEnvelopeSchemaUnsupported(schema_version));
         }
         // kdf_profile_id field
-        let kdf_profile_id = read_field_string(&mut cur, data)?;
+        let kdf_profile_id = read_field_string(&mut cur, data, "kdf_profile_id")?;
         // created_at (i128 LE = 16 bytes)
-        let created_bytes = read_exact(&mut cur, 16, data)?;
-        let created_at_unix_nanos =
-            i128::from_le_bytes(created_bytes.try_into().map_err(|_| {
-                PlatformError::InvalidRecoveryEnvelope("truncated timestamp".into())
-            })?);
+        let mut created_bytes = [0; 16];
+        created_bytes.copy_from_slice(read_exact(&mut cur, 16, data)?);
+        let created_at_unix_nanos = i128::from_le_bytes(created_bytes);
         // entry_count
         let count_bytes = read_exact(&mut cur, 4, data)?;
         let entry_count =
@@ -228,8 +226,8 @@ impl RecoveryEnvelope {
         // Entries
         let mut entries = Vec::with_capacity(entry_count);
         for _ in 0..entry_count {
-            let entry_kind = read_field_string(&mut cur, data)?;
-            let entry_id = read_field_string(&mut cur, data)?;
+            let entry_kind = read_field_string(&mut cur, data, "entry_kind")?;
+            let entry_id = read_field_string(&mut cur, data, "entry_id")?;
             let nonce_bytes = read_exact(&mut cur, NONCE_LEN, data)?;
             let mut nonce = [0u8; NONCE_LEN];
             nonce.copy_from_slice(nonce_bytes);
@@ -242,6 +240,9 @@ impl RecoveryEnvelope {
             ]) as usize;
             let ciphertext = read_exact(&mut cur, ct_len, data)?.to_vec();
             entries.push(RecoveryEnvelopeEntry { entry_kind, entry_id, nonce, ciphertext });
+        }
+        if cur != data.len() {
+            return Err(PlatformError::InvalidRecoveryEnvelope("trailing envelope bytes".into()));
         }
         Ok(Self { kdf_profile_id, created_at_unix_nanos, entries })
     }
@@ -269,10 +270,16 @@ fn read_exact<'a>(cur: &mut usize, n: usize, data: &'a [u8]) -> Result<&'a [u8],
     Ok(slice)
 }
 
-fn read_field_string(cur: &mut usize, data: &[u8]) -> Result<String, PlatformError> {
+fn read_field_string(
+    cur: &mut usize,
+    data: &[u8],
+    expected_name: &str,
+) -> Result<String, PlatformError> {
     let name = read_exact(cur, 2, data)?;
     let name_len = usize::from(u16::from_le_bytes([name[0], name[1]]));
-    read_exact(cur, name_len, data)?;
+    if read_exact(cur, name_len, data)? != expected_name.as_bytes() {
+        return Err(PlatformError::InvalidRecoveryEnvelope("unexpected field name".into()));
+    }
     let value = read_exact(cur, 4, data)?;
     let value_len = u32::from_le_bytes([value[0], value[1], value[2], value[3]]) as usize;
     std::str::from_utf8(read_exact(cur, value_len, data)?)

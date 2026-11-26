@@ -384,6 +384,27 @@ fn provider_scanning_preserves_utf8_positions_and_binary_lines() -> io::Result<(
     Ok(())
 }
 
+#[test]
+fn provider_scanning_redacts_valid_segments_of_a_mixed_encoding_line() -> io::Result<()> {
+    let mut config = config(&[]);
+    config.redact_generic_patterns = true;
+    let (output, stats) = redact(
+        &[
+            b"ghp_abcdef1234567890ABCDEF1234567890abcd\xff",
+            "α=ghp_abcdef123456".as_bytes(),
+            b"7890ABCDEF1234567890abcd;ok\xe2\x82\n",
+        ],
+        config,
+    )?;
+    assert_eq!(
+        output,
+        [b"[REDACTED:locket]\xff".as_slice(), "α=[REDACTED:locket];ok".as_bytes(), b"\xe2\x82\n"]
+            .concat()
+    );
+    assert_eq!(stats.redaction_count, 2);
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn drains_both_child_streams_through_independent_redactors() -> io::Result<()> {

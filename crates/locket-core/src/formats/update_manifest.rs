@@ -261,6 +261,7 @@ fn validate_nonempty_token(value: &str) -> Result<(), UpdateManifestError> {
 
 fn validate_fetch_token(value: &str) -> Result<(), UpdateManifestError> {
     if value.is_empty()
+        || matches!(value, "." | "..")
         || value.len() > 128
         || !value
             .bytes()
@@ -275,15 +276,14 @@ fn validate_https_static_url(url: &str) -> Result<(), UpdateManifestError> {
     let Some(rest) = url.strip_prefix("https://") else {
         return Err(UpdateManifestError::InvalidMetadata);
     };
-    if rest.is_empty()
-        || url.chars().any(char::is_control)
-        || url.contains('?')
-        || url.contains('#')
+    if url.chars().any(|character| character.is_control() || character.is_whitespace())
+        || url.contains(['?', '#', '\\'])
     {
         return Err(UpdateManifestError::InvalidMetadata);
     }
     let host = rest.split('/').next().unwrap_or_default();
-    if host.is_empty() || host.contains('@') || host.contains(':') {
+    // The URL parser normalizes explicit default ports, so check the raw authority too.
+    if host.is_empty() || host.contains(['@', ':']) || url::Url::parse(url).is_err() {
         return Err(UpdateManifestError::InvalidMetadata);
     }
     Ok(())
@@ -582,6 +582,30 @@ mod tests {
             "0.2.0",
         );
         assert_eq!(path_escape, Err(UpdateManifestError::InvalidMetadata));
+    }
+
+    #[test]
+    fn rejects_fetch_components_that_change_when_parsed_as_a_url() {
+        let base = "https://updates.example.test/locket";
+        for (base, platform, arch, version) in [
+            (base, "..", "aarch64", "1.0"),
+            (base, "macos", ".", "1.0"),
+            (base, "macos", "aarch64", ".."),
+            ("https://updates.example.test\\releases", "macos", "aarch64", "1.0"),
+            ("https://bad host.example.test", "macos", "aarch64", "1.0"),
+            ("https://bad%zz.example.test", "macos", "aarch64", "1.0"),
+        ] {
+            assert_eq!(
+                build_update_manifest_fetch_request(
+                    base,
+                    UpdateChannel::Stable,
+                    platform,
+                    arch,
+                    version
+                ),
+                Err(UpdateManifestError::InvalidMetadata)
+            );
+        }
     }
 
     #[test]

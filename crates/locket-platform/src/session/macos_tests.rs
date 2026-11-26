@@ -197,3 +197,12 @@ fn off_main_loop_invocation_runs_on_its_calling_thread() -> io::Result<()> {
     assert_eq!(super::run(|| std::thread::current().id())?, thread);
     Ok(())
 }
+
+#[tokio::test]
+async fn observer_start_fails_immediately_when_the_dispatcher_has_stopped() -> io::Result<()> {
+    let (driver, tasks) = test_dispatch()?;
+    drop(tasks);
+    let result = start_with_driver(driver, Arc::new(|| {}), Duration::from_secs(5)).await;
+    assert!(matches!(result, Err(error) if error.to_string() == "native session loop stopped"));
+    Ok(())
+}

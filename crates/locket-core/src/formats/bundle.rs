@@ -743,6 +743,22 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_checks_payload_length_before_reading_payload() {
+        let payload = b"sealed".to_vec();
+        let mut bytes =
+            BundleContainer::new(sample_manifest(), payload.clone()).unwrap().serialize().unwrap();
+        let length = bytes.len() - payload.len() - 8;
+        assert_eq!(&bytes[length..length + 8], &6_u64.to_le_bytes());
+        let oversized = BUNDLE_MAX_PAYLOAD_LEN + 1;
+        bytes[length..length + 8].copy_from_slice(&oversized.to_le_bytes());
+        assert!(matches!(
+            BundleContainer::deserialize(&bytes),
+            Err(BundleContainerError::PayloadTooLarge(actual, limit))
+                if actual == oversized && limit == BUNDLE_MAX_PAYLOAD_LEN
+        ));
+    }
+
+    #[test]
     fn deserialize_rejects_bad_magic() {
         let mut bytes =
             BundleContainer::new(sample_manifest(), Vec::new()).unwrap().serialize().unwrap();

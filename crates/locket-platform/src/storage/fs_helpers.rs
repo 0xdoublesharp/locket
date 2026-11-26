@@ -129,3 +129,31 @@ pub fn open_regular_file(path: &Path) -> io::Result<fs::File> {
     }
     Ok(file)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nonce_decoder_rejects_short_and_invalid_encodings() {
+        assert!(matches!(decode_nonce(""), Err(PlatformError::InvalidPassphraseFallback)));
+        let invalid = "!".repeat(BASE64URL_NOPAD.encode_len(NONCE_LEN));
+        assert!(matches!(decode_nonce(&invalid), Err(PlatformError::InvalidPassphraseFallback)));
+        assert!(
+            matches!(decode_nonce(&encode_bytes(&[42; NONCE_LEN])), Ok(nonce) if nonce == [42; NONCE_LEN])
+        );
+    }
+
+    #[test]
+    fn owner_only_write_reports_invalid_parent_without_replacing_it() -> Result<(), PlatformError> {
+        let directory = tempfile::tempdir()?;
+        let parent = directory.path().join("regular-file");
+        fs::write(&parent, b"existing")?;
+        assert!(matches!(
+            write_user_only_file(&parent.join("child"), b"new"),
+            Err(PlatformError::Io(_))
+        ));
+        assert_eq!(fs::read(&parent)?, b"existing");
+        Ok(())
+    }
+}

@@ -22,6 +22,38 @@ fn enables_secure_delete_on_each_vault_connection() -> Result<(), Box<dyn Error>
 }
 
 #[test]
+fn concurrent_initializers_agree_on_a_single_fresh_schema() -> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let path = directory.path().join("vault.sqlite3");
+    let stores = (0..4).map(|_| Store::open(&path)).collect::<Result<Vec<_>, _>>()?;
+    let ready = std::sync::Arc::new(std::sync::Barrier::new(stores.len()));
+    let workers: Vec<_> = stores
+        .into_iter()
+        .map(|mut store| {
+            let ready = std::sync::Arc::clone(&ready);
+            std::thread::spawn(move || {
+                ready.wait();
+                store.initialize_schema()?;
+                store.current_schema_version()
+            })
+        })
+        .collect();
+    for worker in workers {
+        assert_eq!(
+            worker.join().map_err(|_| "schema initializer panicked")??,
+            Some(i64::from(SCHEMA_VERSION))
+        );
+    }
+    let store = Store::open(&path)?;
+    let migration_count: u32 =
+        store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row.get(0))?;
+    assert_eq!(migration_count, 1);
+    Ok(())
+}
+
+#[test]
 fn creates_schema_and_records_migration() -> Result<(), Box<dyn Error>> {
     let test_store = open_initialized_store()?;
     let connection = test_store.store.connection();

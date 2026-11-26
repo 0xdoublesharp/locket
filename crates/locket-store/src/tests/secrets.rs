@@ -195,6 +195,42 @@ fn secret_metadata_update_changes_metadata_columns() -> Result<(), Box<dyn Error
 }
 
 #[test]
+fn secret_metadata_and_tombstone_compose_with_atomic_writes() -> Result<(), Box<dyn Error>> {
+    let mut fixture = open_initialized_store()?;
+    let store = &mut fixture.store;
+    insert_project_profile_secret(store)?;
+    let id = "lk_sec_test";
+
+    let result = store.with_atomic_write::<(), StoreError>(|store| {
+        assert!(store.update_secret_metadata(id, Some("described"), None, None, None)?);
+        store.tombstone_secret(id, 300)?;
+        Err(StoreError::LinkSetChanged)
+    });
+    assert!(matches!(result, Err(StoreError::LinkSetChanged)));
+    assert!(
+        store
+            .get_active_secret("lk_proj_test", "lk_prof_test", "DATABASE_URL", "user-local")?
+            .is_some()
+    );
+    assert_eq!(
+        store.get_secret_mutable_metadata(id)?.and_then(|metadata| metadata.description),
+        None
+    );
+
+    store.with_atomic_write::<_, StoreError>(|store| {
+        assert!(store.update_secret_metadata(id, Some("described"), None, None, None)?);
+        store.tombstone_secret(id, 300)
+    })?;
+    assert!(
+        store
+            .get_active_secret("lk_proj_test", "lk_prof_test", "DATABASE_URL", "user-local")?
+            .is_none()
+    );
+    assert!(store.connection().is_autocommit());
+    Ok(())
+}
+
+#[test]
 fn tombstone_secret_hides_it_from_active_queries() -> Result<(), Box<dyn Error>> {
     let mut test_store = open_initialized_store()?;
     insert_project_profile(&test_store.store)?;
@@ -1018,6 +1054,11 @@ fn secret_links_resolve_list_count_and_unlink_on_shared_delete() -> Result<(), B
         .resolve_active_secret_link("lk_proj_test", "lk_prof_test", "RPC_URL")?
         .ok_or("link missing")?;
     assert_eq!(resolved.target_secret.name, "ALCHEMY_MAINNET_RPC");
+    assert_eq!(
+        store.list_active_secret_links_by_profile("lk_proj_test", "lk_prof_test")?,
+        [resolved]
+    );
+    assert_link_requires_active_target_and_can_be_deleted(store, &link)?;
 
     let proj_rows = store.list_active_secret_metadata_by_profile("lk_proj_test", "lk_prof_test")?;
     assert_eq!(proj_rows.len(), 1);
@@ -1035,6 +1076,93 @@ fn secret_links_resolve_list_count_and_unlink_on_shared_delete() -> Result<(), B
     assert_eq!(usages[0].local_name, "RPC_URL");
 
     assert_audited_shared_cascade(store, &shared_secret, link)
+}
+
+fn assert_link_requires_active_target_and_can_be_deleted(
+    store: &mut Store,
+    link: &crate::SecretLinkRecord,
+) -> Result<(), StoreError> {
+    let name = "TEMPORARY_RPC";
+    let temporary = crate::SecretLinkRecord {
+        id: "lk_link_temporary".into(),
+        local_name: name.into(),
+        ..link.clone()
+    };
+    let missing_target =
+        crate::SecretLinkRecord { target_secret_id: "lk_sec_missing".into(), ..temporary.clone() };
+    assert!(matches!(
+        store.upsert_secret_link_with_audit(&missing_target, None),
+        Err(StoreError::SecretStateConflict { secret_id, .. }) if secret_id == "lk_sec_missing"
+    ));
+    store.upsert_secret_link_with_audit(&temporary, None)?;
+    assert_eq!(
+        store.delete_secret_link_with_audit(&link.project_id, &link.profile_id, name, None)?,
+        Some(temporary)
+    );
+    assert!(
+        store
+            .delete_secret_link_with_audit(&link.project_id, &link.profile_id, name, None)?
+            .is_none()
+    );
+    Ok(())
+}
+
+#[test]
+fn transfer_audit_is_atomic_across_projects_and_appends_once_within_a_project()
+-> Result<(), Box<dyn Error>> {
+    let mut fixture = open_initialized_store()?;
+    let store = &mut fixture.store;
+    insert_project_profile_secret(store)?;
+    store.insert_project_if_absent("lk_proj_destination", "destination", 1)?;
+    store.insert_profile_if_absent(
+        "lk_prof_destination",
+        "lk_proj_destination",
+        "dev",
+        false,
+        1,
+    )?;
+    let destination = store
+        .get_profile_by_name("lk_proj_destination", "dev")?
+        .ok_or("destination profile missing")?;
+    let source = test_secret();
+    let transfer = crate::SecretTransferAudit {
+        action: "SECRET_COPY",
+        operation: "created",
+        from_project_id: &source.project_id,
+        from_profile_id: &source.profile_id,
+        from_secret: Some(&source),
+        target_profile: &destination,
+        target_name: "COPY",
+        prior_target_version: None,
+        target_version: 1,
+        timestamp: 300,
+    };
+    let (source_key, destination_key) = ([41; 32], [42; 32]);
+    assert!(matches!(
+        transfer.append(store, &[], &destination_key),
+        Err(StoreError::InvalidAuditKeyLength { actual: 0 }),
+    ));
+    assert_eq!(store.list_exportable_audit_rows(&destination.project_id)?, []);
+    transfer.append(store, &source_key, &destination_key)?;
+    let source_chain = store.verify_audit_chain_read_only(&source.project_id, &source_key)?;
+    assert_eq!((source_chain.hmac_ok, source_chain.rows_verified), (true, 1));
+    let destination_chain =
+        store.verify_audit_chain_read_only(&destination.project_id, &destination_key)?;
+    assert_eq!((destination_chain.hmac_ok, destination_chain.rows_verified), (true, 1));
+    let source_rows = store.list_exportable_audit_rows(&source.project_id)?;
+    let destination_rows = store.list_exportable_audit_rows(&destination.project_id)?;
+    assert_eq!(source_rows[0].metadata_json, destination_rows[0].metadata_json);
+    assert_eq!(source_rows[0].profile_id.as_deref(), Some(source.profile_id.as_str()));
+    assert_eq!(destination_rows[0].profile_id.as_deref(), Some(destination.id.as_str()));
+
+    let source_profile = store
+        .get_profile_by_name(&source.project_id, "default")?
+        .ok_or("source profile missing")?;
+    let within_project = crate::SecretTransferAudit { target_profile: &source_profile, ..transfer };
+    within_project.append(store, &[], &source_key)?;
+    assert_eq!(store.list_exportable_audit_rows(&source.project_id)?.len(), 2);
+    assert_eq!(store.list_exportable_audit_rows(&destination.project_id)?.len(), 1);
+    Ok(())
 }
 
 fn assert_audited_shared_cascade(
@@ -1080,6 +1208,32 @@ fn assert_audited_shared_cascade(
         Err(StoreError::LinkSetChanged),
     ));
     assert_eq!(store.list_shared_secret_usages(&shared_secret.id)?, usages);
+    assert!(matches!(
+        store.tombstone_secret_and_unlink_with_audit(
+            shared_secret,
+            50,
+            None,
+            &BTreeMap::new(),
+            None
+        ),
+        Err(StoreError::LinkSetChanged),
+    ));
+    let bad_scope = AuditWrite { profile_id: None, ..writes[0] };
+    let mut bad_audits = audits.clone();
+    bad_audits.insert(&usages[0].link_id, AuditContext { key: &keys[0], write: &bad_scope });
+    assert!(matches!(
+        store.tombstone_secret_and_unlink_with_audit(shared_secret, 50, None, &bad_audits, None),
+        Err(StoreError::LinkSetChanged),
+    ));
+    let stale_secret = SecretRecord {
+        current_version: shared_secret.current_version + 1,
+        ..shared_secret.clone()
+    };
+    assert!(matches!(
+        store.tombstone_secret_and_unlink_with_audit(&stale_secret, 50, None, &audits, None),
+        Err(StoreError::SecretStateConflict { expected_version, .. })
+            if expected_version == stale_secret.current_version,
+    ));
     let mut bad_audits = audits.clone();
     // Reject an invalid context after the first consumer's audit insert, rolling it back too.
     bad_audits.insert(&usages[1].link_id, AuditContext { key: &[], write: &writes[1] });
@@ -1123,11 +1277,20 @@ fn local_value_fingerprints_group_cross_project_duplicates_and_clear_on_purge()
 -> Result<(), Box<dyn Error>> {
     let mut fixture = open_initialized_store()?;
     let store = &mut fixture.store;
-    insert_project_profile(store)?;
+    // A normal project ID can resemble the prefix but must sort after Global Vault.
+    let ordinary_secret = SecretRecord { project_id: "lk_proj_sharedx".into(), ..test_secret() };
+    store.insert_project_if_absent(&ordinary_secret.project_id, "000 App", 1)?;
+    store.insert_profile_if_absent(
+        &ordinary_secret.profile_id,
+        &ordinary_secret.project_id,
+        "dev",
+        false,
+        1,
+    )?;
     store.insert_project_if_absent("lk_proj_shared_test", "@shared", 1)?;
     store.insert_profile_if_absent("lk_prof_shared", "lk_proj_shared_test", "default", false, 1)?;
     store.create_active_secret(
-        &test_secret(),
+        &ordinary_secret,
         &test_secret_version(),
         &test_secret_blob(),
         &test_secret_fingerprint(),
@@ -1187,6 +1350,7 @@ fn local_value_fingerprints_group_cross_project_duplicates_and_clear_on_purge()
     let groups = store.list_duplicate_value_groups()?;
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].members.len(), 2);
+    assert_eq!(groups[0].members, matches);
 
     store.tombstone_secret(&test_secret().id, 30)?;
     store.purge_secret_version(&test_secret().id, 1, 40)?;

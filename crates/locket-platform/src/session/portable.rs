@@ -172,6 +172,17 @@ mod tests {
     }
 
     #[test]
+    fn portable_session_suspend_fails_when_delivery_is_unavailable() {
+        let (sink, receiver, failures) = stream();
+        drop(receiver);
+        assert!(!sink.suspend(Duration::ZERO));
+        assert_eq!(failures.load(Ordering::SeqCst), 1);
+        sink.acknowledgement.stop();
+        assert!(!sink.suspend(Duration::ZERO));
+        assert_eq!(failures.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn portable_session_suspend_waits_for_matching_erasure()
     -> Result<(), Box<dyn std::error::Error>> {
         let (sink, mut receiver, failures) = stream();

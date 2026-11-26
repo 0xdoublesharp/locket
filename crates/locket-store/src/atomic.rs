@@ -1,6 +1,9 @@
 //! Atomic composition of store operations used by validated imports.
 
+use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+
+use rusqlite::Connection;
 
 use crate::{Store, StoreError};
 
@@ -20,8 +23,33 @@ impl Store {
     where
         E: From<StoreError>,
     {
-        self.connection.execute_batch("SAVEPOINT locket_atomic_write").map_err(StoreError::from)?;
-        match catch_unwind(AssertUnwindSafe(|| operation(self))) {
+        self.begin_atomic_write()?;
+        let result = catch_unwind(AssertUnwindSafe(|| operation(self)));
+        self.finish_atomic_write(result)
+    }
+
+    /// Composes writes that use a shared connection reference.
+    pub(crate) fn with_atomic_connection_write<T>(
+        &self,
+        operation: impl FnOnce(&Connection) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        self.begin_atomic_write()?;
+        let result = catch_unwind(AssertUnwindSafe(|| operation(&self.connection)));
+        self.finish_atomic_write(result)
+    }
+
+    fn begin_atomic_write(&self) -> Result<(), StoreError> {
+        self.connection.execute_batch("SAVEPOINT locket_atomic_write").map_err(StoreError::from)
+    }
+
+    fn finish_atomic_write<T, E>(
+        &self,
+        result: Result<Result<T, E>, Box<dyn Any + Send>>,
+    ) -> Result<T, E>
+    where
+        E: From<StoreError>,
+    {
+        match result {
             Ok(Ok(value)) => {
                 if let Err(error) = self.connection.execute_batch("RELEASE locket_atomic_write") {
                     let _ = self.connection.execute_batch(
