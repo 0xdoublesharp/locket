@@ -606,6 +606,7 @@ fn parses_profile_project_and_agent_commands() {
 fn parses_scan_and_redaction_commands() {
     for args in [
         ["locket", "scan", "--staged", "--require-known"].as_slice(),
+        &["locket", "audit", "verify", "--witness-key", "-abcDEF0123456789"],
         &["locket", "redact", "--stdin", "--redact-names"],
         &["locket", "context", "--redact-names"],
         &["locket", "ai-safe", "--pattern-only", "--", "npm", "test"],

@@ -107,4 +107,4 @@ printf 'Building Lean proofs\n'
     cd -- "$lean_project"
     lake --no-cache --wfail build
 )
-printf 'Formal checks passed for all eleven TLC models and all eleven Lean modules.\n'
+printf 'Formal checks passed for all eleven TLC models and all twelve Lean modules.\n'

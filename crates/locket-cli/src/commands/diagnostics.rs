@@ -16,11 +16,10 @@ use crate::commands::agent::{agent_snapshot_version, request_status_snapshot};
 use crate::commands::config::spec::{CONFIG_KEY_SPECS, config_get_value, read_user_config};
 use crate::runtime::error::corrupt_db_error;
 use crate::{
-    CliError, GITIGNORE_ENTRIES, GITIGNORE_FILE, HOOK_BEGIN, LOCKET_TOML, RuntimeContext,
-    absolutize, agent_log_path, agent_pid_path, agent_socket_path, format_hex,
-    git_dir_for_worktree, invalid_reference_error, load_project_key, metadata_invalid_error,
-    now_unix_nanos, open_store, privacy_alias, privacy_redact_names_enabled, read_project_config,
-    resolve_project, root_hash,
+    CliError, GITIGNORE_FILE, HOOK_BEGIN, LOCKET_TOML, RuntimeContext, absolutize, agent_log_path,
+    agent_pid_path, agent_socket_path, format_hex, git_dir_for_worktree, invalid_reference_error,
+    load_project_key, metadata_invalid_error, now_unix_nanos, open_store, privacy_alias,
+    privacy_redact_names_enabled, read_project_config, resolve_project, root_hash,
 };
 
 const SKIPPED_LOCKED_CHECKS: [&str; 5] = [
@@ -680,20 +679,27 @@ fn check_automation_client_nonces_pruning(store: &locket_store::Store) -> Diagno
 
 fn check_gitignore(root: &Path) -> DiagnosticCheck {
     let path = root.join(GITIGNORE_FILE);
-    let content = match fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return DiagnosticCheck::warn(".gitignore", "missing");
+    let local_exists = match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => true,
+        Ok(_) => {
+            return DiagnosticCheck::fail(".gitignore", false, "gitignore must be a regular file");
         }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
         Err(error) => return DiagnosticCheck::fail(".gitignore", false, error.to_string()),
     };
-    let missing = GITIGNORE_ENTRIES
-        .iter()
-        .filter(|entry| !content.lines().any(|line| line.trim() == **entry))
-        .copied()
-        .collect::<Vec<_>>();
+    let missing = match locket_platform::missing_secret_file_ignores(root) {
+        Ok(missing) => missing,
+        Err(error) => return DiagnosticCheck::fail(".gitignore", false, error.to_string()),
+    };
     if missing.is_empty() {
-        DiagnosticCheck::pass(".gitignore", "required entries present")
+        let detail = if local_exists {
+            "required entries present"
+        } else {
+            "required entries inherited from tracked repository .gitignore"
+        };
+        DiagnosticCheck::pass(".gitignore", detail)
+    } else if !local_exists {
+        DiagnosticCheck::warn(".gitignore", "missing")
     } else {
         DiagnosticCheck::warn(".gitignore", format!("missing entries: {}", missing.join(",")))
     }

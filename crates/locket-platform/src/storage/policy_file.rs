@@ -493,6 +493,50 @@ fn local_exception_present(contents: &str, pattern: &str) -> bool {
     contents.lines().rev().find(|line| *line == pattern || *line == ".env.*") == Some(pattern)
 }
 
+fn missing_patterns_for(root: &Path, previous: &str) -> Vec<&'static str> {
+    let coverage = git_ignore_coverage(root, previous);
+    let (protection, templates) = SECRET_FILE_IGNORE_PATTERNS.split_at(PROTECTION_SAMPLES.len());
+    let mut missing = Vec::new();
+    let mut added_wildcard = false;
+    for (index, &pattern) in protection.iter().enumerate() {
+        let covered = coverage.as_ref().map_or_else(
+            || local_protection_present(previous, pattern),
+            |coverage| coverage.protected[index],
+        );
+        if !covered {
+            missing.push(pattern);
+            added_wildcard |= pattern == ".env.*";
+        }
+    }
+    for (index, &pattern) in templates.iter().enumerate() {
+        if added_wildcard
+            || coverage.as_ref().map_or_else(
+                || !local_exception_present(previous, pattern),
+                |coverage| coverage.ignored_templates[index],
+            )
+        {
+            missing.push(pattern);
+        }
+    }
+    missing
+}
+
+/// Return any required secret-file ignore or template exception rules that are not yet satisfied
+/// by the project's `.gitignore` or a verified tracked repository `.gitignore`.
+///
+/// # Errors
+/// Rejects symbolic links or reports I/O errors while reading the project's `.gitignore`.
+pub fn missing_secret_file_ignores(root: &Path) -> std::io::Result<Vec<&'static str>> {
+    let path = root.join(".gitignore");
+    let previous = match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => fs::read_to_string(&path)?,
+        Ok(_) => return Err(std::io::Error::other("gitignore must be a regular file")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
+    Ok(missing_patterns_for(root, &previous))
+}
+
 /// Add missing secret-file patterns without removing existing project ignore rules.
 ///
 /// # Errors
@@ -507,28 +551,8 @@ pub fn ensure_secret_file_ignores(root: &Path) -> std::io::Result<()> {
     };
     let previous = if metadata.is_some() { fs::read_to_string(&path)? } else { String::new() };
     let mut next = previous.clone();
-    let coverage = git_ignore_coverage(root, &previous);
-    let (protection, templates) = SECRET_FILE_IGNORE_PATTERNS.split_at(PROTECTION_SAMPLES.len());
-    let mut added_wildcard = false;
-    for (index, &pattern) in protection.iter().enumerate() {
-        let covered = coverage.as_ref().map_or_else(
-            || local_protection_present(&previous, pattern),
-            |coverage| coverage.protected[index],
-        );
-        if !covered {
-            append_ignore_pattern(&mut next, pattern);
-            added_wildcard |= pattern == ".env.*";
-        }
-    }
-    for (index, &pattern) in templates.iter().enumerate() {
-        if added_wildcard
-            || coverage.as_ref().map_or_else(
-                || !local_exception_present(&previous, pattern),
-                |coverage| coverage.ignored_templates[index],
-            )
-        {
-            append_ignore_pattern(&mut next, pattern);
-        }
+    for pattern in missing_patterns_for(root, &previous) {
+        append_ignore_pattern(&mut next, pattern);
     }
     if next == previous {
         return Ok(());

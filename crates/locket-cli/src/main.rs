@@ -1261,7 +1261,12 @@ enum AuditCommand {
         #[arg(long, value_name = "FILE")]
         checkpoint: Option<PathBuf>,
         /// Verify Ed25519 receipts with a trusted public key or public-key file.
-        #[arg(long, value_name = "PUBLIC_KEY_OR_FILE", conflicts_with = "checkpoint")]
+        #[arg(
+            long,
+            value_name = "PUBLIC_KEY_OR_FILE",
+            conflicts_with = "checkpoint",
+            allow_hyphen_values = true
+        )]
         witness_key: Option<String>,
         /// Also require an independently retained witness receipt.
         #[arg(long, value_name = "FILE", requires = "witness_key")]

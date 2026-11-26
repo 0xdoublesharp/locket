@@ -202,6 +202,20 @@ fn ignore_rules_refuse_symlinks_without_modifying_target() -> std::io::Result<()
     Ok(())
 }
 
+#[test]
+fn missing_secret_file_ignores_reflects_tracked_parent_coverage() -> std::io::Result<()> {
+    let (repo, package) = git_package()?;
+    fs::write(repo.path().join(".gitignore"), format!("{PROTECTION}{EXCEPTIONS}"))?;
+    // Untracked parent .gitignore must not satisfy coverage.
+    assert_ne!(missing_secret_file_ignores(&package)?, [] as [&str; 0]);
+
+    git_ok(repo.path(), &["add", ".gitignore"])?;
+    // Tracked parent .gitignore satisfies all required entries without a subpackage file.
+    assert_eq!(missing_secret_file_ignores(&package)?, [] as [&str; 0]);
+    assert!(!package.join(".gitignore").exists());
+    Ok(())
+}
+
 fn git_package() -> std::io::Result<(tempfile::TempDir, PathBuf)> {
     let repo = tempfile::tempdir()?;
     git_ok(repo.path(), &["init", "-q"])?;
