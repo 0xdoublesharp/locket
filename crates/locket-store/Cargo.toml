@@ -15,7 +15,7 @@ workspace = true
 
 [dependencies]
 hmac = { workspace = true }
-locket-core = { version = "0.3.7", path = "../locket-core" }
+locket-core = { version = "0.3.8", path = "../locket-core" }
 rusqlite = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
