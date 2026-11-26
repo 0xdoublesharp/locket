@@ -191,6 +191,11 @@ impl TeamTransport for S3 {
         })
     }
 
+    fn delete_package(&self, filename: &str) -> Result<bool> {
+        let path = self.object_path(filename)?;
+        http::delete_package("S3 delete", |cap| self.request("DELETE", &path, "", &[], &[], cap))
+    }
+
     fn summary(&self) -> TransportSummary {
         self.summary.clone()
     }

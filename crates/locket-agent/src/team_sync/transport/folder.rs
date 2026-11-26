@@ -133,6 +133,34 @@ impl TeamTransport for Folder {
         }
     }
 
+    fn delete_package(&self, filename: &str) -> Result<bool> {
+        validate_local_filename(filename)?;
+        match verify_directory(&self.path) {
+            Ok(()) => {}
+            Err(super::super::SyncError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        }
+        let path = self.path.join(filename);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => return Err(reject("package is not a regular file")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        }
+        match fs::remove_file(path) {
+            Ok(()) => {
+                sync_dir(&self.path)?;
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn summary(&self) -> TransportSummary {
         self.summary.clone()
     }

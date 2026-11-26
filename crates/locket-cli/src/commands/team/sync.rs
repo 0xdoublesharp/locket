@@ -57,8 +57,14 @@ pub fn join(
     let (master, _) = load_master_key(context, project)?;
     let sealing = device::build_device_private_key_storage(context, project)?.load(&local.id)?;
     let remote_setup = RemoteSetup::from_join_args(context, args)?;
-    let candidates =
-        join_package_candidates(&store, project, &master, args, remote_setup.as_ref())?;
+    let candidates = join_package_candidates(
+        &store,
+        project,
+        &master,
+        args,
+        remote_setup.as_ref(),
+        &identity.fingerprint,
+    )?;
     let bytes = select_join_package(
         candidates,
         &sealing,
@@ -168,13 +174,19 @@ fn join_package_candidates(
     master: &locket_crypto::KeyBytes,
     args: &TeamJoinArgs,
     remote_setup: Option<&RemoteSetup>,
+    recipient_fingerprint: &str,
 ) -> Result<JoinCandidates, CliError> {
     let remote_packages = if let Some(setup) = remote_setup {
-        Some(setup.join_packages()?)
+        Some(setup.join_packages(recipient_fingerprint)?)
     } else if args.remote {
         Some(
-            team_sync::list_and_read_configured_join_packages(store, project, Some(master))
-                .map_err(failure)?,
+            team_sync::list_and_read_configured_join_packages_for_recipient(
+                store,
+                project,
+                Some(master),
+                recipient_fingerprint,
+            )
+            .map_err(failure)?,
         )
     } else {
         None

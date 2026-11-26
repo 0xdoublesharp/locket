@@ -145,6 +145,11 @@ impl TeamTransport for WebDav {
         })
     }
 
+    fn delete_package(&self, filename: &str) -> Result<bool> {
+        let path = self.object_path(filename)?;
+        http::delete_package("WebDAV delete", |cap| self.request("DELETE", &path, &[], &[], cap))
+    }
+
     fn summary(&self) -> TransportSummary {
         self.summary.clone()
     }

@@ -175,6 +175,10 @@ pub trait TeamTransport: Send + Sync {
     /// # Errors
     /// Rejects invalid names, oversized packages, and failed writes.
     fn put_package(&self, filename: &str, bytes: &[u8]) -> Result<PutOutcome>;
+    /// Delete a package by basename, returning whether it was present.
+    /// # Errors
+    /// Rejects invalid names and failed deletes.
+    fn delete_package(&self, filename: &str) -> Result<bool>;
     /// Return the transport's public configuration metadata.
     fn summary(&self) -> TransportSummary;
 
@@ -204,6 +208,17 @@ pub(super) fn validate_filename(name: &str) -> Result<()> {
         return Err(reject("invalid team package filename"));
     }
     Ok(())
+}
+
+pub(super) fn recipient_prefix(fingerprint: &str) -> Result<String> {
+    if fingerprint.len() != 64 || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(reject("recipient fingerprint must be 64 hexadecimal characters"));
+    }
+    Ok(format!("r-{}-", fingerprint[..16].to_ascii_lowercase()))
+}
+
+pub(super) fn is_recipient_candidate(filename: &str, prefix: &str) -> bool {
+    filename.starts_with(prefix) || !filename.starts_with("r-")
 }
 
 pub(super) fn new_transport(
@@ -384,7 +399,7 @@ pub fn list_and_read_join_packages(
     config: &TransportConfig,
     secret: Option<TransportSecretInput>,
 ) -> Result<JoinPackages> {
-    JoinPackages::new(new_transport(config, secret)?)
+    JoinPackages::new(new_transport(config, secret)?, None)
 }
 
 /// List and stream encrypted join candidates from a configured transport.
@@ -395,7 +410,32 @@ pub fn list_and_read_configured_join_packages(
     project: &str,
     master: Option<&KeyBytes>,
 ) -> Result<JoinPackages> {
-    JoinPackages::new(open_configured(store, project, master)?.0)
+    JoinPackages::new(open_configured(store, project, master)?.0, None)
+}
+
+/// Stream packages addressed to the recipient newest first, then legacy packages.
+/// # Errors
+/// Rejects invalid fingerprints and listing failures. Download errors are returned by the iterator.
+pub fn list_and_read_join_packages_for_recipient(
+    config: &TransportConfig,
+    secret: Option<TransportSecretInput>,
+    recipient_fingerprint: &str,
+) -> Result<JoinPackages> {
+    let prefix = recipient_prefix(recipient_fingerprint)?;
+    JoinPackages::new(new_transport(config, secret)?, Some(&prefix))
+}
+
+/// Stream recipient-addressed and legacy packages from a configured transport.
+/// # Errors
+/// Rejects invalid fingerprints, configuration, and listing failures. Download errors are returned by the iterator.
+pub fn list_and_read_configured_join_packages_for_recipient(
+    store: &Store,
+    project: &str,
+    master: Option<&KeyBytes>,
+    recipient_fingerprint: &str,
+) -> Result<JoinPackages> {
+    let prefix = recipient_prefix(recipient_fingerprint)?;
+    JoinPackages::new(open_configured(store, project, master)?.0, Some(&prefix))
 }
 
 /// Bounded download iterator for encrypted join candidates.
@@ -408,10 +448,20 @@ pub struct JoinPackages {
 }
 
 impl JoinPackages {
-    fn new(transport: Box<dyn TeamTransport>) -> Result<Self> {
-        let names = transport.list_packages()?;
+    fn new(transport: Box<dyn TeamTransport>, prefix: Option<&str>) -> Result<Self> {
+        let mut names = transport.list_packages()?;
+        if let Some(prefix) = prefix {
+            names.retain(|name| is_recipient_candidate(name, prefix));
+        }
         if names.len() > JOIN_CANDIDATE_LIMIT {
             return Err(reject("remote storage exceeds the join candidate package limit"));
+        }
+        if let Some(prefix) = prefix {
+            let (mut addressed, legacy): (Vec<_>, Vec<_>) =
+                names.into_iter().partition(|name| name.starts_with(prefix));
+            addressed.reverse(); // Transport listings are sorted in ascending filename order.
+            addressed.extend(legacy);
+            names = addressed;
         }
         Ok(Self {
             transport,

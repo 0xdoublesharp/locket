@@ -7,7 +7,7 @@ use locket_platform::{
     WrappedLocalFileDevicePrivateKeyStorage,
 };
 use locket_store::Store;
-use rusqlite::OptionalExtension;
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -187,7 +187,11 @@ fn flush_to(store: &Store, project: &str, transport: &dyn TeamTransport) -> Resu
         // a conflicting object for every possible name.
         let mut delivered = false;
         for _ in 0..8 {
-            let allowed: bool = store.connection().query_row(
+            // Serialize this upload with pruning so a stale outbox scan cannot
+            // recreate a package after its row has been pruned.
+            let tx =
+                Transaction::new_unchecked(store.connection(), TransactionBehavior::Immediate)?;
+            let allowed: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM devices d JOIN team_members m ON m.device_id=d.id
                  JOIN teams t ON t.id=m.team_id WHERE t.project_id=?1 AND d.fingerprint=?2
                  AND d.revoked_at IS NULL AND m.removed_at IS NULL)
@@ -196,15 +200,22 @@ fn flush_to(store: &Store, project: &str, transport: &dyn TeamTransport) -> Resu
                 |r| r.get(0),
             )?;
             if !allowed {
-                // A concurrent delivery may have renamed this row, or the
-                // recipient may have been removed after we read the outbox.
+                // The row may have been renamed or pruned, or its recipient
+                // may have been removed since we read the outbox.
                 delivered = true;
                 break;
             }
             match transport.put_package(&name, &bytes)? {
                 PutOutcome::Conflict => {
-                    let next = format!("{}.lkpkg", digest(&locket_crypto::random_bytes::<32>()?));
-                    let updated = store.connection().execute(
+                    let suffix = digest(&locket_crypto::random_bytes::<32>()?);
+                    let next = if let Some((prefix, _)) =
+                        name.rsplit_once('-').filter(|_| name.starts_with("r-"))
+                    {
+                        format!("{prefix}-{}.lkpkg", &suffix[..16])
+                    } else {
+                        format!("{suffix}.lkpkg")
+                    };
+                    let updated = tx.execute(
                         "UPDATE OR IGNORE team_sync_outbox SET filename=?3,delivered=0
                          WHERE project_id=?1 AND filename=?2",
                         (project, &name, &next),
@@ -214,14 +225,17 @@ fn flush_to(store: &Store, project: &str, transport: &dyn TeamTransport) -> Resu
                     }
                 }
                 outcome => {
-                    store.connection().execute(
+                    tx.execute(
                         "UPDATE team_sync_outbox SET delivered=1 WHERE project_id=?1 AND filename=?2",
                         (project, &name),
                     )?;
                     count += usize::from(outcome == PutOutcome::Written);
                     delivered = true;
-                    break;
                 }
+            }
+            tx.commit()?;
+            if delivered {
+                break;
             }
         }
         if !delivered {
@@ -301,8 +315,12 @@ pub fn sync_folder_guarded(
     let sealing = storage.load(&local.id)?;
     let starting_head = receiver_head(store, project)?;
     let mut candidates = Vec::new();
-    let files = transport.list_packages()?;
+    let mut files = transport.list_packages()?;
     let is_remote = !matches!(configured.config, TransportConfig::Folder { .. });
+    if is_remote {
+        let prefix = transport::recipient_prefix(&local.fingerprint)?;
+        files.retain(|name| transport::is_recipient_candidate(name, &prefix));
+    }
     let cursor: Option<String> = store.connection().query_row(
         "SELECT scan_after FROM team_sync_folders WHERE project_id=?1",
         [project],

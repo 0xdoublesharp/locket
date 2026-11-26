@@ -505,6 +505,17 @@ fn status_error(operation: &str, status: u16) -> SyncError {
     reject(&format!("team transport {operation} failed with HTTP {status}"))
 }
 
+pub(super) fn delete_package(
+    operation: &str,
+    request: impl FnOnce(usize) -> Result<Response>,
+) -> Result<bool> {
+    match request(HEADER_LIMIT)?.status {
+        200 | 204 => Ok(true),
+        404 => Ok(false),
+        status => Err(status_error(operation, status)),
+    }
+}
+
 pub(super) fn put_package(
     bytes: &[u8],
     request: impl Fn(&str, &[(&str, &str)], &[u8], usize) -> Result<Response>,

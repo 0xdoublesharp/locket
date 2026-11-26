@@ -15,6 +15,7 @@ const SESSION_TOKEN: &str = "mock-s3-session-canary";
 const TEAM_VALUE: &str = "remote-team-value-canary";
 const DAV_USER: &str = "mock-dav-user-canary";
 const DAV_SECRET: &str = "mock-dav-secret-canary";
+const OTHER_PACKAGES: usize = 301;
 
 #[test]
 fn s3_remote_cli_round_trip() -> TestResult {
@@ -132,6 +133,7 @@ fn round_trip(mode: &str) -> TestResult {
     run(&value_context, &["set", "INITIAL_TOKEN", "--source", "team-managed"])?;
     run(&owner_context, &["team", "publish"])?;
     assert_connection(&owner_context, 2)?;
+    remote.seed_other_packages("exchange/", &device.fingerprint)?;
 
     let join = |pin| {
         [
@@ -177,6 +179,8 @@ fn round_trip(mode: &str) -> TestResult {
 
     let before_clear = sync_status(&receiver_context)?;
     assert!(before_clear["epoch"].as_u64() > joined_status["epoch"].as_u64());
+    assert!(run(&receiver_context, &["team", "remote", "prune", "--dry-run"]).is_err());
+    assert_prune(&owner_context, &remote, "exchange/", 3)?;
     for (context, store) in [(&receiver_context, &recipient), (&owner_context, &issuer)] {
         assert!(run(context, &["team", "remote", "clear"])?.contains("authenticated history"));
         assert_eq!(credential_rows(store)?, 0);
@@ -218,12 +222,90 @@ fn webdav_remote_cli_stores_basic_credentials_and_switches_to_folder() -> TestRe
     assert_eq!(status["credential_mode"], "vault");
     let store = crate::open_store(&context)?;
     assert_eq!(credential_rows(&store)?, 1);
+    let pin = sync_status(&context)?;
+    let pin = pin["owner_fingerprint"].as_str().ok_or("missing owner pin")?;
+    let receiver = tempdir()?;
+    let receiver_context = test_context_with_secret_value(&receiver, DAV_SECRET);
+    fs::copy(directory.path().join("locket.toml"), receiver.path().join("locket.toml"))?;
+    run(&receiver_context, &["team", "join", "--request"])?;
+    let resolved = crate::require_project(&context)?;
+    let recipient = crate::open_store(&receiver_context)?;
+    let device = recipient
+        .get_active_local_device(resolved.config.project_id.as_str())?
+        .ok_or("recipient device missing")?;
+    let descriptor = crate::encode_device_descriptor(&device)?;
+    run(
+        &context,
+        &[
+            "team",
+            "add",
+            "Receiver",
+            "--device",
+            &descriptor,
+            "--confirm-device-fingerprint",
+            &device.fingerprint,
+            "--profile",
+            "dev",
+        ],
+    )?;
+    run(&context, &["team", "publish"])?;
+    run(&context, &["set", "DAV_TOKEN", "--source", "team-managed"])?;
+    run(&context, &["team", "publish"])?;
+    remote.seed_other_packages("team/", &device.fingerprint)?;
+    run(
+        &receiver_context,
+        &[
+            "team",
+            "join",
+            "--owner",
+            pin,
+            "--webdav-url",
+            &url,
+            "--webdav-auth",
+            "basic",
+            "--webdav-username",
+            DAV_USER,
+        ],
+    )?;
+    assert_eq!(sync_status(&receiver_context)?["epoch"], 2);
+    assert_prune(&context, &remote, "team/", 2)?;
     let path = folder.path().to_str().ok_or("folder path must be UTF-8")?;
     run(&context, &["team", "remote", "set", "folder", path])?;
     let status = remote_status(&context)?;
     assert_eq!(status["transport_kind"], "folder");
     assert_eq!(status["credential_mode"], "none");
     assert_eq!(credential_rows(&store)?, 0);
+    Ok(())
+}
+
+fn assert_prune(
+    context: &RuntimeContext,
+    remote: &MockRemote,
+    path: &str,
+    published: usize,
+) -> TestResult {
+    let args = ["team", "remote", "prune", "--keep-epochs", "1"];
+    let dry_args = [&args[..], &["--dry-run"]].concat();
+    let plan: serde_json::Value = serde_json::from_str(&run(context, &dry_args)?)?;
+    assert_eq!(plan["dry_run"], true);
+    assert_eq!(plan["keep_epochs"], 1);
+    assert_eq!(plan["examined"], published);
+    assert_eq!(plan["deleted"], published - 1);
+    assert_eq!(plan["kept"], 1);
+    assert_connection(context, OTHER_PACKAGES + published)?;
+    let result: serde_json::Value = serde_json::from_str(&run(context, &args)?)?;
+    assert_eq!(result["dry_run"], false);
+    assert_eq!(result["deleted_filenames"], plan["deleted_filenames"]);
+    assert_eq!(result["deleted"], published - 1);
+    assert_connection(context, OTHER_PACKAGES + 1)?;
+    let objects =
+        remote.objects.lock().map_err(|_| io::Error::other("mock storage lock poisoned"))?;
+    for name in result["deleted_filenames"].as_array().ok_or("missing pruned names")? {
+        let name = name.as_str().ok_or("invalid pruned name")?;
+        assert!(!objects.contains_key(&format!("{path}{name}")));
+    }
+    assert!(objects.keys().any(|key| key.contains(&format!("-{published:08}-"))));
+    drop(objects);
     Ok(())
 }
 
@@ -269,6 +351,7 @@ enum MockBackend {
 
 struct MockRemote {
     addr: SocketAddr,
+    objects: Arc<std::sync::Mutex<BTreeMap<String, Vec<u8>>>>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<io::Result<()>>>,
 }
@@ -279,17 +362,33 @@ impl MockRemote {
         let addr = listener.local_addr()?;
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
+        let objects = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+        let worker_objects = Arc::clone(&objects);
         let worker = thread::spawn(move || {
-            let mut objects = BTreeMap::new();
             for stream in listener.incoming() {
                 if worker_stop.load(Ordering::Relaxed) {
                     break;
                 }
+                let mut objects = worker_objects
+                    .lock()
+                    .map_err(|_| io::Error::other("mock storage lock poisoned"))?;
                 serve(&mut stream?, &mut objects, backend)?;
             }
             Ok(())
         });
-        Ok(Self { addr, stop, worker: Some(worker) })
+        Ok(Self { addr, objects, stop, worker: Some(worker) })
+    }
+
+    fn seed_other_packages(&self, path: &str, fingerprint: &str) -> io::Result<()> {
+        let other =
+            if fingerprint.starts_with('0') { "1111111111111111" } else { "0000000000000000" };
+        let mut objects =
+            self.objects.lock().map_err(|_| io::Error::other("mock storage lock poisoned"))?;
+        for index in 0..OTHER_PACKAGES {
+            objects.insert(format!("{path}r-{other}-00000001-{index:016x}.lkpkg"), Vec::new());
+        }
+        drop(objects);
+        Ok(())
     }
 }
 
@@ -340,33 +439,45 @@ fn serve(
     let mut body = vec![0; length];
     reader.read_exact(&mut body)?;
     let header = |key: &str| headers.get(key).map(String::as_str);
-    let MockBackend::S3 { with_session } = backend else {
-        let basic = data_encoding::BASE64.encode(format!("{DAV_USER}:{DAV_SECRET}").as_bytes());
-        if header("authorization") != Some(&format!("Basic {basic}")) {
-            return respond(stream, 403, &[]);
+    let key = match backend {
+        MockBackend::WebDav => {
+            let basic = data_encoding::BASE64.encode(format!("{DAV_USER}:{DAV_SECRET}").as_bytes());
+            if header("authorization") != Some(&format!("Basic {basic}")) {
+                return respond(stream, 403, &[]);
+            }
+            if method == "PROPFIND" && target == "/team/" && header("depth") == Some("1") {
+                let mut listing = String::from("<multistatus xmlns=\"DAV:\">");
+                for key in objects.keys() {
+                    write!(listing, "<response><href>/{key}</href></response>")
+                        .map_err(io::Error::other)?;
+                }
+                listing.push_str("</multistatus>");
+                return respond(stream, 207, listing.as_bytes());
+            }
+            target.strip_prefix('/').filter(|key| key.starts_with("team/"))
         }
-        if method == "PROPFIND" && target == "/team/" && header("depth") == Some("1") {
-            return respond(stream, 207, br#"<multistatus xmlns="DAV:"><response><href>/team/</href></response></multistatus>"#);
+        MockBackend::S3 { with_session } => {
+            if !header("authorization").is_some_and(|value| {
+                value.starts_with(&format!("AWS4-HMAC-SHA256 Credential={ACCESS_ID}/"))
+                    && value.contains("/us-east-1/s3/aws4_request")
+            }) || header("x-amz-security-token") != with_session.then_some(SESSION_TOKEN)
+            {
+                return respond(stream, 403, &[]);
+            }
+            if method == "GET" && target == "/bucket?list-type=2&prefix=exchange%2F" {
+                let mut listing =
+                    String::from("<ListBucketResult><IsTruncated>false</IsTruncated>");
+                for key in objects.keys() {
+                    write!(listing, "<Contents><Key>{key}</Key></Contents>")
+                        .map_err(io::Error::other)?;
+                }
+                listing.push_str("</ListBucketResult>");
+                return respond(stream, 200, listing.as_bytes());
+            }
+            target.strip_prefix("/bucket/").filter(|key| key.starts_with("exchange/"))
         }
-        return respond(stream, 400, &[]);
     };
-    if !header("authorization").is_some_and(|value| {
-        value.starts_with(&format!("AWS4-HMAC-SHA256 Credential={ACCESS_ID}/"))
-            && value.contains("/us-east-1/s3/aws4_request")
-    }) || header("x-amz-security-token") != with_session.then_some(SESSION_TOKEN)
-    {
-        return respond(stream, 403, &[]);
-    }
-    if method == "GET" && target == "/bucket?list-type=2&prefix=exchange%2F" {
-        let mut listing = String::from("<ListBucketResult><IsTruncated>false</IsTruncated>");
-        for key in objects.keys() {
-            write!(listing, "<Contents><Key>{key}</Key></Contents>").map_err(io::Error::other)?;
-        }
-        listing.push_str("</ListBucketResult>");
-        return respond(stream, 200, listing.as_bytes());
-    }
-    let Some(key) = target.strip_prefix("/bucket/").filter(|key| key.starts_with("exchange/"))
-    else {
+    let Some(key) = key else {
         return respond(stream, 404, &[]);
     };
     match (method.as_str(), objects.get(key)) {
@@ -378,6 +489,10 @@ fn serve(
         ("PUT", None) => {
             objects.insert(key.to_owned(), body);
             respond(stream, 201, &[])
+        }
+        ("DELETE", _) => {
+            let status = if objects.remove(key).is_some() { 204 } else { 404 };
+            respond(stream, status, &[])
         }
         _ => respond(stream, 400, &[]),
     }

@@ -26,7 +26,7 @@ pub(super) fn anchor(store: &Store, project: &str) -> Result<Option<(String, Dev
         .optional()?;
     row.map(|(team, json)| Ok((team, serde_json::from_str(&json)?))).transpose()
 }
-fn local_owner(store: &Store, project: &str) -> Result<(String, DeviceIdentity)> {
+pub(super) fn local_owner(store: &Store, project: &str) -> Result<(String, DeviceIdentity)> {
     let (team, owner) =
         anchor(store, project)?.ok_or_else(|| reject("initialize and pin the owner first"))?;
     let local =
@@ -36,7 +36,7 @@ fn local_owner(store: &Store, project: &str) -> Result<(String, DeviceIdentity)>
             .get_active_team_member_by_device(&team, &local.id)?
             .is_none_or(|m| m.role != "owner")
     {
-        return Err(reject("only the pinned protected owner can publish"));
+        return Err(reject("only the pinned protected owner can perform this operation"));
     }
     Ok((team, owner))
 }
@@ -427,7 +427,8 @@ pub fn publish_guarded(
         envelope.verify(&owner.fingerprint, project, &member.device, now)?;
         let statement_digest = digest(&envelope.statement);
         let bytes = envelope.seal(&member.device.sealing_key)?;
-        let filename = format!("{}.lkpkg", digest(&locket_crypto::random_bytes::<32>()?));
+        let prefix = super::transport::recipient_prefix(&member.device.fingerprint)?;
+        let filename = format!("{prefix}{:08}-{}.lkpkg", statement.epoch, &digest(&bytes)[..16]);
         packages.push((
             member.device.fingerprint.clone(),
             statement.epoch,

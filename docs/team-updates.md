@@ -79,7 +79,7 @@ locket team join --owner '<independently verified owner fingerprint>' \
 
 To read packages from a backend already configured on this machine, use `locket team join --owner '<independently verified owner fingerprint>' --remote`.
 
-For AWS S3, use a dedicated bucket for team updates. Grant developers only `s3:ListBucket` on that bucket and `s3:GetObject` for packages under the project prefix. Add `s3:PutObject` to the object statement for the owner. Bucket-level list permission also lets S3 report a missing object when Locket checks before upload. Use equivalent scoped credentials with other providers. See [AWS S3 policy examples](https://docs.aws.amazon.com/AmazonS3/latest/userguide/example-policies-s3.html) and the [HeadObject reference](https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadObject.html).
+For AWS S3, use a dedicated bucket for team updates. Grant developers only `s3:ListBucket` on that bucket and `s3:GetObject` for packages under the project prefix. Add `s3:PutObject` to the object statement for the owner. If the owner uses pruning, also grant the owner `s3:DeleteObject` for packages under that prefix. Bucket-level list permission also lets S3 report a missing object when Locket checks before upload. Use equivalent scoped credentials with other providers. See [AWS S3 policy examples](https://docs.aws.amazon.com/AmazonS3/latest/userguide/example-policies-s3.html) and the [HeadObject reference](https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadObject.html).
 
 ```json
 {
@@ -106,6 +106,10 @@ locket team remote clear
 ```
 
 `test` checks connectivity and package listing. `status` shows the configured backend without credentials. `clear` disables delivery and removes locally stored transport credentials while preserving the owner pin and authenticated history.
+
+The pinned owner can run `locket team remote prune [--keep-epochs N] [--dry-run]` to remove superseded packages from the configured backend. Locket keeps five delivered epochs per recipient by default and requires a retention of at least one. Pruning only considers packages recorded in this owner's outbox. Run the command with `--dry-run` to see the proposed deletions as JSON before applying them.
+
+Choose a retention window that covers devices that sync infrequently. A device whose next epoch was pruned needs the missing encrypted packages restored to resume automatic updates.
 
 ## Receive updates
 

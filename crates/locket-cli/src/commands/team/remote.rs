@@ -31,8 +31,20 @@ pub enum RemoteCommand {
     Status,
     /// Check that the configured backend can list encrypted packages.
     Test,
+    /// Prune superseded packages from the configured backend (pinned owner only).
+    Prune(PruneArgs),
     /// Clear delivery and stored transport credentials while retaining trust history.
     Clear,
+}
+
+#[derive(Args, Debug)]
+pub struct PruneArgs {
+    /// Recent delivered epochs to keep per recipient (at least one).
+    #[arg(long, default_value_t = 5)]
+    keep_epochs: usize,
+    /// Show the packages eligible for deletion.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -235,6 +247,18 @@ pub fn run(
                 .map_err(sync::failure)?;
             writeln!(output, "{}", serde_json::to_string_pretty(&result)?)?;
         }
+        RemoteCommand::Prune(args) => {
+            let (master, _) = load_master_key(context, project)?;
+            let result = team_sync::prune_remote_packages(
+                &store,
+                project,
+                Some(&master),
+                args.keep_epochs,
+                args.dry_run,
+            )
+            .map_err(sync::failure)?;
+            writeln!(output, "{}", serde_json::to_string_pretty(&result)?)?;
+        }
         RemoteCommand::Clear => {
             team_sync::clear_transport(&store, project).map_err(sync::failure)?;
             writeln!(
@@ -411,7 +435,10 @@ impl RemoteSetup {
             .transpose()
     }
 
-    pub(super) fn join_packages(&self) -> Result<team_sync::JoinPackages, CliError> {
+    pub(super) fn join_packages(
+        &self,
+        recipient_fingerprint: &str,
+    ) -> Result<team_sync::JoinPackages, CliError> {
         // The iterator owns its credentials. Keep the original for persistence after verification.
         let secret = self.secret.as_ref().map(|secret| match secret {
             TransportSecretInput::S3 { access_key_id, secret_access_key, session_token } => {
@@ -425,7 +452,12 @@ impl RemoteSetup {
                 TransportSecretInput::WebDav { username: username.clone(), secret: secret.clone() }
             }
         });
-        team_sync::list_and_read_join_packages(&self.config, secret).map_err(sync::failure)
+        team_sync::list_and_read_join_packages_for_recipient(
+            &self.config,
+            secret,
+            recipient_fingerprint,
+        )
+        .map_err(sync::failure)
     }
 
     pub(super) fn configure(

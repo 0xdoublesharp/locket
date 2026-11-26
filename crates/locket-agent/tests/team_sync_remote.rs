@@ -102,6 +102,8 @@ struct RemoteState {
     continued: usize,
     writes: usize,
     requests: usize,
+    downloads: usize,
+    deletes: usize,
 }
 
 struct MockRemote {
@@ -268,6 +270,7 @@ fn serve(stream: &mut TcpStream, backend: Backend, state: &Mutex<RemoteState>) -
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", MAX_PACKAGE_BYTES + 19)
         }
         "GET" => {
+            state.downloads += 1;
             let (status, bytes) = state
                 .objects
                 .get(object)
@@ -290,6 +293,16 @@ fn serve(stream: &mut TcpStream, backend: Backend, state: &Mutex<RemoteState>) -
             state.writes += 1;
             drop(state);
             respond(stream, 201, &[])
+        }
+        "DELETE" => {
+            state.deletes += 1;
+            let status = if state.objects.remove(object).is_some() {
+                if matches!(backend, Backend::S3) { 204 } else { 200 }
+            } else {
+                404
+            };
+            drop(state);
+            respond(stream, status, &[])
         }
         _ => respond(stream, 400, &[]),
     }
@@ -594,6 +607,9 @@ fn s3_publication_join_update_conflict_revocation_and_fork() -> TestResult {
             |row| row.get(0),
         )?;
         assert!(!queued);
+        let (prefix, _) = clashing.rsplit_once('-').ok_or("missing recipient and epoch prefix")?;
+        assert!(state.objects.keys().any(|name| name != clashing && name.starts_with(prefix)));
+        drop(state);
     }
     let updated = receiver.sync(151)?;
     assert_eq!(updated.epoch, 2);
@@ -650,6 +666,153 @@ fn s3_publication_join_update_conflict_revocation_and_fork() -> TestResult {
     let status = team_sync::status(&receiver.store, PROJECT)?;
     assert_eq!((status.epoch, status.state.as_str()), (3, "fork"));
     assert!(receiver.store.verify_audit_chain_read_only(PROJECT, &[23; 32])?.hmac_ok);
+    Ok(())
+}
+
+#[test]
+fn s3_recipient_join_and_owner_prune() -> TestResult {
+    recipient_join_and_owner_prune(Backend::S3)
+}
+
+#[test]
+fn webdav_recipient_join_and_owner_prune() -> TestResult {
+    recipient_join_and_owner_prune(Backend::DavBasic)
+}
+
+fn outbox_filenames(store: &Store, device: &Device) -> TestResult<Vec<String>> {
+    Ok(store.connection().prepare(
+        "SELECT filename FROM team_sync_outbox WHERE project_id=?1 AND recipient=?2 ORDER BY rowid",
+    )?.query_map((PROJECT, &device.identity.fingerprint), |row| row.get(0))?
+        .collect::<Result<Vec<_>, _>>()?)
+}
+
+fn seed_legacy_and_foreign_packages(
+    store: &Store,
+    remote: &MockRemote,
+    recipient: &Device,
+    legacy: &str,
+) -> TestResult {
+    let [first] = outbox_filenames(store, recipient)?
+        .try_into()
+        .map_err(|_| "expected one initial package")?;
+    let prefix = &recipient.identity.fingerprint[..16];
+    assert!(first.starts_with(&format!("r-{prefix}-00000001-")));
+    store
+        .connection()
+        .execute("UPDATE team_sync_outbox SET filename=?2 WHERE filename=?1", (&first, legacy))?;
+    let mut state = remote.state()?;
+    let initial = state.objects.remove(&first).ok_or("missing initial package")?;
+    state.objects.insert(legacy.into(), initial);
+    let other = if prefix.starts_with('0') { "1111111111111111" } else { "0000000000000000" };
+    for index in 0..301 {
+        state.objects.insert(format!("r-{other}-00000001-{index:016x}.lkpkg"), Vec::new());
+    }
+    state.objects.insert("foreign.lkpkg".into(), Vec::new());
+    drop(state);
+    Ok(())
+}
+
+fn recipient_join_and_owner_prune(backend: Backend) -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let remote = MockRemote::start(backend)?;
+    let owner = Device::new("owner", 7);
+    let recipient = Device::new("recipient", 10);
+    let removed = Device::new("removed", 30);
+    let mut publisher = Vault::owner(directory.path(), &owner, &[&recipient, &removed], false)?;
+    publisher.configure(&remote, false)?;
+    assert_eq!(publisher.sync(150)?.published, 2);
+    let legacy = "legacy.lkpkg";
+    seed_legacy_and_foreign_packages(&publisher.store, &remote, &recipient, legacy)?;
+    write_value(&publisher.store, 2, "second epoch")?;
+    assert_eq!(publisher.sync(151)?.published, 2);
+    write_value(&publisher.store, 3, "third epoch")?;
+    assert_eq!(publisher.sync(152)?.published, 2);
+
+    let config = remote.config(CredentialMode::Vault);
+    let downloads = remote.state()?.downloads;
+    assert!(
+        team_sync::list_and_read_join_packages_for_recipient(
+            &config,
+            Some(backend.secret()),
+            "invalid",
+        )
+        .is_err()
+    );
+    assert!(team_sync::list_and_read_join_packages(&config, Some(backend.secret())).is_err());
+    let candidates = team_sync::list_and_read_join_packages_for_recipient(
+        &config,
+        Some(backend.secret()),
+        &recipient.identity.fingerprint.to_ascii_uppercase(),
+    )?
+    .collect::<team_sync::Result<Vec<_>>>()?;
+    let [(newest, ciphertext), (older, _), (foreign, _), (legacy_name, _)] = candidates.as_slice()
+    else {
+        return Err("expected two addressed candidates and two legacy candidates".into());
+    };
+    let prefix = &recipient.identity.fingerprint[..16];
+    assert!(newest.starts_with(&format!("r-{prefix}-00000003-")));
+    assert!(older.starts_with(&format!("r-{prefix}-00000002-")));
+    assert_eq!((foreign.as_str(), legacy_name.as_str()), ("foreign.lkpkg", legacy));
+    assert_eq!(remote.state()?.downloads - downloads, 4);
+
+    let mut receiver = recipient.store(directory.path())?;
+    team_sync::apply_package(
+        &mut receiver.store,
+        ciphertext,
+        &MASTER,
+        &recipient.sealing,
+        &recipient.identity,
+        PROJECT,
+        Some(&owner.identity.fingerprint),
+        152,
+    )?;
+    receiver.configure(&remote, false)?;
+    assert!(
+        team_sync::prune_remote_packages(&receiver.store, PROJECT, Some(&MASTER), 1, false)
+            .is_err_and(|error| error.to_string().contains("pinned protected owner"))
+    );
+    assert!(
+        team_sync::prune_remote_packages(&publisher.store, PROJECT, Some(&MASTER), 0, true)
+            .is_err()
+    );
+
+    team_sync::remove_member(&mut publisher.store, PROJECT, "removed", &MASTER, 153)?;
+    assert_eq!(publisher.sync(153)?.published, 1);
+    let active = outbox_filenames(&publisher.store, &recipient)?;
+    let revoked = outbox_filenames(&publisher.store, &removed)?;
+    publisher
+        .store
+        .connection()
+        .execute("UPDATE team_sync_outbox SET delivered=0 WHERE filename=?1", [older])?;
+
+    let downloads = remote.state()?.downloads;
+    assert_eq!(receiver.sync(153)?.epoch, 4);
+    assert_eq!(remote.state()?.downloads - downloads, 5);
+
+    let before = remote.state()?.objects.clone();
+    let dry_run =
+        team_sync::prune_remote_packages(&publisher.store, PROJECT, Some(&MASTER), 2, true)?;
+    assert_eq!((dry_run.examined, dry_run.kept, dry_run.deleted), (7, 5, 2));
+    assert!(dry_run.dry_run);
+    assert!(dry_run.deleted_filenames.iter().any(|name| name == legacy));
+    assert!(dry_run.deleted_filenames.contains(&revoked[0]));
+    assert_eq!(remote.state()?.objects, before);
+    assert_eq!(remote.state()?.deletes, 0);
+    assert_eq!(outbox_filenames(&publisher.store, &recipient)?, active);
+    assert_eq!(outbox_filenames(&publisher.store, &removed)?, revoked);
+
+    let result =
+        team_sync::prune_remote_packages(&publisher.store, PROJECT, Some(&MASTER), 2, false)?;
+    assert_eq!(result, team_sync::PruneResult { dry_run: false, ..dry_run });
+    let mut expected = before;
+    expected.remove(legacy);
+    expected.remove(&revoked[0]);
+    assert_eq!(remote.state()?.objects, expected);
+    assert_eq!(remote.state()?.deletes, 2);
+    assert_eq!(outbox_filenames(&publisher.store, &recipient)?, &active[1..]);
+    assert_eq!(outbox_filenames(&publisher.store, &removed)?, &revoked[1..]);
+    assert_eq!(publisher.sync(154)?.published, 0);
+    assert_eq!(remote.state()?.objects, expected);
     Ok(())
 }
 

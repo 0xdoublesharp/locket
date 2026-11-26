@@ -3,6 +3,7 @@
 mod folder;
 mod keys;
 mod pending;
+mod prune;
 mod snapshot;
 pub mod transport;
 pub use folder::{
@@ -16,6 +17,7 @@ pub use pending::{
     PendingCollision, PendingProfileDetails, pending_profile_details,
     preserve_collision_as_override, rename_local_profile_for_pending,
 };
+pub use prune::{PruneResult, prune_remote_packages};
 pub use snapshot::{
     add_recipient, apply_package, apply_package_guarded, apply_package_with_consent_guarded,
     initialize_owner, join_package_checkpoint, publish, publish_guarded, remove_member,
@@ -84,5 +86,7 @@ pub use transport::{
     CredentialMode, JoinPackages, PutOutcome, RemoteTestResult, TeamTransport, TransportConfig,
     TransportSecretInput, TransportSummary, WebDavAuthKind, clear_transport, configure_transport,
     configure_transport_guarded, list_and_read_configured_join_packages,
-    list_and_read_join_packages, read_package_file, test_configured_transport, test_transport,
+    list_and_read_configured_join_packages_for_recipient, list_and_read_join_packages,
+    list_and_read_join_packages_for_recipient, read_package_file, test_configured_transport,
+    test_transport,
 };
