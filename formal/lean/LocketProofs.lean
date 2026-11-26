@@ -9,3 +9,4 @@ import LocketProofs.CryptoDomainSeparation
 import LocketProofs.PathScopeAndContract
 import LocketProofs.DotenvMetadataNonInterference
 import LocketProofs.PrivacyModeNonInterference
+import LocketProofs.MigrationSafety
