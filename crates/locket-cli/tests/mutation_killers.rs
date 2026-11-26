@@ -668,19 +668,156 @@ shared_secrets = ["SHARED_SETTING"]
         assert!(observed.is_file());
         fs::remove_file(&observed)?;
 
-        for (selector, project_id, unlock) in [
-            (PROJECT, PROJECT, format!("locket unlock --project {PROJECT}")),
-            ("@shared", SHARED_PROJECT, "locket unlock --shared".to_owned()),
-        ] {
+        for (selector, project_id) in [(PROJECT, PROJECT), ("@shared", SHARED_PROJECT)] {
             let output = command(root)
                 .env("LOCKET_NO_PROMPT", "1")
                 .args(["unlock", "--project", selector, "--verify-user"])
                 .output()?;
             assert_eq!(output.status.code(), Some(72), "{output:?}");
             let stderr = String::from_utf8(output.stderr)?;
-            assert!(stderr.contains(project_id) && stderr.contains(&unlock), "{stderr}");
+            assert!(
+                stderr.contains(&format!("`locket unlock --project {project_id} --verify-user`")),
+                "{stderr}"
+            );
             assert!(stderr.contains("Locket Desktop"), "{stderr}");
             assert!(!observed.exists());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn batches_validate_all_selectors_and_profiles_before_any_rpc()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use locket_core::LocketError;
+
+        let project = tempfile::tempdir()?;
+        let root = project.path();
+        let store = initialize_project_store(root)?;
+        for index in 0..8 {
+            let id = format!("lk_proj_batch_{index}");
+            store.insert_project_if_absent(&id, "ambiguous", 1)?;
+            store.insert_profile_if_absent(
+                &format!("lk_prof_batch_{index}"),
+                &id,
+                "dev",
+                false,
+                1,
+            )?;
+        }
+        store.insert_project_if_absent("lk_proj_without_profile", "no-profile", 1)?;
+        let _agent = start_fixture_agent(root)?;
+
+        for verb in ["unlock", "lock"] {
+            let fixed = [verb, "--project", PROJECT];
+            for (selector, kind) in [
+                ("unknown-project", LocketError::ProjectNotFound),
+                ("ambiguous", LocketError::InvalidReference),
+                ("no-profile", LocketError::ProfileNotFound),
+                ("@shared", LocketError::ProjectNotFound),
+            ] {
+                let output = command(root).args(fixed).args(["--project", selector]).output()?;
+                assert_eq!(output.status.code(), Some(i32::from(kind.exit_code())), "{output:?}");
+                assert_eq!(output.stdout, [] as [u8; 0], "{output:?}");
+            }
+            let output = command(root).args(fixed).arg("--shared").output()?;
+            assert_eq!(
+                output.status.code(),
+                Some(i32::from(LocketError::ProjectNotFound.exit_code()))
+            );
+            let mut oversized = command(root);
+            oversized.args(fixed);
+            for index in 0..8 {
+                oversized.arg("--project").arg(format!("lk_proj_batch_{index}"));
+            }
+            let output = oversized.output()?;
+            let stderr = String::from_utf8(output.stderr)?;
+            assert_eq!(
+                output.status.code(),
+                Some(i32::from(LocketError::MetadataInvalid.exit_code()))
+            );
+            assert!(stderr.contains("8-vault batch limit"), "{stderr}");
+        }
+        assert!(!root.join(".fixture-status-request").exists());
+        assert!(!root.join(".fixture-unlock-requests").exists());
+        assert!(!root.join(".fixture-lock-requests").exists());
+
+        let mut within_limit = command(root);
+        within_limit.args(["lock", "--project", PROJECT, "--project", PROJECT]);
+        for index in 0..7 {
+            within_limit.arg("--project").arg(format!("lk_proj_batch_{index}"));
+        }
+        let output = within_limit.output()?;
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(fs::read_to_string(root.join(".fixture-lock-requests"))?.lines().count(), 8);
+        Ok(())
+    }
+
+    #[test]
+    fn unlock_batch_deduplicates_aliases_and_hands_off_one_command()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const WEB: &str = "lk_proj_web_fixture";
+        let project = tempfile::tempdir()?;
+        let root = project.path();
+        let store = initialize_project_store(root)?;
+        store.insert_project_if_absent(WEB, "web", 1)?;
+        store.insert_profile_if_absent("lk_prof_web", WEB, "dev", false, 1)?;
+        store.insert_project_if_absent(SHARED_PROJECT, "@shared", 1)?;
+        store.insert_profile_if_absent("lk_prof_shared", SHARED_PROJECT, "default", false, 1)?;
+        let _agent = start_fixture_agent(root)?;
+        let args = [
+            "unlock",
+            "--project",
+            "mutation",
+            "--project",
+            "mutation",
+            "--project",
+            "web",
+            "--project",
+            "@shared",
+            "--shared",
+            "--ttl",
+            "3600",
+        ];
+        let output = command(root).env("LOCKET_NO_PROMPT", "1").args(args).output()?;
+        assert_eq!(output.status.code(), Some(72), "{output:?}");
+        let stderr = String::from_utf8(output.stderr)?;
+        let interactive = format!(
+            "locket unlock --project {PROJECT} --project {WEB} --project {SHARED_PROJECT} --shared --ttl 3600"
+        );
+        assert!(stderr.contains(&format!("`{interactive}`")), "{stderr}");
+        let observed = root.join(".fixture-unlock-requests");
+        assert!(!observed.exists());
+        assert!(!root.join(".fixture-status-request").exists());
+
+        fs::write(root.join("locket.toml"), POLICY)?;
+        let output = command(root)
+            .env("LOCKET_NO_PROMPT", "1")
+            .args(["unlock", "--shared", "--ttl", "3600"])
+            .output()?;
+        assert_eq!(output.status.code(), Some(72), "{output:?}");
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(
+            stderr.contains(&format!("`locket unlock --project {PROJECT} --shared --ttl 3600`")),
+            "{stderr}"
+        );
+        assert!(!observed.exists());
+        assert!(!root.join(".fixture-status-request").exists());
+
+        let output = command(root).env_remove("LOCKET_NO_PROMPT").args(args).output()?;
+        assert!(output.status.success(), "{output:?}");
+        let requests = fs::read_to_string(observed)?
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(requests.len(), 3);
+        for (request, (project, profile)) in requests.iter().zip([
+            (PROJECT, PROFILE),
+            (WEB, "lk_prof_web"),
+            (SHARED_PROJECT, "lk_prof_shared"),
+        ]) {
+            assert_eq!(request["project_id"], project);
+            assert_eq!(request["profile_id"], profile);
+            assert_eq!(request["ttl_seconds"], 3600);
         }
         Ok(())
     }
@@ -691,6 +828,7 @@ shared_secrets = ["SHARED_SETTING"]
         let root = project.path();
         let store = initialize_project_store(root)?;
         store.insert_project_if_absent(SHARED_PROJECT, "@shared", 1)?;
+        store.insert_profile_if_absent("lk_prof_shared", SHARED_PROJECT, "default", false, 1)?;
         let _agent = start_fixture_agent(root)?;
         let observed = root.join(".fixture-lock-requests");
         let lock = |args: &[&str], expected: &[Value]| -> Result<(), Box<dyn std::error::Error>> {
@@ -715,6 +853,10 @@ shared_secrets = ["SHARED_SETTING"]
         fs::write(root.join("locket.toml"), POLICY)?;
         lock(&["--shared"], &[json!(PROJECT), json!(SHARED_PROJECT)])?;
         lock(&["--project", "@shared", "--shared"], &[json!(SHARED_PROJECT)])?;
+        lock(
+            &["--project", "@shared", "--project", "mutation", "--project", PROJECT, "--shared"],
+            &[json!(SHARED_PROJECT), json!(PROJECT)],
+        )?;
         Ok(())
     }
 
@@ -1105,8 +1247,21 @@ env_mode = "strict"
         request: &RequestEnvelope,
     ) -> Result<ResponseEnvelope, Box<dyn std::error::Error>> {
         let payload = match request.method()? {
-            AgentMethod::Status => Ok(fixture_status(&request.payload)),
+            AgentMethod::Status => {
+                fs::write(".fixture-status-request", [])?;
+                Ok(fixture_status(&request.payload))
+            }
             AgentMethod::Unlock => {
+                let mut observed = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(".fixture-unlock-requests")?;
+                let metadata = json!({
+                    "project_id": request.payload["project_id"],
+                    "profile_id": request.payload["audit"]["profile_id"],
+                    "ttl_seconds": request.payload["ttl_seconds"],
+                });
+                writeln!(observed, "{metadata}")?;
                 if request.payload["verify_user"] == true {
                     fs::write(".fixture-unlock-request", [])?;
                 }

@@ -3,6 +3,40 @@ use super::*;
 use clap::CommandFactory;
 
 #[test]
+fn parses_repeated_vault_selectors() -> Result<(), Box<dyn std::error::Error>> {
+    let unlock = Cli::try_parse_from([
+        "locket",
+        "unlock",
+        "--project",
+        "api",
+        "--project",
+        "web",
+        "--shared",
+        "--ttl",
+        "3600",
+    ])?;
+    assert!(matches!(
+        unlock.command, Some(crate::Command::Unlock(args))
+        if args.project == ["api", "web"] && args.shared && args.ttl == Some(3600)
+    ));
+
+    let lock = Cli::try_parse_from([
+        "locket",
+        "lock",
+        "--project",
+        "api",
+        "--project",
+        "@shared",
+        "--shared",
+    ])?;
+    assert!(matches!(
+        lock.command, Some(crate::Command::Lock(args)) if args.project == ["api", "@shared"] && args.shared
+    ));
+    assert!(Cli::try_parse_from(["locket", "unlock", "--all"]).is_err());
+    Ok(())
+}
+
+#[test]
 fn env_import_parser_handles_exports_quotes_comments_and_invalid_lines() {
     let entries = crate::parse_env_import(
         "# ignored\n\

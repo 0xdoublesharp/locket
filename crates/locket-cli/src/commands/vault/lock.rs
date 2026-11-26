@@ -14,21 +14,27 @@ use crate::commands::discovery::{
     GLOBAL_VAULT, SHARED_PROJECT_PREFIX, select_project, trusted_project_configs,
 };
 use crate::commands::exec::run::agent_invoke;
-use crate::commands::secrets::links::shared_vault_target;
 use crate::runtime::error::{
     metadata_invalid_error, profile_not_found_error, project_not_found_error, typed_cli_error,
 };
 use crate::runtime::prompts::prompts_disabled;
 use crate::runtime::user_verification::require_user_verification;
+use crate::support::handoff::shell_quote;
 use crate::{
-    CliError, LockArgs, MasterKeySource, RuntimeContext, UnlockArgs, default_profile,
-    ensure_project_exists, load_project_key_with_source, now_unix_nanos, open_store,
-    resolve_project,
+    CliError, LockArgs, MasterKeySource, ResolvedProject, RuntimeContext, UnlockArgs,
+    default_profile, ensure_project_exists, load_project_key_with_source, now_unix_nanos,
+    open_store, resolve_project,
 };
 
 const DIRECT_CLI_CLIENT_KIND: &str = "direct-cli";
 const LOCK_COMMAND: &str = "lock";
 const UNLOCK_COMMAND: &str = "unlock";
+const MAX_BATCH_PROJECTS: usize = 8;
+
+struct VaultTarget {
+    profile: ProfileRecord,
+    explicit: bool,
+}
 
 const fn unlock_method(source: MasterKeySource) -> &'static str {
     match source {
@@ -42,32 +48,25 @@ pub fn lock_command(
     output: &mut impl Write,
     args: &LockArgs,
 ) -> Result<(), CliError> {
-    let resolved = if args.project.is_none() { resolve_project(&context.cwd)? } else { None };
-    let explicit = args
-        .project
-        .as_deref()
-        .map(|selector| select_project(&open_store(context)?, &context.cwd, selector))
+    let current = current_project(context, &args.project)?;
+    let mut store = (current.is_some() || !args.project.is_empty() || args.shared)
+        .then(|| open_store(context))
         .transpose()?;
-    let project_id = explicit
+    let targets = store
         .as_ref()
-        .map(|project| project.id.as_str())
-        .or_else(|| resolved.as_ref().map(|project| project.config.project_id.as_str()));
+        .map(|store| vault_targets(context, store, current.as_ref(), &args.project, args.shared))
+        .transpose()?
+        .unwrap_or_default();
+
     if agent_is_available(context)? {
-        let shared = args
-            .shared
-            .then(|| select_project(&open_store(context)?, &context.cwd, GLOBAL_VAULT))
-            .transpose()?;
-        let shared_id = shared.as_ref().map(|project| project.id.as_str());
-        let targets = [project_id, shared_id.filter(|&id| Some(id) != project_id)];
-        if project_id.is_none() && shared_id.is_none() {
+        if targets.is_empty() {
             lock_agent(context, None)?;
         }
-        for project_id in targets.into_iter().flatten() {
-            lock_agent(context, Some(project_id))?;
-        }
-        for project_id in targets.into_iter().flatten() {
-            writeln!(output, "project_id: {project_id}")?;
-        }
+        run_vault_batch(output, &targets, LOCK_COMMAND, "locked", |output, profile| {
+            lock_agent(context, Some(&profile.project_id))?;
+            writeln!(output, "project_id: {}", profile.project_id)?;
+            Ok(())
+        })?;
         writeln!(output, "agent: locked")?;
         writeln!(output, "cached_keys: cleared")?;
         return Ok(());
@@ -76,24 +75,33 @@ pub fn lock_command(
     writeln!(output, "lock: no agent-held keys to clear")?;
     writeln!(output, "agent: unavailable")?;
     writeln!(output, "metadata_only: yes")?;
-
-    let Some(project_id) = project_id else { return Ok(()) };
-    writeln!(output, "project_id: {project_id}")?;
-
-    let mut store = open_store(context)?;
-    if store.get_project(project_id)?.is_none() {
-        return Ok(());
+    if let Some(store) = &mut store {
+        run_vault_batch(
+            output,
+            &targets,
+            LOCK_COMMAND,
+            "locked (metadata only)",
+            |output, profile| {
+                writeln!(output, "project_id: {}", profile.project_id)?;
+                lock_direct(context, store, profile)
+            },
+        )?;
     }
+    Ok(())
+}
+
+fn lock_direct(
+    context: &RuntimeContext,
+    store: &mut Store,
+    profile: &ProfileRecord,
+) -> Result<(), CliError> {
+    let project_id = &profile.project_id;
     let Ok((audit_key, _)) =
-        load_project_key_with_source(context, &store, project_id, KeyPurpose::Audit)
+        load_project_key_with_source(context, store, project_id, KeyPurpose::Audit)
     else {
         // Without an agent or an audit key, the lock remains a metadata-only no-op.
         return Ok(());
     };
-    let profile_id_for_row = resolved
-        .as_ref()
-        .and_then(|project| default_profile(&store, &project.config).ok())
-        .map(|profile| profile.id);
 
     let timestamp = now_unix_nanos()?;
     let metadata = json!({
@@ -110,7 +118,7 @@ pub fn lock_command(
     });
     let audit = AuditWrite {
         project_id,
-        profile_id: profile_id_for_row.as_deref(),
+        profile_id: Some(&profile.id),
         action: "LOCK",
         status: "SUCCESS",
         secret_name: None,
@@ -138,102 +146,168 @@ pub fn unlock_command(
     args: &UnlockArgs,
 ) -> Result<(), CliError> {
     let mut store = open_store(context)?;
-    let local = unlock_profile(context, &store, args)?;
+    let current = current_project(context, &args.project)?;
+    let targets = vault_targets(context, &store, current.as_ref(), &args.project, args.shared)?;
+    if targets.is_empty() {
+        return Err(project_not_found_error());
+    }
     if prompts_disabled() {
-        return Err(noninteractive_unlock_error(local.as_ref(), args));
+        return Err(noninteractive_unlock_error(&targets, args));
     }
     if agent_is_available(context)? {
         let ttl = unlock_ttl(context, args.ttl)?;
-        let shared = args
-            .shared
-            .then(|| shared_vault_target(&store))
-            .transpose()?
-            .map(|(_, profile)| profile);
-        let additional = shared.filter(|shared| {
-            local.as_ref().is_none_or(|local| local.project_id != shared.project_id)
-        });
-        for profile in local.iter().chain(additional.iter()) {
+        return run_vault_batch(output, &targets, UNLOCK_COMMAND, "unlocked", |output, profile| {
             unlock_agent(context, profile, ttl, args.verify_user)?;
             writeln!(output, "project_id: {}", profile.project_id)?;
             writeln!(output, "active_profile: {} ({})", profile.name, profile.id)?;
             writeln!(output, "agent: unlocked")?;
             writeln!(output, "cached_keys: yes")?;
             writeln!(output, "ttl_seconds: {ttl}")?;
-        }
-        return Ok(());
+            Ok(())
+        });
     }
 
-    let start_agent = "start the agent with `locket agent start` to unlock the Global Vault";
-    let Some(profile) =
-        local.filter(|profile| !profile.project_id.starts_with(SHARED_PROJECT_PREFIX))
-    else {
-        return Err(typed_cli_error(LocketError::AgentUnavailable, start_agent));
-    };
-    unlock_direct(context, output, &mut store, &profile, args.verify_user)?;
-    if args.shared {
-        writeln!(output, "shared: {start_agent}")?;
+    if targets.iter().any(|target| target.profile.project_id.starts_with(SHARED_PROJECT_PREFIX)) {
+        return Err(typed_cli_error(
+            LocketError::AgentUnavailable,
+            "start the agent with `locket agent start` to unlock the Global Vault",
+        ));
     }
-    Ok(())
+    run_vault_batch(
+        output,
+        &targets,
+        UNLOCK_COMMAND,
+        "unlocked (metadata only)",
+        |output, profile| unlock_direct(context, output, &mut store, profile, args.verify_user),
+    )
 }
 
-fn noninteractive_unlock_error(local: Option<&ProfileRecord>, args: &UnlockArgs) -> CliError {
-    let (vault, command) = match local {
-        Some(profile) if !profile.project_id.starts_with(SHARED_PROJECT_PREFIX) => {
-            let mut vault = format!("vault {}", profile.project_id);
-            let mut command = if args.project.is_some() {
-                format!("locket unlock --project {}", profile.project_id)
-            } else {
-                "locket unlock".to_owned()
-            };
-            if args.shared {
-                vault.push_str(" and the Global Vault (@shared)");
-                command.push_str(" --shared");
-            }
-            (vault, command)
+fn noninteractive_unlock_error(targets: &[VaultTarget], args: &UnlockArgs) -> CliError {
+    use std::fmt::Write as _;
+
+    let mut command = String::from("locket unlock");
+    let mut vaults = Vec::with_capacity(targets.len());
+    for target in targets {
+        let id = &target.profile.project_id;
+        let shared = id.starts_with(SHARED_PROJECT_PREFIX);
+        if target.explicit || (targets.len() > 1 && !shared) {
+            let _ = write!(command, " --project {}", shell_quote(id));
         }
-        Some(profile) => (
-            format!("the Global Vault ({})", profile.project_id),
-            "locket unlock --shared".to_owned(),
-        ),
-        None => ("the Global Vault (@shared)".to_owned(), "locket unlock --shared".to_owned()),
-    };
+        if shared {
+            vaults.push(format!("the Global Vault ({id})"));
+        } else {
+            vaults.push(format!("vault {id}"));
+        }
+    }
+    if args.shared {
+        command.push_str(" --shared");
+    }
+    if let Some(ttl) = args.ttl {
+        let _ = write!(command, " --ttl {ttl}");
+    }
+    if args.verify_user {
+        command.push_str(" --verify-user");
+    }
+    let vaults = vaults.join(", ");
     typed_cli_error(
         LocketError::UnlockRequired,
         format!(
-            "unlocking {vault} requires interactive verification (LOCKET_NO_PROMPT is set). Run `{command}` from an interactive desktop terminal or unlock in Locket Desktop"
+            "unlocking {vaults} requires interactive verification (LOCKET_NO_PROMPT is set). Run `{command}` from an interactive desktop terminal or unlock in Locket Desktop"
         ),
     )
 }
 
-fn unlock_profile(
+fn current_project(
+    context: &RuntimeContext,
+    selectors: &[String],
+) -> Result<Option<ResolvedProject>, CliError> {
+    if selectors.is_empty() { resolve_project(&context.cwd) } else { Ok(None) }
+}
+
+fn vault_targets(
     context: &RuntimeContext,
     store: &Store,
-    args: &UnlockArgs,
-) -> Result<Option<ProfileRecord>, CliError> {
-    if let Some(selector) = &args.project {
-        let project = select_project(store, &context.cwd, selector)?;
-        let profile = if project.id.starts_with(SHARED_PROJECT_PREFIX) {
-            store
-                .get_profile_by_name(&project.id, "default")?
-                .ok_or_else(|| profile_not_found_error("Global Vault default profile is missing"))?
-        } else if let Some(resolved) = trusted_project_configs(store, &project.id)?.first() {
-            default_profile(store, &resolved.config)?
-        } else {
-            store
-                .list_profiles(&project.id)?
-                .into_iter()
-                .next()
-                .ok_or_else(|| profile_not_found_error("project has no profile"))?
-        };
-        Ok(Some(profile))
-    } else if let Some(resolved) = resolve_project(&context.cwd)? {
-        ensure_project_exists(store, resolved.config.project_id.as_str())?;
-        Ok(Some(default_profile(store, &resolved.config)?))
-    } else if args.shared {
-        Ok(None)
-    } else {
-        Err(project_not_found_error())
+    current: Option<&ResolvedProject>,
+    selectors: &[String],
+    shared: bool,
+) -> Result<Vec<VaultTarget>, CliError> {
+    let mut targets = Vec::new();
+    if let Some(current) = current {
+        ensure_project_exists(store, current.config.project_id.as_str())?;
+        targets.push(VaultTarget {
+            profile: default_profile(store, &current.config)?,
+            explicit: false,
+        });
     }
+
+    let selections = selectors.iter().map(|selector| (selector.as_str(), true));
+    for (selector, explicit) in selections.chain(shared.then_some((GLOBAL_VAULT, false))) {
+        let project = select_project(store, &context.cwd, selector).map_err(|error| {
+            if selector == GLOBAL_VAULT
+                && matches!(error, CliError::Typed { kind: LocketError::ProjectNotFound, .. })
+            {
+                return typed_cli_error(
+                    LocketError::ProjectNotFound,
+                    "Global Vault (@shared) is not initialized. Run `locket shared init` first.",
+                );
+            }
+            error
+        })?;
+        if targets.iter().any(|target| target.profile.project_id == project.id) {
+            continue;
+        }
+        if targets.len() == MAX_BATCH_PROJECTS {
+            return Err(metadata_invalid_error(format!(
+                "lock and unlock have an {MAX_BATCH_PROJECTS}-vault batch limit"
+            )));
+        }
+        let profile = project_profile(store, &project.id)?;
+        targets.push(VaultTarget { profile, explicit });
+    }
+    Ok(targets)
+}
+
+fn project_profile(store: &Store, project_id: &str) -> Result<ProfileRecord, CliError> {
+    if project_id.starts_with(SHARED_PROJECT_PREFIX) {
+        store
+            .get_profile_by_name(project_id, "default")?
+            .ok_or_else(|| profile_not_found_error("Global Vault default profile is missing"))
+    } else if let Some(resolved) = trusted_project_configs(store, project_id)?.first() {
+        default_profile(store, &resolved.config)
+    } else {
+        store
+            .list_profiles(project_id)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| profile_not_found_error("project has no profile"))
+    }
+}
+
+fn run_vault_batch<W: Write>(
+    output: &mut W,
+    targets: &[VaultTarget],
+    command: &str,
+    success: &str,
+    mut run: impl FnMut(&mut W, &ProfileRecord) -> Result<(), CliError>,
+) -> Result<(), CliError> {
+    let batch = targets.len() > 1;
+    for (index, target) in targets.iter().enumerate() {
+        let id = &target.profile.project_id;
+        if let Err(error) = run(output, &target.profile) {
+            if batch {
+                let _ = writeln!(output, "vault {id}: {command} failed");
+                for skipped in &targets[index + 1..] {
+                    let _ =
+                        writeln!(output, "vault {}: {command} skipped", skipped.profile.project_id);
+                }
+            }
+            return Err(error);
+        }
+        if batch {
+            writeln!(output, "vault {id}: {success}")?;
+        }
+    }
+    Ok(())
 }
 
 fn agent_is_available(context: &RuntimeContext) -> Result<bool, CliError> {

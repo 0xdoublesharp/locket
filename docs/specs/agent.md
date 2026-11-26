@@ -108,7 +108,13 @@ CLI agent commands:
 
 `locket agent status` contacts the agent over the local socket or pipe and prints metadata only: running or stopped state, agent version, pid, socket or pipe path, lock state, unlock TTL remaining when available, live grant count, active project/profile when a project context is resolved, degraded hardening flags, and last error summary. When the agent is unreachable, it reports stopped and includes the last known PID from `agent.pid` if that file is present.
 
-`locket lock` locks the current project in the running agent, or all vaults when no project is resolved. Use `--project <PROJECT>` to select a vault by ID or name, including `@shared`. Use `--shared` to include the Global Vault or lock it on its own from outside a project.
+`locket lock` locks the current project in the running agent, or all vaults when no project is resolved and no vault is selected. Both `locket unlock` and `locket lock` accept repeated `--project <PROJECT>` flags for vault IDs or names, including `@shared`. The `--shared` flag appends the Global Vault after the selected projects, or selects it on its own from outside a project.
+
+Before contacting the agent or prompting, the CLI resolves every selector and its profile. It deduplicates vaults by project ID in selection order and rejects batches of more than eight distinct vaults. Each vault receives its own agent RPC and audit handling. An explicit unlock applies the requested `--ttl` to each vault and performs its required user verification separately. `--ttl` accepts 1 to 86400 seconds and defaults to `agent.unlock_ttl` (15 minutes unless configured).
+
+The CLI stops at the first failure or cancellation, reports which vaults succeeded, failed, or were skipped, and exits with the error. Vaults that already succeeded keep their new state. With `LOCKET_NO_PROMPT=1`, unlock returns `UnlockRequired` with a single interactive command for the selected vaults.
+
+Without a running agent, unlock runs in metadata-only direct mode for local vaults. A batch that includes the Global Vault requires a running agent before any vault can be unlocked.
 
 `locket agent invite request` prints a paste-friendly setup request for the current machine or for a supplied `--device <descriptor>`. When no descriptor is supplied, the command uses the active local device descriptor; if none exists, it fails with actionable guidance to run `locket device init` explicitly. It then prints a bounded text block containing the device descriptor, fingerprint, safety words, optional project metadata, and an issuer command of the form `locket agent invite create <label> --device <descriptor> --profile dev --role developer [--expires-in 7d]`. The request block is metadata-only and contains no secret values, wrapped key material, recovery material, or device private keys.
 

@@ -298,7 +298,7 @@ pub fn shared_command(
                 context,
                 output,
                 &crate::UnlockArgs {
-                    project: Some(GLOBAL_VAULT.to_owned()),
+                    project: vec![GLOBAL_VAULT.to_owned()],
                     ttl,
                     ..Default::default()
                 },

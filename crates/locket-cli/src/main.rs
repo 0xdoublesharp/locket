@@ -879,9 +879,9 @@ pub struct ComposeRunArgs {
 
 #[derive(Debug, Args)]
 struct LockArgs {
-    /// Select a registered project by ID or name, including @shared.
-    #[arg(long)]
-    project: Option<String>,
+    /// Select a project by ID or name, including @shared. Repeat for up to eight vaults.
+    #[arg(long = "project", value_name = "PROJECT")]
+    pub project: Vec<String>,
     /// Also lock the Global Vault. Outside a project, lock it on its own.
     #[arg(long)]
     shared: bool,
@@ -895,9 +895,9 @@ struct UnlockArgs {
     /// Also unlock the Global Vault. Outside a project, unlock it on its own.
     #[arg(long)]
     shared: bool,
-    /// Select a registered project by ID or name, including @shared.
-    #[arg(long)]
-    project: Option<String>,
+    /// Select a project by ID or name, including @shared. Repeat for up to eight vaults.
+    #[arg(long = "project", value_name = "PROJECT")]
+    pub project: Vec<String>,
     /// Override the agent unlock lifetime in seconds.
     #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..=86_400))]
     ttl: Option<u64>,

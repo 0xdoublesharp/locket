@@ -1040,14 +1040,280 @@ fn lock_and_unlock_use_direct_metadata_only_mode() -> Result<(), Box<dyn std::er
     assert!(unlock_output.contains("cached_keys: no"));
     assert!(unlock_output.contains("verify_user: not requested"));
     let mut fallback = Vec::new();
-    run_with_context(
+    let result = run_with_context(
         Cli::try_parse_from(["locket", "unlock", "--shared"])?,
         &context,
         &mut fallback,
+    );
+    assert!(matches!(
+        result,
+        Err(crate::CliError::Typed { kind: locket_core::LocketError::ProjectNotFound, .. })
+    ));
+    assert_eq!(fallback, [] as [u8; 0]);
+    Ok(())
+}
+
+fn init_batch_project(
+    context: &RuntimeContext,
+    name: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let cwd = context.cwd.join(name);
+    fs::create_dir(&cwd)?;
+    let project = RuntimeContext { cwd, ..context.clone() };
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--name", name, "--no-device", "--no-passkey"])?,
+        &project,
+        &mut Vec::new(),
     )?;
-    let fallback = String::from_utf8(fallback)?;
-    assert!(fallback.contains("metadata-only direct CLI unlock succeeded"));
-    assert!(fallback.contains("start the agent with `locket agent start`"));
+    Ok(crate::require_project(&project)?.config.project_id.into_string())
+}
+
+#[test]
+fn direct_unlock_batch_is_metadata_only_and_requires_an_agent_for_shared()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let keys = Arc::new(super::cross_project::ProjectKeys::default());
+    let context = test_context_with_key_store(&directory, keys);
+    let api = init_batch_project(&context, "api")?;
+    let web = init_batch_project(&context, "web")?;
+    run_with_context(
+        Cli::try_parse_from(["locket", "shared", "init"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+
+    let mut output = Vec::new();
+    let result = run_with_context(
+        Cli::try_parse_from([
+            "locket",
+            "unlock",
+            "--project",
+            "api",
+            "--project",
+            "web",
+            "--shared",
+        ])?,
+        &context,
+        &mut output,
+    );
+    assert!(matches!(
+        result,
+        Err(crate::CliError::Typed { kind: locket_core::LocketError::AgentUnavailable, .. })
+    ));
+    assert_eq!(output, [] as [u8; 0]);
+
+    run_with_context(
+        Cli::try_parse_from(["locket", "unlock", "--project", "api", "--project", "web"])?,
+        &context,
+        &mut output,
+    )?;
+    let output = String::from_utf8(output)?;
+    for id in [api, web] {
+        assert!(output.contains(&format!("vault {id}: unlocked (metadata only)")), "{output}");
+    }
+    let store = crate::open_store(&context)?;
+    let count: u32 = store.connection().query_row(
+        "SELECT COUNT(*) FROM audit_log WHERE action = 'UNLOCK'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(count, 2);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn live_agent_vault_batches_stop_after_verification_or_lock_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    let directory = tempdir()?;
+    let keys = Arc::new(super::cross_project::ProjectKeys::default());
+    let context = test_context_with_key_store(&directory, keys);
+    let ids = [
+        init_batch_project(&context, "api")?,
+        init_batch_project(&context, "web")?,
+        init_batch_project(&context, "worker")?,
+    ];
+    let context = RuntimeContext { agent_data_dir: Some(directory.path().into()), ..context };
+    let endpoint = crate::agent_socket_path(&context);
+    let listener = UnixListener::bind(&endpoint)?;
+    listener.set_nonblocking(true)?;
+    let (record_prompt, prompts) = std::sync::mpsc::channel();
+    let cancel_web = Arc::new(AtomicBool::new(false));
+    let state = locket_agent::AgentSocketState::with_stores(
+        "test",
+        locket_agent::current_process_uid(),
+        Arc::clone(&context.key_store),
+        Arc::new(context.passphrase_store.clone()),
+    )
+    .with_canonical_store_path(context.store_path.clone())
+    .with_user_verifier(Arc::new(BatchUserVerifier {
+        record_prompt,
+        cancel_web: Arc::clone(&cancel_web),
+    }));
+    let (stop, mut shutdown) = tokio::sync::oneshot::channel::<()>();
+    let server = std::thread::spawn(move || -> std::io::Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        runtime.block_on(async {
+            let listener = tokio::net::UnixListener::from_std(listener)?;
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown => return Ok(()),
+                    accepted = listener.accept() => {
+                        let (stream, _) = accepted?;
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            locket_agent::handle_connection(stream, state.clone()),
+                        ).await?;
+                    }
+                }
+            }
+        })
+    });
+    let result = check_live_vault_batches(&context, &ids, &prompts, &cancel_web);
+    let _ = stop.send(());
+    server.join().map_err(|_| "vault batch server panicked")??;
+    result
+}
+
+#[cfg(unix)]
+struct BatchUserVerifier {
+    record_prompt: std::sync::mpsc::Sender<String>,
+    cancel_web: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(unix)]
+impl locket_platform::LocalUserVerifier for BatchUserVerifier {
+    fn verify_user(
+        &self,
+        request: &locket_platform::LocalUserVerificationRequest,
+    ) -> Result<locket_platform::LocalUserVerification, locket_platform::PlatformError> {
+        use locket_platform::PlatformError;
+        self.record_prompt
+            .send(request.reason.clone())
+            .map_err(|_| PlatformError::LocalUserVerificationUnavailable)?;
+        if request.reason.ends_with("(web)")
+            && self.cancel_web.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return MemoryLocalUserVerifier::cancelled().verify_user(request);
+        }
+        MemoryLocalUserVerifier::allowing().verify_user(request)
+    }
+}
+
+#[cfg(unix)]
+fn check_live_vault_batches(
+    context: &RuntimeContext,
+    [api, web, worker]: &[String; 3],
+    prompts: &std::sync::mpsc::Receiver<String>,
+    cancel_web: &std::sync::atomic::AtomicBool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use locket_core::LocketError;
+    use std::sync::atomic::Ordering;
+
+    let run = |args: &[&str]| -> Result<_, Box<dyn std::error::Error>> {
+        let cli = Cli::try_parse_from(std::iter::once("locket").chain(args.iter().copied()))?;
+        let mut output = Vec::new();
+        let result = run_with_context(cli, context, &mut output);
+        Ok((result, String::from_utf8(output)?))
+    };
+    let endpoint = crate::agent_socket_path(context);
+    let status = |id: &str| crate::commands::agent::request_project_status_snapshot(&endpoint, id);
+    let store = crate::open_store(context)?;
+    let audits = |action: &str, id: &str| -> Result<u32, rusqlite::Error> {
+        store.connection().query_row(
+            "SELECT COUNT(*) FROM audit_log WHERE action = ?1 AND project_id = ?2",
+            [action, id],
+            |row| row.get(0),
+        )
+    };
+    let verify_two = || {
+        assert_eq!(
+            prompts.try_iter().collect::<Vec<_>>(),
+            ["Unlock the Locket vault (api)", "Unlock the Locket vault (web)",]
+        );
+    };
+
+    let (result, text) = run(&[
+        "unlock",
+        "--project",
+        "api",
+        "--project",
+        api,
+        "--project",
+        "web",
+        "--verify-user",
+        "--ttl",
+        "3600",
+    ])?;
+    result?;
+    verify_two();
+    for id in [api, web] {
+        assert!(text.contains(&format!("vault {id}: unlocked")), "{text}");
+        assert_eq!(status(id)?["lock_state"], "unlocked");
+        assert_eq!(audits("UNLOCK", id)?, 1);
+        let row = store
+            .list_exportable_audit_rows(id)?
+            .into_iter()
+            .find(|row| row.action == "UNLOCK")
+            .ok_or("missing unlock audit row")?;
+        let metadata: serde_json::Value = serde_json::from_str(&row.metadata_json)?;
+        assert_eq!(metadata["ttl_seconds"], 3600);
+        assert_eq!(metadata["user_verification"]["satisfied"], true);
+    }
+
+    let (result, text) = run(&["lock", "--project", "api", "--project", "web"])?;
+    result?;
+    for id in [api, web] {
+        assert!(text.contains(&format!("vault {id}: locked")), "{text}");
+        assert_eq!(status(id)?["lock_state"], "locked");
+        assert_eq!(audits("LOCK", id)?, 1);
+    }
+
+    let selectors = ["--project", "api", "--project", "web", "--project", "worker"];
+    let unlock = [vec!["unlock", "--verify-user"], selectors.to_vec()].concat();
+    cancel_web.store(true, Ordering::SeqCst);
+    let (result, text) = run(&unlock)?;
+    assert!(matches!(
+        result,
+        Err(crate::CliError::Typed { kind: LocketError::UserVerificationFailed, .. })
+    ));
+    verify_two();
+    for expected in [
+        format!("vault {api}: unlocked"),
+        format!("vault {web}: unlock failed"),
+        format!("vault {worker}: unlock skipped"),
+    ] {
+        assert!(text.contains(&expected), "{text}");
+    }
+    assert_eq!(status(api)?["lock_state"], "unlocked");
+    assert_eq!(status(web)?["lock_state"], "locked");
+    assert_eq!(status(worker)?["lock_state"], "locked");
+    assert_eq!(audits("UNLOCK", web)?, 1);
+    assert_eq!(audits("UNLOCK", worker)?, 0);
+
+    cancel_web.store(false, Ordering::SeqCst);
+    run(&unlock)?.0?;
+    store.connection().execute_batch(&format!(
+        "CREATE TRIGGER reject_web_lock BEFORE INSERT ON audit_log
+         WHEN NEW.action = 'LOCK' AND NEW.project_id = '{web}'
+         BEGIN SELECT RAISE(ABORT, 'fixture lock audit failure'); END;"
+    ))?;
+    let (result, text) = run(&[vec!["lock"], selectors.to_vec()].concat())?;
+    assert!(matches!(result, Err(crate::CliError::Typed { kind: LocketError::CorruptDb, .. })));
+    for expected in [
+        format!("vault {api}: locked"),
+        format!("vault {web}: lock failed"),
+        format!("vault {worker}: lock skipped"),
+    ] {
+        assert!(text.contains(&expected), "{text}");
+    }
+    assert_eq!(status(api)?["lock_state"], "locked");
+    assert_eq!(status(worker)?["lock_state"], "unlocked");
+    assert_eq!(audits("LOCK", worker)?, 0);
     Ok(())
 }
 
@@ -1088,7 +1354,7 @@ fn no_prompt_unlock_rejects_direct_verification() -> Result<(), Box<dyn std::err
         result,
         Err(crate::CliError::Typed { kind: locket_core::LocketError::UnlockRequired, message })
         if message.contains(&project_id)
-            && message.contains("`locket unlock`")
+            && message.contains("`locket unlock --verify-user`")
             && message.contains("Locket Desktop")
     ));
     assert_eq!(output, [] as [u8; 0]);
