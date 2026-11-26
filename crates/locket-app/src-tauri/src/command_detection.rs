@@ -6,6 +6,13 @@ use serde::Serialize;
 use serde_json::Value;
 
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+const PACKAGE_MANAGER_MARKERS: &[(&str, &[&str])] = &[
+    ("pnpm", &["pnpm-lock.yaml", "pnpm-workspace.yaml"]),
+    ("yarn", &["yarn.lock"]),
+    ("bun", &["bun.lock", "bun.lockb"]),
+    ("npm", &["package-lock.json"]),
+];
+const PACKAGE_MANAGER_SEARCH_DEPTH: usize = 8;
 
 #[derive(Serialize)]
 pub(crate) struct DetectedCommand {
@@ -114,6 +121,11 @@ pub(super) fn detect(root: &Path, project_id: &str) -> Result<Vec<DetectedComman
         }
     }
 
+    if regular_file(root, "foundry.toml") {
+        add("foundry.toml", "forge-build", &["forge", "build"]);
+        add("foundry.toml", "forge-test", &["forge", "test"]);
+    }
+
     Ok(found)
 }
 
@@ -137,23 +149,30 @@ fn read_manifest(root: &Path, name: &str) -> Option<String> {
 }
 
 fn node_package_manager(root: &Path, manifest: &Value) -> &'static str {
-    let manager = manifest
-        .get("packageManager")
-        .and_then(Value::as_str)
-        .and_then(|manager| manager.split_once('@'))
-        .map(|(manager, _)| manager);
-    let managers = [
-        ("pnpm", "pnpm-lock.yaml"),
-        ("yarn", "yarn.lock"),
-        ("bun", "bun.lock"),
-        ("bun", "bun.lockb"),
-        ("npm", "package-lock.json"),
-    ];
-    managers
-        .iter()
-        .find(|(name, _)| Some(*name) == manager)
-        .or_else(|| managers.iter().find(|(_, lockfile)| regular_file(root, lockfile)))
-        .map_or("npm", |(manager, _)| *manager)
+    if let Some(declared) = manifest.get("packageManager").and_then(Value::as_str) {
+        let name = declared.split_once('@').map_or(declared, |(name, _)| name);
+        if let Some((manager, _)) =
+            PACKAGE_MANAGER_MARKERS.iter().find(|(manager, _)| *manager == name)
+        {
+            return manager;
+        }
+    }
+
+    let directory_count = root
+        .ancestors()
+        .position(|directory| {
+            fs::symlink_metadata(directory.join(".git"))
+                .is_ok_and(|metadata| metadata.is_dir() || metadata.is_file())
+        })
+        .map_or(1, |depth| (depth + 1).min(PACKAGE_MANAGER_SEARCH_DEPTH));
+    root.ancestors()
+        .take(directory_count)
+        .find_map(|directory| {
+            PACKAGE_MANAGER_MARKERS.iter().find_map(|(manager, markers)| {
+                markers.iter().any(|marker| regular_file(directory, marker)).then_some(*manager)
+            })
+        })
+        .unwrap_or("npm")
 }
 
 fn make_targets(makefile: &str) -> BTreeSet<&str> {

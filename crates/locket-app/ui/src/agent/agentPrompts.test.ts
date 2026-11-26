@@ -24,23 +24,35 @@ describe('mcpClientSnippets', () => {
 });
 
 describe('dotenvMigrationPrompt', () => {
-  it('specifies a metadata-only scan, approval, and a non-destructive split import', () => {
+  it('guides an approved migration from remaining-file inventory through safe archiving', () => {
     const prompt = dotenvMigrationPrompt();
     for (const instruction of [
       'NEVER read raw .env file contents directly',
-      'locket env scan --json',
+      'locket env scan --remaining --json',
       'locket_scan_env_files',
-      'shared_candidates',
-      'locket import <file> --dry-run --json',
-      'wait for my approval before writing',
-      'locket import <file> --project @shared --only <keys> --keep --json',
-      'locket import <file> --exclude <keys> --keep --json',
-      'locket_import_env',
-      'Keep the original .env files through verification',
       'If the metadata-only scan or preview options are unavailable, stop',
     ]) {
       expect(prompt).toContain(instruction);
     }
+    const steps = prompt.split('\n\n').filter((paragraph) => /^\d\. /.test(paragraph));
+    expect(steps).toEqual([
+      expect.stringContaining('by key name and migration status'),
+      expect.stringContaining('locket shared list'),
+      expect.stringContaining('locket import <file> --dry-run --json'),
+      expect.stringContaining('locket unlock --project <project1> --project <project2> --ttl 3600'),
+      expect.stringContaining(
+        'locket import <file> --archive <DIR> --archive-if-matching [--verify-policy <POLICY>] --dry-run --json',
+      ),
+    ]);
+    expect(steps[1]).toContain('locket import <file> --keep');
+    expect(steps[2]).toContain('locket init');
+    expect(steps[2]).toContain('locket_import_env');
+    expect(steps[2]).toContain('locket policy detect');
+    expect(steps[2]).toContain('locket policy add');
+    expect(steps[2]).toContain('wait for my approval');
+    expect(steps[3]).toContain('locket run <policy>');
+    expect(steps[3]).toContain('locket exec');
+    expect(steps[4]).toContain('archive_consumer_warnings');
   });
 
   it('adds vault context without changing the migration steps', () => {

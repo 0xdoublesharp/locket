@@ -2276,7 +2276,10 @@ function copyToSharedError(error: AgentClientError, name: string): string {
     if (error.code === 'UnlockRequired' && error.message.includes('Global Vault')) {
       return 'Open and unlock Global Vault (@shared), then return here and try again.';
     }
-    if (error.code === 'ProjectNotFound' && error.message.includes('Global Vault')) {
+    if (
+      error.code === 'SharedVaultNotInitialized' ||
+      (error.code === 'ProjectNotFound' && error.message.includes('Global Vault'))
+    ) {
       return 'Set up Global Vault (@shared), then return here and try again.';
     }
   }

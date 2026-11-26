@@ -1109,6 +1109,7 @@ fn mcp_detects_commands_inside_cwd_and_trusted_projects() -> Result<(), Box<dyn 
             "commands": [{
                 "name": "test", "argv": ["npm", "run", "test"], "command_preview": "npm run test",
                 "source_file": "package.json", "already_configured": already_configured,
+                "suggested_command": "locket policy add test -- npm run test",
             }],
             "metadata_only": true,
         }))

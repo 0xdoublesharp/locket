@@ -614,6 +614,16 @@ describe('desktop environment, secret, and command actions', () => {
       'a user-local secret with this name already exists in the Global Vault',
       'TOKEN already exists in Global Vault. Open Global Vault to review the existing secret.',
     ],
+    [
+      'SharedVaultNotInitialized',
+      'Initialize @shared first.',
+      'Set up Global Vault (@shared), then return here and try again.',
+    ],
+    [
+      'ProjectNotFound',
+      'Set up the Global Vault first.',
+      'Set up Global Vault (@shared), then return here and try again.',
+    ],
   ])('shows actionable copy feedback for %s', async (code, message, notice) => {
     overrides.set('agent_list_secrets', () => ({ rows: [row] }));
     overrides.set('desktop_copy_secret_to_shared', () =>
@@ -1680,7 +1690,10 @@ describe('desktop scan terminal handoff in the mounted app', () => {
     await settle();
 
     for (const [label, text] of [
-      ['Copy AI agent .env migration prompt', expect.stringContaining('locket env scan --json')],
+      [
+        'Copy AI agent .env migration prompt',
+        expect.stringContaining('locket env scan --remaining --json'),
+      ],
       ['Copy MCP config JSON', json],
     ] as const) {
       const action = findNode(

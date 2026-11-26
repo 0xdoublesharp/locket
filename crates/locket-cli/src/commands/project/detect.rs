@@ -31,8 +31,23 @@ pub struct PolicyDetection {
     pub name: &'static str,
     pub argv: Vec<&'static str>,
     pub command_preview: String,
+    pub suggested_command: String,
     pub source_file: &'static str,
     pub already_configured: bool,
+}
+
+impl PolicyDetection {
+    pub(crate) fn new(
+        name: &'static str,
+        argv: Vec<&'static str>,
+        source_file: &'static str,
+        already_configured: bool,
+    ) -> Self {
+        // Detection only supplies fixed names and argv tokens that are safe to paste.
+        let command_preview = argv.join(" ");
+        let suggested_command = format!("locket policy add {name} -- {command_preview}");
+        Self { name, argv, command_preview, suggested_command, source_file, already_configured }
+    }
 }
 
 pub fn detect_policy_commands(
@@ -50,14 +65,16 @@ pub fn detect_policy_commands(
         .and_then(toml::Value::as_table);
     Ok(detect_commands(root, follow_manifest_links)?
         .into_iter()
-        .map(|command| PolicyDetection {
-            name: command.name,
-            command_preview: command.argv.join(" "),
-            argv: command.argv,
-            source_file: command.source_file,
-            already_configured: configured
+        .map(|command| {
+            let already_configured = configured
                 .and_then(|commands| commands.get(command.name))
-                .is_some_and(toml::Value::is_table),
+                .is_some_and(toml::Value::is_table);
+            PolicyDetection::new(
+                command.name,
+                command.argv,
+                command.source_file,
+                already_configured,
+            )
         })
         .collect())
 }

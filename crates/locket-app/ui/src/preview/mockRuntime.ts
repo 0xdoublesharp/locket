@@ -496,7 +496,8 @@ export function createMockRuntime(params: URLSearchParams) {
 
   function sharedProject(): DesktopProjectContext {
     const target = projects.find((project) => project.is_shared);
-    if (!target) fail('ProjectNotFound', 'Set up the Global Vault first.', 'Open Global Vault.');
+    if (!target)
+      fail('SharedVaultNotInitialized', 'Set up the Global Vault first.', 'Open Global Vault.');
     return target;
   }
 

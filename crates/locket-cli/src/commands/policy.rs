@@ -127,6 +127,9 @@ fn detect(
                 "{}: {} (source_file={}, already_configured={})",
                 row.name, row.command_preview, row.source_file, row.already_configured
             )?;
+            if !row.already_configured {
+                writeln!(output, "  add: {}", row.suggested_command)?;
+            }
         }
     }
     Ok(())

@@ -505,15 +505,9 @@ fn detect_open_workspace(directory: &InputDirectory) -> Result<Vec<PolicyDetecti
     let configured = config.as_ref().and_then(|value| value.get("commands"));
     let mut commands = Vec::new();
     let mut add = |name, argv: Vec<&'static str>, source_file| {
-        commands.push(PolicyDetection {
-            name,
-            command_preview: argv.join(" "),
-            argv,
-            source_file,
-            already_configured: configured
-                .and_then(|value| value.get(name))
-                .is_some_and(toml::Value::is_table),
-        });
+        let already_configured =
+            configured.and_then(|value| value.get(name)).is_some_and(toml::Value::is_table);
+        commands.push(PolicyDetection::new(name, argv, source_file, already_configured));
     };
 
     if let Some(manifest) = read_workspace_manifest(directory, "package.json")? {

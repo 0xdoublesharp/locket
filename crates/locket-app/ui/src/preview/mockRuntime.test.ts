@@ -234,7 +234,7 @@ it('recovers a disconnected preview agent and supports a fresh project and Globa
   });
   await request('agent_unlock', { project_id: project.project_id, ttl_seconds: 900 });
   await expect(request('desktop_copy_secret_to_shared', copy)).rejects.toMatchObject({
-    code: 'ProjectNotFound',
+    code: 'SharedVaultNotInitialized',
   });
   const shared = (await invoke('desktop_open_shared_vault', {})) as DesktopProjectContext;
   expect(shared).toMatchObject({ is_shared: true, project_name: '@shared' });

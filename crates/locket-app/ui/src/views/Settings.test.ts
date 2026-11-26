@@ -115,7 +115,7 @@ it('copies the native MCP JSON and the command for each selected client', async 
     }
     await click('Copy agent prompt');
     expect(invoke).toHaveBeenLastCalledWith('desktop_copy_text_plain', {
-      text: expect.stringContaining('locket env scan --json'),
+      text: expect.stringContaining('locket env scan --remaining --json'),
     });
     expect(
       findNode(

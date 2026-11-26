@@ -1352,6 +1352,7 @@ fn command_detection_reads_manifests_and_identifies_saved_commands_without_runni
         fixture.root.join("pyproject.toml"),
         "[project.scripts]\nserve='fixture:serve'\n[tool.poetry.scripts]\nworker='fixture:worker'\n",
     )?;
+    fs::write(fixture.root.join("foundry.toml"), "")?;
     let context = open_project_at(&fixture.store, &fixture.root)?;
     let candidates = serde_json::to_value(detect_commands_for_context(&context)?)?;
     let rows = candidates.as_array().ok_or("candidate rows")?;
@@ -1367,6 +1368,8 @@ fn command_detection_reads_manifests_and_identifies_saved_commands_without_runni
         ("Cargo.toml", "cargo-run", "cargo run", false),
         ("pyproject.toml", "serve", "uv run serve", false),
         ("pyproject.toml", "worker", "poetry run worker", false),
+        ("foundry.toml", "forge-build", "forge build", false),
+        ("foundry.toml", "forge-test", "forge test", false),
     ];
     assert_eq!(rows.len(), expected.len());
     for (source, name, preview, configured) in expected {
@@ -1385,6 +1388,40 @@ fn command_detection_reads_manifests_and_identifies_saved_commands_without_runni
     assert!(!candidates.to_string().contains("private-command-body-canary"));
     assert!(!fixture.root.join("canary-executed").exists());
     assert_eq!(fs::read_to_string(config_path)?, config);
+    Ok(())
+}
+
+#[test]
+fn command_detection_inherits_package_managers_only_within_the_worktree()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let worktree = fixture.directory.path();
+    let context = open_project_at(&fixture.store, &fixture.root)?;
+    let manifest = fixture.root.join("package.json");
+    let assert_runner = |declared: Option<&str>, runner: &str| -> Result<(), Box<dyn Error>> {
+        fs::write(
+            &manifest,
+            serde_json::json!({"packageManager": declared, "scripts": {"dev": "local-dev"}})
+                .to_string(),
+        )?;
+        let rows = serde_json::to_value(detect_commands_for_context(&context)?)?;
+        assert_eq!(rows[0]["argv"], serde_json::json!([runner, "run", "dev"]));
+        Ok(())
+    };
+
+    fs::write(worktree.join("pnpm-lock.yaml"), "")?;
+    assert_runner(None, "npm")?;
+    fs::create_dir(worktree.join(".git"))?;
+    assert_runner(None, "pnpm")?;
+    fs::remove_dir(worktree.join(".git"))?;
+    fs::write(worktree.join(".git"), "gitdir: ../linked-worktree")?;
+    fs::remove_file(worktree.join("pnpm-lock.yaml"))?;
+    fs::write(worktree.join("pnpm-workspace.yaml"), "")?;
+    assert_runner(None, "pnpm")?;
+    fs::write(fixture.root.join("yarn.lock"), "")?;
+    assert_runner(None, "yarn")?;
+    assert_runner(Some("bun@1.3.0"), "bun")?;
+    assert_runner(Some("pnpm"), "pnpm")?;
     Ok(())
 }
 

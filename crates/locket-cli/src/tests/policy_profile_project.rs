@@ -52,6 +52,7 @@ fn policy_detect_reports_metadata_across_manifests_without_initializing()
     for (name, argv, source_file) in expected {
         assert!(detected.contains(&json!({
             "name": name, "argv": argv, "command_preview": argv.join(" "),
+            "suggested_command": format!("locket policy add {name} -- {}", argv.join(" ")),
             "source_file": source_file, "already_configured": false,
         })));
     }
@@ -105,7 +106,14 @@ fn policy_detect_uses_lockfile_runners_and_marks_existing_commands_from_subdirec
     }
     let mut output = Vec::new();
     run_with_context(Cli::try_parse_from(["locket", "policy", "detect"])?, &context, &mut output)?;
-    assert!(String::from_utf8(output)?.contains("npm run dev"));
+    let output = String::from_utf8(output)?;
+    assert!(
+        output.contains("dev: npm run dev (source_file=package.json, already_configured=true)")
+    );
+    assert!(!output.contains("  add: locket policy add dev"));
+    assert!(output.contains(
+        "run: cargo run (source_file=Cargo.toml, already_configured=false)\n  add: locket policy add run -- cargo run\n"
+    ));
     assert_eq!(std::fs::read_to_string(root.join("locket.toml"))?, config);
     Ok(())
 }
