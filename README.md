@@ -74,7 +74,7 @@ Start with a personal Global Vault (`@shared`) in one click, or connect any repo
 - Monorepos can add `[paths."<relative/path>"]` env sets to make package-specific secret names available only when commands run from that subtree.
 - Secret values stay in the local encrypted vault, outside Git-tracked project files.
 - `.env.example` is maintained as a names-only contract for expected variables.
-- `.gitignore` is updated to keep plaintext local env files out of Git.
+- `.gitignore` protects local plaintext env files, inherits verified tracked rules in monorepos, and keeps `.env.*` templates visible to Git.
 
 ## Current Scope
 
@@ -170,7 +170,9 @@ locket emit-example
 
 ```bash
 locket set <KEY> [--source user-local|machine-local|team-managed]
-locket import .env [--overwrite] [--literal]
+locket env keys .env
+locket env scan
+locket import .env [--overwrite] [--literal] [--keep | --archive <DIR> [--archive-if-matching]]
 locket list [--all]
 locket get <KEY>
 locket get <KEY> --reveal
@@ -334,11 +336,13 @@ locket ai-safe -- <command> [args...]
 ### Access And Recovery
 
 ```bash
-locket unlock [--verify-user]
-locket lock
+locket unlock [--project <PROJECT>...] [--shared] [--ttl <seconds>] [--verify-user]
+locket lock [--project <PROJECT>...] [--shared]
 locket recover
 locket recovery rotate
 ```
+
+`locket unlock` and `locket lock` accept repeated `--project` selectors (up to eight distinct vaults per batch) and resolve every selector before prompting. Each vault runs its own verification and audit handling and applies `--ttl` (1 to 86400 seconds, defaulting to `agent.unlock_ttl`).
 
 Recovery and verification flows are local-first. Keep each project's recovery code separately from its encrypted recovery files in `.locket/recovery` and back up both the recovery files and local vault. The encrypted files are excluded from Git; one project's recovery code does not recover other projects.
 

@@ -17,7 +17,7 @@ Locket stores project and Global Vault (`@shared`) secrets locally and injects t
 
 ## Onboarding a repository
 
-0. Before `locket init`, preview key names with `locket env keys .env` or find workspace environment files with `locket env scan`. `locket import --dry-run` requires an initialized `locket.toml`.
+0. Before `locket init`, preview key names with `locket env keys .env` or list workspace environment files with `locket env scan` (skips template and non-dotenv suffixes and prints `locket=yes` or `locket=no`). `locket import --dry-run` requires an initialized `locket.toml`.
 1. Check the installed binary and repository context.
 
 ```sh
@@ -49,9 +49,9 @@ locket shared usages ALCHEMY_MAINNET_RPC
 
 1. Preview the local import with `locket import .env --dry-run --json`. If it returns `UnlockRequired`, follow the unlock instructions below before retrying.
 2. Import and keep the source with `locket import .env --keep`.
-3. Run `locket policy detect`. Give the user ready-to-run `locket policy add <name> -- <argv>` commands alongside the unlock command so they can review and approve each policy.
+3. Run `locket policy detect`, which resolves monorepo package managers (`packageManager` and parent lockfiles) and Foundry projects (`foundry.toml`). Give the user ready-to-run `locket policy add <name> -- <argv>` commands alongside the unlock command so they can review and approve each policy.
 4. Verify the target app or command with `locket run <POLICY>` or a scoped `locket exec` invocation.
-5. When the user chooses to archive, run `locket import .env --archive <PRIVATE_DIR> --archive-if-matching --dry-run --json`. Review `archive_consumer_warnings`, and check Makefiles and framework configuration for direct reads of `.env`. Once the preview reports `delete_env: would-archive` and you've addressed file consumers, repeat the command without `--dry-run`. Use a private directory outside the project or ignored by Git for the plaintext backup.
+5. When the user chooses to archive, run `locket import .env --archive <PRIVATE_DIR> --archive-if-matching --dry-run --json`. Review `archive_consumer_warnings` (Compose files, Makefiles, `package.json` scripts, and directly invoked local scripts), check framework or dotenv loaders such as `dotenv/config`, Vite, Next.js, and Prisma, and confirm `archive_directory`. Once the preview reports `delete_env: would-archive` and file consumers are addressed, repeat the command without `--dry-run`. Use a private directory outside any Git worktree or ignored by Git for the plaintext backup. If archiving fails after the import commits, Locket keeps the source in place, exits nonzero, and reports `archive_error` alongside the import summary.
 
 `--archive-if-matching` compares skipped values with the values the app receives under runtime precedence. Filtered keys block archiving. If the preview reports `delete_env: kept`, check `archive_blocked_reason`.
 
