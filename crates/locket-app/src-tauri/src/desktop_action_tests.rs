@@ -876,6 +876,38 @@ fn readiness_scope_and_acl_use_verified_command_directory() -> Result<(), Box<dy
 }
 
 #[test]
+fn team_sync_request_debug_redacts_transport_credentials() -> Result<(), Box<dyn Error>> {
+    use serde_json::json;
+    for transport in [
+        json!({
+            "kind":"s3","bucket":"fixture","region":"auto","credential_mode":"vault",
+            "access_key_id":"fixture-access-id","secret_access_key":"fixture-secret-key",
+            "session_token":"fixture-session-token",
+        }),
+        json!({
+            "kind":"webdav","url":"https://webdav.example.test/team","credential_mode":"vault",
+            "auth_kind":"bearer","secret":"fixture-bearer-token",
+        }),
+    ] {
+        let request = json!({"project_id":"fixture-project","transport":transport});
+        let configure: DesktopTeamSyncConfigureRequest = serde_json::from_value(request.clone())?;
+        let test_remote: DesktopTeamSyncTestRemoteRequest = serde_json::from_value(request)?;
+        for debug in [format!("{configure:?}"), format!("{test_remote:?}")] {
+            for credential in [
+                "fixture-access-id",
+                "fixture-secret-key",
+                "fixture-session-token",
+                "fixture-bearer-token",
+            ] {
+                assert!(!debug.contains(credential));
+            }
+            assert!(debug.contains("[redacted]"));
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn pending_profile_payload_pins_native_scope_and_rejects_webview_authority_fields()
 -> Result<(), Box<dyn Error>> {
     let fixture = Fixture::new()?;

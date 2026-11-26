@@ -29,6 +29,7 @@ desktop_save_policy
 desktop_variable_readiness
 desktop_team_sync_status
 desktop_team_sync_configure
+desktop_team_sync_test_remote
 desktop_team_sync_now
 desktop_team_sync_rename_profile
 desktop_team_sync_preserve_override

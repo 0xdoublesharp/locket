@@ -1927,11 +1927,76 @@ pub(crate) async fn desktop_variable_readiness(
 #[derive(Deserialize)]
 pub(crate) struct DesktopTeamSyncRequest {
     project_id: String,
-    folder: Option<PathBuf>,
-    #[serde(default)]
-    allow_dangerous: bool,
     confirm_dangerous_profile: Option<String>,
 }
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct DesktopTeamSyncConfigureRequest {
+    project_id: String,
+    #[serde(default)]
+    folder: Option<String>,
+    #[serde(default)]
+    transport: Option<locket_agent::TeamSyncTransportConfigureInput>,
+    #[serde(default)]
+    allow_dangerous: bool,
+    #[serde(default)]
+    confirm_dangerous_profile: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct DesktopTeamSyncTestRemoteRequest {
+    project_id: String,
+    #[serde(default)]
+    transport: Option<locket_agent::TeamSyncTransportConfigureInput>,
+    #[serde(default)]
+    confirm_dangerous_profile: Option<String>,
+}
+
+fn team_sync_scope(context: &DesktopProjectContext, store: &Path) -> locket_agent::TeamSyncRequest {
+    locket_agent::TeamSyncRequest {
+        project_id: context.project_id.clone(),
+        store_path: Some(store.into()),
+        profile_id: Some(context.profile_id.clone()),
+        grant_id: None,
+        binding: None,
+    }
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum TeamSyncTransportRequest {
+    Configure(locket_agent::TeamSyncConfigureRequest),
+    TestRemote(locket_agent::TeamSyncTestRemoteRequest),
+}
+
+// Keep credentials in the agent's zeroizing transport input until IPC encoding.
+#[derive(Serialize)]
+struct TeamSyncGrantPayload {
+    #[serde(flatten)]
+    request: TeamSyncTransportRequest,
+    #[serde(skip)]
+    confirmation: Option<String>,
+}
+
+impl GrantPayload for TeamSyncGrantPayload {
+    fn confirms_dangerous(&self, profile_name: &str) -> bool {
+        matches_profile_confirmation(self.confirmation.as_deref(), profile_name)
+    }
+
+    fn authorize(
+        &mut self,
+        grant: &locket_agent::GrantIdPayload,
+        binding: locket_agent::GrantBinding,
+    ) {
+        let scope = match &mut self.request {
+            TeamSyncTransportRequest::Configure(request) => &mut request.scope,
+            TeamSyncTransportRequest::TestRemote(request) => &mut request.scope,
+        };
+        scope.grant_id = Some(grant.grant_id.clone());
+        scope.binding = Some(binding);
+    }
+}
+
 async fn team_sync_request(
     request: DesktopTeamSyncRequest,
     method: locket_agent::AgentMethod,
@@ -1942,21 +2007,6 @@ async fn team_sync_request(
     let mut payload = serde_json::json!({"project_id": context.project_id, "profile_id": context.profile_id, "store_path": store});
     if method == locket_agent::AgentMethod::TeamSyncStatus {
         return super::invoke_method(&super::resolve_socket_path(), method, &payload).await;
-    }
-    if method == locket_agent::AgentMethod::TeamSyncConfigure {
-        let folder = request.folder.ok_or_else(|| super::AgentClientError::Protocol {
-            reason: "Choose a shared folder first.".into(),
-        })?;
-        if request.allow_dangerous
-            && !matches_profile_confirmation(
-                request.confirm_dangerous_profile.as_deref(),
-                &context.profile_name,
-            )
-        {
-            return Err(confirmation_required());
-        }
-        payload["folder"] = serde_json::json!(folder);
-        payload["allow_dangerous"] = serde_json::json!(request.allow_dangerous);
     }
     payload["confirm_dangerous_profile"] = serde_json::json!(request.confirm_dangerous_profile);
     invoke_granted(
@@ -1977,10 +2027,67 @@ pub(crate) async fn desktop_team_sync_status(
 }
 #[tauri::command]
 pub(crate) async fn desktop_team_sync_configure(
-    request: DesktopTeamSyncRequest,
+    request: DesktopTeamSyncConfigureRequest,
 ) -> Result<serde_json::Value, super::AgentClientError> {
-    team_sync_request(request, locket_agent::AgentMethod::TeamSyncConfigure).await
+    let store = super::default_store_path()?;
+    let context = granted_project_context(&store, &request.project_id, None)?;
+    if request.folder.is_some() == request.transport.is_some() {
+        return Err(AgentClientError::Protocol {
+            reason: "Choose exactly one team sync transport.".into(),
+        });
+    }
+    if request.allow_dangerous
+        && !matches_profile_confirmation(
+            request.confirm_dangerous_profile.as_deref(),
+            &context.profile_name,
+        )
+    {
+        return Err(confirmation_required());
+    }
+    let payload = TeamSyncGrantPayload {
+        request: TeamSyncTransportRequest::Configure(locket_agent::TeamSyncConfigureRequest {
+            scope: team_sync_scope(&context, &store),
+            folder: request.folder.map(PathBuf::from),
+            transport: request.transport,
+            allow_dangerous: request.allow_dangerous,
+        }),
+        confirmation: request.confirm_dangerous_profile,
+    };
+    invoke_granted_at(
+        &super::resolve_socket_path(),
+        AgentMethod::TeamSyncConfigure,
+        GrantAction::TeamSync,
+        payload,
+        &store,
+        &context,
+    )
+    .await
 }
+
+#[tauri::command]
+pub(crate) async fn desktop_team_sync_test_remote(
+    request: DesktopTeamSyncTestRemoteRequest,
+) -> Result<locket_agent::team_sync::RemoteTestResult, super::AgentClientError> {
+    let store = super::default_store_path()?;
+    let context = granted_project_context(&store, &request.project_id, None)?;
+    let payload = TeamSyncGrantPayload {
+        request: TeamSyncTransportRequest::TestRemote(locket_agent::TeamSyncTestRemoteRequest {
+            scope: team_sync_scope(&context, &store),
+            transport: request.transport,
+        }),
+        confirmation: request.confirm_dangerous_profile,
+    };
+    invoke_granted_at(
+        &super::resolve_socket_path(),
+        AgentMethod::TeamSyncTestRemote,
+        GrantAction::TeamSync,
+        payload,
+        &store,
+        &context,
+    )
+    .await
+}
+
 #[tauri::command]
 pub(crate) async fn desktop_team_sync_now(
     request: DesktopTeamSyncRequest,
@@ -2014,13 +2121,7 @@ fn pending_reconcile_payload(
     action: locket_agent::TeamSyncAction,
 ) -> Result<serde_json::Value, super::AgentClientError> {
     serde_json::to_value(locket_agent::TeamSyncReconcileRequest {
-        scope: locket_agent::TeamSyncRequest {
-            project_id: context.project_id.clone(),
-            store_path: Some(store.into()),
-            profile_id: Some(context.profile_id.clone()),
-            grant_id: None,
-            binding: None,
-        },
+        scope: team_sync_scope(context, store),
         incoming_profile_id,
         action,
     })

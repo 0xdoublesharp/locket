@@ -484,6 +484,7 @@ fn malformed_requests(ipc: &Ipc) {
         "desktop_variable_readiness",
         "desktop_team_sync_status",
         "desktop_team_sync_configure",
+        "desktop_team_sync_test_remote",
         "desktop_team_sync_now",
         "desktop_team_sync_rename_profile",
         "desktop_team_sync_preserve_override",
@@ -747,6 +748,11 @@ fn live_agent_commands(ipc: &Ipc, vault: &Vault) {
     let locked = ipc.rejected("desktop_copy_secret_to_shared", copy.clone(), "UnlockRequired");
     assert_eq!(locked["display_reason"], locked["message"]);
     assert!(ipc.request("desktop_team_sync_configure", project.clone()).is_err());
+    ipc.rejected(
+        "desktop_team_sync_test_remote",
+        json!({"project_id":vault.id,"grant_id":"webview-supplied-grant"}),
+        "UnlockRequired",
+    );
 
     ipc.ok(
         "agent_unlock",
@@ -939,8 +945,20 @@ fn with_exchanges(socket: &Path, exchanges: Vec<Exchange>, run: impl FnOnce()) {
             let (mut stream, _) = listener.accept().await.expect("accept request");
             let request = read_request(&mut stream).await;
             assert_eq!(request.method().ok(), Some(expected.method));
-            for (key, value) in expected.fields.as_object().expect("expected request fields") {
-                assert_eq!(request.payload.get(key), Some(value), "{:?}.{key}", expected.method);
+            if matches!(
+                expected.method,
+                AgentMethod::TeamSyncConfigure | AgentMethod::TeamSyncTestRemote
+            ) {
+                assert_eq!(request.payload, expected.fields);
+            } else {
+                for (key, value) in expected.fields.as_object().expect("expected request fields") {
+                    assert_eq!(
+                        request.payload.get(key),
+                        Some(value),
+                        "{:?}.{key}",
+                        expected.method
+                    );
+                }
             }
             let response = match expected.reply {
                 Reply::Success(payload) => {
@@ -1143,6 +1161,7 @@ fn wire_command_contracts(ipc: &Ipc, vault: &Vault, socket: &Path) {
     );
 
     wire_granted_actions(ipc, vault, socket, policy);
+    wire_team_sync_delivery(ipc, vault, socket);
     dangerous_actions_require_typed_name(ipc, vault);
     clipboard_uses_agent_ttl(ipc, vault, socket);
 }
@@ -1232,7 +1251,10 @@ fn wire_granted_actions(ipc: &Ipc, vault: &Vault, socket: &Path, policy: Value) 
                 "project_id":vault.id,"folder":vault.root.join("shared"),"allow_dangerous":true,
                 "confirm_dangerous_profile":"dev",
             }),
-            json!({"folder":vault.root.join("shared"),"allow_dangerous":true}),
+            json!({
+                "profile_id":PROFILE,"store_path":vault.store,
+                "folder":vault.root.join("shared"),"allow_dangerous":true,
+            }),
             json!({"state":"configured"}),
             true,
             PROFILE,
@@ -1337,6 +1359,89 @@ fn wire_granted_actions(ipc: &Ipc, vault: &Vault, socket: &Path, policy: Value) 
     }
 }
 
+fn team_sync_remote_transports() -> [Value; 2] {
+    [
+        json!({
+            "kind":"s3","bucket":"fixture","region":"auto","prefix":"team",
+            "endpoint":"https://s3.example.test","path_style":true,"credential_mode":"vault",
+            "access_key_id":"fixture-access-id","secret_access_key":TOKEN,
+            "session_token":"fixture-session-token",
+        }),
+        json!({
+            "kind":"webdav","url":"https://webdav.example.test/team","credential_mode":"vault",
+            "auth_kind":"bearer","username":null,"secret":TOKEN,
+        }),
+    ]
+}
+
+fn wire_team_sync_delivery(ipc: &Ipc, vault: &Vault, socket: &Path) {
+    vault.dangerous(false);
+    let [s3, webdav] = team_sync_remote_transports();
+    for (transport, allow_dangerous) in [(&s3, true), (&webdav, false)] {
+        let mut request = json!({"project_id":vault.id,"transport":transport});
+        if allow_dangerous {
+            request["allow_dangerous"] = json!(true);
+            request["confirm_dangerous_profile"] = json!("dev");
+        }
+        let response = json!({"state":"configured","transport_kind":transport["kind"]});
+        let operation = Exchange::success(
+            AgentMethod::TeamSyncConfigure,
+            json!({
+                "profile_id":PROFILE,"store_path":vault.store,"transport":transport,
+                "allow_dangerous":allow_dangerous,
+            }),
+            response.clone(),
+        );
+        with_exchanges(
+            socket,
+            native_grant_exchanges(vault, "TeamSync", PROFILE, allow_dangerous, operation),
+            || assert_eq!(ipc.ok("desktop_team_sync_configure", request), response),
+        );
+    }
+
+    for (kind, transport) in [("s3", None), ("s3", Some(s3)), ("webdav", Some(webdav))] {
+        let mut request = json!({"project_id":vault.id});
+        let mut fields = json!({"profile_id":PROFILE,"store_path":vault.store});
+        let confirmed = transport.is_some();
+        vault.dangerous(confirmed);
+        if let Some(transport) = transport {
+            request["confirm_dangerous_profile"] = json!("dev");
+            request["transport"] = transport.clone();
+            fields["transport"] = transport;
+        }
+        let metadata = json!({
+            "ok":true,"transport_kind":kind,"target":"fixture-target","package_count":3,
+            "writable_checked":false,"message":"Package listing succeeded",
+        });
+        let mut agent_response = metadata.clone();
+        agent_response["secret"] = json!(TOKEN);
+        let operation = Exchange::success(AgentMethod::TeamSyncTestRemote, fields, agent_response);
+        with_exchanges(
+            socket,
+            native_grant_exchanges(vault, "TeamSync", PROFILE, confirmed, operation),
+            || assert_eq!(ipc.ok("desktop_team_sync_test_remote", request), metadata),
+        );
+    }
+
+    vault.dangerous(false);
+    let operation = Exchange::reject(
+        AgentMethod::TeamSyncTestRemote,
+        json!({"profile_id":PROFILE,"store_path":vault.store}),
+        "GrantRequired",
+    );
+    with_exchanges(
+        socket,
+        native_grant_exchanges(vault, "TeamSync", PROFILE, false, operation),
+        || {
+            ipc.rejected(
+                "desktop_team_sync_test_remote",
+                json!({"project_id":vault.id}),
+                "GrantRequired",
+            );
+        },
+    );
+}
+
 fn dangerous_actions_require_typed_name(ipc: &Ipc, vault: &Vault) {
     vault.dangerous(true);
     let access = json!({"project_id":vault.id,"profile_id":PROFILE,"secret_name":"TOKEN"});
@@ -1354,12 +1459,7 @@ fn dangerous_actions_require_typed_name(ipc: &Ipc, vault: &Vault) {
             }),
         ),
         ("desktop_team_sync_now", json!({"project_id":vault.id})),
-        (
-            "desktop_team_sync_configure",
-            json!({
-                "project_id":vault.id,"folder":vault.root.join("shared"),"allow_dangerous":true,
-            }),
-        ),
+        ("desktop_team_sync_test_remote", json!({"project_id":vault.id})),
         (
             "agent_export_bundle",
             json!({
@@ -1389,20 +1489,40 @@ fn dangerous_actions_require_typed_name(ipc: &Ipc, vault: &Vault) {
             );
         }
     }
-    vault.dangerous(false);
-    // Even with a safe active profile, enabling automatic dangerous-profile sync
-    // requires exact typed confirmation in native code.
-    for confirmation in [None, Some(""), Some("DEV")] {
-        let mut request = json!({
-            "project_id":vault.id,
-            "folder":vault.root.join("shared"),
-            "allow_dangerous":true,
-        });
-        if let Some(typed) = confirmation {
-            request["confirm_dangerous_profile"] = json!(typed);
+    let [s3, webdav] = team_sync_remote_transports();
+    for dangerous in [true, false] {
+        vault.dangerous(dangerous);
+        // Automatic dangerous-profile sync requires exact confirmation even on a safe active profile.
+        for (field, value) in [
+            ("folder", json!(vault.root.join("shared"))),
+            ("transport", s3.clone()),
+            ("transport", webdav.clone()),
+        ] {
+            for confirmation in [None, Some(""), Some("DEV"), Some("dev ")] {
+                let mut request = json!({
+                    "project_id":vault.id,"allow_dangerous":true,"confirm_dangerous":true,
+                });
+                request[field] = value.clone();
+                if let Some(typed) = confirmation {
+                    request["confirm_dangerous_profile"] = json!(typed);
+                }
+                let error =
+                    ipc.rejected("desktop_team_sync_configure", request, "ConfirmationFailed");
+                assert_eq!(
+                    error["message"],
+                    "Type the exact active profile name to confirm this action."
+                );
+            }
         }
-        let error = ipc.rejected("desktop_team_sync_configure", request, "ConfirmationFailed");
-        assert_eq!(error["message"], "Type the exact active profile name to confirm this action.");
+    }
+    for request in [
+        json!({"project_id":vault.id}),
+        json!({"project_id":vault.id,"folder":vault.root.join("shared"),"transport":s3}),
+    ] {
+        assert_eq!(
+            ipc.request("desktop_team_sync_configure", request),
+            Err(json!({"kind":"protocol","reason":"Choose exactly one team sync transport."})),
+        );
     }
 }
 
