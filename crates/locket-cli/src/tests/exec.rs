@@ -275,6 +275,122 @@ fn exec_secret_requires_unlocked_vault_before_spawn() -> Result<(), Box<dyn std:
     Ok(())
 }
 
+#[cfg(unix)]
+struct UnlockPromptRecorder(std::sync::mpsc::Sender<locket_platform::LocalUserVerificationRequest>);
+
+#[cfg(unix)]
+impl locket_platform::LocalUserVerifier for UnlockPromptRecorder {
+    fn verify_user(
+        &self,
+        request: &locket_platform::LocalUserVerificationRequest,
+    ) -> Result<locket_platform::LocalUserVerification, locket_platform::PlatformError> {
+        self.0
+            .send(request.clone())
+            .map_err(|_| locket_platform::PlatformError::LocalUserVerificationUnavailable)?;
+        locket_platform::MemoryLocalUserVerifier::allowing().verify_user(request)
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn exec_respects_live_project_lock_with_key_present() -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::net::UnixListener;
+    use std::time::Duration;
+
+    let directory = tempdir()?;
+    let socket_dir = tempdir()?;
+    let context = test_context(&directory);
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--name", "app", "--no-device", "--no-passkey"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    crate::set_secret_value(
+        &context,
+        &test_secret_write_args("DATABASE_URL"),
+        "fixture-database",
+        "manual",
+        1_000,
+    )?;
+    let (project_id, _) = test_project_id_and_master_key(&context)?;
+    let context = RuntimeContext { agent_data_dir: Some(socket_dir.path().into()), ..context };
+    let endpoint = crate::agent_socket_path(&context);
+    let listener = UnixListener::bind(&endpoint)?;
+    listener.set_nonblocking(true)?;
+    let (record_prompt, prompts) = std::sync::mpsc::channel();
+    let state = locket_agent::AgentSocketState::with_stores(
+        "test",
+        locket_agent::current_process_uid(),
+        Arc::clone(&context.key_store),
+        Arc::new(context.passphrase_store.clone()),
+    )
+    .with_canonical_store_path(context.store_path.clone())
+    .with_user_verifier(Arc::new(UnlockPromptRecorder(record_prompt)));
+    let (stop, mut shutdown) = tokio::sync::oneshot::channel::<()>();
+    let server = std::thread::spawn(move || -> std::io::Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        runtime.block_on(async {
+            let listener = tokio::net::UnixListener::from_std(listener)?;
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown => return Ok(()),
+                    accepted = listener.accept() => {
+                        let (stream, _) = accepted?;
+                        let _ = tokio::time::timeout(Duration::from_secs(5), locket_agent::handle_connection(stream, state.clone())).await?;
+                    }
+                }
+            }
+        })
+    });
+    let run = |args: &[&str]| -> Result<Vec<u8>, crate::CliError> {
+        let cli = Cli::try_parse_from(std::iter::once("locket").chain(args.iter().copied()))
+            .map_err(std::io::Error::other)?;
+        let mut output = Vec::new();
+        run_with_context(cli, &context, &mut output)?;
+        Ok(output)
+    };
+    let verify = || -> Result<(), Box<dyn std::error::Error>> {
+        let status =
+            || crate::commands::agent::request_project_status_snapshot(&endpoint, &project_id);
+        let received = directory.path().join("received");
+        let exec = || {
+            run(&[
+                "exec",
+                "--secret",
+                "DATABASE_URL",
+                "--",
+                test_shell(),
+                "-c",
+                r#"test "$DATABASE_URL" = fixture-database && touch received"#,
+            ])
+        };
+        let expect_locked = || -> Result<(), Box<dyn std::error::Error>> {
+            assert_eq!(status()?["lock_state"], "locked");
+            let error = exec().err().ok_or("exec accepted a locked project with a key present")?;
+            assert_eq!(error.exit_code(), 72);
+            assert!(error.to_string().contains(&format!("locket unlock --project {project_id}")));
+            assert!(!received.exists());
+            Ok(())
+        };
+
+        expect_locked()?;
+        run(&["unlock", "--verify-user"])?;
+        assert_eq!(prompts.try_recv()?.reason, "Unlock the Locket vault (app)");
+        assert_eq!(status()?["lock_state"], "unlocked");
+        exec()?;
+        assert!(received.is_file());
+        fs::remove_file(&received)?;
+        let output = String::from_utf8(run(&["lock"])?)?;
+        assert!(output.contains("agent: locked\ncached_keys: cleared"));
+        assert!(context.key_store.load_master_key(&project_id).is_ok());
+        expect_locked()
+    };
+    let result = verify();
+    drop(stop);
+    server.join().map_err(|_| "agent fixture panicked")??;
+    result
+}
+
 #[test]
 fn run_policy_injects_required_and_optional_secrets_without_printing_values()
 -> Result<(), Box<dyn std::error::Error>> {

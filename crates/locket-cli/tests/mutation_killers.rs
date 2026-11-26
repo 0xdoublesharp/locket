@@ -647,6 +647,78 @@ shared_secrets = ["SHARED_SETTING"]
     }
 
     #[test]
+    fn unlock_with_redirected_stdin_reports_waiting_and_no_prompt_skips_rpc()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let root = project.path();
+        let store = initialize_project_store(root)?;
+        store.insert_project_if_absent(SHARED_PROJECT, "@shared", 1)?;
+        store.insert_profile_if_absent("lk_prof_shared", SHARED_PROJECT, "default", false, 1)?;
+        let _agent = start_fixture_agent(root)?;
+        let output = command(root)
+            .env_remove("LOCKET_NO_PROMPT")
+            .args(["unlock", "--project", PROJECT, "--verify-user"])
+            .output()?;
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8(output.stderr)?
+                .contains("locket: waiting for vault unlock (Touch ID or password)...")
+        );
+        let observed = root.join(".fixture-unlock-request");
+        assert!(observed.is_file());
+        fs::remove_file(&observed)?;
+
+        for (selector, project_id, unlock) in [
+            (PROJECT, PROJECT, format!("locket unlock --project {PROJECT}")),
+            ("@shared", SHARED_PROJECT, "locket unlock --shared".to_owned()),
+        ] {
+            let output = command(root)
+                .env("LOCKET_NO_PROMPT", "1")
+                .args(["unlock", "--project", selector, "--verify-user"])
+                .output()?;
+            assert_eq!(output.status.code(), Some(72), "{output:?}");
+            let stderr = String::from_utf8(output.stderr)?;
+            assert!(stderr.contains(project_id) && stderr.contains(&unlock), "{stderr}");
+            assert!(stderr.contains("Locket Desktop"), "{stderr}");
+            assert!(!observed.exists());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn lock_selectors_route_each_vault_to_the_agent() -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let root = project.path();
+        let store = initialize_project_store(root)?;
+        store.insert_project_if_absent(SHARED_PROJECT, "@shared", 1)?;
+        let _agent = start_fixture_agent(root)?;
+        let observed = root.join(".fixture-lock-requests");
+        let lock = |args: &[&str], expected: &[Value]| -> Result<(), Box<dyn std::error::Error>> {
+            let output = command(root).arg("lock").args(args).output()?;
+            assert!(output.status.success(), "{output:?}");
+            assert!(
+                String::from_utf8(output.stdout)?.contains("agent: locked\ncached_keys: cleared")
+            );
+            let requests = fs::read_to_string(&observed)?
+                .lines()
+                .map(serde_json::from_str)
+                .collect::<Result<Vec<Value>, _>>()?;
+            assert_eq!(requests, expected);
+            fs::remove_file(&observed)?;
+            Ok(())
+        };
+
+        lock(&[], &[Value::Null])?;
+        lock(&["--project", PROJECT], &[json!(PROJECT)])?;
+        lock(&["--project", "@shared"], &[json!(SHARED_PROJECT)])?;
+        lock(&["--shared"], &[json!(SHARED_PROJECT)])?;
+        fs::write(root.join("locket.toml"), POLICY)?;
+        lock(&["--shared"], &[json!(PROJECT), json!(SHARED_PROJECT)])?;
+        lock(&["--project", "@shared", "--shared"], &[json!(SHARED_PROJECT)])?;
+        Ok(())
+    }
+
+    #[test]
     fn ide_session_delivers_only_names_authorized_by_the_run_policy()
     -> Result<(), Box<dyn std::error::Error>> {
         let project = tempfile::tempdir()?;
@@ -1034,7 +1106,20 @@ env_mode = "strict"
     ) -> Result<ResponseEnvelope, Box<dyn std::error::Error>> {
         let payload = match request.method()? {
             AgentMethod::Status => Ok(fixture_status(&request.payload)),
-            AgentMethod::Unlock => Ok(Value::Null),
+            AgentMethod::Unlock => {
+                if request.payload["verify_user"] == true {
+                    fs::write(".fixture-unlock-request", [])?;
+                }
+                Ok(Value::Null)
+            }
+            AgentMethod::Lock => {
+                let mut observed = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(".fixture-lock-requests")?;
+                writeln!(observed, "{}", request.payload["project_id"])?;
+                Ok(Value::Null)
+            }
             AgentMethod::IdeEnvSession
                 if request.payload["session_id"] == "fixture-session"
                     && request.payload["project_id"] == PROJECT =>

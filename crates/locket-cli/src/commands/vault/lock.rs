@@ -10,16 +10,20 @@ use serde_json::json;
 
 use crate::commands::agent::request_status_snapshot;
 use crate::commands::config::spec::{config_get_value, read_user_config};
-use crate::commands::discovery::{SHARED_PROJECT_PREFIX, select_project, trusted_project_configs};
+use crate::commands::discovery::{
+    GLOBAL_VAULT, SHARED_PROJECT_PREFIX, select_project, trusted_project_configs,
+};
 use crate::commands::exec::run::agent_invoke;
 use crate::commands::secrets::links::shared_vault_target;
 use crate::runtime::error::{
     metadata_invalid_error, profile_not_found_error, project_not_found_error, typed_cli_error,
 };
+use crate::runtime::prompts::prompts_disabled;
 use crate::runtime::user_verification::require_user_verification;
 use crate::{
-    CliError, MasterKeySource, RuntimeContext, UnlockArgs, default_profile, ensure_project_exists,
-    load_project_key_with_source, now_unix_nanos, open_store, resolve_project,
+    CliError, LockArgs, MasterKeySource, RuntimeContext, UnlockArgs, default_profile,
+    ensure_project_exists, load_project_key_with_source, now_unix_nanos, open_store,
+    resolve_project,
 };
 
 const DIRECT_CLI_CLIENT_KIND: &str = "direct-cli";
@@ -33,37 +37,63 @@ const fn unlock_method(source: MasterKeySource) -> &'static str {
     }
 }
 
-pub fn lock_command(context: &RuntimeContext, output: &mut impl Write) -> Result<(), CliError> {
+pub fn lock_command(
+    context: &RuntimeContext,
+    output: &mut impl Write,
+    args: &LockArgs,
+) -> Result<(), CliError> {
+    let resolved = if args.project.is_none() { resolve_project(&context.cwd)? } else { None };
+    let explicit = args
+        .project
+        .as_deref()
+        .map(|selector| select_project(&open_store(context)?, &context.cwd, selector))
+        .transpose()?;
+    let project_id = explicit
+        .as_ref()
+        .map(|project| project.id.as_str())
+        .or_else(|| resolved.as_ref().map(|project| project.config.project_id.as_str()));
+    if agent_is_available(context)? {
+        let shared = args
+            .shared
+            .then(|| select_project(&open_store(context)?, &context.cwd, GLOBAL_VAULT))
+            .transpose()?;
+        let shared_id = shared.as_ref().map(|project| project.id.as_str());
+        let targets = [project_id, shared_id.filter(|&id| Some(id) != project_id)];
+        if project_id.is_none() && shared_id.is_none() {
+            lock_agent(context, None)?;
+        }
+        for project_id in targets.into_iter().flatten() {
+            lock_agent(context, Some(project_id))?;
+        }
+        for project_id in targets.into_iter().flatten() {
+            writeln!(output, "project_id: {project_id}")?;
+        }
+        writeln!(output, "agent: locked")?;
+        writeln!(output, "cached_keys: cleared")?;
+        return Ok(());
+    }
+
     writeln!(output, "lock: no agent-held keys to clear")?;
     writeln!(output, "agent: unavailable")?;
     writeln!(output, "metadata_only: yes")?;
 
-    let Some(resolved) = resolve_project(&context.cwd)? else {
-        return Ok(());
-    };
-    let project_id = resolved.config.project_id.as_str();
+    let Some(project_id) = project_id else { return Ok(()) };
     writeln!(output, "project_id: {project_id}")?;
 
     let mut store = open_store(context)?;
     if store.get_project(project_id)?.is_none() {
         return Ok(());
     }
-    let mut profile_id_for_row: Option<String> = None;
-    let audit_key =
-        match load_project_key_with_source(context, &store, project_id, KeyPurpose::Audit) {
-            Ok((key, _)) => {
-                if let Ok(profile) = default_profile(&store, &resolved.config) {
-                    profile_id_for_row = Some(profile.id);
-                }
-                key
-            }
-            Err(_) => {
-                // Vault is locked or audit key cannot be unwrapped. The CLI client
-                // never holds keys, so the lock action is a no-op and writing audit
-                // requires the audit key we just failed to load. Stay metadata-only.
-                return Ok(());
-            }
-        };
+    let Ok((audit_key, _)) =
+        load_project_key_with_source(context, &store, project_id, KeyPurpose::Audit)
+    else {
+        // Without an agent or an audit key, the lock remains a metadata-only no-op.
+        return Ok(());
+    };
+    let profile_id_for_row = resolved
+        .as_ref()
+        .and_then(|project| default_profile(&store, &project.config).ok())
+        .map(|profile| profile.id);
 
     let timestamp = now_unix_nanos()?;
     let metadata = json!({
@@ -92,6 +122,16 @@ pub fn lock_command(context: &RuntimeContext, output: &mut impl Write) -> Result
     Ok(())
 }
 
+fn lock_agent(context: &RuntimeContext, project_id: Option<&str>) -> Result<(), CliError> {
+    let _: serde_json::Value = agent_invoke(
+        context,
+        locket_agent::AgentMethod::Lock,
+        &json!({ "project_id": project_id }),
+        "lock vault",
+    )?;
+    Ok(())
+}
+
 pub fn unlock_command(
     context: &RuntimeContext,
     output: &mut impl Write,
@@ -99,6 +139,9 @@ pub fn unlock_command(
 ) -> Result<(), CliError> {
     let mut store = open_store(context)?;
     let local = unlock_profile(context, &store, args)?;
+    if prompts_disabled() {
+        return Err(noninteractive_unlock_error(local.as_ref(), args));
+    }
     if agent_is_available(context)? {
         let ttl = unlock_ttl(context, args.ttl)?;
         let shared = args
@@ -131,6 +174,35 @@ pub fn unlock_command(
         writeln!(output, "shared: {start_agent}")?;
     }
     Ok(())
+}
+
+fn noninteractive_unlock_error(local: Option<&ProfileRecord>, args: &UnlockArgs) -> CliError {
+    let (vault, command) = match local {
+        Some(profile) if !profile.project_id.starts_with(SHARED_PROJECT_PREFIX) => {
+            let mut vault = format!("vault {}", profile.project_id);
+            let mut command = if args.project.is_some() {
+                format!("locket unlock --project {}", profile.project_id)
+            } else {
+                "locket unlock".to_owned()
+            };
+            if args.shared {
+                vault.push_str(" and the Global Vault (@shared)");
+                command.push_str(" --shared");
+            }
+            (vault, command)
+        }
+        Some(profile) => (
+            format!("the Global Vault ({})", profile.project_id),
+            "locket unlock --shared".to_owned(),
+        ),
+        None => ("the Global Vault (@shared)".to_owned(), "locket unlock --shared".to_owned()),
+    };
+    typed_cli_error(
+        LocketError::UnlockRequired,
+        format!(
+            "unlocking {vault} requires interactive verification (LOCKET_NO_PROMPT is set). Run `{command}` from an interactive desktop terminal or unlock in Locket Desktop"
+        ),
+    )
 }
 
 fn unlock_profile(

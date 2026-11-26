@@ -11,7 +11,8 @@ use serde_json::json;
 
 use super::run::{
     RuntimeExecutionRequest, child_output_redaction, child_redactor, execute_exec_child,
-    require_linked_secret_access, require_shared_vault_unlocked, unique_secret_names,
+    require_linked_secret_access, require_shared_vault_unlocked, require_vault_unlocked,
+    unique_secret_names,
 };
 use crate::commands::agent::ensure_agent_running_for_execution;
 use crate::commands::discovery::{SHARED_PROJECT_PREFIX, select_project, trusted_project_configs};
@@ -148,6 +149,13 @@ fn resolve_exec_secrets(
     if profile.project_id.starts_with(SHARED_PROJECT_PREFIX) {
         require_shared_vault_unlocked(context, &profile.project_id)?;
         selected.shared_projects.insert(profile.project_id.clone());
+    } else if !names.is_empty() {
+        require_vault_unlocked(
+            context,
+            &profile.project_id,
+            "the consuming project vault",
+            "executing with project secrets",
+        )?;
     }
     for name in unique_secret_names(names.iter().map(String::as_str)) {
         let key = SecretName::new(name.as_str())
@@ -159,7 +167,7 @@ fn resolve_exec_secrets(
                 error
             }
         })?;
-        require_linked_secret_access(context, store, profile, &secret, false)?;
+        require_linked_secret_access(context, store, profile, &secret, true)?;
         let source = if secret.project_id == profile.project_id {
             secret.source.clone()
         } else {

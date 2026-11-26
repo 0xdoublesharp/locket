@@ -7,6 +7,7 @@ use crate::runtime::error::{
     tty_required_error,
 };
 
+/// Whether the caller requested a non-interactive invocation via `LOCKET_NO_PROMPT`.
 pub fn prompts_disabled() -> bool {
     std::env::var("LOCKET_NO_PROMPT").is_ok_and(|value| {
         ["1", "true", "yes"].iter().any(|enabled| value.eq_ignore_ascii_case(enabled))

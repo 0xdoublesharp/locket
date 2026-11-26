@@ -74,7 +74,7 @@ Agent protocol:
 - Authentication fields are exactly `payload.auth.client_id`, `payload.auth.challenge_id`, `payload.auth.nonce`, `payload.auth.request_timestamp`, `payload.auth.signature`, and `payload.auth.public_key_hint` when present. No other fields are omitted from `canonical_request_hash`. The signed request must still include `client_id`, `challenge_id`, `nonce`, `request_timestamp`, and `signature` under `payload.auth` so the agent can verify the signature and freshness after recomputing the hash.
 - Automation-client request timestamps have a default freshness window of 5 minutes. Accepted agent-issued challenge nonces are persisted in `automation_client_nonces.nonce` with `expires_at = request_timestamp + 10 minutes`; the `(client_id, nonce)` uniqueness constraint prevents replay across agent restarts. The persisted nonce is the challenge nonce returned by the agent and echoed in `payload.auth.nonce`, not any additional request payload field. The 10-minute retention window intentionally exceeds the 5-minute freshness window so nonce rows remain available during cleanup lag. Expired nonce rows are pruned opportunistically during client authentication and by `locket doctor`.
 - The agent rejects oversized messages, malformed messages, unknown protocol versions, and requests missing required context. Default maximum message size is 1 MiB, configurable upward only when explicitly required by scan or bundle flows.
-- Default request timeout is 5 seconds for metadata/status calls and 30 seconds for unlock, scan, import, export, and execution preparation calls.
+- Default request timeout is 5 seconds for metadata/status calls and 30 seconds for scan, import, export, and execution preparation calls. The CLI allows 135 seconds for `Unlock` so macOS LocalAuthentication can finish or report a verification error within its 120-second deadline.
 - Decrypted secret values may cross the socket only for explicitly authorized CLI execution, reveal, copy, redaction, or scan flows. UI, tray, shell prompt, VS Code status, diagnostics, and metadata calls receive no secret values.
 - Status and subscription payloads must honor `privacy.redact_names` for tray, shell, notifications, and VS Code status clients by returning stable aliases or counts where exact names are not required. Detail views may request exact metadata only after declaring a UI/detail client kind; the response is still metadata-only and never contains values.
 - Grant validation checks project id, profile id, action, directory hash, peer identity, process id, process start time where available, shell session id where available, and expiration.
@@ -86,8 +86,8 @@ Agent protocol:
 Required agent RPC methods:
 
 - `Status`: returns lock state, active project/profile metadata, grant summary, and agent version.
-- `Unlock`: performs OS keychain or passphrase-fallback unlock and starts the in-memory key TTL.
-- `Lock`: clears unwrapped keys and live TTL grants.
+- `Unlock`: performs OS keychain or passphrase-fallback unlock and starts the in-memory key TTL. When local user verification is required, the prompt names the project or its ID.
+- `Lock`: clears unwrapped keys and live TTL grants for the supplied project ID or all projects when no ID is supplied.
 - `RegisterClient`: stores a scoped automation-client public key and writes `CLIENT_ADD`.
 - `RevokeClient`: revokes an automation client and writes `CLIENT_REVOKE`.
 - `RequestGrant`: evaluates policy and returns a grant id without secret values.
@@ -107,6 +107,8 @@ CLI agent commands:
 `locket agent stop` sends a graceful shutdown request only to a trusted current-user agent. The agent clears all in-memory keys, revokes live TTL grants, closes subscriptions, removes the socket or pipe and pid file, then exits. It writes a `LOCK` audit row when project context is available and keys were held, and `AGENT_REVOKE` audit rows for grants revoked because of stop. If no agent is running (`agent.pid` absent or process not live), the command exits successfully with a notice after removing any stale endpoint it can verify as unowned. `locket agent stop` waits up to 5 seconds for a clean exit; if the process does not exit within that window, it fails with an error and reports the PID so the user can investigate.
 
 `locket agent status` contacts the agent over the local socket or pipe and prints metadata only: running or stopped state, agent version, pid, socket or pipe path, lock state, unlock TTL remaining when available, live grant count, active project/profile when a project context is resolved, degraded hardening flags, and last error summary. When the agent is unreachable, it reports stopped and includes the last known PID from `agent.pid` if that file is present.
+
+`locket lock` locks the current project in the running agent, or all vaults when no project is resolved. Use `--project <PROJECT>` to select a vault by ID or name, including `@shared`. Use `--shared` to include the Global Vault or lock it on its own from outside a project.
 
 `locket agent invite request` prints a paste-friendly setup request for the current machine or for a supplied `--device <descriptor>`. When no descriptor is supplied, the command uses the active local device descriptor; if none exists, it fails with actionable guidance to run `locket device init` explicitly. It then prints a bounded text block containing the device descriptor, fingerprint, safety words, optional project metadata, and an issuer command of the form `locket agent invite create <label> --device <descriptor> --profile dev --role developer [--expires-in 7d]`. The request block is metadata-only and contains no secret values, wrapped key material, recovery material, or device private keys.
 

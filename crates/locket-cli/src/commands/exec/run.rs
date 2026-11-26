@@ -1104,7 +1104,7 @@ pub(super) fn require_shared_vault_unlocked(
     require_vault_unlocked(context, project_id, "the Global Vault", "executing with shared secrets")
 }
 
-fn require_vault_unlocked(
+pub(super) fn require_vault_unlocked(
     context: &RuntimeContext,
     project_id: &str,
     vault_name: &str,
@@ -1843,20 +1843,41 @@ fn agent_invoke_endpoint_value(
     use locket_agent::{RequestEnvelope, ResponseEnvelope};
 
     let timeout = if method == locket_agent::AgentMethod::Unlock {
-        if io::stdin().is_terminal() && !crate::runtime::prompts::prompts_disabled() {
-            let _ = writeln!(io::stderr(), "locket: waiting for vault unlock...");
+        if !crate::runtime::prompts::prompts_disabled() {
+            let _ = writeln!(
+                io::stderr(),
+                "locket: waiting for vault unlock (Touch ID or password)..."
+            );
         }
-        std::time::Duration::from_secs(120)
+        // Allow the agent to report a typed error after LocalAuthentication's 120-second deadline.
+        std::time::Duration::from_secs(135)
     } else {
         std::time::Duration::from_secs(15)
     };
     let request = RequestEnvelope::new(format!("run-{operation}"), method, payload);
     match crate::commands::agent::exchange_agent_request(socket_path, request, Some(timeout))
-        .map_err(|error| agent_unavailable(operation, &error))?
+        .map_err(|error| agent_exchange_error(method, operation, &error))?
     {
         ResponseEnvelope::Success(success) => Ok(success.payload),
         ResponseEnvelope::Error(error) => Err(agent_error_to_cli(&error)),
     }
+}
+
+#[cfg(any(unix, windows))]
+fn agent_exchange_error(
+    method: locket_agent::AgentMethod,
+    operation: &'static str,
+    error: &io::Error,
+) -> CliError {
+    if method == locket_agent::AgentMethod::Unlock
+        && matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)
+    {
+        return typed_cli_error(
+            LocketError::UnlockRequired,
+            "vault unlock timed out waiting for Touch ID or password verification; run `locket unlock` from a desktop terminal or unlock in Locket Desktop",
+        );
+    }
+    agent_unavailable(operation, error)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1923,6 +1944,33 @@ mod framing_tests {
             super::agent_invoke_value(context, locket_agent::AgentMethod::Status, json!({}), "test")
         });
         assert_eq!(result.unwrap(), json!({"ok": true}));
+    }
+
+    #[test]
+    fn unlock_transport_timeouts_are_typed_separately_from_other_agent_errors() {
+        use std::io::{Error, ErrorKind};
+
+        use locket_agent::AgentMethod;
+        use locket_core::LocketError;
+
+        for kind in [ErrorKind::TimedOut, ErrorKind::WouldBlock] {
+            let error = Error::from(kind);
+            let unlock = super::agent_exchange_error(AgentMethod::Unlock, "unlock vault", &error);
+            assert!(matches!(
+                unlock,
+                crate::CliError::Typed { kind: LocketError::UnlockRequired, message }
+                if message.contains("timed out waiting for Touch ID or password verification")
+                    && message.contains("`locket unlock`")
+            ));
+            let status = super::agent_exchange_error(AgentMethod::Status, "read status", &error);
+            assert_eq!(status.exit_code(), LocketError::AgentUnavailable.exit_code());
+        }
+        let refused = super::agent_exchange_error(
+            AgentMethod::Unlock,
+            "unlock vault",
+            &Error::from(ErrorKind::ConnectionRefused),
+        );
+        assert_eq!(refused.exit_code(), LocketError::AgentUnavailable.exit_code());
     }
 }
 

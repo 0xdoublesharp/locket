@@ -1654,7 +1654,12 @@ async fn handle_unlock(
         );
     };
     let verification = if payload.verify_user || verification_required {
-        match state.verify_local_user(envelope, "unlock", "Unlock the Locket vault").await {
+        let project = unlock_store
+            .as_ref()
+            .and_then(|opened| opened.store.get_project(&payload.project_id).ok().flatten());
+        let label = project.as_ref().map_or(payload.project_id.as_str(), |project| &project.name);
+        let reason = format!("Unlock the Locket vault ({label})");
+        match state.verify_local_user(envelope, "unlock", reason).await {
             Ok(verification) => verification,
             Err(response) => return response,
         }

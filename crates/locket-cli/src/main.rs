@@ -269,7 +269,7 @@ enum Command {
         command: ComposeCommand,
     },
     /// Lock local agent-held keys.
-    Lock,
+    Lock(LockArgs),
     /// Unlock the local vault.
     Unlock(UnlockArgs),
     /// Manage profiles.
@@ -875,6 +875,16 @@ pub struct ComposeRunArgs {
     /// Docker Compose command and arguments after `--`.
     #[arg(last = true, required = true)]
     pub command: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct LockArgs {
+    /// Select a registered project by ID or name, including @shared.
+    #[arg(long)]
+    project: Option<String>,
+    /// Also lock the Global Vault. Outside a project, lock it on its own.
+    #[arg(long)]
+    shared: bool,
 }
 
 #[derive(Debug, Default, Args)]
@@ -2024,7 +2034,7 @@ fn run_with_context(
         Command::Diff(args) => scan::diff::diff_command(context, output, &args)?,
         Command::Copy(args) => secrets::lifecycle::copy_command(context, output, &args)?,
         Command::Audit { command } => audit::audit_command(context, output, command)?,
-        Command::Lock => vault::lock::lock_command(context, output)?,
+        Command::Lock(args) => vault::lock::lock_command(context, output, &args)?,
         Command::Unlock(args) => vault::lock::unlock_command(context, output, &args)?,
         Command::EmitExample { replace } => {
             project::emit_example::emit_example_command(context, output, replace)?;

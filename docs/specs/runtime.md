@@ -129,7 +129,7 @@ Exec audit metadata must include the command policy name where present, the argv
 
 Set the user default with `locket config set run.redact_output <auto|always|never>`. A project's `[run]` table in `locket.toml` overrides that setting. `LOCKET_REDACT_OUTPUT` overrides both and also accepts `1` and `true` for `always`, or `0` and `false` for `never`. The mutually exclusive `--redact-output` and `--no-redact-output` flags take precedence over the environment. For `locket run`, `--egress-host` always enables strict redaction. See [scan-redaction.md](scan-redaction.md) for what each mode filters.
 
-CLI agent requests for execution use a 15-second deadline for ordinary requests and a 120-second deadline for unlock. During interactive unlock the CLI prints a notice while it waits.
+CLI execution RPCs use a 15-second deadline for ordinary requests. The CLI waits up to 135 seconds for an `Unlock` RPC so the agent can report macOS LocalAuthentication's result within its 120-second deadline. The CLI prints a waiting notice to stderr when interactive prompts are enabled, including when stdin is redirected. If the socket times out during unlock, the CLI returns `UnlockRequired`. Setting `LOCKET_NO_PROMPT=1` (or `true` or `yes`, case-insensitive) makes explicit `locket unlock` return `UnlockRequired` before requesting local user verification.
 
 ## Reference URIs (`lk://`)
 
@@ -160,7 +160,7 @@ Rules:
 - Resolution requires project context, profile access, active unlock/grant, and policy authorization.
 - Reference strings are safe to commit because they contain names and versions only, never values.
 - Invalid or unauthorized references fail closed.
-- `lk://` resolution requires the local agent. In agent-less invocations, references are not silently passed through as literal strings; resolution fails with `AgentUnavailable` so a placeholder never reaches the child process. Direct CLI execution paths that require resolved values (e.g., `locket exec --secret KEY`) start the agent on demand or fall back to a single-shot direct unlock when policy permits. `locket run <policy>` also starts the agent on demand when none is running, using the same on-demand startup path; if on-demand startup fails, `locket run` fails with `AgentUnavailable`.
+- `lk://` resolution requires the local agent. If the agent is unavailable, resolution fails with `AgentUnavailable` before a placeholder reaches the child process. `locket exec --secret KEY` and `locket run <policy>` start the agent on demand. When `locket exec` selects secrets, the agent must report the consuming project vault as unlocked before the CLI reads their values. A locked vault returns `UnlockRequired`.
 
 This borrows the ergonomics of `op://` references while remaining local-only and project-policy aware.
 

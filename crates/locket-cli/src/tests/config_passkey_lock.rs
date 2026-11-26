@@ -1052,6 +1052,50 @@ fn lock_and_unlock_use_direct_metadata_only_mode() -> Result<(), Box<dyn std::er
 }
 
 #[test]
+fn no_prompt_unlock_rejects_direct_verification() -> Result<(), Box<dyn std::error::Error>> {
+    const TEST: &str = "tests::config_passkey_lock::no_prompt_unlock_rejects_direct_verification";
+    if std::env::var_os("LOCKET_TEST_NO_PROMPT_UNLOCK").is_none() {
+        for value in ["1", "TrUe", "YES"] {
+            let child = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", TEST])
+                .env("LOCKET_TEST_NO_PROMPT_UNLOCK", "1")
+                .env("LOCKET_NO_PROMPT", value)
+                .stdin(std::process::Stdio::null())
+                .output()?;
+            assert!(child.status.success(), "{}", String::from_utf8_lossy(&child.stdout));
+        }
+        return Ok(());
+    }
+
+    assert!(crate::runtime::prompts::prompts_disabled());
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--name", "app", "--no-device", "--no-passkey"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    let context =
+        context_with_user_verifier(&context, Arc::new(MemoryLocalUserVerifier::denying()));
+    let (project_id, _) = test_project_id_and_master_key(&context)?;
+    let mut output = Vec::new();
+    let result = run_with_context(
+        Cli::try_parse_from(["locket", "unlock", "--verify-user"])?,
+        &context,
+        &mut output,
+    );
+    assert!(matches!(
+        result,
+        Err(crate::CliError::Typed { kind: locket_core::LocketError::UnlockRequired, message })
+        if message.contains(&project_id)
+            && message.contains("`locket unlock`")
+            && message.contains("Locket Desktop")
+    ));
+    assert_eq!(output, [] as [u8; 0]);
+    Ok(())
+}
+
+#[test]
 fn unlock_with_verify_user_records_satisfied_verification_audit()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempdir()?;
