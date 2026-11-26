@@ -2,6 +2,34 @@
 use super::*;
 
 #[test]
+fn team_remote_sources_are_unambiguous() {
+    for args in [
+        &["team", "join", "--owner", "pin", "--remote"][..],
+        &["team", "join", "--owner", "pin", "--s3-bucket", "bucket"],
+        &["team", "join", "--owner", "pin", "--webdav-url", "https://dav.example/team"],
+        &["team", "join", "--owner", "pin", "package.lkpkg", "--folder", "share"],
+        &["team", "join", "--owner", "pin", "--folder", "share"],
+    ] {
+        assert!(
+            Cli::try_parse_from(std::iter::once("locket").chain(args.iter().copied())).is_ok(),
+            "{args:?}"
+        );
+    }
+    for args in [
+        &["team", "join", "--owner", "pin", "--remote", "package.lkpkg"][..],
+        &["team", "join", "--owner", "pin", "--s3-bucket", "bucket", "--folder", "share"],
+        &["team", "join", "--request", "--webdav-url", "https://dav.example/team"],
+        &["team", "join", "--owner", "pin", "--remote", "--credentials", "env"],
+        &["team", "join", "--owner", "pin", "--s3-bucket", "bucket", "--webdav-auth", "basic"],
+    ] {
+        assert!(
+            Cli::try_parse_from(std::iter::once("locket").chain(args.iter().copied())).is_err(),
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
 fn team_pending_cli_accepts_explicit_metadata_resolution_commands()
 -> Result<(), Box<dyn std::error::Error>> {
     for argv in [

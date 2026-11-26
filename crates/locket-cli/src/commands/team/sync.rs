@@ -1,5 +1,5 @@
-//! Authenticated owner-published team onboarding and folder delivery.
-use super::device;
+//! Authenticated owner-published team onboarding and delivery.
+use super::{device, remote::RemoteSetup};
 use crate::runtime::key_access::load_master_key;
 use crate::{
     CliError, RuntimeContext, TeamAddArgs, TeamConflictChoice, TeamFolderArgs, TeamJoinArgs,
@@ -14,7 +14,7 @@ use std::io::Write;
 /// Consequences shared by terminal help and a completed local profile rename.
 pub const PROFILE_RENAME_CONSEQUENCES: &str = "Policies, default_profile, and lk:// references using the old name will refer to the incoming team profile after retry. Review those references before using it. Directory grants remain bound to the renamed local profile ID.";
 
-fn failure(error: impl std::fmt::Display) -> CliError {
+pub(super) fn failure(error: impl std::fmt::Display) -> CliError {
     metadata_invalid_error(error.to_string())
 }
 fn now() -> Result<i64, CliError> {
@@ -56,37 +56,17 @@ pub fn join(
         .to_ascii_lowercase();
     let (master, _) = load_master_key(context, project)?;
     let sealing = device::build_device_private_key_storage(context, project)?.load(&local.id)?;
-    let candidates = join_package_candidates(args)?;
-    let mut chosen: Option<(u64, String, Vec<u8>)> = None;
-    let mut highest_equivocation = false;
-    for package in candidates {
-        let Ok(bytes) = team_sync::read_package_file(&package) else {
-            continue;
-        };
-        match team_sync::join_package_checkpoint(&bytes, &sealing, &identity, project, &pin, now()?)
-        {
-            Ok((epoch, digest)) => {
-                if chosen
-                    .as_ref()
-                    .is_some_and(|(prior, hash, _)| *prior == epoch && hash != &digest)
-                {
-                    highest_equivocation = true;
-                }
-                if chosen.as_ref().is_none_or(|(prior, _, _)| epoch > *prior) {
-                    chosen = Some((epoch, digest, bytes));
-                    highest_equivocation = false;
-                }
-            }
-            Err(error) if args.package.is_some() => return Err(failure(error)),
-            Err(_) => {}
-        }
-    }
-    if highest_equivocation {
-        return Err(metadata_invalid_error(
-            "two owner packages claim the highest join revision; contact the owner",
-        ));
-    }
-    let (_, _, bytes) = chosen.ok_or_else(|| metadata_invalid_error("no valid package for this device and independently verified owner; ask the owner to publish, or select your package explicitly"))?;
+    let remote_setup = RemoteSetup::from_join_args(context, args)?;
+    let candidates =
+        join_package_candidates(&store, project, &master, args, remote_setup.as_ref())?;
+    let bytes = select_join_package(
+        candidates,
+        &sealing,
+        &identity,
+        project,
+        &pin,
+        args.package.is_some(),
+    )?;
     let mut result = team_sync::apply_package_with_consent_guarded(
         &mut store,
         &bytes,
@@ -123,6 +103,16 @@ pub fn join(
         .map_err(failure)?;
         writeln!(output, "Automatic signed updates enabled for this machine while unlocked.")?;
     }
+    if let Some(setup) = remote_setup {
+        setup.configure(
+            &store,
+            project,
+            &device::device_private_key_root(context)?,
+            &master,
+            args.allow_dangerous,
+        )?;
+        writeln!(output, "Automatic signed updates enabled for this machine while unlocked.")?;
+    }
     writeln!(
         output,
         "Owner fingerprint was supplied independently; imported commands remain unapproved."
@@ -130,14 +120,74 @@ pub fn join(
     Ok(())
 }
 
-fn join_package_candidates(args: &TeamJoinArgs) -> Result<Vec<std::path::PathBuf>, CliError> {
+type JoinCandidates = Box<dyn Iterator<Item = Result<Vec<u8>, team_sync::SyncError>>>;
+
+fn select_join_package(
+    candidates: JoinCandidates,
+    sealing: &locket_crypto::KeyBytes,
+    identity: &DeviceIdentity,
+    project: &str,
+    pin: &str,
+    explicit_file: bool,
+) -> Result<Vec<u8>, CliError> {
+    let mut chosen: Option<(u64, String, Vec<u8>)> = None;
+    let mut highest_equivocation = false;
+    let checked_at = now()?;
+    for candidate in candidates {
+        let bytes = candidate.map_err(failure)?;
+        match team_sync::join_package_checkpoint(
+            &bytes, sealing, identity, project, pin, checked_at,
+        ) {
+            Ok((epoch, digest)) => {
+                if chosen
+                    .as_ref()
+                    .is_some_and(|(prior, hash, _)| *prior == epoch && hash != &digest)
+                {
+                    highest_equivocation = true;
+                }
+                if chosen.as_ref().is_none_or(|(prior, _, _)| epoch > *prior) {
+                    chosen = Some((epoch, digest, bytes));
+                    highest_equivocation = false;
+                }
+            }
+            Err(error) if explicit_file => return Err(failure(error)),
+            Err(_) => {}
+        }
+    }
+    if highest_equivocation {
+        return Err(metadata_invalid_error(
+            "two owner packages claim the highest join revision; contact the owner",
+        ));
+    }
+    chosen.map(|(_, _, bytes)| bytes).ok_or_else(|| metadata_invalid_error("no valid package for this device and independently verified owner; ask the owner to publish, or select your package explicitly"))
+}
+
+fn join_package_candidates(
+    store: &locket_store::Store,
+    project: &str,
+    master: &locket_crypto::KeyBytes,
+    args: &TeamJoinArgs,
+    remote_setup: Option<&RemoteSetup>,
+) -> Result<JoinCandidates, CliError> {
+    let remote_packages = if let Some(setup) = remote_setup {
+        Some(setup.join_packages()?)
+    } else if args.remote {
+        Some(
+            team_sync::list_and_read_configured_join_packages(store, project, Some(master))
+                .map_err(failure)?,
+        )
+    } else {
+        None
+    };
+    if let Some(packages) = remote_packages {
+        return Ok(Box::new(packages.map(|candidate| candidate.map(|(_, bytes)| bytes))));
+    }
     let candidates = if let Some(package) = &args.package {
         vec![package.clone()]
     } else {
-        let folder = args
-            .folder
-            .as_ref()
-            .ok_or_else(|| metadata_invalid_error("provide an encrypted .lkpkg or --folder"))?;
+        let folder = args.folder.as_ref().ok_or_else(|| {
+            metadata_invalid_error("provide an encrypted .lkpkg, --folder, or a remote backend")
+        })?;
         if std::fs::symlink_metadata(folder)?.file_type().is_symlink() {
             return Err(metadata_invalid_error("shared folder must be a regular directory"));
         }
@@ -156,7 +206,9 @@ fn join_package_candidates(args: &TeamJoinArgs) -> Result<Vec<std::path::PathBuf
         candidates.sort();
         candidates
     };
-    Ok(candidates)
+    Ok(Box::new(
+        candidates.into_iter().filter_map(|path| team_sync::read_package_file(&path).ok().map(Ok)),
+    ))
 }
 
 pub fn add(
@@ -223,23 +275,37 @@ pub fn folder(
     let resolved = require_project(context)?;
     let mut store = open_store(context)?;
     ensure_trusted_project_root(&store, &resolved)?;
-    if team_sync::status(&store, resolved.config.project_id.as_str())
-        .map_err(failure)?
-        .owner_fingerprint
-        .is_none()
-    {
-        let local = local(&store, resolved.config.project_id.as_str())?;
+    configure_shared_folder(context, output, &mut store, resolved.config.project_id.as_str(), args)
+}
+
+pub(super) fn ensure_owner_anchor(
+    store: &mut locket_store::Store,
+    project: &str,
+) -> Result<(), CliError> {
+    if team_sync::status(store, project).map_err(failure)?.owner_fingerprint.is_none() {
+        let local = local(store, project)?;
         team_sync::initialize_owner(
-            &mut store,
-            resolved.config.project_id.as_str(),
+            store,
+            project,
             &team_sync::identity(&local).map_err(failure)?,
             now()?,
         )
         .map_err(failure)?;
     }
+    Ok(())
+}
+
+pub(super) fn configure_shared_folder(
+    context: &RuntimeContext,
+    output: &mut impl Write,
+    store: &mut locket_store::Store,
+    project: &str,
+    args: &TeamFolderArgs,
+) -> Result<(), CliError> {
+    ensure_owner_anchor(store, project)?;
     team_sync::configure_folder(
-        &store,
-        resolved.config.project_id.as_str(),
+        store,
+        project,
         &args.path,
         &device::device_private_key_root(context)?,
         args.allow_dangerous,
@@ -271,7 +337,8 @@ pub fn publish(context: &RuntimeContext, output: &mut impl Write) -> Result<(), 
     confirm_dangerous_sharing(context, output, &store, project, &profiles)?;
     let queued =
         team_sync::publish(&mut store, project, &master, &signer, now()?).map_err(failure)?;
-    let written = team_sync::flush_outbox(&store, project).map_err(failure)?;
+    let written =
+        team_sync::flush_outbox_with_master(&store, project, Some(&master)).map_err(failure)?;
     writeln!(
         output,
         "Encrypted signed packages: queued {queued}, delivered {written}. Peers apply them when unlocked."
@@ -389,7 +456,7 @@ fn show_pending_profiles(
         if details.iter().any(|profile| profile.reason == "consent-required") {
             writeln!(
                 output,
-                "Dangerous profile values require local consent. After reviewing their scope, configure this machine with `locket team folder PATH --allow-dangerous`, then retry explicitly."
+                "Dangerous profile values require local consent. After reviewing their scope, configure this machine's shared delivery backend with `--allow-dangerous`, then retry explicitly."
             )?;
         }
         write_pending_retry_guidance(output, store, project)?;
@@ -461,10 +528,10 @@ fn write_pending_retry_guidance(
     store: &locket_store::Store,
     project: &str,
 ) -> Result<(), CliError> {
-    if team_sync::status(store, project).map_err(failure)?.folder.is_none() {
+    if team_sync::status(store, project).map_err(failure)?.transport_kind.is_none() {
         writeln!(
             output,
-            "Configure this machine's shared folder with `locket team folder PATH` before retrying delivery."
+            "Configure this machine's shared delivery backend with `locket team remote set` before retrying delivery."
         )?;
     }
     writeln!(
@@ -493,7 +560,7 @@ pub fn remove_authenticated(
     }
     // Revocation is already durable. Report delivery failure without claiming rollback.
     match team_sync::publish(store, project, &master, &signer, now()?)
-        .and_then(|_| team_sync::flush_outbox(store, project))
+        .and_then(|_| team_sync::flush_outbox_with_master(store, project, Some(&master)))
     {
         Ok(count) => writeln!(
             output,
@@ -501,7 +568,7 @@ pub fn remove_authenticated(
         )?,
         Err(_) => writeln!(
             output,
-            "Revocation is saved locally; delivery is pending. Restore the shared folder and run `locket team publish`."
+            "Revocation is saved locally; delivery is pending. Restore the shared delivery backend and run `locket team publish`."
         )?,
     }
     Ok(())

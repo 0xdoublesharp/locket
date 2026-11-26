@@ -1299,15 +1299,20 @@ pub(crate) enum TeamCommand {
     Join(TeamJoinArgs),
     /// Add a verified device to owner-published team updates.
     Add(TeamAddArgs),
-    /// Publish an encrypted signed snapshot to the configured shared folder.
+    /// Publish an encrypted signed snapshot to the configured delivery backend.
     Publish,
-    /// Check or apply authenticated updates from the shared folder.
+    /// Check or apply authenticated updates from the configured delivery backend.
     Sync {
         #[command(subcommand)]
         command: Option<TeamSyncCommand>,
     },
     /// Choose this machine's shared folder (local consent, never imported).
     Folder(TeamFolderArgs),
+    /// Manage the shared delivery backend on this machine.
+    Remote {
+        #[command(subcommand)]
+        command: commands::team::remote::RemoteCommand,
+    },
     /// Initialize a team for this project.
     Init(TeamInitArgs),
     /// Create a signed team invite for a recipient device.
@@ -1327,12 +1332,22 @@ pub(crate) enum TeamCommand {
 }
 
 #[derive(Debug, Args)]
+#[allow(clippy::struct_excessive_bools)] // Independent CLI switches.
+#[command(
+    group(clap::ArgGroup::new("remote_backend").args(["s3_bucket", "webdav_url"])),
+    group(clap::ArgGroup::new("s3_options").multiple(true)
+        .args(["s3_region", "s3_prefix", "s3_endpoint", "s3_path_style"])
+        .conflicts_with_all(["package", "folder", "remote", "webdav_url"])),
+    group(clap::ArgGroup::new("webdav_options").multiple(true)
+        .args(["webdav_auth", "webdav_username"])
+        .conflicts_with_all(["package", "folder", "remote", "s3_bucket"]))
+)]
 pub(crate) struct TeamJoinArgs {
     /// Generate a receiving device descriptor without creating shared profile keys.
-    #[arg(long, conflicts_with_all = ["package", "owner", "folder"])]
+    #[arg(long, conflicts_with_all = ["package", "owner", "folder", "remote", "remote_backend"])]
     pub request: bool,
     /// Encrypted .lkpkg provided by the owner.
-    #[arg(required_unless_present_any = ["request", "folder"])]
+    #[arg(required_unless_present_any = ["request", "folder", "remote", "s3_bucket", "webdav_url"])]
     pub package: Option<PathBuf>,
     /// Full owner fingerprint verified through a separate trusted channel.
     #[arg(long, required_unless_present = "request")]
@@ -1340,7 +1355,37 @@ pub(crate) struct TeamJoinArgs {
     /// Opt into automatic updates from this shared folder after joining.
     #[arg(long)]
     pub folder: Option<PathBuf>,
-    /// Explicitly permit dangerous profile values and later folder updates on this machine.
+    /// Find a join package on this machine's configured delivery backend.
+    #[arg(long, conflicts_with_all = ["package", "folder", "remote_backend"])]
+    pub remote: bool,
+    /// Download join packages from this S3-compatible bucket.
+    #[arg(long, conflicts_with_all = ["package", "folder"])]
+    pub s3_bucket: Option<String>,
+    /// S3 signing region (defaults to us-east-1).
+    #[arg(long, requires = "s3_bucket")]
+    pub s3_region: Option<String>,
+    /// S3 object prefix containing the join packages.
+    #[arg(long, requires = "s3_bucket")]
+    pub s3_prefix: Option<String>,
+    /// Custom S3 endpoint, which implies path-style addressing.
+    #[arg(long, requires = "s3_bucket")]
+    pub s3_endpoint: Option<String>,
+    /// Put the bucket name in the S3 URL path.
+    #[arg(long, requires = "s3_bucket")]
+    pub s3_path_style: bool,
+    /// Download join packages from this `WebDAV` collection URL.
+    #[arg(long, conflicts_with_all = ["package", "folder"])]
+    pub webdav_url: Option<String>,
+    /// `WebDAV` HTTP authentication method (defaults to none).
+    #[arg(long, value_enum, requires = "webdav_url")]
+    pub webdav_auth: Option<commands::team::remote::WebDavAuthArg>,
+    /// `WebDAV` Basic username.
+    #[arg(long, requires = "webdav_url")]
+    pub webdav_username: Option<String>,
+    /// Store credentials in the vault, use the environment, or use unauthenticated `WebDAV`.
+    #[arg(long, value_enum, requires = "remote_backend", conflicts_with_all = ["package", "folder", "remote"])]
+    pub credentials: Option<commands::team::remote::RemoteCredentialsArg>,
+    /// Explicitly permit dangerous profile values on this machine.
     #[arg(long)]
     pub allow_dangerous: bool,
 }

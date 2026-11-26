@@ -102,6 +102,7 @@ pub fn team_command(
         TeamCommand::Publish => super::sync::publish(context, output),
         TeamCommand::Sync { command } => super::sync::sync(context, output, command),
         TeamCommand::Folder(args) => super::sync::folder(context, output, &args),
+        TeamCommand::Remote { command } => super::remote::run(context, output, command),
         TeamCommand::Init(args) => team_init_command(context, output, &args),
         TeamCommand::Invite(args) => team_invite_command(context, output, &args),
         TeamCommand::RevokeInvite(args) => team_revoke_invite_command(context, output, &args),

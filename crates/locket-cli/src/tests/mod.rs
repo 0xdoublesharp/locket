@@ -494,6 +494,7 @@ mod source_precedence;
 mod variable_contract;
 
 mod team_pending_cli;
+mod team_remote_cli;
 
 /// Builds a valid sealed invite payload that imports nothing.
 pub(crate) fn empty_sealed_invite_payload(
