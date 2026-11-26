@@ -197,3 +197,38 @@ pub fn read_package_file(path: &Path) -> Result<Vec<u8>> {
     }
     Ok(bytes)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folder_packages_are_create_only_and_bounded() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("exchange");
+        fs::create_dir(&path)?;
+        let config =
+            super::super::TransportConfig::Folder { path: path.to_string_lossy().into_owned() };
+        let folder = Folder::new(path.clone(), config.summary()?)?;
+        let name = "team.lkpkg";
+        assert_eq!(folder.put_package(name, b"payload")?, PutOutcome::Written);
+        assert_eq!(folder.put_package(name, b"payload")?, PutOutcome::AlreadyPresent);
+        assert_eq!(folder.put_package(name, b"other")?, PutOutcome::Conflict);
+        assert_eq!(folder.get_package(name)?, b"payload");
+        fs::create_dir(path.join("a-directory.lkpkg"))?;
+        assert!(folder.delete_package("a-directory.lkpkg").is_err());
+        assert_eq!(folder.list_packages()?, [name]);
+        assert!(folder.delete_package(name)?);
+        assert!(!folder.delete_package(name)?);
+        let large = path.join("large.lkpkg");
+        fs::File::create(&large)?.set_len((PACKAGE_LIMIT + 1) as u64)?;
+        assert!(read_package_file(&large).is_err());
+        assert!(folder.delete_package("large.lkpkg")?);
+        assert!(folder.get_package("../other.lkpkg").is_err());
+        fs::remove_dir_all(&path)?;
+        assert!(!folder.delete_package(name)?);
+        fs::write(&path, b"not a folder")?;
+        assert!(folder.delete_package(name).is_err());
+        Ok(())
+    }
+}

@@ -154,3 +154,56 @@ impl TeamTransport for WebDav {
         self.summary.clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn listing_resolves_only_direct_children_of_the_configured_collection() -> Result<()> {
+        let config = TransportConfig::WebDav {
+            url: "https://example.test/team%20files".into(),
+            auth_kind: WebDavAuthKind::None,
+            username: None,
+            credential_mode: CredentialMode::None,
+        };
+        let transport = WebDav::new(&config, config.summary()?, None)?;
+        for href in [
+            "file%20name.lkpkg",
+            "/team%20files/file%20name.lkpkg",
+            "https://EXAMPLE.test:443/team%20files/file%20name.lkpkg",
+        ] {
+            assert_eq!(transport.direct_child(href).as_deref(), Some("file name.lkpkg"));
+        }
+        for href in [
+            "/team%20files/",
+            "/team%20files/nested/file.lkpkg",
+            "/other/file.lkpkg",
+            "https://example.test:8443/team%20files/file.lkpkg",
+            "https://other.test/team%20files/file.lkpkg",
+            "//example.test/team%20files/file.lkpkg",
+            "file.lkpkg?query",
+            "file.lkpkg#fragment",
+            "file%FF.lkpkg",
+        ] {
+            assert_eq!(transport.direct_child(href), None, "{href}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn authentication_configuration_enforces_kind_and_username() -> Result<()> {
+        validate_auth(WebDavAuthKind::None, None, CredentialMode::None)?;
+        validate_auth(WebDavAuthKind::Basic, Some("owner"), CredentialMode::Vault)?;
+        validate_auth(WebDavAuthKind::Bearer, None, CredentialMode::Env)?;
+        for (kind, name, mode) in [
+            (WebDavAuthKind::None, None, CredentialMode::Vault),
+            (WebDavAuthKind::Basic, None, CredentialMode::None),
+            (WebDavAuthKind::Basic, Some("bad:user"), CredentialMode::Vault),
+            (WebDavAuthKind::Bearer, Some("owner"), CredentialMode::Vault),
+        ] {
+            assert!(validate_auth(kind, name, mode).is_err());
+        }
+        Ok(())
+    }
+}

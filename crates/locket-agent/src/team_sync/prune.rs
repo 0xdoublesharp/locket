@@ -61,10 +61,10 @@ pub fn prune_remote_packages(
         let mut retained_epochs = 0;
         while let Some(row) = rows.next()? {
             let filename: String = row.get(1)?;
-            if remote_names.binary_search(&filename).is_err() {
-                continue;
+            let listed = remote_names.binary_search(&filename).is_ok();
+            if listed {
+                result.examined += 1;
             }
-            result.examined += 1;
             let row_recipient: String = row.get(2)?;
             if row_recipient != recipient {
                 recipient = row_recipient;
@@ -73,17 +73,35 @@ pub fn prune_remote_packages(
             let delivered: bool = row.get(3)?;
             if !active.contains(&recipient) {
                 // Delete these packages even if a prior upload never marked them delivered.
-                candidates.push((row.get::<_, i64>(0)?, filename, recipient.clone(), false));
+                if listed {
+                    candidates.push((
+                        row.get::<_, i64>(0)?,
+                        filename,
+                        recipient.clone(),
+                        false,
+                        true,
+                    ));
+                }
             } else if delivered && retained_epochs == keep_epochs {
-                candidates.push((row.get::<_, i64>(0)?, filename, recipient.clone(), true));
-            } else {
+                // A lost DELETE response can leave an obsolete outbox row after
+                // its object disappears. Retry the deletion before retiring it.
+                if listed || !dry_run {
+                    candidates.push((
+                        row.get::<_, i64>(0)?,
+                        filename,
+                        recipient.clone(),
+                        true,
+                        listed,
+                    ));
+                }
+            } else if listed {
                 result.kept += 1;
                 retained_epochs += usize::from(delivered);
             }
         }
     }
 
-    for (rowid, filename, recipient, require_delivered) in candidates {
+    for (rowid, filename, recipient, require_delivered, listed) in candidates {
         if !dry_run {
             let tx =
                 Transaction::new_unchecked(store.connection(), TransactionBehavior::Immediate)?;
@@ -125,7 +143,10 @@ pub fn prune_remote_packages(
             tx.execute("DELETE FROM team_sync_outbox WHERE rowid=?1", [rowid])?;
             tx.commit()?;
         }
-        result.deleted_filenames.push(filename);
+        // Some backends acknowledge an absent object as a successful deletion.
+        if listed {
+            result.deleted_filenames.push(filename);
+        }
     }
     result.deleted = result.deleted_filenames.len();
     Ok(result)

@@ -298,3 +298,137 @@ pub(super) fn valid_username(username: &str) -> bool {
 fn header_secret(secret: &str) -> bool {
     !secret.is_empty() && secret.len() <= 8192 && secret.bytes().all(|byte| byte.is_ascii_graphic())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CREDENTIAL_CASE: &str = "LOCKET_TEST_TEAM_SYNC_CREDENTIAL_CASE";
+    const S3_KEYS: &[&str] = &[
+        "LOCKET_S3_ACCESS_KEY_ID",
+        "LOCKET_S3_SECRET_ACCESS_KEY",
+        "LOCKET_S3_SESSION_TOKEN",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+    ];
+    const DAV_KEYS: &[&str] =
+        &["LOCKET_WEBDAV_USERNAME", "LOCKET_WEBDAV_SECRET", "LOCKET_WEBDAV_TOKEN"];
+
+    #[test]
+    fn environment_credentials_use_one_source_at_a_time() -> Result<()> {
+        if let Ok(case) = env::var(CREDENTIAL_CASE) {
+            return check_credential_case(&case);
+        }
+        let cases: &[(&str, &[(&str, &str)])] = &[
+            ("missing", &[]),
+            (
+                "aws",
+                &[
+                    ("AWS_ACCESS_KEY_ID", "aws"),
+                    ("AWS_SECRET_ACCESS_KEY", "aws-secret"),
+                    ("AWS_SESSION_TOKEN", "aws-token"),
+                ],
+            ),
+            ("incomplete-aws", &[("AWS_ACCESS_KEY_ID", "aws")]),
+            (
+                "locket",
+                &[
+                    ("LOCKET_S3_ACCESS_KEY_ID", "locket"),
+                    ("LOCKET_S3_SECRET_ACCESS_KEY", "locket-secret"),
+                    ("LOCKET_S3_SESSION_TOKEN", "locket-token"),
+                    ("AWS_ACCESS_KEY_ID", "aws"),
+                    ("AWS_SECRET_ACCESS_KEY", "aws-secret"),
+                ],
+            ),
+            (
+                "incomplete-locket",
+                &[
+                    ("LOCKET_S3_ACCESS_KEY_ID", "locket"),
+                    ("AWS_ACCESS_KEY_ID", "aws"),
+                    ("AWS_SECRET_ACCESS_KEY", "aws-secret"),
+                ],
+            ),
+            ("incomplete-locket-id", &[("LOCKET_S3_SESSION_TOKEN", "locket-token")]),
+            (
+                "webdav",
+                &[
+                    ("LOCKET_WEBDAV_USERNAME", "owner"),
+                    ("LOCKET_WEBDAV_SECRET", ""),
+                    ("LOCKET_WEBDAV_TOKEN", "dav-token"),
+                ],
+            ),
+            ("webdav-missing", &[]),
+        ];
+        // Child environments keep credentials isolated from concurrent tests.
+        for (case, values) in cases {
+            let mut child = std::process::Command::new(env::current_exe()?);
+            child.args(["--exact", "team_sync::transport::credentials::tests::environment_credentials_use_one_source_at_a_time"]);
+            for key in S3_KEYS.iter().chain(DAV_KEYS) {
+                child.env_remove(key);
+            }
+            let output = child.env(CREDENTIAL_CASE, case).envs(values.iter().copied()).output()?;
+            assert!(output.status.success(), "{case}: {}", String::from_utf8_lossy(&output.stdout));
+        }
+        Ok(())
+    }
+
+    fn check_credential_case(case: &str) -> Result<()> {
+        let config = if case.starts_with("webdav") {
+            TransportConfig::WebDav {
+                url: "https://example.test/team".into(),
+                auth_kind: WebDavAuthKind::Basic,
+                username: None,
+                credential_mode: CredentialMode::Env,
+            }
+        } else {
+            TransportConfig::S3 {
+                bucket: "bucket".into(),
+                region: "us-east-1".into(),
+                prefix: String::new(),
+                endpoint: None,
+                path_style: false,
+                credential_mode: CredentialMode::Env,
+            }
+        };
+        match case {
+            "aws" | "locket" => {
+                let Some(TransportSecretInput::S3 {
+                    ref access_key_id,
+                    ref secret_access_key,
+                    ref session_token,
+                }) = resolve(&config, None)?
+                else {
+                    return Err(reject("missing S3 credentials"));
+                };
+                assert_eq!(access_key_id, case);
+                assert_eq!(secret_access_key.as_str(), format!("{case}-secret"));
+                assert_eq!(
+                    session_token.as_ref().map(|token| token.as_str()),
+                    Some(format!("{case}-token").as_str())
+                );
+            }
+            "webdav" => {
+                let Some(TransportSecretInput::WebDav { ref username, ref secret }) =
+                    resolve(&config, None)?
+                else {
+                    return Err(reject("missing WebDAV credentials"));
+                };
+                assert_eq!(username.as_deref(), Some("owner"));
+                assert_eq!(secret.as_str(), "dav-token");
+            }
+            _ => {
+                let expected = match case {
+                    "incomplete-locket" | "incomplete-locket-id" => {
+                        "incomplete LOCKET_S3_* environment credentials"
+                    }
+                    "missing" | "incomplete-aws" => "S3 environment credentials are missing",
+                    "webdav-missing" => "WebDAV environment credentials are missing",
+                    _ => return Err(reject("unknown test credential case")),
+                };
+                assert!(resolve(&config, None).is_err_and(|error| error.to_string() == expected));
+            }
+        }
+        Ok(())
+    }
+}

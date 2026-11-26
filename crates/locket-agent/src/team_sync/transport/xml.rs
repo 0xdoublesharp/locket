@@ -10,6 +10,9 @@ pub(super) fn fields(
     mut field: impl FnMut(&[&str], String) -> Result<()>,
 ) -> Result<()> {
     let mut input = std::str::from_utf8(bytes).map_err(|_| invalid())?;
+    if !input.chars().all(valid_xml_char) {
+        return Err(invalid());
+    }
     input = input.strip_prefix('\u{feff}').unwrap_or(input).trim_start();
     if let Some(declaration) = input.strip_prefix("<?xml ") {
         let (_, remaining) = declaration.split_once("?>").ok_or_else(invalid)?;
@@ -142,15 +145,21 @@ fn unescape(mut text: &str, result: &mut String) -> Result<()> {
             "quot" => '"',
             "apos" => '\'',
             _ => {
-                let numeric = if let Some(hex) = entity.strip_prefix("#x") {
-                    u32::from_str_radix(hex, 16)
+                let (digits, radix) = if let Some(hex) = entity.strip_prefix("#x") {
+                    (hex, 16)
                 } else {
-                    entity.strip_prefix('#').ok_or_else(invalid)?.parse()
+                    (entity.strip_prefix('#').ok_or_else(invalid)?, 10)
                 };
-                numeric
+                if !digits
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (radix == 16 && byte.is_ascii_hexdigit()))
+                {
+                    return Err(invalid());
+                }
+                u32::from_str_radix(digits, radix)
                     .ok()
                     .and_then(char::from_u32)
-                    .filter(|ch| *ch != '\0')
+                    .filter(|ch| valid_xml_char(*ch))
                     .ok_or_else(invalid)?
             }
         };
@@ -160,6 +169,77 @@ fn unescape(mut text: &str, result: &mut String) -> Result<()> {
     Ok(())
 }
 
+const fn valid_xml_char(ch: char) -> bool {
+    matches!(ch, '\u{9}' | '\u{A}' | '\u{D}' | '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}')
+}
+
 fn invalid() -> SyncError {
     reject("invalid team transport XML listing")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn extract(xml: &[u8]) -> Result<Vec<String>> {
+        let mut values = Vec::new();
+        fields(
+            xml,
+            "root",
+            |path| path == ["root", "value"],
+            |_, value| {
+                values.push(value);
+                Ok(())
+            },
+        )?;
+        Ok(values)
+    }
+
+    #[test]
+    fn extracts_namespaced_fields_comments_cdata_and_references() -> Result<()> {
+        let body = "\u{feff}<?xml version='1.0'?>\n<!-- before --><n:root xmlns:n='urn:example' marker='>'><n:value>&lt;&amp;&gt;&quot;&apos;&#65;&#x1F680;<![CDATA[<data>]]><!-- ignored --></n:value><value/><wrapper><value>ignored</value></wrapper></n:root>";
+        assert_eq!(extract(body.as_bytes())?, ["<&>\"'A🚀<data>", ""]);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_invalid_xml_structure_and_entities() {
+        for body in [
+            &b"\xff"[..],
+            &b"<?xml version='1.0'"[..],
+            &b"<root><!-- nope"[..],
+            &b"<![CDATA[outside]]><root/>"[..],
+            &b"<root><![CDATA[incomplete</root>"[..],
+            &b"text<root/>"[..],
+            &b"<other/>"[..],
+            &b"<root/><root/>"[..],
+            &b"<root<value/>"[..],
+            &b"<root bad='incomplete>"[..],
+            &b"<root><value></root>"[..],
+            &b"<root><value><nested/></value></root>"[..],
+            &b"<root><a:b:c/></root>"[..],
+            &b"<root>"[..],
+            &b"<root><value>&bad;</value></root>"[..],
+            &b"<root><value>&unterminated</value></root>"[..],
+            &b"<root><value>&#x110000;</value></root>"[..],
+            &b"<root><value>&#x0;</value></root>"[..],
+        ] {
+            assert!(extract(body).is_err(), "{body:?}");
+        }
+        let deep = format!("<root>{}{}</root>", "<node>".repeat(32), "</node>".repeat(32));
+        assert!(extract(deep.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn rejects_disallowed_xml_characters_and_signed_character_references() {
+        for body in [
+            &b"<root><value>&#+65;</value></root>"[..],
+            &b"<root><value>&#x+41;</value></root>"[..],
+            &b"<root><value>&#1;</value></root>"[..],
+            &b"<root><value>&#xFFFE;</value></root>"[..],
+            &b"<root><value>literal \x01</value></root>"[..],
+        ] {
+            assert!(extract(body).is_err(), "{body:?}");
+        }
+    }
 }

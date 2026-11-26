@@ -464,6 +464,10 @@ pub fn publish_with_warnings(
     }
     let _authorization = authorization.map(|authorize| authorize()).transpose()?;
     store.with_atomic_write(|store| {
+        let (current_team, current_owner) = local_owner(store, project)?;
+        if current_team != team || current_owner != owner {
+            return Err(reject("publisher owner changed; retry publication"));
+        }
         if roster(store,project,&team)? != members {
             return Err(reject("membership changed while preparing publication; retry"));
         }
@@ -987,18 +991,22 @@ fn apply_secret(
     now: i64,
     force: bool,
 ) -> Result<()> {
-    let existing: Option<(String, String, String, u32)> = store
+    let existing: Option<(String, String, String, u32, String)> = store
         .connection()
         .query_row(
-            "SELECT project_id,profile_id,source,current_version FROM secrets WHERE id=?1",
+            "SELECT project_id,profile_id,source,current_version,name FROM secrets WHERE id=?1",
             [&s.id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()?;
     if existing.as_ref().is_some_and(|r| {
         r.0 != project || r.1 != p.id || r.2 != "team-managed" || (!force && r.3 > s.version)
     }) {
         return Err(reject("secret scope/version collision"));
+    }
+    // Historical blobs authenticate the stored name as well as the ID and version.
+    if existing.is_some_and(|row| row.4 != s.name) {
+        return Err(reject("secret name changed for an existing secret ID"));
     }
     if !force
         && let Some(local) = current_secret(store, project, &p.id, &s.id)?
@@ -1037,6 +1045,23 @@ fn apply_secret(
 /// Returns an error when trust, scope, cryptography, storage or folder validation fails.
 pub fn resolve_conflict(
     store: &mut Store,
+    project: &str,
+    selector: &str,
+    keep_local: bool,
+    master: &KeyBytes,
+    sealing: &KeyBytes,
+    local: &DeviceIdentity,
+    now: i64,
+) -> Result<()> {
+    store.with_atomic_write(|store| {
+        resolve_conflict_in_transaction(
+            store, project, selector, keep_local, master, sealing, local, now,
+        )
+    })
+}
+
+fn resolve_conflict_in_transaction(
+    store: &Store,
     project: &str,
     selector: &str,
     keep_local: bool,
@@ -1093,31 +1118,71 @@ pub fn resolve_conflict(
     if *current_key != profile.secret_key {
         return Err(reject("conflict key epoch superseded; fetch latest owner snapshot"));
     }
-    store.with_atomic_write(|store| {
-        if keep_local && !current.deleted {
-            if store.get_secret_by_source(project,&profile.id,&current.name,"user-local")?.is_some() {return Err(reject("existing user-local override preserved; rename it before keeping this edit"));}
-            let value=plaintext(project,profile,&current)?.ok_or_else(||reject("local value missing"))?;
-            let local_id=locket_core::SecretId::generate().map_err(|_|reject("clock unavailable"))?.into_string();
-            let aad=secret_blob_aad_v1(&SecretBlobAad::new(project,&profile.id,&local_id,&current.name,1))?;
-            let wrap=key_wrap_aad_v1(&KeyWrapAad::new(project,&local_id,Some(&profile.id),1,KeyWrapPurpose::SecretDek))?;
-            let blob=locket_crypto::encrypt_secret_value_v1(&current_key,&value,&aad,&wrap)?;
-            store.connection().execute("INSERT INTO secrets(id,project_id,profile_id,name,source,origin,required,current_version,state,created_at,updated_at) VALUES (?1,?2,?3,?4,'user-local','manual',0,1,'active',?5,?5)",params![local_id,project,profile.id,current.name,nanos(now)?])?;
-            store.connection().execute("INSERT INTO secret_versions(secret_id,version,source,origin,state,created_at) VALUES (?1,1,'user-local','manual','current',?2)",params![local_id,nanos(now)?])?;
-            store.connection().execute("INSERT INTO blobs VALUES (?1,1,?2,?3,?4,1,?5)",params![local_id,blob.encrypted_dek,blob.ciphertext,blob.value_nonce.as_slice(),nanos(now)?])?;
-            let fp=secret_fingerprint_v1(&profile.fingerprint_key,&value)?;
-            store.connection().execute("INSERT INTO fingerprints VALUES (?1,1,?2,?3)",params![local_id,fp.as_slice(),nanos(now)?])?;
+    if keep_local && !current.deleted {
+        if store.get_secret_by_source(project, &profile.id, &current.name, "user-local")?.is_some()
+        {
+            return Err(reject(
+                "existing user-local override preserved; rename it before keeping this edit",
+            ));
         }
-        if let Some(incoming)=profile.secrets.iter().find(|s|&s.id==id) {
-            store.connection().execute("DELETE FROM secret_versions WHERE secret_id=?1 AND version>=?2",params![id,incoming.version])?;
-            apply_secret(store,project,profile,incoming,now,true)?;
-        } else {
-            store.connection().execute("UPDATE secrets SET state='deleted',deleted_at=?2 WHERE id=?1",params![id,nanos(now)?])?;
-            let updated=current_secret(store,project,&profile.id,id)?.ok_or_else(||reject("value disappeared"))?;
-            store.connection().execute("INSERT INTO team_sync_values VALUES (?1,?2,?3) ON CONFLICT(project_id,secret_id) DO UPDATE SET digest=excluded.digest",params![project,id,digest(&serde_json::to_vec(&updated)?)])?;
-            store.connection().execute("DELETE FROM team_sync_conflicts WHERE project_id=?1 AND secret_id=?2",(project,id))?;
-        }
-        Ok(())
-    })
+        let value =
+            plaintext(project, profile, &current)?.ok_or_else(|| reject("local value missing"))?;
+        let local_id = locket_core::SecretId::generate()
+            .map_err(|_| reject("clock unavailable"))?
+            .into_string();
+        let aad = secret_blob_aad_v1(&SecretBlobAad::new(
+            project,
+            &profile.id,
+            &local_id,
+            &current.name,
+            1,
+        ))?;
+        let wrap = key_wrap_aad_v1(&KeyWrapAad::new(
+            project,
+            &local_id,
+            Some(&profile.id),
+            1,
+            KeyWrapPurpose::SecretDek,
+        ))?;
+        let blob = locket_crypto::encrypt_secret_value_v1(&current_key, &value, &aad, &wrap)?;
+        store.connection().execute("INSERT INTO secrets(id,project_id,profile_id,name,source,origin,required,current_version,state,created_at,updated_at) VALUES (?1,?2,?3,?4,'user-local','manual',0,1,'active',?5,?5)",params![local_id,project,profile.id,current.name,nanos(now)?])?;
+        store.connection().execute("INSERT INTO secret_versions(secret_id,version,source,origin,state,created_at) VALUES (?1,1,'user-local','manual','current',?2)",params![local_id,nanos(now)?])?;
+        store.connection().execute(
+            "INSERT INTO blobs VALUES (?1,1,?2,?3,?4,1,?5)",
+            params![
+                local_id,
+                blob.encrypted_dek,
+                blob.ciphertext,
+                blob.value_nonce.as_slice(),
+                nanos(now)?
+            ],
+        )?;
+        let fp = secret_fingerprint_v1(&profile.fingerprint_key, &value)?;
+        store.connection().execute(
+            "INSERT INTO fingerprints VALUES (?1,1,?2,?3)",
+            params![local_id, fp.as_slice(), nanos(now)?],
+        )?;
+    }
+    if let Some(incoming) = profile.secrets.iter().find(|s| &s.id == id) {
+        store.connection().execute(
+            "DELETE FROM secret_versions WHERE secret_id=?1 AND version>=?2",
+            params![id, incoming.version],
+        )?;
+        apply_secret(store, project, profile, incoming, now, true)?;
+    } else {
+        store.connection().execute(
+            "UPDATE secrets SET state='deleted',deleted_at=?2 WHERE id=?1",
+            params![id, nanos(now)?],
+        )?;
+        let updated = current_secret(store, project, &profile.id, id)?
+            .ok_or_else(|| reject("value disappeared"))?;
+        store.connection().execute("INSERT INTO team_sync_values VALUES (?1,?2,?3) ON CONFLICT(project_id,secret_id) DO UPDATE SET digest=excluded.digest",params![project,id,digest(&serde_json::to_vec(&updated)?)])?;
+        store.connection().execute(
+            "DELETE FROM team_sync_conflicts WHERE project_id=?1 AND secret_id=?2",
+            (project, id),
+        )?;
+    }
+    Ok(())
 }
 
 /// # Errors
@@ -1129,25 +1194,24 @@ pub fn remove_member(
     master: &KeyBytes,
     now: i64,
 ) -> Result<Vec<String>> {
-    let (team, owner) = local_owner(store, project)?;
-    let members = roster(store, project, &team)?;
-    let target = members
-        .iter()
-        .find(|m| m.id == member || m.name == member)
-        .ok_or_else(|| reject("member not found"))?;
-    if target.device == owner {
-        return Err(reject("cannot remove this member"));
-    }
-    let mut snapshots = target
-        .profiles
-        .iter()
-        .map(|id| profile_snapshot(store, project, id, master))
-        .collect::<Result<Vec<_>>>()?;
-    let names = snapshots
-        .iter()
-        .flat_map(|p| p.secrets.iter().filter(|s| !s.deleted).map(|s| s.name.clone()))
-        .collect();
     store.with_atomic_write(|store| {
+        let (team, owner) = local_owner(store, project)?;
+        let members = roster(store, project, &team)?;
+        let target = members.iter().find(|m| m.id == member)
+            .or_else(|| members.iter().find(|m| m.name == member))
+            .ok_or_else(|| reject("member not found"))?;
+        if target.device == owner {
+            return Err(reject("cannot remove this member"));
+        }
+        let mut snapshots = target
+            .profiles
+            .iter()
+            .map(|id| profile_snapshot(store, project, id, master))
+            .collect::<Result<Vec<_>>>()?;
+        let names = snapshots
+            .iter()
+            .flat_map(|p| p.secrets.iter().filter(|s| !s.deleted).map(|s| s.name.clone()))
+            .collect();
         for profile in &mut snapshots {
             let old=zeroize::Zeroizing::new(profile.secret_key);
             profile.secret_key = *locket_crypto::generate_key()?;
@@ -1159,7 +1223,7 @@ pub fn remove_member(
             store.connection().execute("INSERT INTO team_sync_profile_epochs VALUES (?1,?2,?3) ON CONFLICT(project_id,profile_id) DO UPDATE SET epoch=excluded.epoch",params![project,profile.id,profile.key_epoch])?;
         }
         store.remove_team_member(&target.id,nanos(now)?)?;
-        store.connection().execute("UPDATE devices SET revoked_at=?2 WHERE id=?1",params![target.device.id,nanos(now)?])?;
+        store.connection().execute("UPDATE devices SET revoked_at=COALESCE(revoked_at,?2) WHERE id=?1",params![target.device.id,nanos(now)?])?;
         audit_event(store,project,master,"TEAM_SYNC_REMOVE",now,&serde_json::json!({"member_id":target.id,"profile_count":snapshots.len()}))?;
         Ok(names)
     })

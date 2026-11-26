@@ -247,6 +247,18 @@ fn resolve(endpoint: &Endpoint, deadline: Instant) -> Result<Vec<SocketAddr>> {
             SocketAddr::new(Ipv6Addr::LOCALHOST.into(), port),
         ]);
     }
+    let host = endpoint.host.clone();
+    lookup_dns(deadline, move || {
+        (host.as_str(), port)
+            .to_socket_addrs()
+            .map(|addresses| addresses.take(MAX_RESOLVED_ADDRESSES).collect())
+    })
+}
+
+fn lookup_dns(
+    deadline: Instant,
+    lookup: impl FnOnce() -> io::Result<Vec<SocketAddr>> + Send + 'static,
+) -> Result<Vec<SocketAddr>> {
     ACTIVE_LOOKUPS
         .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
             (count < MAX_CONCURRENT_LOOKUPS).then_some(count + 1)
@@ -254,7 +266,6 @@ fn resolve(endpoint: &Endpoint, deadline: Instant) -> Result<Vec<SocketAddr>> {
         .map_err(|_| reject("too many active team transport DNS lookups"))?;
 
     let slot = LookupSlot;
-    let host = endpoint.host.clone();
     let (send, receive) = mpsc::sync_channel(1);
     // Native DNS can block beyond the connect deadline. Keep worker count
     // bounded even when the OS resolver is slow to return.
@@ -262,10 +273,7 @@ fn resolve(endpoint: &Endpoint, deadline: Instant) -> Result<Vec<SocketAddr>> {
         .name("team-sync-dns".into())
         .spawn(move || {
             let _slot = slot;
-            let result = (host.as_str(), port)
-                .to_socket_addrs()
-                .map(|addresses| addresses.take(MAX_RESOLVED_ADDRESSES).collect());
-            let _ = send.send(result);
+            let _ = send.send(lookup());
         })
         .map_err(http_io)?;
     receive
@@ -466,6 +474,7 @@ fn read_body(reader: &mut impl BufRead, framing: Framing, cap: usize) -> Result<
                     while !read_line(reader, &mut buffer, &mut budget)?.is_empty() {}
                     break;
                 }
+                budget = budget.checked_sub(2).ok_or_else(invalid_response)?;
                 append_exact(reader, &mut body, size, cap)?;
                 let mut delimiter = [0; 2];
                 reader.read_exact(&mut delimiter).map_err(http_io)?;
@@ -541,5 +550,281 @@ pub(super) fn put_package(
         200 | 201 | 204 => Ok(PutOutcome::Written),
         409 | 412 => compare(),
         status => Err(status_error("PUT", status)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::io::Cursor;
+
+    fn respond(method: &str, response: &[u8], cap: usize) -> Result<Response> {
+        // Keep reads and writes independent, like the two halves of a socket.
+        struct Exchange<'a>(Cursor<&'a [u8]>);
+        impl Read for Exchange<'_> {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                self.0.read(output)
+            }
+        }
+        impl Write for Exchange<'_> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        exchange(Exchange(Cursor::new(response)), method, b"request", b"", cap)
+    }
+
+    #[test]
+    fn endpoint_normalizes_and_checks_origin() -> Result<()> {
+        let endpoint = Endpoint::parse("https://EXAMPLE.test/a%20b/%c3%a9/")?;
+        assert_eq!(endpoint.url(), "https://example.test/a%20b/%C3%A9/");
+        assert_eq!(endpoint.host_header(), "example.test");
+        assert!(endpoint.same_origin(&Endpoint::parse("https://example.test:443/elsewhere")?));
+        assert!(!endpoint.same_origin(&Endpoint::parse("https://example.test:8443/")?));
+        let ipv6 = Endpoint::parse("http://[0:0:0:0:0:0:0:1]:8080/a")?;
+        assert_eq!(ipv6.url(), "http://[::1]:8080/a");
+        assert_eq!(
+            resolve(&ipv6, Instant::now())?,
+            ["[::1]:8080".parse::<SocketAddr>().map_err(|_| invalid_response())?]
+        );
+        assert_eq!(
+            resolve(&Endpoint::parse("http://LOCALHOST")?, Instant::now())?,
+            [
+                SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 80),
+                SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 80),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn endpoint_rejects_invalid_authorities_paths_and_headers() -> Result<()> {
+        for url in [
+            "example.test",
+            "s3://example.test/",
+            "https://[::1",
+            "https://[example.test]/",
+            "https://[::1]invalid/",
+            "https://localhost:",
+            "https://localhost:x",
+            "https://localhost:0",
+            "https://localhost:65536",
+            "https://-example.test",
+            "https://example.test/a/%",
+            "https://example.test/a/%Z0",
+            "https://example.test/a/%0Z",
+            "https://example.test/a/%FF",
+            "https://example.test/a/%00",
+            "https://example.test/a/%2F",
+            "https://example.test/a/..",
+        ] {
+            assert!(Endpoint::parse(url).is_err(), "{url}");
+        }
+        let endpoint = Endpoint::parse("http://localhost")?;
+        let result = endpoint.request("GET", "/", &[("authorization", "first\nsecond")], &[], 4);
+        assert!(result.is_err_and(|error| {
+            error.to_string().contains("invalid team transport request header")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn response_framing_reads_bounded_bodies() -> Result<()> {
+        for response in [
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndata"[..],
+            &b"HTTP/1.0 200 OK\r\n\r\ndata"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: CHUNKED\r\n\r\n2;ext=yes\r\nda\r\n2\r\nta\r\n0\r\nTrailer: value\r\n\r\n"[..],
+        ] {
+            assert_eq!(respond("GET", response, 4)?.body, b"data");
+            assert!(matches!(respond("GET", response, 3), Err(SyncError::RemoteBodyTooLarge)));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn response_framing_rejects_invalid_heads_and_chunks() {
+        for response in [
+            &b"HTTP/1.1\r\n\r\n"[..],
+            &b"HTTP/2.0 200 OK\r\n\r\n"[..],
+            &b"HTTP/1.1 999 Unknown\r\n\r\n"[..],
+            &b"HTTP/1.1 20 OK\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\n\n"[..],
+            &b"HTTP/1.1 200 \xff\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nno-colon\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nSpace Here: value\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nHeader: bad\x00value\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Length: 4\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 9999999999999999999999\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\ninvalid\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffffffff\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na!\r\n0\r\n\r\n"[..],
+        ] {
+            assert!(
+                respond("GET", response, 4)
+                    .is_err_and(|error| error.to_string() == "invalid team transport HTTP response"),
+                "{response:?}"
+            );
+        }
+        let response = format!("HTTP/1.1 200 OK\r\nLong: {}\r\n\r\n", "x".repeat(HEADER_LIMIT));
+        assert!(respond("GET", response.as_bytes(), 4).is_err());
+        assert!(
+            respond("GET", b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nda", 4)
+                .is_err_and(|error| error.to_string() == "team transport HTTP I/O failed")
+        );
+    }
+
+    #[test]
+    fn chunk_overhead_limit_includes_chunk_delimiters() {
+        // Each chunk contributes three bytes of size line and a two-byte delimiter.
+        let chunks = CHUNK_OVERHEAD_LIMIT / 4;
+        let mut wire = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        wire.extend(b"1\r\na\r\n".repeat(chunks));
+        wire.extend(b"0\r\n\r\n");
+        assert!(
+            respond("GET", &wire, chunks)
+                .is_err_and(|error| error.to_string() == "invalid team transport HTTP response")
+        );
+    }
+
+    #[test]
+    fn response_status_controls_body_and_rejects_upgrades() -> Result<()> {
+        let continued =
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nx";
+        assert_eq!(respond("GET", continued, 1)?.body, b"x");
+        for response in [
+            &b"HTTP/1.1 101 Switching Protocols\r\n\r\n"[..],
+            &b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /another\r\n\r\n"[..],
+        ] {
+            assert!(
+                respond("GET", response, 0)
+                    .is_err_and(|error| error.to_string().contains("redirect or protocol upgrade"))
+            );
+        }
+        let continued_only = b"HTTP/1.1 100 Continue\r\n\r\n".repeat(8);
+        assert!(respond("GET", &continued_only, 0).is_err());
+        for (method, status) in [("HEAD", 200), ("GET", 204), ("GET", 205), ("GET", 403)] {
+            let response = format!("HTTP/1.1 {status} Test\r\nContent-Length: 100\r\n\r\n");
+            let response = respond(method, response.as_bytes(), 0)?;
+            assert_eq!(response.status, status);
+            assert_eq!(response.body, b"");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn upload_checks_conditional_status_and_existing_content() -> Result<()> {
+        let cases = [
+            (200, None, 200, &b"package"[..], Some(PutOutcome::AlreadyPresent)),
+            (204, None, 404, &b""[..], Some(PutOutcome::Conflict)),
+            (200, None, 200, &b"other"[..], Some(PutOutcome::Conflict)),
+            (200, None, 401, &b""[..], None),
+            (401, None, 0, &b""[..], None),
+            (404, Some(201), 0, &b""[..], Some(PutOutcome::Written)),
+            (405, Some(409), 200, &b"package"[..], Some(PutOutcome::AlreadyPresent)),
+            (501, Some(412), 404, &b""[..], Some(PutOutcome::Conflict)),
+            (404, Some(403), 0, &b""[..], None),
+        ];
+        for (head, put, get, existing, expected) in cases {
+            let requests = RefCell::new(Vec::new());
+            let outcome = put_package(b"package", |method, headers, body, cap| {
+                let status = match method {
+                    "HEAD" => {
+                        assert_eq!(cap, 0);
+                        assert_eq!(body, b"");
+                        "HEAD"
+                    }
+                    "PUT" => {
+                        assert_eq!(cap, HEADER_LIMIT);
+                        assert_eq!(body, b"package");
+                        assert!(headers.contains(&("if-none-match", "*")));
+                        "PUT"
+                    }
+                    "GET" => {
+                        assert_eq!(cap, PACKAGE_LIMIT);
+                        assert_eq!(body, b"");
+                        "GET"
+                    }
+                    _ => return Err(invalid_response()),
+                };
+                requests.borrow_mut().push(status);
+                Ok(match status {
+                    "HEAD" => Response { status: head, body: Vec::new() },
+                    "PUT" => {
+                        Response { status: put.ok_or_else(invalid_response)?, body: Vec::new() }
+                    }
+                    _ => Response { status: get, body: existing.to_vec() },
+                })
+            });
+            assert_eq!(outcome.ok(), expected);
+            let mut expected_requests = vec!["HEAD"];
+            if put.is_some() {
+                expected_requests.push("PUT");
+            }
+            if get != 0 {
+                expected_requests.push("GET");
+            }
+            assert_eq!(*requests.borrow(), expected_requests);
+        }
+        assert_eq!(
+            put_package(b"package", |method, _, _, _| {
+                if method == "GET" {
+                    Err(SyncError::RemoteBodyTooLarge)
+                } else {
+                    Ok(Response { status: 200, body: Vec::new() })
+                }
+            })?,
+            PutOutcome::Conflict,
+        );
+        assert!(put_package(b"package", |_, _, _, _| Err(invalid_response())).is_err());
+        for (status, expected) in
+            [(200, Some(true)), (204, Some(true)), (404, Some(false)), (202, None), (207, None)]
+        {
+            assert_eq!(
+                delete_package("delete", |_| Ok(Response { status, body: Vec::new() })).ok(),
+                expected
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn io_timeout_is_redacted() {
+        let deadline = Instant::now();
+        let error = remaining(deadline).err().map(http_io);
+        assert!(error.is_some_and(|error| error.to_string() == "team transport HTTP operation timed out"));
+    }
+
+    #[test]
+    fn dns_worker_returns_addresses_and_redacts_lookup_failure() -> Result<()> {
+        let address = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 443);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        assert_eq!(lookup_dns(deadline, move || Ok(vec![address]))?, [address]);
+        assert!(
+            lookup_dns(deadline, || Err(io::Error::other("resolver detail")))
+                .is_err_and(|error| error.to_string() == "team transport DNS lookup failed")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tls_rejects_a_peer_that_does_not_negotiate_tls() -> Result<()> {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let endpoint = Endpoint::parse(&format!("https://{}", listener.local_addr()?))?;
+        let peer = std::thread::spawn(move || -> io::Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+            stream.read_exact(&mut [0])?;
+            stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+        });
+        let result = endpoint.request("GET", "/", &[], &[], 4);
+        peer.join().map_err(|_| reject("test TLS peer stopped"))??;
+        assert!(result.is_err_and(|error| error.to_string().contains("TLS handshake")));
+        Ok(())
     }
 }

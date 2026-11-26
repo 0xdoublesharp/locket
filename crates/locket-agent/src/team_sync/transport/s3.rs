@@ -397,4 +397,110 @@ mod tests {
             "%C3%A9=&a=%2B%2F%3D&a=2&~=space%20here"
         );
     }
+    #[test]
+    fn listing_page_filters_names_and_checks_pagination() -> Result<()> {
+        let mut entries = 0;
+        let mut files = BTreeSet::new();
+        let page = br"<ListBucketResult>
+          <Contents><Key>prefix/team.lkpkg</Key></Contents>
+          <Contents><Key>prefix/other.txt</Key></Contents>
+          <Contents><Key>different/team.lkpkg</Key></Contents>
+          <Contents><Key>prefix/team.lkpkg</Key></Contents>
+          <IsTruncated>true</IsTruncated><NextContinuationToken>next&amp;+</NextContinuationToken>
+        </ListBucketResult>";
+        assert_eq!(
+            parse_page(page, "prefix/", &mut entries, &mut files)?.as_deref(),
+            Some("next&+")
+        );
+        assert_eq!(entries, 4);
+        assert_eq!(files, BTreeSet::from(["team.lkpkg".to_owned()]));
+        assert_eq!(
+            parse_page(
+                b"<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>",
+                "prefix/",
+                &mut entries,
+                &mut files
+            )?,
+            None,
+        );
+        for (body, message) in [
+            ("<IsTruncated>maybe</IsTruncated>", "invalid S3 pagination flag"),
+            (
+                "<IsTruncated>true</IsTruncated><IsTruncated>false</IsTruncated>",
+                "duplicate S3 pagination flag",
+            ),
+            ("<NextContinuationToken/>", "invalid S3 continuation token"),
+            (
+                "<NextContinuationToken>a</NextContinuationToken><NextContinuationToken>b</NextContinuationToken>",
+                "invalid S3 continuation token",
+            ),
+            ("<IsTruncated>true</IsTruncated>", "inconsistent S3 pagination response"),
+            (
+                "<IsTruncated>false</IsTruncated><NextContinuationToken>extra</NextContinuationToken>",
+                "inconsistent S3 pagination response",
+            ),
+        ] {
+            let page = format!("<ListBucketResult>{body}</ListBucketResult>");
+            assert!(
+                parse_page(page.as_bytes(), "prefix/", &mut entries, &mut files)
+                    .is_err_and(|error| error.to_string() == message)
+            );
+        }
+        entries = ENTRY_LIMIT;
+        assert!(
+            parse_page(page, "prefix/", &mut entries, &mut files)
+                .is_err_and(|error| error.to_string().contains("too many entries"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn s3_paths_use_the_bucket_only_in_path_style() -> Result<()> {
+        for (custom, path_style, url, path, object) in [
+            (
+                None,
+                false,
+                "https://bucket.s3.us-east-1.amazonaws.com",
+                "/",
+                "/some%20prefix/file.lkpkg",
+            ),
+            (
+                None,
+                true,
+                "https://s3.us-east-1.amazonaws.com",
+                "/bucket",
+                "/bucket/some%20prefix/file.lkpkg",
+            ),
+            (
+                Some("http://localhost:3200/gateway///"),
+                false,
+                "http://localhost:3200/gateway///",
+                "/gateway",
+                "/gateway/some%20prefix/file.lkpkg",
+            ),
+        ] {
+            let config = TransportConfig::S3 {
+                bucket: "bucket".into(),
+                region: "us-east-1".into(),
+                prefix: "some prefix".into(),
+                endpoint: custom.map(str::to_owned),
+                path_style,
+                credential_mode: CredentialMode::Vault,
+            };
+            let summary = config.summary()?;
+            assert_eq!(summary.endpoint.as_deref(), Some(url));
+            let transport = S3::new(
+                &config,
+                summary,
+                Some(TransportSecretInput::S3 {
+                    access_key_id: "demo".into(),
+                    secret_access_key: Zeroizing::new("demo".into()),
+                    session_token: None,
+                }),
+            )?;
+            assert_eq!(transport.bucket_path, path);
+            assert_eq!(transport.object_path("file.lkpkg")?, object);
+        }
+        Ok(())
+    }
 }

@@ -218,32 +218,46 @@ fn insert_local(store: &Store, d: &DeviceIdentity) -> Result<(), Box<dyn std::er
 #[test]
 fn value_conflict_advances_membership_then_keep_local_creates_override()
 -> Result<(), Box<dyn std::error::Error>> {
-    value_conflict_flow(true, false, false)
+    value_conflict_flow(true, ConflictUpdate::Present)
 }
 
 #[test]
 fn value_conflict_take_team_restores_shared_value_without_local_override()
 -> Result<(), Box<dyn std::error::Error>> {
-    value_conflict_flow(false, false, false)
+    value_conflict_flow(false, ConflictUpdate::Present)
 }
 
 #[test]
 fn stale_conflict_cannot_restore_a_profile_after_scope_revocation()
 -> Result<(), Box<dyn std::error::Error>> {
-    value_conflict_flow(false, true, false)
+    value_conflict_flow(false, ConflictUpdate::ScopeRevoked)
 }
 
 #[test]
 fn pending_profile_blocks_resolution_of_older_value_conflicts()
 -> Result<(), Box<dyn std::error::Error>> {
-    value_conflict_flow(false, false, true)
+    value_conflict_flow(false, ConflictUpdate::ProfileHeld)
+}
+
+#[test]
+fn omitted_team_values_can_be_deleted_or_preserved_as_local_overrides()
+-> Result<(), Box<dyn std::error::Error>> {
+    value_conflict_flow(true, ConflictUpdate::Omitted)?;
+    value_conflict_flow(false, ConflictUpdate::Omitted)
+}
+
+#[derive(Clone, Copy)]
+enum ConflictUpdate {
+    Present,
+    ScopeRevoked,
+    ProfileHeld,
+    Omitted,
 }
 
 #[allow(clippy::too_many_lines)]
 fn value_conflict_flow(
     keep_local: bool,
-    revoke_scope: bool,
-    hold_profile: bool,
+    update: ConflictUpdate,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let mut store = receiver(&dir.path().join("receiver.db"))?;
@@ -279,6 +293,9 @@ fn value_conflict_flow(
     statement.epoch = 2;
     statement.previous_digest = locket_core::team_package::digest(&first.statement);
     statement.nonce = [6; 24];
+    if matches!(update, ConflictUpdate::Omitted) {
+        statement.profiles[0].secrets.clear();
+    }
     let next = SignedStatement::sign(&statement, &key)?.seal(&statement.recipient.sealing_key)?;
     let result = team_sync::apply_package(
         &mut store,
@@ -292,7 +309,7 @@ fn value_conflict_flow(
     )?;
     assert_eq!(result.conflicts, 1);
     assert_eq!(team_sync::status(&store, "project")?.epoch, 2);
-    if hold_profile {
+    if matches!(update, ConflictUpdate::ProfileHeld) {
         let second = SignedStatement::open(&next, &sealing)?;
         statement.epoch = 3;
         statement.previous_digest = locket_core::team_package::digest(&second.statement);
@@ -333,7 +350,7 @@ fn value_conflict_flow(
         assert!(store.verify_audit_chain_read_only("project", &[23; 32])?.hmac_ok);
         return Ok(());
     }
-    if revoke_scope {
+    if matches!(update, ConflictUpdate::ScopeRevoked) {
         let second = SignedStatement::open(&next, &sealing)?;
         statement.epoch = 3;
         statement.previous_digest = locket_core::team_package::digest(&second.statement);
@@ -388,13 +405,32 @@ fn value_conflict_flow(
         store.get_secret_by_source("project", "profile", "TOKEN", "user-local")?.is_some(),
         keep_local
     );
-    assert_eq!(
-        store
-            .get_secret_by_source("project", "profile", "TOKEN", "team-managed")?
-            .ok_or("team value missing")?
-            .current_version,
-        1
-    );
+    let shared = store
+        .get_secret_by_source("project", "profile", "TOKEN", "team-managed")?
+        .ok_or("team value missing")?;
+    if matches!(update, ConflictUpdate::Omitted) {
+        assert_eq!((shared.state.as_str(), shared.current_version), ("deleted", 2));
+        assert!(store.get_blob("secret", 2)?.is_some());
+
+        let second = SignedStatement::open(&next, &sealing)?;
+        statement.epoch = 3;
+        statement.previous_digest = locket_core::team_package::digest(&second.statement);
+        let bytes =
+            SignedStatement::sign(&statement, &key)?.seal(&statement.recipient.sealing_key)?;
+        let result = team_sync::apply_package(
+            &mut store,
+            &bytes,
+            &[22; 32],
+            &sealing,
+            &statement.recipient,
+            "project",
+            None,
+            151,
+        )?;
+        assert_eq!((result.applied, result.conflicts), (0, 0));
+    } else {
+        assert_eq!((shared.state.as_str(), shared.current_version), ("active", 1));
+    }
     assert_eq!(team_sync::status(&store, "project")?.conflicts, 0);
     Ok(())
 }
@@ -2340,5 +2376,72 @@ fn signed_update_cannot_erase_personal_values_or_reinstate_removed_members()
             .is_some()
     );
     assert!(store.verify_audit_chain_read_only("project", &[23; 32])?.hmac_ok);
+    Ok(())
+}
+
+#[test]
+fn signed_update_cannot_rename_a_secret_id_bound_to_encrypted_history()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let mut store = receiver(&dir.path().join("receiver.db"))?;
+    let (mut statement, signer, sealing) = fixture()?;
+    insert_local(&store, &statement.recipient)?;
+    let first = SignedStatement::sign(&statement, &signer)?;
+    team_sync::apply_package(
+        &mut store,
+        &first.seal(&statement.recipient.sealing_key)?,
+        &[22; 32],
+        &sealing,
+        &statement.recipient,
+        "project",
+        Some(&statement.publisher.fingerprint),
+        150,
+    )?;
+
+    statement.epoch = 2;
+    statement.previous_digest = locket_core::team_package::digest(&first.statement);
+    let secret = &mut statement.profiles[0].secrets[0];
+    secret.version = 2;
+    secret.name = "RENAMED".into();
+    let aad =
+        secret_blob_aad_v1(&SecretBlobAad::new("project", "profile", "secret", "RENAMED", 2))?;
+    let wrap = key_wrap_aad_v1(&KeyWrapAad::new(
+        "project",
+        "secret",
+        Some("profile"),
+        2,
+        KeyWrapPurpose::SecretDek,
+    ))?;
+    let blob = encrypt_secret_value_v1(&[11; 32], "renamed value", &aad, &wrap)?;
+    secret.blob = Some(TeamBlob {
+        encrypted_dek: blob.encrypted_dek,
+        ciphertext: blob.ciphertext,
+        value_nonce: blob.value_nonce,
+        aad_schema_version: blob.aad_schema_version,
+    });
+    let bytes =
+        SignedStatement::sign(&statement, &signer)?.seal(&statement.recipient.sealing_key)?;
+    assert!(
+        team_sync::apply_package(
+            &mut store,
+            &bytes,
+            &[22; 32],
+            &sealing,
+            &statement.recipient,
+            "project",
+            None,
+            151,
+        )
+        .is_err_and(|error| error.to_string().contains("secret name changed"))
+    );
+    assert_eq!(team_sync::status(&store, "project")?.epoch, 1);
+    assert_eq!(
+        store
+            .get_secret_by_source("project", "profile", "TOKEN", "team-managed")?
+            .ok_or("original value missing")?
+            .current_version,
+        1,
+    );
+    assert!(store.get_blob("secret", 2)?.is_none());
     Ok(())
 }

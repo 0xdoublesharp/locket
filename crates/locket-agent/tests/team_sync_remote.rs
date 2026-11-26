@@ -98,7 +98,9 @@ struct RemoteState {
     redirect: bool,
     refuse_auth: bool,
     conflict_next_put: bool,
+    drop_delete_response_for: Option<String>,
     clashing_name: Option<String>,
+    continuation_override: Option<usize>,
     continued: usize,
     writes: usize,
     requests: usize,
@@ -296,11 +298,18 @@ fn serve(stream: &mut TcpStream, backend: Backend, state: &Mutex<RemoteState>) -
         }
         "DELETE" => {
             state.deletes += 1;
-            let status = if state.objects.remove(object).is_some() {
-                if matches!(backend, Backend::S3) { 204 } else { 200 }
+            let existed = state.objects.remove(object).is_some();
+            let status = if matches!(backend, Backend::S3) {
+                204
+            } else if existed {
+                200
             } else {
                 404
             };
+            if state.drop_delete_response_for.as_deref() == Some(object) {
+                state.drop_delete_response_for = None;
+                return Ok(());
+            }
             drop(state);
             respond(stream, status, &[])
         }
@@ -346,7 +355,8 @@ fn s3_listing(target: &str, state: &mut RemoteState) -> Option<String> {
             .ok()?;
     }
     if is_truncated {
-        write!(body, "<NextContinuationToken>next+/{next}=&amp;</NextContinuationToken>").ok()?;
+        let token = state.continuation_override.unwrap_or(next);
+        write!(body, "<NextContinuationToken>next+/{token}=&amp;</NextContinuationToken>").ok()?;
     }
     body.push_str("</ListBucketResult>");
     Some(body)
@@ -1016,5 +1026,166 @@ fn remote_urls_redirects_listing_traversal_and_oversized_downloads_are_rejected(
                 .is_err_and(|error| error.to_string().contains("join candidate package limit"))
         );
     }
+    Ok(())
+}
+
+#[test]
+fn prune_retry_does_not_reupload_a_package_deleted_before_disconnect() -> TestResult {
+    for backend in [Backend::S3, Backend::DavBasic] {
+        verify_prune_retry(backend)?;
+    }
+    Ok(())
+}
+
+fn verify_prune_retry(backend: Backend) -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let remote = MockRemote::start(backend)?;
+    let owner = Device::new("owner", 7);
+    let recipient = Device::new("recipient", 10);
+    let mut publisher = Vault::owner(directory.path(), &owner, &[&recipient], false)?;
+    publisher.configure(&remote, false)?;
+    assert_eq!(publisher.sync(150)?.published, 1);
+    write_value(&publisher.store, 2, "second epoch")?;
+    assert_eq!(publisher.sync(151)?.published, 1);
+    let files = outbox_filenames(&publisher.store, &recipient)?;
+    let [old, newest] = files.as_slice() else {
+        return Err("expected two delivered packages".into());
+    };
+
+    remote.state()?.drop_delete_response_for = Some(old.clone());
+    assert!(
+        team_sync::prune_remote_packages(&publisher.store, PROJECT, Some(&MASTER), 1, false)
+            .is_err_and(|error| error.to_string().contains("HTTP response"))
+    );
+    assert!(!remote.state()?.objects.contains_key(old));
+    assert_eq!(outbox_filenames(&publisher.store, &recipient)?, files);
+
+    let result =
+        team_sync::prune_remote_packages(&publisher.store, PROJECT, Some(&MASTER), 1, false)?;
+    assert_eq!((result.examined, result.kept, result.deleted), (1, 1, 0));
+    assert_eq!(outbox_filenames(&publisher.store, &recipient)?, [newest.as_str()]);
+    assert_eq!(publisher.sync(152)?.published, 0);
+    assert!(!remote.state()?.objects.contains_key(old));
+    assert!(remote.state()?.objects.contains_key(newest));
+    Ok(())
+}
+
+#[test]
+fn retrying_offboarding_preserves_the_original_revocation_time() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let owner = Device::new("owner", 7);
+    let recipient = Device::new("recipient", 10);
+    let mut publisher = Vault::owner(directory.path(), &owner, &[&recipient], false)?;
+    team_sync::remove_member(&mut publisher.store, PROJECT, "recipient", &MASTER, 150)?;
+    let revoked_at = |store: &Store| -> TestResult<_> {
+        Ok(store.find_device(PROJECT, "recipient")?.and_then(|device| device.revoked_at))
+    };
+    assert_eq!(revoked_at(&publisher.store)?, Some(150_000_000_000));
+    team_sync::remove_member(&mut publisher.store, PROJECT, "recipient", &MASTER, 151)?;
+    assert_eq!(revoked_at(&publisher.store)?, Some(150_000_000_000));
+    Ok(())
+}
+
+#[test]
+fn offboarding_prefers_the_member_id_over_a_matching_display_name() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let owner = Device::new("owner", 7);
+    let first = Device::new("first", 10);
+    let second = Device::new("second", 20);
+    let mut publisher = Vault::owner(directory.path(), &owner, &[&first, &second], false)?;
+    let member_id = |device: &str| -> TestResult<String> {
+        Ok(publisher
+            .store
+            .get_team_member_by_device("team", device)?
+            .ok_or("missing membership")?
+            .id)
+    };
+    let mut members = [(member_id("first")?, "first"), (member_id("second")?, "second")];
+    members.sort_unstable();
+    let [(earlier, unaffected), (later, removed)] = members;
+    publisher
+        .store
+        .connection()
+        .execute("UPDATE team_members SET display_name=?2 WHERE id=?1", (&earlier, &later))?;
+    assert!(
+        team_sync::remove_member(&mut publisher.store, PROJECT, "owner", &MASTER, 150)
+            .is_err_and(|error| error.to_string().contains("cannot remove"))
+    );
+    assert_eq!(
+        team_sync::remove_member(&mut publisher.store, PROJECT, &later, &MASTER, 151)?,
+        ["TOKEN"],
+    );
+    assert!(
+        publisher
+            .store
+            .find_device(PROJECT, unaffected)?
+            .is_some_and(|device| device.revoked_at.is_none())
+    );
+    assert!(
+        publisher
+            .store
+            .find_device(PROJECT, removed)?
+            .is_some_and(|device| device.revoked_at.is_some())
+    );
+    Ok(())
+}
+
+#[test]
+fn publication_rechecks_vault_state_under_the_commit_guard() -> TestResult {
+    for (change, expected) in [
+        ("DELETE FROM team_sync_anchors WHERE project_id=?1", "pin the owner"),
+        (
+            "UPDATE team_members SET display_name='changed' WHERE team_id IN (SELECT id FROM teams WHERE project_id=?1) AND role='developer'",
+            "membership changed",
+        ),
+        ("UPDATE profiles SET dangerous=1 WHERE project_id=?1", "profile content changed"),
+        (
+            "INSERT INTO team_sync_outbound(project_id,recipient,epoch,digest,content_digest,expires_at) SELECT ?1, fingerprint, 1, 'new', 'content', 200 FROM devices WHERE project_id=?1 AND id='recipient'",
+            "publisher predecessor changed",
+        ),
+    ] {
+        let directory = tempfile::tempdir()?;
+        let owner = Device::new("owner", 7);
+        let recipient = Device::new("recipient", 10);
+        let mut publisher = Vault::owner(directory.path(), &owner, &[&recipient], false)?;
+        let path = publisher.root.join("vault.db");
+        let authorization: team_sync::CommitAuthorization = Arc::new(move || {
+            let other = Store::open(&path)?;
+            other.connection().execute(change, [PROJECT])?;
+            Ok(Box::new(()))
+        });
+        assert!(
+            team_sync::publish_guarded(
+                &mut publisher.store,
+                PROJECT,
+                &MASTER,
+                &owner.signing,
+                150,
+                Some(&authorization),
+            )
+            .is_err_and(|error| error.to_string().contains(expected)),
+            "{expected}"
+        );
+        assert_eq!(outbox_filenames(&publisher.store, &recipient)?, Vec::<String>::new());
+    }
+    Ok(())
+}
+
+#[test]
+fn s3_listing_stops_when_storage_repeats_a_continuation_token() -> TestResult {
+    let remote = MockRemote::start(Backend::S3)?;
+    {
+        let mut state = remote.state()?;
+        state.continuation_override = Some(2);
+        state.extra_keys = (0..5).map(|index| format!("{index}.lkpkg")).collect();
+    }
+    assert!(
+        team_sync::test_transport(
+            &remote.config(CredentialMode::Vault),
+            Some(Backend::S3.secret()),
+        )
+        .is_err_and(|error| error.to_string().contains("repeated a continuation token"))
+    );
+    assert_eq!(remote.state()?.requests, 2);
     Ok(())
 }
