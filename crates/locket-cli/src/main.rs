@@ -550,6 +550,9 @@ struct ImportSelectionArgs {
     /// Archive the plaintext input file after a complete import.
     #[arg(long, value_name = "DIR", conflicts_with = "keep")]
     archive: Option<PathBuf>,
+    /// Archive even when keys are skipped, if their values match the vault.
+    #[arg(long, requires = "archive")]
+    archive_if_matching: bool,
     /// Plan the import without writing. Shared deduplication needs the Global Vault fingerprint key.
     #[arg(long)]
     dry_run: bool,

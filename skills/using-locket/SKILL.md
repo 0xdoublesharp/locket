@@ -41,7 +41,8 @@ locket parity
 
 - Pass `--link-shared` to link exact matches already stored in `@shared`, or `--promote-duplicates` to promote repeated values across projects into `@shared` and link them back. Both flags fail closed if `@shared` is unavailable or locked.
 - `--dry-run` uses the same classification planner as real execution and reports `would_link`, `would_promote`, `linked_names`, `promoted_names`, and `duplicate_matches`.
-- When the user chooses to archive the source, use `locket import .env --archive <DIR>` in place of `--keep`. Locket writes a private plaintext backup and removes the source after a complete import with no skipped or filtered keys. Use a directory outside the project or one ignored by Git. Add `--dry-run` to preview without creating a backup.
+- When the user chooses to archive the source, use `locket import .env --archive <DIR>` in place of `--keep`. Locket writes a private plaintext backup and removes the source after importing every key. Use a directory outside the project or one ignored by Git.
+- Add `--archive-if-matching` to archive an already imported file when every skipped value matches its active vault value. Verifying a shared link requires both vaults to be unlocked. Filtered keys block archiving. Add `--dry-run` to check eligibility without writing. A blocked preview reports `delete_env: kept` and gives the reason in `archive_blocked` in text or `archive_blocked_reason` in JSON.
 - To promote, link, or unlink individual secrets after import:
 
 ```sh

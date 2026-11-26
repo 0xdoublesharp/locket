@@ -597,6 +597,7 @@ fn import_env(context: &RuntimeContext, args: ImportEnvArgs) -> Result<Value, Cl
         overwrite: args.overwrite,
         literal: args.literal,
         dry_run: args.dry_run,
+        archive: None,
         link_shared: args.link_shared,
         promote_duplicates: args.promote_duplicates,
         confirmed_profiles: if args.confirm_dangerous {

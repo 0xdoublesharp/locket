@@ -194,7 +194,7 @@ locket deny
 Import and scanning:
 
 ```bash
-locket import .env [--profile <name>] [--source user-local|machine-local|team-managed] [--overwrite] [--keep | --archive <DIR>]
+locket import .env [--profile <name>] [--source user-local|machine-local|team-managed] [--overwrite] [--keep | --archive <DIR> [--archive-if-matching]]
 locket scan [path] [--no-gitignore] [--require-known]
 locket scan --staged [--require-known]
 locket redact file.log [--redact-names]
@@ -209,7 +209,11 @@ locket install-hooks
 
 Use `locket import .env --link-shared` to link entries that exactly match an indexed Global Vault value. Use `--promote-duplicates` to create a Global Vault entry and link the incoming name when its value matches another project and the name is available in the Global Vault. Both options require an initialized Global Vault and access to its fingerprint key, including during `--dry-run`. The preview reports the same plan as a real import from the same starting state.
 
-Use `--archive <DIR>` to move the plaintext input into a uniquely named backup after a successful import with no skipped or filtered keys. Locket copies and syncs the file before removing the source, including across filesystems. On Unix, new directories use `0700` and backups use `0600`. Backups within the project root must be ignored by Git. With `--dry-run`, `delete_env` is `would-archive` and the filesystem stays unchanged. After archiving, text and JSON reports show `delete_env` as `archived` and include the backup path in `archived_to`. If archiving fails, the import remains in the vault and the source stays in place.
+Use `--archive <DIR>` to move the plaintext input into a uniquely named backup after importing every key. Add `--archive-if-matching` to allow skipped keys when every skipped value matches its active vault value, including when the entire file was already imported. Verifying a shared link requires both vaults to be unlocked. Filtered keys block archiving.
+
+With `--dry-run`, `delete_env` is `would-archive` when the file is eligible, and the filesystem stays unchanged. A blocked archive reports `delete_env: kept` and gives the reason in `archive_blocked` in text or `archive_blocked_reason` in JSON. Verification reports match counts and mismatch names without exposing values.
+
+Locket copies and syncs the file before removing the source, including across filesystems. On Unix, new directories use `0700` and backups use `0600`. Backups within the project root must be ignored by Git. Successful archives report `delete_env: archived` and give the backup path in `archived_to`. If archiving fails, the import remains in the vault and the source stays in place.
 
 Import skips a candidate link or promotion when it would replace an active local value or retarget a link. With `--overwrite`, it tombstones any active local source that would take precedence over the link. Use `--confirm-dangerous <PROFILE>` to confirm overwrites and links in a dangerous consuming profile, or promotion into a dangerous Global Vault profile. Promotion records `SECRET_PROMOTE` in the consuming project and the Global Vault. Other projects keep their copies. Run `locket promote <KEY> --consolidate-duplicates` to convert eligible copies to links.
 

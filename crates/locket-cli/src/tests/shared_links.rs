@@ -563,8 +563,8 @@ fn linked_cli_value_access_checks_the_live_agent_even_with_both_keys_available()
                     locket_agent::UnlockMethod::OsKeychain,
                 ),
             );
-            for request in 0..6 {
-                if request == 4 {
+            for request in 0..9 {
+                if request == 5 {
                     let mut cache = state.unlock_cache.lock().await;
                     cache.evict(&consumer);
                     cache.insert(
@@ -599,20 +599,29 @@ fn linked_cli_value_access_checks_the_live_agent_even_with_both_keys_available()
         &effective,
         &effective.policy,
     );
+    let source = workspace.path().join(".env");
+    fs::write(&source, "RPC_URL=linked-fixture-value\n")?;
+    let archive_args = ["import", ".env", "--archive", "backups", "--archive-if-matching"];
+    let preview_args = [&archive_args[..], &["--dry-run"]].concat();
+    let preview = run_cli_args(&context, &preview_args);
     let consumer_locked = run_cli_args(&context, &["get", "RPC_URL", "--reveal", "--force"]);
+    let archive = run_cli_args(&context, &archive_args);
     server.join().map_err(|_| "agent socket fixture panicked")??;
-    for error in [get.err(), explicit.err(), run.err(), docker.err()] {
+    for error in [get.err(), explicit.err(), run.err(), docker.err(), preview.err()] {
         assert!(matches!(
             error,
             Some(CliError::Typed { kind: locket_core::LocketError::UnlockRequired, message })
-                if message.contains("Global Vault"),
+                if message.contains("Global Vault") && !message.contains("linked-fixture-value"),
         ));
     }
-    assert!(matches!(
-        consumer_locked,
-        Err(CliError::Typed { kind: locket_core::LocketError::UnlockRequired, message })
-            if message.contains("consuming project"),
-    ));
+    for result in [consumer_locked, archive] {
+        assert!(matches!(
+            result,
+            Err(CliError::Typed { kind: locket_core::LocketError::UnlockRequired, message })
+                if message.contains("consuming project") && !message.contains("linked-fixture-value"),
+        ));
+    }
+    assert!(source.is_file() && !workspace.path().join("backups").exists());
     Ok(())
 }
 
@@ -769,6 +778,57 @@ fn import_with_only_shared_links_can_delete_the_source() -> Result<(), Box<dyn s
     assert!(output.contains("linked: 1"));
     assert!(output.contains("delete_env: deleted"));
     assert!(!output.contains(input));
+    assert!(!source.exists());
+    Ok(())
+}
+
+#[test]
+fn import_archive_if_matching_verifies_existing_shared_aliases()
+-> Result<(), Box<dyn std::error::Error>> {
+    let workspace = tempfile::tempdir()?;
+    let outside = tempfile::tempdir()?;
+    let value = "shared-link-archive-fixture";
+    let context = RuntimeContext {
+        key_store: Arc::new(ProjectKeys::default()),
+        ..test_context_with_secret_value(&workspace, value)
+    };
+    run_cli_args(&context, &["init", "--no-device", "--no-passkey"])?;
+    run_cli_args(&context, &["shared", "init"])?;
+    run_cli_args(&context, &["shared", "set", "TOKEN"])?;
+    run_cli_args(&context, &["link", "ALIAS", "TOKEN"])?;
+    let source = workspace.path().join(".env");
+    let contents = format!("ALIAS={value}\n");
+    fs::write(&source, &contents)?;
+    let backup = outside.path().join("backups");
+    let directory = backup.to_str().ok_or("archive path must be UTF-8")?;
+    let args = ["import", ".env", "--archive", directory, "--archive-if-matching", "--json"];
+    for link_shared in [false, true] {
+        let mut preview = args.to_vec();
+        preview.push("--dry-run");
+        if link_shared {
+            preview.push("--link-shared");
+        }
+        let (code, output) = run_cli_result(&context, &preview)?;
+        assert_eq!(code, 0);
+        assert!(!output.contains(value));
+        let report: Value = serde_json::from_str(&output)?;
+        assert_eq!(report["skipped_names"], json!(["ALIAS"]));
+        assert_eq!(report["verified_matching_names"], json!(["ALIAS"]));
+        assert_eq!(report["verified_matching"], 1);
+        assert_eq!(report["delete_env"], "would-archive");
+        assert!(report.get("linked").is_none());
+        assert!(fs::read(&source)?.as_slice().eq(contents.as_bytes()), "source changed");
+        assert!(!backup.exists());
+    }
+    let (code, output) = run_cli_result(&context, &args)?;
+    assert_eq!(code, 0);
+    assert!(!output.contains(value));
+    let report: Value = serde_json::from_str(&output)?;
+    assert_eq!(report["verified_matching_names"], json!(["ALIAS"]));
+    assert_eq!(report["delete_env"], "archived");
+    assert_eq!(report["imported"], 0);
+    let destination = report["archived_to"].as_str().ok_or("missing archive path")?;
+    assert!(fs::read(destination)?.as_slice().eq(contents.as_bytes()), "backup bytes changed");
     assert!(!source.exists());
     Ok(())
 }

@@ -39,6 +39,7 @@ use super::set::{
 use crate::commands::discovery::{
     require_metadata_store, trusted_project_configs, write_json_result,
 };
+use crate::commands::exec::run::require_linked_secret_access;
 use crate::runtime::RuntimeContext;
 use crate::runtime::error::{
     CliError, confirmation_failed_error, invalid_profile_name_error, invalid_secret_name_error,
@@ -46,6 +47,7 @@ use crate::runtime::error::{
 };
 use crate::runtime::prompts::ConfirmationReader;
 use crate::support::project_files::{ensure_gitignore, refresh_example_for_project_if_enabled};
+use crate::support::secret_helpers::{decrypt_secret_version, resolve_active_secret_in_profile};
 use crate::{
     EnvFileCommand, ImportArgs, ImportSelectionArgs, NANOS_PER_SECOND, ResolvedProject,
     SecretMetadataFlags, SecretSourceArg, absolutize, active_profile_secret_names,
@@ -66,10 +68,17 @@ pub(crate) struct EnvImportOptions {
     pub overwrite: bool,
     pub literal: bool,
     pub dry_run: bool,
+    pub archive: Option<ArchivePolicy>,
     pub link_shared: bool,
     pub promote_duplicates: bool,
     pub confirmed_profiles: Vec<String>,
     pub source: SecretSourceArg,
+}
+
+#[derive(Clone, Copy)]
+pub enum ArchivePolicy {
+    CompleteImport,
+    VerifySkipped,
 }
 
 pub fn env_file_command(
@@ -183,6 +192,13 @@ fn import_cli(
         overwrite: args.overwrite,
         literal: args.literal,
         dry_run: selection.dry_run,
+        archive: selection.archive.as_ref().map(|_| {
+            if selection.archive_if_matching {
+                ArchivePolicy::VerifySkipped
+            } else {
+                ArchivePolicy::CompleteImport
+            }
+        }),
         link_shared: selection.link_shared,
         promote_duplicates: selection.promote_duplicates,
         confirmed_profiles,
@@ -200,21 +216,21 @@ fn import_cli(
             if selection.json { Ok(()) } else { write_import_diagnostics(output, warnings, errors) }
         })?;
     refresh_import_project_files(context, root.as_deref())?;
-    if selection.dry_run && selection.archive.is_some() {
-        report.delete_env = "would-archive";
-    } else if let Some((dir, file, original)) = archive_source
-        && report.completed_cleanly()
-    {
-        let destination = absolutize(&context.cwd, dir);
-        let archived =
-            archive_env_source(&path, file, &original, &destination, &report.project_name)
-                .map_err(|error| {
-                    metadata_invalid_error(format!(
-                        "Import succeeded. Could not archive the dotenv source ({error})."
-                    ))
-                })?;
-        report.delete_env = "archived";
-        report.archived_to = Some(archived.display().to_string());
+    if let Some(policy) = options.archive {
+        report.archive_blocked_reason = report.archive_blocker(policy);
+        if report.archive_blocked_reason.is_none() {
+            match archive_source {
+                Some((dir, file, original)) => {
+                    report.archive_source(
+                        &path,
+                        file,
+                        &original,
+                        &absolutize(&context.cwd, dir),
+                    )?;
+                }
+                None => report.delete_env = "would-archive",
+            }
+        }
     }
     if selection.json {
         return Ok(serde_json::to_value(report)?);
@@ -321,6 +337,12 @@ fn write_import_report(
     writeln!(output, "env_names: {}", report.env_names.len())?;
     writeln!(output, "profile_names: {}", report.profile_name_count)?;
     writeln!(output, "skipped_names: {}", format_name_set(&report.skipped_names))?;
+    if report.verified_matching > 0 || !report.mismatched_names.is_empty() {
+        writeln!(output, "verified_matching: {}", report.verified_matching)?;
+    }
+    if !report.mismatched_names.is_empty() {
+        writeln!(output, "mismatched_names: {}", format_name_set(&report.mismatched_names))?;
+    }
     writeln!(output, "missing_in_profile: {}", format_name_set(&report.missing_in_profile))?;
     writeln!(output, "extra_in_profile: {}", format_name_set(&report.extra_in_profile))?;
     if selection.archive.is_none()
@@ -331,6 +353,9 @@ fn write_import_report(
         write_env_delete_prompt(output, path, context.confirmation_reader.as_ref())?;
     } else {
         writeln!(output, "delete_env: {}", report.delete_env)?;
+        if let Some(reason) = &report.archive_blocked_reason {
+            writeln!(output, "archive_blocked: {reason}")?;
+        }
         if let Some(archived_to) = &report.archived_to {
             writeln!(output, "archived_to: {archived_to}")?;
         }
@@ -361,6 +386,12 @@ struct ImportReport {
     imported_names: BTreeSet<String>,
     overwritten_names: BTreeSet<String>,
     skipped_names: BTreeSet<String>,
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    verified_matching: usize,
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    verified_matching_names: BTreeSet<String>,
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    mismatched_names: BTreeSet<String>,
     #[serde(skip_serializing_if = "BTreeSet::is_empty")]
     linked_names: BTreeSet<String>,
     #[serde(skip_serializing_if = "BTreeSet::is_empty")]
@@ -370,6 +401,8 @@ struct ImportReport {
     extra_in_profile: BTreeSet<String>,
     warnings: Vec<Diagnostic>,
     delete_env: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    archive_blocked_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     archived_to: Option<String>,
     metadata_only: bool,
@@ -382,6 +415,51 @@ impl ImportReport {
         self.filtered_out == 0
             && self.skipped == 0
             && self.imported + self.overwritten + self.linked + self.promoted > 0
+    }
+
+    fn archive_blocker(&self, policy: ArchivePolicy) -> Option<String> {
+        if self.filtered_out > 0 {
+            return Some(
+                "filtered keys exist; archive requires importing all keys in the file".to_owned(),
+            );
+        }
+        if self.env_names.is_empty() {
+            return Some("no keys to import".to_owned());
+        }
+        if self.skipped == 0 {
+            return None;
+        }
+        match policy {
+            ArchivePolicy::CompleteImport => Some(
+                "skipped keys exist; pass --archive-if-matching to verify skipped values against the vault and archive, or --overwrite to replace them".to_owned(),
+            ),
+            ArchivePolicy::VerifySkipped if !self.mismatched_names.is_empty() => Some(format!(
+                "skipped keys differ from the vault: {}",
+                self.mismatched_names.iter().map(String::as_str).collect::<Vec<_>>().join(", "),
+            )),
+            ArchivePolicy::VerifySkipped if self.verified_matching != self.skipped => {
+                Some("some skipped keys could not be verified against the vault".to_owned())
+            }
+            ArchivePolicy::VerifySkipped => None,
+        }
+    }
+
+    fn archive_source(
+        &mut self,
+        path: &Path,
+        file: fs::File,
+        original: &fs::Metadata,
+        destination: &Path,
+    ) -> Result<(), CliError> {
+        let archived = archive_env_source(path, file, original, destination, &self.project_name)
+            .map_err(|error| {
+                metadata_invalid_error(format!(
+                    "Import succeeded. Could not archive the dotenv source ({error})."
+                ))
+            })?;
+        self.delete_env = "archived";
+        self.archived_to = Some(archived.display().to_string());
+        Ok(())
     }
 }
 
@@ -433,17 +511,9 @@ fn run_import(
         let mut profile_names =
             active_profile_secret_names(store, &target.project.id, &target.profile.id)?;
         let plan = planner.plan(store, &values)?;
-        let mut counts = ImportNames::default();
-        for ((name, _), action) in values.iter().zip(&plan.actions) {
-            match action {
-                ImportAction::Import => &mut counts.imported,
-                ImportAction::Overwrite(_) => &mut counts.overwritten,
-                ImportAction::Skip => &mut counts.skipped,
-                ImportAction::Link { .. } => &mut counts.linked,
-                ImportAction::Promote { .. } => &mut counts.promoted,
-            }
-            .insert(name.clone());
-        }
+        let verify_skipped = matches!(options.archive, Some(ArchivePolicy::VerifySkipped))
+            && filtered_out_names.is_empty();
+        let counts = planner.summarize(context, store, &values, &plan.actions, verify_skipped)?;
         profile_names
             .extend(counts.imported.iter().chain(&counts.linked).chain(&counts.promoted).cloned());
         if !options.dry_run {
@@ -476,6 +546,9 @@ fn run_import(
         imported_names: counts.imported,
         overwritten_names: counts.overwritten,
         skipped_names: counts.skipped,
+        verified_matching: counts.verified_matching.len(),
+        verified_matching_names: counts.verified_matching,
+        mismatched_names: counts.mismatched,
         linked_names: counts.linked,
         promoted_names: counts.promoted,
         filtered_out_names,
@@ -483,6 +556,7 @@ fn run_import(
         extra_in_profile,
         warnings,
         delete_env: "kept",
+        archive_blocked_reason: None,
         archived_to: None,
         metadata_only: true,
         profile_name_count: profile_names.len(),
@@ -506,6 +580,8 @@ struct ImportNames {
     imported: BTreeSet<String>,
     overwritten: BTreeSet<String>,
     skipped: BTreeSet<String>,
+    verified_matching: BTreeSet<String>,
+    mismatched: BTreeSet<String>,
     linked: BTreeSet<String>,
     promoted: BTreeSet<String>,
 }
@@ -513,9 +589,14 @@ struct ImportNames {
 enum ImportAction {
     Import,
     Overwrite(Box<SecretRecord>),
-    Skip,
+    Skip(SkipTarget),
     Link { target: Box<SecretRecord>, shadowing: Vec<SecretRecord> },
     Promote { shadowing: Vec<SecretRecord> },
+}
+
+enum SkipTarget {
+    Source(Box<SecretRecord>),
+    Effective,
 }
 
 struct ImportPlan {
@@ -593,7 +674,16 @@ impl<'a> ImportPlanner<'a> {
                 (None, Some(secret)) if self.options.overwrite => {
                     ImportAction::Overwrite(Box::new(secret))
                 }
-                (None, Some(_)) => ImportAction::Skip,
+                (None, Some(secret)) => ImportAction::Skip(SkipTarget::Source(Box::new(secret))),
+                (None, None)
+                    if self.options.archive.is_some()
+                        && !self.options.overwrite
+                        && store
+                            .resolve_active_secret_link(project_id, profile_id, name)?
+                            .is_some() =>
+                {
+                    ImportAction::Skip(SkipTarget::Effective)
+                }
                 (None, None) => ImportAction::Import,
             });
             plan.duplicate_matches.append(&mut matches);
@@ -658,14 +748,82 @@ impl<'a> ImportPlanner<'a> {
         let retargets_link = link.as_ref().is_some_and(|link| {
             target.as_ref().is_none_or(|target| link.target_secret_id != target.id)
         });
-        if !self.options.overwrite && (!shadowing.is_empty() || retargets_link) {
-            return Ok(Some(ImportAction::Skip));
+        let keeps_link = link.is_some() && !retargets_link && self.options.archive.is_some();
+        if !self.options.overwrite && (!shadowing.is_empty() || retargets_link || keeps_link) {
+            return Ok(Some(ImportAction::Skip(SkipTarget::Effective)));
         }
         Ok(Some(match target {
             Some(target) => ImportAction::Link { target: Box::new(target), shadowing },
             None => ImportAction::Promote { shadowing },
         }))
     }
+
+    fn summarize(
+        &self,
+        context: &RuntimeContext,
+        store: &Store,
+        values: &[(String, Zeroizing<String>)],
+        actions: &[ImportAction],
+        verify_skipped: bool,
+    ) -> Result<ImportNames, CliError> {
+        let mut names = ImportNames::default();
+        for ((name, value), action) in values.iter().zip(actions) {
+            match action {
+                ImportAction::Import => &mut names.imported,
+                ImportAction::Overwrite(_) => &mut names.overwritten,
+                ImportAction::Skip(target) => {
+                    if verify_skipped {
+                        let resolved;
+                        let secret = match target {
+                            SkipTarget::Source(secret) => secret.as_ref(),
+                            SkipTarget::Effective => {
+                                let name = SecretName::new(name.as_str()).map_err(|_| {
+                                    invalid_secret_name_error("invalid key in import plan")
+                                })?;
+                                resolved = resolve_active_secret_in_profile(
+                                    store,
+                                    &self.target.profile,
+                                    &name,
+                                )?;
+                                &resolved
+                            }
+                        };
+                        require_linked_secret_access(context, store, &self.target.profile, secret)?;
+                        let vault_value = decrypt_secret_version(
+                            context,
+                            store,
+                            &secret.project_id,
+                            &secret.profile_id,
+                            secret,
+                            secret.current_version,
+                        )?;
+                        if equal_value_bytes(value.as_bytes(), vault_value.as_bytes()) {
+                            names.verified_matching.insert(name.clone());
+                        } else {
+                            names.mismatched.insert(name.clone());
+                        }
+                    }
+                    &mut names.skipped
+                }
+                ImportAction::Link { .. } => &mut names.linked,
+                ImportAction::Promote { .. } => &mut names.promoted,
+            }
+            .insert(name.clone());
+        }
+        Ok(names)
+    }
+}
+
+fn equal_value_bytes(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    // Compare every byte of equal-length values through an optimization barrier.
+    let mut difference = 0;
+    for (&left_byte, &right_byte) in left.iter().zip(right) {
+        difference |= std::hint::black_box(left_byte ^ right_byte);
+    }
+    difference == 0
 }
 
 fn apply_import(
@@ -703,7 +861,7 @@ fn apply_import(
     let mut keys = None;
     for ((name, value), action) in values.into_iter().zip(actions) {
         match action {
-            ImportAction::Skip => {}
+            ImportAction::Skip(_) => {}
             ImportAction::Link { target, shadowing } => {
                 link_import(
                     context,

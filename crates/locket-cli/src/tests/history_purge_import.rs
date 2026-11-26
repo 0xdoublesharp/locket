@@ -907,6 +907,15 @@ fn run_env_json(
     args: &[&str],
     canaries: &[&str],
 ) -> Result<(u8, serde_json::Value), Box<dyn std::error::Error>> {
+    let (code, output) = run_env_command(context, args, canaries)?;
+    Ok((code, serde_json::from_str(&output)?))
+}
+
+fn run_env_command(
+    context: &RuntimeContext,
+    args: &[&str],
+    canaries: &[&str],
+) -> Result<(u8, String), Box<dyn std::error::Error>> {
     let mut output = Vec::new();
     let result = run_with_context(
         Cli::try_parse_from(std::iter::once("locket").chain(args.iter().copied()))?,
@@ -918,7 +927,7 @@ fn run_env_json(
         assert!(!output.contains(canary));
         assert!(!result.as_ref().is_err_and(|error| error.to_string().contains(canary)));
     }
-    Ok((result?, serde_json::from_str(&output)?))
+    Ok((result?, output))
 }
 
 #[test]
@@ -1017,29 +1026,211 @@ fn import_archive_keeps_source_when_keys_are_skipped_or_filtered()
         &context,
         &mut Vec::new(),
     )?;
-    crate::set_secret_value(&context, &test_secret_write_args("TOKEN"), "old", "manual", 1000)?;
+    crate::set_secret_value(
+        &context,
+        &test_secret_write_args("TOKEN"),
+        "vault-archive-fixture",
+        "manual",
+        1000,
+    )?;
     let source = project.path().join(".env");
     let contents = "TOKEN=skipped-archive-fixture\nNEW=imported-archive-fixture\n";
     fs::write(&source, contents)?;
 
-    for (options, count) in
-        [(&[][..], "skipped"), (&["--exclude", "TOKEN", "--overwrite"][..], "filtered_out")]
-    {
-        let mut args = vec!["import", ".env", "--archive", "backups", "--json"];
+    let canaries = ["skipped-archive-fixture", "imported-archive-fixture", "vault-archive-fixture"];
+    let skipped = "skipped keys exist; pass --archive-if-matching to verify skipped values against the vault and archive, or --overwrite to replace them";
+    let filtered = "filtered keys exist; archive requires importing all keys in the file";
+    for (options, reason) in [
+        (&["--dry-run"][..], skipped),
+        (&["--dry-run", "--only", "TOKEN", "--archive-if-matching"][..], filtered),
+        (&["--exclude", "TOKEN", "--overwrite"][..], filtered),
+        (&[][..], skipped),
+    ] {
+        let mut args = vec!["import", ".env", "--archive", "backups"];
         args.extend_from_slice(options);
-        let (code, report) = run_env_json(
-            &context,
-            &args,
-            &["skipped-archive-fixture", "imported-archive-fixture"],
-        )?;
+        let (code, output) = run_env_command(&context, &args, &canaries)?;
         assert_eq!(code, 0);
-        assert_eq!(report[count], 1);
+        assert!(output.contains(&format!("delete_env: kept\narchive_blocked: {reason}\n")));
+        assert!(!output.contains("would-archive"));
+
+        args.push("--json");
+        let (code, report) = run_env_json(&context, &args, &canaries)?;
+        assert_eq!(code, 0);
         assert_eq!(report["delete_env"], "kept");
+        assert_eq!(report["archive_blocked_reason"], reason);
         assert!(report.get("archived_to").is_none());
-        assert_eq!(fs::read_to_string(&source)?, contents);
+        assert!(report.get("mismatched_names").is_none());
+        assert!(report.get("verified_matching").is_none());
+        assert!(fs::read(&source)?.as_slice().eq(contents.as_bytes()), "source changed");
         assert!(!project.path().join("backups").exists());
     }
     Ok(())
+}
+
+#[test]
+fn import_archive_keeps_empty_source() -> Result<(), Box<dyn std::error::Error>> {
+    let project = tempdir()?;
+    let context = test_context(&project);
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--no-device", "--no-passkey"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    let source = project.path().join(".env");
+    fs::write(&source, "# no entries\n")?;
+
+    for options in [&["--dry-run"][..], &[][..]] {
+        let mut args = vec!["import", ".env", "--archive", "backups", "--json"];
+        args.extend_from_slice(options);
+        let (code, report) = run_env_json(&context, &args, &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(report["delete_env"], "kept");
+        assert_eq!(report["archive_blocked_reason"], "no keys to import");
+        assert!(report.get("archived_to").is_none());
+        assert!(source.is_file());
+        assert!(!project.path().join("backups").exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn import_archive_if_matching_previews_and_archives_an_already_imported_file()
+-> Result<(), Box<dyn std::error::Error>> {
+    let project = tempdir()?;
+    let outside = tempdir()?;
+    let context = test_context(&project);
+    let archive = outside.path().join("backups");
+    let archive_arg = archive.to_str().ok_or("archive path must be UTF-8")?;
+    let source = project.path().join(".env");
+    let canaries = [
+        "archive-match-token-fixture",
+        "archive-match-zeta-fixture",
+        "archive-higher-precedence-fixture",
+    ];
+    let contents = format!(
+        "# preserve comment and line endings\r\nZETA=\"{}\"\r\nTOKEN='{}'\r\n",
+        canaries[1], canaries[0]
+    );
+    fs::write(&source, &contents)?;
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--no-device", "--no-passkey"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    assert_eq!(run_env_json(&context, &["import", ".env", "--keep", "--json"], &canaries)?.0, 0);
+    crate::set_secret_value(
+        &context,
+        &test_secret_write_args_for_source("TOKEN", crate::SecretSourceArg::MachineLocal),
+        canaries[2],
+        "manual",
+        1000,
+    )?;
+
+    let args = [
+        "import",
+        ".env",
+        "--source",
+        "user-local",
+        "--archive",
+        archive_arg,
+        "--archive-if-matching",
+    ];
+    let mut preview = args.to_vec();
+    preview.extend(["--dry-run", "--json"]);
+    let (code, report) = run_env_json(&context, &preview, &canaries)?;
+    assert_eq!(code, 0);
+    assert_eq!(report["skipped"], 2);
+    assert_eq!(report["verified_matching"], 2);
+    assert_eq!(report["verified_matching_names"], serde_json::json!(["TOKEN", "ZETA"]));
+    assert_eq!(report["delete_env"], "would-archive");
+    assert!(report.get("archive_blocked_reason").is_none());
+    assert!(report.get("mismatched_names").is_none());
+    assert!(report.get("archived_to").is_none());
+    assert!(fs::read(&source)?.as_slice().eq(contents.as_bytes()), "source changed");
+    assert!(!archive.exists());
+
+    let (code, output) = run_env_command(&context, &args, &canaries)?;
+    assert_eq!(code, 0);
+    assert!(output.contains("imported: 0\n"));
+    assert!(output.contains("skipped: 2\n"));
+    assert!(output.contains("verified_matching: 2\n"));
+    assert!(output.contains("delete_env: archived\n"));
+    let archived = output
+        .lines()
+        .find_map(|line| line.strip_prefix("archived_to: "))
+        .ok_or("missing archive path")?;
+    let archived = Path::new(archived);
+    assert_eq!(archived.parent(), Some(archive.canonicalize()?.as_path()));
+    assert!(fs::read(archived)?.as_slice().eq(contents.as_bytes()), "backup bytes changed");
+    assert!(!source.exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(fs::metadata(archived)?.permissions().mode() & 0o777, 0o600);
+    }
+    Ok(())
+}
+
+#[test]
+fn import_archive_if_matching_keeps_the_source_if_any_skipped_values_differ()
+-> Result<(), Box<dyn std::error::Error>> {
+    let project = tempdir()?;
+    let context = test_context(&project);
+    let source = project.path().join(".env");
+    let canaries = [
+        "archive-vault-zeta-fixture",
+        "archive-vault-alpha-fixture",
+        "archive-input-zeta-fixture",
+        "archive-input-alpha",
+        "archive-matching-fixture",
+    ];
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--no-device", "--no-passkey"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    fs::write(
+        &source,
+        format!("ZETA={}\nALPHA={}\nMATCH={}\n", canaries[0], canaries[1], canaries[4]),
+    )?;
+    assert_eq!(run_env_json(&context, &["import", ".env", "--keep", "--json"], &canaries)?.0, 0);
+    for (options, alpha, matching, mismatched) in [
+        (&["--dry-run"][..], canaries[3], &["MATCH"][..], &["ALPHA", "ZETA"][..]),
+        (&[][..], canaries[1], &["ALPHA", "MATCH"][..], &["ZETA"][..]),
+    ] {
+        let contents = format!("ZETA={}\nALPHA={alpha}\nMATCH={}\n", canaries[2], canaries[4]);
+        fs::write(&source, &contents)?;
+        let mut args = vec!["import", ".env", "--archive", "backups", "--archive-if-matching"];
+        args.extend_from_slice(options);
+        let reason = format!("skipped keys differ from the vault: {}", mismatched.join(", "));
+        let (code, output) = run_env_command(&context, &args, &canaries)?;
+        assert_eq!(code, 0);
+        assert!(output.contains(&format!("verified_matching: {}\n", matching.len())));
+        assert!(output.contains(&format!("mismatched_names: {}\n", mismatched.join(","))));
+        assert!(output.contains(&format!("delete_env: kept\narchive_blocked: {reason}\n")));
+
+        args.push("--json");
+        let (code, report) = run_env_json(&context, &args, &canaries)?;
+        assert_eq!(code, 0);
+        assert_eq!(report["skipped"], 3);
+        assert_eq!(report["verified_matching"], matching.len());
+        assert_eq!(report["verified_matching_names"], serde_json::json!(matching));
+        assert_eq!(report["mismatched_names"], serde_json::json!(mismatched));
+        assert_eq!(report["archive_blocked_reason"], reason);
+        assert_eq!(report["delete_env"], "kept");
+        assert!(report.get("archived_to").is_none());
+        assert!(fs::read(&source)?.as_slice().eq(contents.as_bytes()), "source changed");
+        assert!(!project.path().join("backups").exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn import_archive_if_matching_requires_archive() {
+    let result = Cli::try_parse_from(["locket", "import", ".env", "--archive-if-matching"]);
+    assert!(
+        matches!(result, Err(error) if error.kind() == clap::error::ErrorKind::MissingRequiredArgument && error.to_string().contains("--archive <DIR>"))
+    );
 }
 
 #[test]
@@ -1418,6 +1609,7 @@ fn import_overwrite_checks_the_current_profile_policy_before_mutating()
         overwrite: false,
         literal: false,
         dry_run: false,
+        archive: None,
         link_shared: false,
         promote_duplicates: false,
         confirmed_profiles: Vec::new(),
