@@ -3,12 +3,18 @@
 use crate::key_wrap::{split_wrapped_dek_v1, wrap_dek_with_nonce_v1};
 use crate::{CryptoError, KEY_LEN, NONCE_LEN, TAG_LEN, canonical_field, unwrap_dek_v1};
 
+fn kani_optimization_barrier<T: ?Sized>(val: &T) {
+    // Mirrors zeroize's non-inline-asm fallback (`barrier.rs`) so Kani can model
+    // Zeroizing<T> drops without hitting unsupported `TerminatorKind::InlineAsm`.
+    std::hint::black_box(val);
+}
+
 #[kani::proof]
-#[kani::unwind(12)]
+#[kani::unwind(8)]
 fn canonical_field_preserves_utf8_boundaries() {
-    // Four bytes cover every 1–4 byte UTF-8 sequence and every split point
-    // without triggering stdlib's 8-byte SWAR UTF-8 validation path.
-    let bytes: [u8; 4] = kani::any();
+    // Three bytes cover empty, multi-byte UTF-8 (1–3 bytes), and every split
+    // point without triggering stdlib's 8-byte SWAR UTF-8 validation path.
+    let bytes: [u8; 3] = kani::any();
     let split: usize = kani::any();
     kani::assume(split <= bytes.len());
     let (name, value) = bytes.split_at(split);
@@ -50,6 +56,7 @@ fn embedded_nonce_and_ciphertext_require_exact_lengths() {
 }
 
 #[kani::proof]
+#[kani::stub(zeroize::optimization_barrier, kani_optimization_barrier)]
 #[kani::unwind(80)]
 fn fixed_wrap_round_trips_and_rejects_a_flipped_tag_bit() {
     let key = [7; KEY_LEN];

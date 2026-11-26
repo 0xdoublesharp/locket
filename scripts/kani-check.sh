@@ -40,7 +40,7 @@ fi
 export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--cfg=chacha20_backend=\"soft\" --cfg=poly1305_backend=\"soft\""
 # Run each crate sequentially by default so CBMC stays within GitHub runner RAM
 # and reports per-crate verification summaries as it progresses.
-cargo kani -p locket-crypto --lib --target-dir "$work" \
+cargo kani -Z stubbing -p locket-crypto --lib --target-dir "$work" \
     --output-format terse -j "${KANI_JOBS:-1}"
-cargo kani -p locket-core --lib --target-dir "$work" \
+cargo kani -Z stubbing -p locket-core --lib --target-dir "$work" \
     --output-format terse -j "${KANI_JOBS:-1}"

@@ -47,12 +47,24 @@ build() {
     "--remap-path-prefix=${cargo_home}=/cargo"
     "--remap-path-prefix=${rustup_home}=/rustup"
     "--remap-path-prefix=${build_dir}=/build"
+    "-C" "codegen-units=1"
+    "-C" "debuginfo=0"
+    "-C" "symbol-mangling-version=v0"
   )
+  if [[ "$(uname -s)" == "Linux" ]]; then
+    flags+=("-C" "link-arg=-Wl,--build-id=none")
+  fi
+  local cflags="-ffile-prefix-map=${workspace}=/locket -ffile-prefix-map=${cargo_home}=/cargo -ffile-prefix-map=${build_dir}=/build"
 
   mkdir -p "${build_dir}"
   local encoded_flags
   encoded_flags="$(IFS=$'\x1f'; printf '%s' "${flags[*]}")"
-  CARGO_ENCODED_RUSTFLAGS="${encoded_flags}" CARGO_BUILD_BUILD_DIR="${build_dir}/intermediate" \
+  RUSTC_WRAPPER="" \
+  ZERO_AR_DATE=1 \
+  CFLAGS="${cflags}" \
+  CXXFLAGS="${cflags}" \
+  CARGO_ENCODED_RUSTFLAGS="${encoded_flags}" \
+  CARGO_BUILD_BUILD_DIR="${build_dir}/intermediate" \
     "${cargo_bin}" build --release --locked --offline -p locket-cli --bin locket \
       --target-dir "${build_dir}/target" --jobs "${jobs}"
 }
