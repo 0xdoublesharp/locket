@@ -64,7 +64,7 @@ Start with a personal Global Vault (`@shared`) in one click, or connect any repo
 - 🔄 **Rotation, history, and diffs**: Rotate values safely and compare profiles without revealing plaintext.
 - 🧹 **Scanner, pre-commit, redaction, and AI-safe tools**: Keep secrets out of code, logs, and prompts before sharing context with local AI agents.
 - 🪪 **Recovery and device trust**: Local verification, recovery rotation, and sealed export/import without a hosted service.
-- 👥 **Zero-Trust Teams**: Deliver signed, per-device encrypted updates over AWS S3, Cloudflare R2, Backblaze B2, MinIO, WebDAV, or a shared folder. Personal overrides stay local, and Locket requires no dedicated server or SaaS. [Team setup guide](docs/team-updates.md)
+- 👥 **Zero-Trust Teams & Headless CI/CD**: Deliver signed, per-device encrypted updates over AWS S3, Cloudflare R2, Backblaze B2, MinIO, WebDAV, or a shared folder, and inject verified snapshots directly in CI pipelines with `locket ci exec` — no dedicated server or SaaS required. [Team setup guide](docs/team-updates.md) · [CI/CD guide](docs/ci-cd.md)
 - 🧾 **Metadata-only audit and diagnostics**: Report what happened without exposing secret values.
 - 🚫 **No telemetry or analytics**: Network access is limited to opt-in update checks or explicit sealed sync, export, and import.
 

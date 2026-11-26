@@ -22,8 +22,8 @@ Scores reflect **shipped behavior** on a 0–2 scale:
 | Formal verification (TLA+ / Lean 4 / live trace replay) | **2** | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
 | **Local-Dev & Security Subtotal (max 16)** | **16 / 16** | **5 / 16** | **6 / 16** | **7 / 16** | **6 / 16** | **7 / 16** | **5 / 16** | **6 / 16** |
 | Multi-admin team sync & RBAC | 1⁶ (S3-compatible, WebDAV, shared folder) | **2** | **2** | **2** | **2** | 1 | 1 | 1 |
-| Cloud CI/CD, SSO/SCIM & dynamic production secrets | 0⁷ | **2** | **2** | 1 | 1 | 1 | 1 | 0 |
-| **Overall Total (max 20)** | **17 / 20** | **9 / 20** | **10 / 20** | **10 / 20** | **9 / 20** | **9 / 20** | **7 / 20** | **7 / 20** |
+| CI/CD delivery, SSO/SCIM & dynamic production secrets | 1⁷ (zero-SaaS S3/WebDAV CI exec) | **2** | **2** | 1 | 1 | 1 | 1 | 0 |
+| **Overall Total (max 20)** | **18 / 20** | **9 / 20** | **10 / 20** | **10 / 20** | **9 / 20** | **9 / 20** | **7 / 20** | **7 / 20** |
 
 ### Scoring notes
 
@@ -33,7 +33,7 @@ Scores reflect **shipped behavior** on a 0–2 scale:
 4. **Desktop, IDE & shell**: Doppler, Infisical, and Bitwarden SM provide web consoles, while 1Password pairs a native desktop app with `op`. Locket ships a native Tauri v2 desktop companion (Global Vault, 1-click Keychain unlock, Day-2 CRUD, detected commands, MCP/agent setup, and tray), a VS Code extension, and shell hooks.
 5. **Audit, rotation & recovery**: Hosted tools keep audit logs and rotation on their servers. Locket keeps a local tamper-evident HMAC audit chain with external witness receipts, pinned `lk://...@vN` grace windows, and offline recovery envelopes.
 6. **Team sync & RBAC**. Locket ships zero-trust delivery of signed, per-device encrypted packages over AWS S3, Cloudflare R2, Backblaze B2, MinIO, WebDAV, and shared folders. It supports fingerprint-verified onboarding, holds conflicting updates for review, and keeps personal overrides local. The score reflects a single pinned owner. Owner handover is unavailable, and live cloud-provider acceptance remains open. Hosted platforms score 2 for multi-admin hosted RBAC. [Team updates](team-updates.md)
-7. **Cloud CI/CD, SSO/SCIM & dynamic secrets**: Out of scope for Locket. Production and CI pipelines should use platform-native secret stores or hosted platforms like Doppler, Infisical, or HashiCorp Vault.
+7. **CI/CD, SSO/SCIM & dynamic secrets**: Locket ships vault-free CI machine identities (`locket ci init-device`, `locket ci verify`, `locket ci exec`) that pull and verify owner-pinned `.lkpkg` snapshots directly from S3-compatible storage, WebDAV, or a shared folder in memory without writing plaintext to disk ([CI/CD guide](ci-cd.md)). SSO/SCIM, hosted audit controls, and dynamic production secret engines remain out of scope; use platform-native secret stores or hosted platforms like Doppler, Infisical, or HashiCorp Vault when those are required.
 
 ## What sets the Rust version apart
 
@@ -54,7 +54,7 @@ Scores reflect **shipped behavior** on a 0–2 scale:
 | Are imported commands trusted? | Approve command access locally. Signed team updates never install command approvals or project configuration; manual sealed bundles do not authenticate their issuer. |
 | How does a fresh machine join? | Prepare device keys, compare full fingerprints independently with the owner, then join an owner-signed package. Owner handover and trust-fork recovery remain unsupported. |
 | What works in the desktop? | Global Vault (`@shared`) and auto-detecting project setup, 1-click Keychain or passphrase unlock, Secret CRUD + Copy to Global Vault, Environment creation, Detected Commands, 1-click MCP & AI migration prompt copy, readiness checks, terminal launch, and team delivery controls for publishing, disconnecting, and resolving conflicts. |
-| Is this a production secret-management service? | No. Use infrastructure designed for your production and CI requirements. |
+| Is this a production secret-management service? | No. `locket ci` supports headless read-only CI injection from your own S3/WebDAV bucket ([CI/CD guide](ci-cd.md)), while SSO/SCIM and dynamic production secrets belong in dedicated production infrastructure. |
 
 ## Claims to avoid
 

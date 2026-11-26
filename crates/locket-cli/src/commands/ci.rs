@@ -11,7 +11,7 @@ use std::process::Command;
 use clap::{ArgGroup, Args, Subcommand};
 use data_encoding::BASE64URL_NOPAD;
 use locket_agent::team_sync::{
-    CredentialMode, TransportConfig, WebDavAuthKind, list_and_read_join_packages,
+    CredentialMode, TransportConfig, WebDavAuthKind, list_and_read_join_packages_for_recipient,
 };
 use locket_core::team_package::{DeviceIdentity, SignedStatement, VerifiedStatement};
 use locket_core::{
@@ -377,7 +377,8 @@ fn latest_snapshot(
 ) -> Result<VerifiedStatement, CliError> {
     let delivery_error =
         |error: locket_agent::team_sync::SyncError| metadata_invalid_error(error.to_string());
-    let candidates = list_and_read_join_packages(config, None).map_err(delivery_error)?;
+    let candidates = list_and_read_join_packages_for_recipient(config, None, &device.fingerprint)
+        .map_err(delivery_error)?;
     let now = now_unix_nanos()? / 1_000_000_000;
     let mut latest: Option<VerifiedStatement> = None;
     let mut fork = false;
