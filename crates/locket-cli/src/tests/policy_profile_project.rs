@@ -383,6 +383,9 @@ fn policy_edit_uses_configured_editor_validates_and_audits()
     )?;
 
     let editor = directory.path().join("policy-editor.sh");
+    let policy_path = directory.path().join("locket.toml");
+    let original = std::fs::read_to_string(&policy_path)?;
+    std::fs::write(&policy_path, format!("# Keep project notes\n{original}"))?;
     std::fs::write(
         &editor,
         r#"#!/bin/sh
@@ -419,7 +422,8 @@ mv "$next" "$input"
     assert!(output.contains("metadata_only: yes"));
     assert!(!output.contains("pnpm"));
 
-    let policy_text = std::fs::read_to_string(directory.path().join("locket.toml"))?;
+    let policy_text = std::fs::read_to_string(&policy_path)?;
+    assert!(policy_text.contains("# Keep project notes"));
     let document = locket_core::PolicyDocument::from_toml_str(&policy_text)?;
     let policy = document.commands.get("dev").ok_or("missing dev policy")?;
     assert!(policy.confirm);
@@ -434,6 +438,33 @@ mv "$next" "$input"
     assert!(metadata.contains("\"operation\":\"edit\""));
     assert!(metadata.contains("\"policy\":\"dev\""));
     assert!(!metadata.contains("pnpm"));
+
+    // The editor receives a temporary file. Simulate a separate writer
+    // updating the live source while that copy is open.
+    std::fs::write(
+        &editor,
+        r#"#!/bin/sh
+set -eu
+printf '\n# Concurrent update\n' >> "$(dirname "$1")/locket.toml"
+"#,
+    )?;
+    let result = run_with_context(
+        Cli::try_parse_from(["locket", "policy", "edit", "dev"])?,
+        &context,
+        &mut Vec::new(),
+    );
+    let Err(error) = result else {
+        return Err("policy edit should reject a stale snapshot".into());
+    };
+    assert!(error.to_string().contains("project configuration changed"));
+    assert!(std::fs::read_to_string(&policy_path)?.contains("# Concurrent update"));
+    let edit_rows: u32 = store.connection().query_row(
+        "SELECT COUNT(*) FROM audit_log WHERE action = 'POLICY_UPDATE'
+         AND metadata_json LIKE '%\"operation\":\"edit\"%'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(edit_rows, 1);
     Ok(())
 }
 

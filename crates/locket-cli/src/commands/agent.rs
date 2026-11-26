@@ -18,7 +18,7 @@ use crate::{
     AgentInviteRequestArgs, AgentLogsArgs, CliError, InternalAgentServeArgs, NANOS_PER_SECOND,
     RuntimeContext, TeamAcceptArgs, TeamCommand, TeamInviteArgs, agent_log_path,
     agent_log_paths_oldest_first, agent_pid_path, agent_socket_path, append_agent_log,
-    metadata_invalid_error, now_unix_nanos, prepare_agent_log_dir, read_agent_pid, require_project,
+    metadata_invalid_error, now_unix_nanos, prepare_agent_log_dir, require_project,
     resolve_project, sanitize_agent_log_line, set_user_only_file_permissions,
     unix_nanos_to_rfc3339, write_agent_paths,
 };
@@ -386,60 +386,50 @@ pub fn probe_agent_core_dump_hardening(context: &RuntimeContext) -> Option<Strin
 fn agent_status_command(context: &RuntimeContext, output: &mut impl Write) -> Result<(), CliError> {
     let pid_path = agent_pid_path(context);
     let socket_path = agent_socket_path(context);
+    let recorded_pid = read_recorded_pid(context)?;
+    let live_pid = recorded_pid.filter(|pid| process_is_live(*pid));
 
-    let live_pid = read_running_pid(context)?;
-    let Some(pid) = live_pid else {
-        let last_known = read_agent_pid(context)?;
+    let snapshot = if live_pid.is_some() || socket_path.exists() || cfg!(target_os = "windows") {
+        request_status_snapshot(&socket_path).ok()
+    } else {
+        None
+    };
+    if let Some(snapshot) = snapshot {
+        writeln!(output, "agent: running")?;
+        writeln!(output, "running: yes")?;
+        let pid = live_pid.map_or_else(|| "-".to_owned(), |pid| pid.to_string());
+        writeln!(output, "pid: {pid}")?;
+        write_agent_paths(context, output)?;
+        write_agent_status_snapshot(output, &snapshot)?;
+    } else {
+        // A failed RPC alone does not justify removing a live listener's PID.
+        #[cfg(unix)]
+        if let Some(pid) = live_pid
+            && let Ok(Some(_lease)) = try_acquire_endpoint_lease(&socket_path)
+            && fs::symlink_metadata(&socket_path)
+                .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+            && owned_agent_pid(&pid_path)
+                .is_ok_and(|raw| raw.as_deref().and_then(parse_pid) == Some(pid))
+        {
+            let _ignored = fs::remove_file(&pid_path);
+        }
+        #[cfg(not(unix))]
+        if live_pid.is_some() {
+            let _ignored = fs::remove_file(&pid_path);
+        }
         writeln!(output, "agent: stopped")?;
         writeln!(output, "running: no")?;
-        match last_known {
-            Some(pid) => writeln!(output, "last_known_pid: {pid}")?,
-            None => writeln!(output, "last_known_pid: -")?,
-        }
+        let last_known = recorded_pid.map_or_else(|| "-".to_owned(), |pid| pid.to_string());
+        writeln!(output, "last_known_pid: {last_known}")?;
         write_agent_paths(context, output)?;
-        if let Some(project) = resolve_project(&context.cwd)? {
-            writeln!(output, "active_project_id: {}", project.config.project_id)?;
-            writeln!(output, "active_profile: {}", project.config.default_profile)?;
-        }
-        return Ok(());
-    };
-
-    match request_status_snapshot(&socket_path) {
-        Ok(snapshot) => {
-            writeln!(output, "agent: running")?;
-            writeln!(output, "running: yes")?;
-            writeln!(output, "pid: {pid}")?;
-            write_agent_paths(context, output)?;
-            write_agent_status_snapshot(output, &snapshot)?;
-            if let Some(project) = resolve_project(&context.cwd)? {
-                writeln!(output, "active_project_id: {}", project.config.project_id)?;
-                writeln!(output, "active_profile: {}", project.config.default_profile)?;
-            }
-        }
-        Err(_error) => {
-            // A failed RPC is not evidence that a live listener has exited.
-            #[cfg(unix)]
-            if let Ok(Some(_lease)) = try_acquire_endpoint_lease(&socket_path)
-                && fs::symlink_metadata(&socket_path)
-                    .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
-                && owned_agent_pid(&pid_path)
-                    .is_ok_and(|raw| raw.as_deref().and_then(parse_pid) == Some(pid))
-            {
-                let _ignored = fs::remove_file(&pid_path);
-            }
-            #[cfg(not(unix))]
-            let _ignored = fs::remove_file(&pid_path);
-            writeln!(output, "agent: stopped")?;
-            writeln!(output, "running: no")?;
-            writeln!(output, "last_known_pid: {pid}")?;
-            write_agent_paths(context, output)?;
+        if live_pid.is_some() {
             writeln!(output, "lock_state: unknown")?;
             writeln!(output, "live_grants: 0")?;
-            if let Some(project) = resolve_project(&context.cwd)? {
-                writeln!(output, "active_project_id: {}", project.config.project_id)?;
-                writeln!(output, "active_profile: {}", project.config.default_profile)?;
-            }
         }
+    }
+    if let Some(project) = resolve_project(&context.cwd)? {
+        writeln!(output, "active_project_id: {}", project.config.project_id)?;
+        writeln!(output, "active_profile: {}", project.config.default_profile)?;
     }
     Ok(())
 }
@@ -449,7 +439,7 @@ fn agent_stop_command(context: &RuntimeContext, output: &mut impl Write) -> Resu
     let pid_path = agent_pid_path(context);
     let socket_path = agent_socket_path(context);
 
-    let last_known = read_agent_pid(context)?;
+    let last_known = crate::read_agent_pid(context)?;
     let Some(raw_pid) = last_known else {
         append_agent_log(context, "stop", "stopped", "no daemon was running")?;
         writeln!(output, "agent: stopped")?;
@@ -649,17 +639,15 @@ fn wait_for_agent_endpoint(
 /// dead PID is treated as stale and ignored (but is not deleted here —
 /// the caller decides when to remove it).
 fn read_running_pid(context: &RuntimeContext) -> Result<Option<u32>, CliError> {
+    Ok(read_recorded_pid(context)?.filter(|pid| process_is_live(*pid)))
+}
+
+fn read_recorded_pid(context: &RuntimeContext) -> Result<Option<u32>, CliError> {
     #[cfg(unix)]
     let raw = owned_agent_pid(&agent_pid_path(context))?;
     #[cfg(not(unix))]
-    let raw = read_agent_pid(context)?;
-    let Some(raw) = raw else {
-        return Ok(None);
-    };
-    let Some(pid) = parse_pid(&raw) else {
-        return Ok(None);
-    };
-    Ok(if process_is_live(pid) { Some(pid) } else { None })
+    let raw = crate::read_agent_pid(context)?;
+    Ok(raw.as_deref().and_then(parse_pid))
 }
 
 fn write_agent_status_snapshot(output: &mut impl Write, snapshot: &Value) -> Result<(), io::Error> {

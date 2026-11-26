@@ -11,6 +11,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use crate::runtime::error::corrupt_db_error;
+use crate::runtime::key_access::load_profile_key;
 use crate::support::secret_helpers::summarize_names;
 use crate::{
     AI_SAFE_PARTIAL_LINE_MAX_BYTES, AI_SAFE_READ_CHUNK_BYTES, AiSafeArgs, CliError, RedactArgs,
@@ -36,20 +37,17 @@ pub fn redact_command(
         args.require_known,
         now_unix_nanos()?,
     )?;
-    let (result, invalid_utf8_passthrough) = if args.stdin {
-        let mut input = Vec::new();
+    let redacted = if args.stdin {
+        let mut input = zeroize::Zeroizing::new(Vec::new());
         io::stdin().read_to_end(&mut input)?;
-        let redacted = redact_stdin_bytes(&input, &coverage.redactions);
-        output.write_all(&redacted.bytes)?;
-        (redacted.result, redacted.invalid_utf8_passthrough)
+        redact_stdin_bytes(&input, &coverage.redactions)
     } else if let Some(file) = args.file.as_deref() {
-        let input = fs::read_to_string(absolutize(&context.cwd, Path::new(file)))?;
-        let result = redact_input(&input, &coverage.redactions);
-        write!(output, "{}", result.text)?;
-        (result, false)
+        let input = zeroize::Zeroizing::new(fs::read(absolutize(&context.cwd, Path::new(file)))?);
+        redact_bytes(&input, &coverage.redactions, false)
     } else {
         return Err(invalid_reference_error("redact requires a file path or --stdin"));
     };
+    output.write_all(&redacted.bytes)?;
 
     if !coverage.known_coverage_active {
         let mut stderr = io::stderr();
@@ -62,12 +60,10 @@ pub fn redact_command(
             );
         }
     }
-    if invalid_utf8_passthrough {
+    if redacted.invalid_utf8_passthrough {
         let mut stderr = io::stderr();
-        let _ignored = writeln!(
-            stderr,
-            "locket: redact stdin passed non-UTF-8 byte segment(s) through unchanged"
-        );
+        let _ignored =
+            writeln!(stderr, "locket: redact passed non-UTF-8 byte segment(s) through unchanged");
     }
 
     write_redact_audit_if_available(
@@ -75,8 +71,8 @@ pub fn redact_command(
         project.as_ref(),
         args,
         &coverage,
-        &result,
-        invalid_utf8_passthrough,
+        &redacted.counts,
+        redacted.invalid_utf8_passthrough,
     )?;
     Ok(())
 }
@@ -140,7 +136,7 @@ fn write_redact_audit_if_available(
     project: Option<&ResolvedProject>,
     args: &RedactArgs,
     coverage: &RedactCoverage,
-    result: &locket_scan::RedactionResult,
+    counts: &BTreeMap<FindingKind, usize>,
     invalid_utf8_passthrough: bool,
 ) -> Result<(), CliError> {
     let Some(project) = project else { return Ok(()) };
@@ -148,11 +144,22 @@ fn write_redact_audit_if_available(
     if store.get_project(project.config.project_id.as_str())?.is_none() {
         return Ok(());
     }
-    let audit_key =
-        load_project_key(context, &store, project.config.project_id.as_str(), KeyPurpose::Audit)?;
+    let audit_key = match load_project_key(
+        context,
+        &store,
+        project.config.project_id.as_str(),
+        KeyPurpose::Audit,
+    ) {
+        Ok(key) => key,
+        Err(CliError::Platform(locket_platform::PlatformError::MasterKeyNotFound))
+            if !coverage.known_coverage_active =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
 
-    let counts_by_rule: serde_json::Value = result
-        .counts
+    let counts_by_rule: serde_json::Value = counts
         .iter()
         .map(|(kind, count)| (redact_finding_kind_label(*kind).to_owned(), json!(count)))
         .collect::<serde_json::Map<_, _>>()
@@ -214,7 +221,7 @@ fn redact_input(
 
 pub struct RedactedBytes {
     pub bytes: Vec<u8>,
-    pub result: locket_scan::RedactionResult,
+    pub counts: BTreeMap<FindingKind, usize>,
     pub invalid_utf8_passthrough: bool,
 }
 
@@ -222,11 +229,19 @@ pub fn redact_stdin_bytes(
     input: &[u8],
     known_redactions: &[KnownSecretRedaction],
 ) -> RedactedBytes {
+    redact_bytes(input, known_redactions, true)
+}
+
+fn redact_bytes(
+    input: &[u8],
+    known_redactions: &[KnownSecretRedaction],
+    localize_patterns: bool,
+) -> RedactedBytes {
     let mut bytes = Vec::with_capacity(input.len());
     let mut counts = BTreeMap::<FindingKind, usize>::new();
     let mut invalid_utf8_passthrough = false;
     let mut remaining = input;
-    let mut pattern_index = 1_usize;
+    let mut pattern_index = localize_patterns.then_some(1_usize);
 
     while !remaining.is_empty() {
         match std::str::from_utf8(remaining) {
@@ -263,12 +278,7 @@ pub fn redact_stdin_bytes(
         }
     }
 
-    let text = String::from_utf8_lossy(&bytes).into_owned();
-    RedactedBytes {
-        bytes,
-        result: locket_scan::RedactionResult { text, counts },
-        invalid_utf8_passthrough,
-    }
+    RedactedBytes { bytes, counts, invalid_utf8_passthrough }
 }
 
 fn append_redacted_stdin_text(
@@ -276,11 +286,14 @@ fn append_redacted_stdin_text(
     known_redactions: &[KnownSecretRedaction],
     bytes: &mut Vec<u8>,
     counts: &mut BTreeMap<FindingKind, usize>,
-    pattern_index: &mut usize,
+    pattern_index: &mut Option<usize>,
 ) {
-    let mut result = redact_input(text, known_redactions);
-    result.text = localize_pattern_markers(&result.text, pattern_index);
-    bytes.extend_from_slice(result.text.as_bytes());
+    let result = redact_input(text, known_redactions);
+    if let Some(pattern_index) = pattern_index {
+        bytes.extend_from_slice(localize_pattern_markers(&result.text, pattern_index).as_bytes());
+    } else {
+        bytes.extend_from_slice(result.text.as_bytes());
+    }
     for (kind, count) in result.counts {
         *counts.entry(kind).or_default() += count;
     }
@@ -817,6 +830,14 @@ pub fn collect_known_secret_redactions(
     let store = open_store(context)?;
     ensure_trusted_project_root(&store, project)?;
     let profile = default_profile(&store, &project.config)?;
+    // Prove access even when there are no versions to decrypt.
+    load_profile_key(
+        context,
+        &store,
+        project.config.project_id.as_str(),
+        &profile.id,
+        KeyPurpose::ProfileSecret,
+    )?;
     let mut values = Vec::new();
     for secret in store.list_secrets_by_profile(project.config.project_id.as_str(), &profile.id)? {
         let marker = known_secret_redaction_marker(&secret, redact_names);

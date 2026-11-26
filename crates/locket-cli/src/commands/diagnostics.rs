@@ -16,9 +16,10 @@ use crate::commands::config::spec::{CONFIG_KEY_SPECS, config_get_value, read_use
 use crate::runtime::error::corrupt_db_error;
 use crate::{
     CliError, GITIGNORE_ENTRIES, GITIGNORE_FILE, HOOK_BEGIN, LOCKET_TOML, RuntimeContext,
-    agent_log_path, agent_pid_path, agent_socket_path, format_hex, git_dir_for_worktree,
-    invalid_reference_error, load_project_key, metadata_invalid_error, now_unix_nanos, open_store,
-    privacy_alias, privacy_redact_names_enabled, read_project_config, resolve_project, root_hash,
+    absolutize, agent_log_path, agent_pid_path, agent_socket_path, format_hex,
+    git_dir_for_worktree, invalid_reference_error, load_project_key, metadata_invalid_error,
+    now_unix_nanos, open_store, privacy_alias, privacy_redact_names_enabled, read_project_config,
+    resolve_project, root_hash,
 };
 
 const SKIPPED_LOCKED_CHECKS: [&str; 5] = [
@@ -238,7 +239,7 @@ pub fn debug_bundle_command(
 
     let path = output_path.map_or_else(
         || default_debug_bundle_path(context),
-        |output_path| Ok(PathBuf::from(output_path)),
+        |output_path| Ok(absolutize(&context.cwd, Path::new(output_path))),
     )?;
     write_debug_bundle_file(&path, &text)?;
     writeln!(output, "debug_bundle: {}", path.display())?;
@@ -753,22 +754,24 @@ fn check_agent_socket_path_matches_spec(context: &RuntimeContext) -> DiagnosticC
             Ok(sid) => sid,
             Err(error) => return DiagnosticCheck::fail(NAME, false, error.to_string()),
         };
-        let dacl = match locket_platform::agent_pipe_dacl_sddl_for_sid(&sid) {
-            Ok(dacl) => dacl,
-            Err(error) => return DiagnosticCheck::fail(NAME, false, error.to_string()),
-        };
+        if let Err(error) = locket_platform::agent_pipe_dacl_sddl_for_sid(&sid) {
+            return DiagnosticCheck::fail(NAME, false, error.to_string());
+        }
         if actual_socket != Path::new(&pipe_name) {
             return DiagnosticCheck::fail(
                 NAME,
                 false,
                 format!(
-                    "agent pipe path drifted from current-user SID: actual={} expected={}",
-                    actual_socket.display(),
-                    pipe_name,
+                    "agent pipe path drifted from current-user SID: actual_hash={} expected_hash={}",
+                    path_hash(&actual_socket),
+                    path_hash(Path::new(&pipe_name)),
                 ),
             );
         }
-        DiagnosticCheck::pass(NAME, format!("windows named pipe path ok dacl_sddl={dacl}"))
+        DiagnosticCheck::pass(
+            NAME,
+            "windows named pipe path verified and current-user DACL available",
+        )
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -786,9 +789,9 @@ fn check_agent_socket_path_matches_spec(context: &RuntimeContext) -> DiagnosticC
                 NAME,
                 false,
                 format!(
-                    "agent socket path drifted from configured agent_data_dir: actual={} configured={}",
-                    actual_socket.display(),
-                    configured_socket.display(),
+                    "agent socket path drifted from configured agent_data_dir: actual_hash={} configured_hash={}",
+                    path_hash(&actual_socket),
+                    path_hash(&configured_socket),
                 ),
             );
         }
@@ -809,17 +812,17 @@ fn check_agent_socket_path_matches_spec(context: &RuntimeContext) -> DiagnosticC
         if expected_candidates.iter().any(|candidate| candidate == configured) {
             DiagnosticCheck::pass(
                 NAME,
-                format!("platform={} dir={}", std::env::consts::OS, configured.display()),
+                format!("platform={} dir_hash={}", std::env::consts::OS, path_hash(configured)),
             )
         } else {
             DiagnosticCheck::warn(
                 NAME,
                 format!(
-                    "agent_data_dir does not match spec candidates: dir={} expected_one_of={}",
-                    configured.display(),
+                    "agent_data_dir does not match spec candidates: dir_hash={} expected_hashes={}",
+                    path_hash(configured),
                     expected_candidates
                         .iter()
-                        .map(|p| p.display().to_string())
+                        .map(|path| path_hash(path))
                         .collect::<Vec<_>>()
                         .join(", "),
                 ),
@@ -979,8 +982,16 @@ fn write_doctor_audit_if_available(
     if store.get_project(project.config.project_id.as_str())?.is_none() {
         return Ok(());
     }
-    let audit_key =
-        load_project_key(context, &store, project.config.project_id.as_str(), KeyPurpose::Audit)?;
+    let audit_key = match load_project_key(
+        context,
+        &store,
+        project.config.project_id.as_str(),
+        KeyPurpose::Audit,
+    ) {
+        Ok(key) => key,
+        Err(CliError::Platform(locket_platform::PlatformError::MasterKeyNotFound)) => return Ok(()),
+        Err(error) => return Err(error),
+    };
     let metadata = report.audit_metadata();
     let status = if report.counts.fail == 0 { "SUCCESS" } else { "FAILED" };
     let audit = AuditWrite {
@@ -1019,13 +1030,15 @@ fn default_debug_bundle_path(context: &RuntimeContext) -> Result<PathBuf, CliErr
         .store_path
         .parent()
         .ok_or_else(|| corrupt_db_error("could not resolve diagnostics directory"))?;
-    Ok(parent.join("diagnostics").join(format!("locket-debug-{}.tar.gz", now_unix_nanos()?)))
+    let directory = parent.join("diagnostics");
+    fs::create_dir_all(&directory)?;
+    set_user_only_dir_permissions(&directory)?;
+    Ok(directory.join(format!("locket-debug-{}.tar.gz", now_unix_nanos()?)))
 }
 
 fn write_debug_bundle_file(path: &Path, text: &str) -> Result<(), CliError> {
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
-        set_user_only_dir_permissions(parent)?;
     }
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -1037,9 +1050,8 @@ fn write_debug_bundle_file(path: &Path, text: &str) -> Result<(), CliError> {
             CliError::Io(error)
         }
     })?;
-    write_debug_bundle_archive(file, text)?;
-    set_user_only_file_permissions(path)?;
-    Ok(())
+    set_user_only_file_permissions(&file)?;
+    write_debug_bundle_archive(file, text)
 }
 
 fn write_debug_bundle_archive(file: fs::File, text: &str) -> Result<(), CliError> {
@@ -1066,14 +1078,14 @@ fn set_user_only_file_options(options: &mut fs::OpenOptions) {
 const fn set_user_only_file_options(_options: &mut fs::OpenOptions) {}
 
 #[cfg(unix)]
-fn set_user_only_file_permissions(path: &Path) -> Result<(), CliError> {
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+fn set_user_only_file_permissions(file: &fs::File) -> Result<(), CliError> {
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 
 #[cfg(not(unix))]
 #[allow(clippy::unnecessary_wraps)] // Retain the shared fallible interface; Windows inherits ACLs.
-const fn set_user_only_file_permissions(_path: &Path) -> Result<(), CliError> {
+const fn set_user_only_file_permissions(_file: &fs::File) -> Result<(), CliError> {
     Ok(())
 }
 

@@ -295,7 +295,10 @@ pub fn scan_path(
     findings: &mut Vec<ScanFinding>,
     suppressed: &mut Vec<SuppressedFinding>,
 ) -> Result<(), CliError> {
-    if path.is_dir() {
+    let metadata = fs::metadata(path).map_err(|error| {
+        io::Error::new(error.kind(), format!("could not scan {}: {error}", path.display()))
+    })?;
+    if metadata.is_dir() {
         let mut builder = WalkBuilder::new(path);
         builder
             .add_custom_ignore_filename(LOCKETIGNORE_FILE)
@@ -315,7 +318,11 @@ pub fn scan_path(
         return Ok(());
     }
 
-    scan_file(root, path, known_values, entropy_rule, findings, suppressed)
+    if metadata.is_file() {
+        scan_file(root, path, known_values, entropy_rule, findings, suppressed)
+    } else {
+        Err(metadata_invalid_error("scan path must be a regular file or directory"))
+    }
 }
 
 fn scan_file(

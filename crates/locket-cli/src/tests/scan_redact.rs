@@ -630,6 +630,137 @@ fn scan_staged_uses_index_content_without_printing_known_values()
 }
 
 #[test]
+fn scan_and_redact_reject_ambiguous_input_selection() {
+    for args in [
+        &["locket", "scan", "--staged", "sample.log"][..],
+        &["locket", "redact", "--stdin", "sample.log"][..],
+    ] {
+        let result = Cli::try_parse_from(args);
+        assert!(
+            result.is_err_and(|error| error.kind() == clap::error::ErrorKind::ArgumentConflict)
+        );
+    }
+    assert!(
+        Cli::try_parse_from(["locket", "redact"])
+            .is_err_and(|error| error.kind() == clap::error::ErrorKind::MissingRequiredArgument)
+    );
+}
+
+#[test]
+fn scan_missing_explicit_path_reports_an_error() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    let mut output = Vec::new();
+    let result = run_with_context(
+        Cli::try_parse_from(["locket", "scan", "missing.log"])?,
+        &context,
+        &mut output,
+    );
+    assert!(result.is_err(), "a missing path was reported as clean");
+    assert_eq!(output, [] as [u8; 0]);
+    Ok(())
+}
+
+#[test]
+fn required_known_coverage_rejects_a_locked_empty_vault() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--no-device", "--no-passkey"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    std::fs::write(directory.path().join("sample.txt"), "example\n")?;
+    let locked = test_context_with_key_store(&directory, Arc::new(UnavailableMasterKeyStore));
+    for args in [
+        vec!["locket", "scan", "--require-known", "sample.txt"],
+        vec!["locket", "redact", "--require-known", "sample.txt"],
+        vec!["locket", "ai-safe", "--", "__locket_nonexistent_test_program__"],
+    ] {
+        let mut output = Vec::new();
+        let result = run_with_context(Cli::try_parse_from(args.clone())?, &locked, &mut output);
+        let Err(error) = result else {
+            return Err(format!("{args:?} accepted a locked vault").into());
+        };
+        assert_eq!(
+            error.exit_code(),
+            locket_core::LocketError::UnlockRequired.exit_code(),
+            "{args:?}"
+        );
+        assert!(output.is_empty(), "{args:?} produced output before denying access");
+    }
+    Ok(())
+}
+
+#[test]
+fn redact_locked_vault_finishes_in_pattern_only_mode() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--no-device", "--no-passkey"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    let args = test_secret_write_args("DATABASE_URL");
+    crate::set_secret_value(&context, &args, "local-fixture-value", "manual", 1_000)?;
+    std::fs::write(directory.path().join("sample.log"), "token=sk_test_sampleTokenValue123\n")?;
+    let locked = test_context_with_key_store(&directory, Arc::new(UnavailableMasterKeyStore));
+    let mut output = Vec::new();
+    let code = run_with_context(
+        Cli::try_parse_from(["locket", "redact", "sample.log"])?,
+        &locked,
+        &mut output,
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output, b"token=lk_redacted_PROVIDER_TOKEN\n");
+    let store = locket_store::Store::open(directory.path().join("store.db"))?;
+    let rows: u32 = store.connection().query_row(
+        "SELECT COUNT(*) FROM audit_log WHERE action = 'REDACT'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(rows, 0);
+    Ok(())
+}
+
+#[test]
+fn redact_file_passes_invalid_utf8_between_known_values() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--no-device", "--no-passkey"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    let args = test_secret_write_args("DATABASE_URL");
+    crate::set_secret_value(&context, &args, "fixture-database-value", "manual", 1_000)?;
+    std::fs::write(
+        directory.path().join("sample.log"),
+        b"old=fixture-database-value\xffnew=fixture-database-value\xe2\x82",
+    )?;
+    let mut output = Vec::new();
+    run_with_context(
+        Cli::try_parse_from(["locket", "redact", "--require-known", "sample.log"])?,
+        &context,
+        &mut output,
+    )?;
+    assert_eq!(output, b"old=lk_redacted_DATABASE_URL\xffnew=lk_redacted_DATABASE_URL\xe2\x82");
+    let store = locket_store::Store::open(directory.path().join("store.db"))?;
+    let metadata: String = store.connection().query_row(
+        "SELECT metadata_json FROM audit_log WHERE action = 'REDACT'",
+        [],
+        |row| row.get(0),
+    )?;
+    let metadata: serde_json::Value = serde_json::from_str(&metadata)?;
+    assert_eq!(metadata["input_kind"], "file");
+    assert_eq!(metadata["invalid_utf8_passthrough"], true);
+    assert_eq!(metadata["redaction_counts_by_rule"]["known_secret_value"], 2);
+    Ok(())
+}
+
+#[test]
 fn redact_replaces_provider_tokens() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempdir()?;
     let sample_path = directory.path().join("sample.log");
@@ -739,11 +870,8 @@ fn redact_stdin_bytes_passes_invalid_utf8_and_localizes_pattern_markers() {
     assert!(!text.contains("known-secret-value"));
     assert!(!text.contains("ghp_sampleTokenValue1234567890"));
     assert!(!text.contains("lk_redacted_PROVIDER_TOKEN"));
-    assert_eq!(redacted.result.counts.get(&locket_scan::FindingKind::KnownSecretValue), Some(&1));
-    assert_eq!(
-        redacted.result.counts.get(&locket_scan::FindingKind::ProviderTokenPattern),
-        Some(&1)
-    );
+    assert_eq!(redacted.counts.get(&locket_scan::FindingKind::KnownSecretValue), Some(&1));
+    assert_eq!(redacted.counts.get(&locket_scan::FindingKind::ProviderTokenPattern), Some(&1));
 }
 
 #[test]

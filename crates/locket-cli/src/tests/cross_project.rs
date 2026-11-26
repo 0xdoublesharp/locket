@@ -917,6 +917,32 @@ fn mcp_exchange(context: &RuntimeContext, requests: &[Value]) -> Result<String, 
 }
 
 #[test]
+fn mcp_echoes_request_ids_and_rejects_invalid_requests_without_losing_the_session()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempdir()?;
+    let context = super::test_context(&directory);
+    let requests = [
+        json!({"jsonrpc":"2.0", "method":"notifications/initialized"}),
+        json!({"jsonrpc":"2.0", "id":"missing-name", "method":"tools/call"}),
+        json!({"jsonrpc":"2.0", "id":3, "method":"no-such-method"}),
+        json!({"jsonrpc":"2.0", "id":true, "method":"ping"}),
+        json!({"jsonrpc":"2.0", "id":"ready", "method":"initialize", "params":{"protocolVersion":"2025-11-25"}}),
+    ];
+    let output = mcp_exchange(&context, &requests)?;
+    let replies = output.lines().map(serde_json::from_str).collect::<Result<Vec<Value>, _>>()?;
+    assert_eq!(replies.len(), 4);
+    assert_eq!(replies[0]["id"], "missing-name");
+    assert_eq!(replies[0]["error"]["code"], -32602);
+    assert_eq!(replies[1]["id"], 3);
+    assert_eq!(replies[1]["error"]["code"], -32601);
+    assert_eq!(replies[2]["id"], Value::Null);
+    assert_eq!(replies[2]["error"]["code"], -32600);
+    assert_eq!(replies[3]["id"], "ready");
+    assert_eq!(replies[3]["result"]["protocolVersion"], "2025-11-25");
+    Ok(())
+}
+
+#[test]
 #[allow(clippy::too_many_lines)] // Keep the complete exchange in one session.
 fn mcp_roundtrip_lists_tools_and_never_returns_values() -> Result<(), Box<dyn Error>> {
     let directory = tempdir()?;

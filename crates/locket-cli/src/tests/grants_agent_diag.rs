@@ -1060,7 +1060,10 @@ fn doctor_reports_zero_pruned_when_no_expired_nonces() -> Result<(), Box<dyn std
 #[test]
 fn debug_bundle_redacted_writes_metadata_only_summary() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempdir()?;
-    let context = test_context(&directory);
+    let context = RuntimeContext {
+        agent_data_dir: Some(directory.path().join("custom-agent-dir")),
+        ..test_context(&directory)
+    };
     let mut init_output = Vec::new();
     run_with_context(
         Cli::try_parse_from(["locket", "init", "--name", "app", "--profile", "dev"])?,
@@ -1089,6 +1092,7 @@ fn debug_bundle_redacted_writes_metadata_only_summary() -> Result<(), Box<dyn st
     assert!(bundle.contains("\"project\""));
     assert!(bundle.contains("\"diagnostics\""));
     assert!(bundle.contains("\"store_path_hash\""));
+    assert!(!bundle.contains("custom-agent-dir"));
     assert!(!bundle.contains(directory.path().to_string_lossy().as_ref()));
     #[cfg(unix)]
     {
@@ -1174,6 +1178,51 @@ fn debug_bundle_default_output_uses_user_diagnostics_dir() -> Result<(), Box<dyn
     let bundle = read_debug_bundle_json(&output_path)?;
     assert!(bundle.contains("\"redacted\": true"));
     assert!(!bundle.contains(directory.path().to_string_lossy().as_ref()));
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn debug_bundle_explicit_output_keeps_parent_permissions() -> Result<(), Box<dyn std::error::Error>>
+{
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    let parent = directory.path().join("exports");
+    fs::create_dir(&parent)?;
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o750))?;
+    let path = parent.join("report.tar.gz");
+    let args = ["locket", "debug", "bundle", "--redacted", "--output", "exports/report.tar.gz"];
+    run_with_context(Cli::try_parse_from(args)?, &context, &mut Vec::new())?;
+    assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+    assert_eq!(fs::metadata(&parent)?.permissions().mode() & 0o777, 0o750);
+    assert_error_contains(
+        run_with_context(Cli::try_parse_from(args)?, &context, &mut Vec::new()).map(|_| ()),
+        "debug bundle output already exists",
+    );
+    assert_eq!(fs::metadata(&parent)?.permissions().mode() & 0o777, 0o750);
+    Ok(())
+}
+
+#[test]
+fn doctor_reports_metadata_checks_when_master_key_is_unavailable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--no-device", "--no-passkey"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    let locked = test_context_with_key_store(&directory, Arc::new(UnavailableMasterKeyStore));
+    let mut output = Vec::new();
+    let code = run_with_context(Cli::try_parse_from(["locket", "doctor"])?, &locked, &mut output)?;
+    assert!(code <= 1, "unexpected critical status {code}");
+    let output = String::from_utf8(output)?;
+    assert!(output.contains("pass sqlite_integrity"));
+    assert!(output.contains("skip audit_hmac_verification"));
+    assert!(output.contains("summary:"));
     Ok(())
 }
 

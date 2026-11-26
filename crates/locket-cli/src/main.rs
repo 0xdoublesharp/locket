@@ -966,7 +966,7 @@ enum ProjectCommand {
 #[allow(clippy::struct_excessive_bools)] // Independent CLI switches.
 struct ScanArgs {
     /// Scan staged Git content.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "path")]
     staged: bool,
     /// Require known-value coverage.
     #[arg(long)]
@@ -983,6 +983,7 @@ struct ScanArgs {
 #[derive(Debug, Args)]
 struct RedactArgs {
     /// File to redact.
+    #[arg(required_unless_present = "stdin")]
     file: Option<String>,
     /// Read from stdin.
     #[arg(long, conflicts_with = "file")]
@@ -2734,6 +2735,13 @@ pub(crate) fn collect_known_secret_values(
 ) -> Result<Vec<zeroize::Zeroizing<String>>, CliError> {
     let store = open_store(context)?;
     ensure_trusted_project_root(&store, project)?;
+    // An empty result is only meaningful after verifying access to the vault.
+    load_project_key(
+        context,
+        &store,
+        project.config.project_id.as_str(),
+        KeyPurpose::ProjectMetadata,
+    )?;
     let mut values = Vec::new();
     for profile in store.list_profiles(project.config.project_id.as_str())? {
         for secret in
@@ -2874,6 +2882,7 @@ fn write_agent_paths(context: &RuntimeContext, output: &mut impl Write) -> Resul
     Ok(())
 }
 
+#[cfg(not(unix))]
 fn read_agent_pid(context: &RuntimeContext) -> Result<Option<String>, CliError> {
     match fs::read_to_string(agent_pid_path(context)) {
         Ok(pid) => {

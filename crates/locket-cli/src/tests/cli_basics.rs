@@ -2,6 +2,7 @@
 use super::*;
 
 #[test]
+#[allow(clippy::too_many_lines)] // Keep the retained-receipt assertions in the same witness chain.
 fn audit_witness_detects_tampering_and_rollback_to_an_older_receipt()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempdir()?;
@@ -68,6 +69,22 @@ fn audit_witness_detects_tampering_and_rollback_to_an_older_receipt()
         &mut verification,
     )?;
     assert!(String::from_utf8(verification)?.contains("witness: verified 2 receipt(s)"));
+
+    let mut conflicting = second.clone();
+    conflicting.statement.witness_id = "mismatched-receipt".to_owned();
+    let conflicting_path = retained.path().join("conflicting.json");
+    std::fs::write(&conflicting_path, serde_json::to_vec(&conflicting)?)?;
+    let conflicting_path = conflicting_path.to_str().ok_or("receipt path is not UTF-8")?;
+    let mut conflict_output = Vec::new();
+    let conflict = cli(
+        &["locket", "audit", "verify", "--witness-key", trusted_key, "--receipt", conflicting_path],
+        &mut conflict_output,
+    );
+    assert!(
+        conflict
+            .is_err_and(|error| error.to_string().contains("conflicts with the stored receipt"))
+    );
+    assert_eq!(conflict_output, [] as [u8; 0]);
 
     let command = ["locket", "audit", "verify", "--witness-key", trusted_key];
     let original_status: String = store.connection().query_row(

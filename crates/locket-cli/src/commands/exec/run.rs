@@ -2434,6 +2434,35 @@ mod approval_tests {
                 .ok_or_else(|| crate::confirmation_failed_error("unexpected prompt"))
         }
     }
+
+    #[test]
+    fn compose_config_only_imports_allowed_scalar_or_assignment_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let doc = locket_core::PolicyDocument::from_toml_str(
+            "schema_version=1\n[commands.dev]\nargv=[\"true\"]\noptional_secrets=[\"PORT\",\"DEBUG\",\"ABSENT\",\"HOST\"]",
+        )?;
+        let policy = &doc.commands["dev"];
+        let environment = super::resolve_external_env_compose_json(
+            policy,
+            br#"{
+                "environment": {"PORT": 3000, "DEBUG": true, "ABSENT": {"ignored": true}, "PRIVATE": "excluded"},
+                "services": {
+                    "app": {"environment": ["HOST=local=fixture", "ABSENT", 5, "PRIVATE=excluded"]},
+                    "worker": {"environment": null}
+                }
+            }"#,
+        )?;
+        assert_eq!(environment.get("PORT").map(|value| value.as_str()), Some("3000"));
+        assert_eq!(environment.get("DEBUG").map(|value| value.as_str()), Some("true"));
+        assert_eq!(environment.get("HOST").map(|value| value.as_str()), Some("local=fixture"));
+        assert_eq!(environment.len(), 3);
+        let Err(error) = super::resolve_external_env_compose_json(policy, b"{") else {
+            return Err("malformed Compose output was accepted".into());
+        };
+        assert!(error.to_string().contains("docker compose config returned invalid JSON"));
+        Ok(())
+    }
+
     #[test]
     fn external_file_preserves_literal_data_and_ignores_unrelated_invalid_names()
     -> Result<(), Box<dyn std::error::Error>> {

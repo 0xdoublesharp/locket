@@ -164,6 +164,34 @@ fn agent_start_preserves_live_socket_without_pid_file()
 
 #[cfg(unix)]
 #[test]
+fn agent_status_reports_a_live_endpoint_without_a_pid_file()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::Builder::new().prefix("a").rand_bytes(4).tempdir()?;
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))?;
+    let context = test_context(&directory);
+    let socket = crate::agent_socket_path(&context);
+    let server = serve_status_requests(socket.clone(), 2);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !socket.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(socket.exists(), "test agent did not bind socket within deadline");
+
+    let mut output = Vec::new();
+    run_with_context(Cli::try_parse_from(["locket", "agent", "status"])?, &context, &mut output)?;
+    let output = String::from_utf8(output)?;
+    assert!(output.contains("running: yes"), "{output}");
+    assert!(output.contains("pid: -"), "{output}");
+    assert!(output.contains("lock_state: locked"), "{output}");
+    read_status_snapshot(&socket)?;
+    server.join().map_err(|_| "serve thread panicked")??;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn run_internal_agent_serve_listens_and_cleans_up_on_sigterm()
 -> Result<(), Box<dyn std::error::Error>> {
     use locket_agent::{

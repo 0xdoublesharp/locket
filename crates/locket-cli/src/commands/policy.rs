@@ -246,12 +246,12 @@ fn edit(
 ) -> Result<(), CliError> {
     let resolved = require_project(context)?;
     let path = resolved.root.join(LOCKET_TOML);
-    let document = read_locket_toml(&path)?;
+    let mut document = read_locket_toml(&path)?;
     ensure_policy_exists(&document, &args.name)?;
     let editor = configured_editor(context)?;
     let edit_path = write_edit_copy(&path, &document)?;
     let edit_result = run_policy_editor(&editor, &edit_path)
-        .and_then(|()| apply_edited_policy(&path, &edit_path, &args.name));
+        .and_then(|()| apply_edited_policy(&mut document, &edit_path, &args.name));
     let cleanup_result = fs::remove_file(&edit_path);
     if let Err(error) = cleanup_result
         && error.kind() != io::ErrorKind::NotFound
@@ -259,14 +259,11 @@ fn edit(
     {
         return Err(error.into());
     }
-    edit_result?;
-    let updated_document = read_locket_toml(&path)?;
-    let policy_document = PolicyDocument::from_toml_value(&updated_document)
-        .map_err(|error| metadata_invalid_error(error.to_string()))?;
+    let policy_document = edit_result?;
     write_policy_index_update_if_available(
         context,
         resolved.config.project_id.as_str(),
-        &updated_document,
+        &document,
         &policy_document,
         &args.name,
         "edit",
@@ -1021,16 +1018,19 @@ fn run_policy_editor(editor: &str, edit_path: &Path) -> Result<(), CliError> {
     }
 }
 
-fn apply_edited_policy(path: &Path, edit_path: &Path, name: &str) -> Result<(), CliError> {
+fn apply_edited_policy(
+    document: &mut locket_platform::PolicyFileDocument,
+    edit_path: &Path,
+    name: &str,
+) -> Result<PolicyDocument, CliError> {
     let edited_text = fs::read_to_string(edit_path)?;
     let edited = toml::from_str::<toml::Value>(&edited_text)
         .map_err(|error| invalid_policy_error(format!("invalid edited policy TOML: {error}")))?;
     ensure_policy_exists(&edited, name)?;
-    let content = toml::to_string_pretty(&edited)?;
     PolicyDocument::from_toml_value(&edited)
         .map_err(|error| invalid_policy_error(format!("invalid edited policy: {error}")))?;
-    fs::write(path, content)?;
-    Ok(())
+    **document = edited;
+    document.save().map_err(|error| metadata_invalid_error(error.to_string()))
 }
 
 fn commands_table_mut(

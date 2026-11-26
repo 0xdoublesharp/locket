@@ -484,6 +484,30 @@ fn recovery_rotate_creates_envelope_and_prints_full_code() -> Result<(), Box<dyn
 }
 
 #[test]
+fn recovery_rotate_refuses_a_directory_at_the_envelope_path()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--no-device", "--no-passkey"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    let envelope = directory.path().join(".locket/recovery/envelope.bin");
+    fs::create_dir_all(&envelope)?;
+    let mut output = Vec::new();
+    let result = run_with_context(
+        Cli::try_parse_from(["locket", "recovery", "rotate"])?,
+        &context,
+        &mut output,
+    );
+    assert_error_contains(result.map(|_| ()), "recovery envelope must be a regular file");
+    assert_eq!(output, [] as [u8; 0]);
+    assert!(envelope.is_dir());
+    Ok(())
+}
+
+#[test]
 fn recovery_rotate_requires_fresh_user_verification_before_writing()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempdir()?;

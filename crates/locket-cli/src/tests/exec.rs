@@ -3125,6 +3125,43 @@ inherit_env = ['PATH', 'DOCKER_CONFIG']
 
 #[cfg(unix)]
 #[test]
+fn exec_with_no_injected_values_preserves_exit_status_when_redacting()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = super::context_with_confirmation(&test_context(&directory), "exec --all dev\n");
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--no-device", "--no-passkey"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    let mut output = Vec::new();
+    let result = run_with_context(
+        Cli::try_parse_from([
+            "locket",
+            "exec",
+            "--all",
+            "--redact-output",
+            "--",
+            "/bin/sh",
+            "-c",
+            "exit 23",
+        ])?,
+        &context,
+        &mut output,
+    );
+    assert!(matches!(result, Err(crate::CliError::ChildExit(23))), "{result:?}");
+    assert!(String::from_utf8(output)?.contains("exec_secret_count: 0"));
+    let store = crate::open_store(&context)?;
+    let sessions: u32 =
+        store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM runtime_sessions", [], |row| row.get(0))?;
+    assert_eq!(sessions, 0, "no secrets were injected");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn exec_redacts_captured_long_values_and_leaves_short_values_visible()
 -> Result<(), Box<dyn std::error::Error>> {
     const MODE: &str = "LOCKET_TEST_EXEC_REDACTION";
