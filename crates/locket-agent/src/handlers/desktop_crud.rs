@@ -615,12 +615,12 @@ fn link_secret(
         metadata_json: &metadata,
         timestamp,
     };
-    store.upsert_secret_link_with_audit(
+    let persisted_link_id = store.upsert_secret_link_with_audit(
         &link,
         Some(AuditContext { key: key.as_ref(), write: &audit }),
     )?;
     Ok(LinkSecretResponse {
-        link_id,
+        link_id: persisted_link_id,
         local_name: local_name.into_string(),
         target_project_id: target_project.id,
         target_secret_id: target_secret.id,

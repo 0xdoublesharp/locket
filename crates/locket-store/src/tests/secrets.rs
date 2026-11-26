@@ -1001,7 +1001,18 @@ fn secret_links_resolve_list_count_and_unlink_on_shared_delete() -> Result<(), B
         created_at: 30,
         updated_at: 30,
     };
-    store.upsert_secret_link_with_audit(&link, None)?;
+    let persisted = store.upsert_secret_link_with_audit(&link, None)?;
+    assert_eq!(persisted, link.id);
+    // Retargeting/updating an existing link preserves and returns the original stored link ID.
+    let updated_id = store.upsert_secret_link_with_audit(
+        &crate::SecretLinkRecord {
+            id: "lk_link_replacement".into(),
+            updated_at: 31,
+            ..link.clone()
+        },
+        None,
+    )?;
+    assert_eq!(updated_id, link.id);
 
     let resolved = store
         .resolve_active_secret_link("lk_proj_test", "lk_prof_test", "RPC_URL")?

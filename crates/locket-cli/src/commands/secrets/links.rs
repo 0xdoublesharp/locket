@@ -241,11 +241,11 @@ pub fn create_link_record_with_audit(
         metadata_json: &metadata,
         timestamp,
     };
-    store.upsert_secret_link_with_audit(
+    let persisted_id = store.upsert_secret_link_with_audit(
         &link,
         Some(AuditContext { key: audit_key.as_ref(), write: &audit }),
     )?;
-    Ok(link_id)
+    Ok(persisted_id)
 }
 
 pub fn link_command(

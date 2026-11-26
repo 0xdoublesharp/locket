@@ -249,6 +249,8 @@ fn duplicate_member_from_row(
 impl Store {
     /// Inserts or replaces a project secret link to an active Global Vault secret atomically.
     ///
+    /// Returns the persisted link ID (preserving the existing row ID when retargeting).
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError`] when the link violates depth-1 Global Vault constraints,
@@ -257,7 +259,7 @@ impl Store {
         &mut self,
         link: &SecretLinkRecord,
         audit: Option<AuditContext<'_>>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<String, StoreError> {
         let transaction = self.connection.savepoint()?;
         let target_active = transaction.query_row(
             "SELECT EXISTS(
@@ -276,7 +278,7 @@ impl Store {
                 expected_version: 1,
             });
         }
-        transaction.execute(
+        let persisted_id: String = transaction.query_row(
             "INSERT INTO secret_links(
                id, project_id, profile_id, local_name,
                target_project_id, target_profile_id, target_secret_id,
@@ -287,7 +289,8 @@ impl Store {
                target_project_id = excluded.target_project_id,
                target_profile_id = excluded.target_profile_id,
                target_secret_id = excluded.target_secret_id,
-               updated_at = excluded.updated_at",
+               updated_at = excluded.updated_at
+             RETURNING id",
             params![
                 link.id,
                 link.project_id,
@@ -299,10 +302,11 @@ impl Store {
                 link.created_at,
                 link.updated_at,
             ],
+            |row| row.get(0),
         )?;
         append_optional_audit(&transaction, audit)?;
         transaction.commit()?;
-        Ok(())
+        Ok(persisted_id)
     }
 
     /// Removes one secret link for a project/profile/name and optionally appends an audit row.
