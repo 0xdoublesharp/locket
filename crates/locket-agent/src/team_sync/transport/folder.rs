@@ -40,6 +40,7 @@ fn validate_local_filename(filename: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(not(unix), allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps))]
 fn sync_dir(path: &Path) -> Result<()> {
     #[cfg(unix)]
     fs::File::open(path)?.sync_all()?;
