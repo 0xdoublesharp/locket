@@ -705,12 +705,12 @@ fn import_shared_requires_an_available_vault_and_overwrite_for_collisions()
         "SHADOW=incoming-fixture-value\nRETARGET=incoming-fixture-value\n",
     )?;
     for flag in ["--link-shared", "--promote-duplicates"] {
-        let failure = cli_json(
-            &context,
-            &["import", ".env", flag, "--dry-run", "--json"],
-            LocketError::ProjectNotFound.exit_code(),
-        )?;
-        assert_eq!(failure["error"]["code"], "ProjectNotFound");
+        let failure = cli_json(&context, &["import", ".env", flag, "--dry-run", "--json"], 64)?;
+        assert_eq!(failure["error"]["code"], "SharedVaultNotInitialized");
+        assert_eq!(
+            failure["error"]["message"],
+            "Global Vault (@shared) is not initialized; run `locket shared init` first"
+        );
     }
 
     run_cli_args(&context, &["shared", "init"])?;

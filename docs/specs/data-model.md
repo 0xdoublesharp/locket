@@ -508,6 +508,7 @@ Typed errors:
 ```rust
 enum LocketError {
     ProjectNotFound,
+    SharedVaultNotInitialized,
     ProjectRootNotTrusted,
     ProfileNotFound,
     SecretNotFound,
@@ -546,6 +547,10 @@ enum LocketError {
     SecretVersionExpired,
 }
 ```
+
+`SharedVaultNotInitialized` indicates that a secret operation requires a Global
+Vault (`@shared`) that has yet to be created. Run `locket shared init` to create
+it. The CLI exits with code `64`.
 
 ## Secret Metadata And Ownership
 

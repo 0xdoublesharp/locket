@@ -331,7 +331,7 @@ fn import_promotion_profile(store: &Store) -> Result<locket_store::ProfileRecord
         .filter(|project| is_shared_project_id(&project.id))
         .min_by_key(|project| project.name != "@shared")
         .ok_or_else(|| {
-            failure("ProjectNotFound", "set up the Global Vault before promoting secrets")
+            failure("SharedVaultNotInitialized", "set up the Global Vault before promoting secrets")
         })?;
     store
         .get_profile_by_name(&project.id, "default")?

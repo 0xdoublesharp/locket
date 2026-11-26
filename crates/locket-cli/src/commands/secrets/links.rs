@@ -117,7 +117,7 @@ pub struct CliDuplicateMatch {
 pub fn shared_vault_target(store: &Store) -> Result<(ProjectRecord, ProfileRecord), CliError> {
     let project = global_vault_project(store)?.ok_or_else(|| {
         typed_cli_error(
-            LocketError::ProjectNotFound,
+            LocketError::SharedVaultNotInitialized,
             "Global Vault (@shared) is not initialized; run `locket shared init` first",
         )
     })?;

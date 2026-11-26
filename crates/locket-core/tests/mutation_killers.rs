@@ -22,9 +22,9 @@ fn typed_errors_offer_failure_specific_recovery() {
         MetadataInvalid, MetadataLooksLikeSecret, PolicyNotFound, PolicyValidationIncomplete,
         ProfileNotFound, ProjectNotFound, ProjectRootUntrusted, ReplayDetected, ScanFindingBlocked,
         SchemaNewerThanBinary, SecretAlreadyExists, SecretDeleted, SecretNotFound,
-        SecretVersionExpired, SecretVersionOverflow, StorageBusy, TeamBundleConflict,
-        TeamRoleDenied, TtyRequired, UnlockRequired, UnrecoverableVault, UpdateManifestInvalid,
-        UserVerificationFailed,
+        SecretVersionExpired, SecretVersionOverflow, SharedVaultNotInitialized, StorageBusy,
+        TeamBundleConflict, TeamRoleDenied, TtyRequired, UnlockRequired, UnrecoverableVault,
+        UpdateManifestInvalid, UserVerificationFailed,
     };
 
     let cases = [
@@ -47,6 +47,7 @@ fn typed_errors_offer_failure_specific_recovery() {
         (TeamRoleDenied, "owner or maintainer"),
         (ProjectRootUntrusted, "locket project trust-root"),
         (ProjectNotFound, "locket init"),
+        (SharedVaultNotInitialized, "locket shared init"),
         (UnlockRequired, "locket unlock"),
         (GrantRequired, "locket allow"),
         (UserVerificationFailed, "verification"),

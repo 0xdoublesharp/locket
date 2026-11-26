@@ -65,6 +65,9 @@ pub enum LocketError {
     /// No Locket project could be resolved from the current directory.
     #[error("project not found")]
     ProjectNotFound,
+    /// The local Global Vault (`@shared`) has not been initialized.
+    #[error("Global Vault (@shared) is not initialized")]
+    SharedVaultNotInitialized,
     /// Vault or required key is locked.
     #[error("unlock required")]
     UnlockRequired,
@@ -194,6 +197,7 @@ impl LocketError {
             b"TeamRoleDenied" => Some(Self::TeamRoleDenied),
             b"ProjectRootUntrusted" => Some(Self::ProjectRootUntrusted),
             b"ProjectNotFound" => Some(Self::ProjectNotFound),
+            b"SharedVaultNotInitialized" => Some(Self::SharedVaultNotInitialized),
             b"UnlockRequired" => Some(Self::UnlockRequired),
             b"GrantRequired" => Some(Self::GrantRequired),
             b"UserVerificationFailed" => Some(Self::UserVerificationFailed),
@@ -323,6 +327,10 @@ impl LocketError {
             Self::ProjectNotFound => Some(ErrorDisplayCopy {
                 reason: "No Locket project was found.",
                 next_action: "Run locket init or move into an existing Locket project.",
+            }),
+            Self::SharedVaultNotInitialized => Some(ErrorDisplayCopy {
+                reason: "Global Vault (@shared) is not initialized",
+                next_action: "Run `locket shared init` first",
             }),
             Self::UnlockRequired => Some(ErrorDisplayCopy {
                 reason: "The vault is locked.",
@@ -467,7 +475,8 @@ impl LocketError {
             | Self::InvalidSecretName
             | Self::InvalidProfileName
             | Self::PolicyNotFound
-            | Self::ProjectNotFound => 64,
+            | Self::ProjectNotFound
+            | Self::SharedVaultNotInitialized => 64,
             Self::PolicyValidationIncomplete | Self::InvalidPolicy => 65,
             Self::EnvironmentConflict | Self::MetadataLooksLikeSecret => 66,
             Self::SecretAlreadyExists => 67,
@@ -536,6 +545,7 @@ mod tests {
         LocketError::TeamRoleDenied,
         LocketError::ProjectRootUntrusted,
         LocketError::ProjectNotFound,
+        LocketError::SharedVaultNotInitialized,
         LocketError::UnlockRequired,
         LocketError::GrantRequired,
         LocketError::UserVerificationFailed,
@@ -576,6 +586,7 @@ mod tests {
         assert_eq!(LocketError::InvalidProfileName.exit_code(), 64);
         assert_eq!(LocketError::PolicyNotFound.exit_code(), 64);
         assert_eq!(LocketError::ProjectNotFound.exit_code(), 64);
+        assert_eq!(LocketError::SharedVaultNotInitialized.exit_code(), 64);
         assert_eq!(LocketError::PolicyValidationIncomplete.exit_code(), 65);
         assert_eq!(LocketError::InvalidPolicy.exit_code(), 65);
         assert_eq!(LocketError::EnvironmentConflict.exit_code(), 66);
@@ -711,6 +722,7 @@ mod tests {
             (LocketError::ProfileNotFound, "profile not found"),
             (LocketError::SecretVersionOverflow, "secret version overflow"),
             (LocketError::ProjectNotFound, "project not found"),
+            (LocketError::SharedVaultNotInitialized, "Global Vault (@shared) is not initialized"),
             (LocketError::InvalidSecretName, "invalid secret name"),
             (LocketError::InvalidProfileName, "invalid profile name"),
         ];

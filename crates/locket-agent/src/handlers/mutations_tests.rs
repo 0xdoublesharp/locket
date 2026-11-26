@@ -1043,7 +1043,7 @@ async fn copy_to_shared_rejects_stale_sources_and_invalid_destinations_without_w
     let original = db
         .get_active_secret(PROJECT, PROFILE, "TOKEN", "user-local")?
         .ok_or("source not stored")?;
-    assert_eq!(code(call_crud(&state, &request).await), "ProjectNotFound");
+    assert_eq!(code(call_crud(&state, &request).await), "SharedVaultNotInitialized");
     db.insert_project_if_absent(SHARED_PROJECT, "@shared", 1)?;
     unlock_fixture(&state, SHARED_PROJECT, &MASTER).await;
 
@@ -1391,6 +1391,12 @@ async fn shared_link_mutations_list_metadata_and_enforce_dangerous_confirmation(
 
     let fixture = Fixture::new()?;
     let state = fixture.state(GrantAction::LinkSecret).await;
+    let missing_vault = crud_request(
+        AgentMethod::LinkSecret,
+        &fixture.scope,
+        json!({"local_name":"TOKEN", "target_secret_name":"GLOBAL_TOKEN"}),
+    );
+    assert_eq!(code(call_crud(&state, &missing_vault).await), "SharedVaultNotInitialized");
     let shared = seed_shared_vault(&fixture, &state).await?;
     let target =
         set_link_fixture_value(&state, &shared, "GLOBAL_TOKEN", "user-local", CANARY).await;
@@ -1561,12 +1567,6 @@ async fn dotenv_promotion_requires_both_grants_pinned_unlocks_and_target_confirm
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = Fixture::new()?;
     let state = fixture.state(GrantAction::ImportDotenv).await;
-    let mut shared = seed_shared_vault(&fixture, &state).await?;
-    shared.grant_id = Some("lk_grant_import_target".into());
-    let store = fixture.store();
-    store.set_profile_dangerous(SHARED_PROJECT, "default", true)?;
-    unlock_pinned(&state, &fixture.scope, &MASTER).await?;
-
     let mut request = fixture.import("ORDINARY=ordinary\nTOKEN=first\n", false);
     request.promote_to_shared.insert("TOKEN".into(), "GLOBAL_TOKEN".into());
     let call = |request: &ImportDotenvRequest| {
@@ -1574,6 +1574,13 @@ async fn dotenv_promotion_requires_both_grants_pinned_unlocks_and_target_confirm
         let state = state.clone();
         async move { handle_import_dotenv(&rpc, &state, NOW).await }
     };
+    assert_eq!(code(call(&request).await), "SharedVaultNotInitialized");
+
+    let mut shared = seed_shared_vault(&fixture, &state).await?;
+    shared.grant_id = Some("lk_grant_import_target".into());
+    let store = fixture.store();
+    store.set_profile_dangerous(SHARED_PROJECT, "default", true)?;
+    unlock_pinned(&state, &fixture.scope, &MASTER).await?;
 
     request.dry_run = true;
     let preview = success(call(&request).await);

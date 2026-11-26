@@ -567,7 +567,7 @@ fn link_secret(
         .filter(|project| is_shared_project_id(&project.id))
         .min_by_key(|project| project.name != "@shared")
         .ok_or_else(|| {
-            failure("ProjectNotFound", "set up the Global Vault before linking secrets")
+            failure("SharedVaultNotInitialized", "set up the Global Vault before linking secrets")
         })?;
     let target_profile = store
         .get_profile_by_name(&target_project.id, "default")?
@@ -729,7 +729,10 @@ fn copy_to_shared(
         .filter(|project| is_shared_project_id(&project.id))
         .min_by_key(|project| project.name != "@shared")
         .ok_or_else(|| {
-            failure("ProjectNotFound", "set up the Global Vault before copying the secret")
+            failure(
+                "SharedVaultNotInitialized",
+                "set up the Global Vault before copying the secret",
+            )
         })?;
     let target_entry = cache
         .lookup(&target.id, i128::from(timestamp))
