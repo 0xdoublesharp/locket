@@ -266,7 +266,7 @@ fn rotate_with_explicit_source_rotates_only_that_source() -> Result<(), Box<dyn 
         metadata: crate::SecretMetadataFlags::default(),
         grace_ttl: None,
     };
-    let (source, version) =
+    let crate::RotationResult { source, version, .. } =
         crate::rotate_secret_value(&context, &rotate_args, "machine-rotated", 2_000, None)?;
     assert_eq!(source, "machine-local");
     assert_eq!(version, 2);

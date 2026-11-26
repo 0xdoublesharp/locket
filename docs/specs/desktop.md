@@ -35,6 +35,10 @@ Design direction:
 - Accessible keyboard navigation, visible focus states, screen-reader labels, sufficient contrast, reduced-motion support, and reveal/copy flows that do not expose values through accessibility metadata after TTL expiry.
 - When `privacy.redact_names = true`, dashboard, tray, shell-status mirrored UI, and notification surfaces must use local aliases for project, profile, secret, policy, device, and member names unless the user explicitly opens a detail view that requires exact names for editing.
 
+### Global Vault links
+
+In **Secrets**, choose a project and environment. Promote a local value to the Global Vault, or link an existing Global Vault entry under the name the project expects. A linked variable appears with its Global Vault target. Unlink it from the project to remove that mapping. In **Global Vault**, inspect usages before rotating or removing an entry. Rotation supplies the new value on subsequent runs of approved commands in the linked projects.
+
 ## UX Requirements
 
 Every user-facing surface must make the secure path obvious and the unsafe path deliberate.

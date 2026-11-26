@@ -5156,10 +5156,16 @@ fn team_join_request_bootstraps_no_speculative_shared_profile_keys()
 fn authenticated_team_cli_joins_independent_store_and_receives_next_update()
 -> Result<(), Box<dyn std::error::Error>> {
     let owner = tempdir()?;
-    let owner_context = test_context_with_secret_value(&owner, "team-cli-first-synthetic-value");
+    let owner_context = RuntimeContext {
+        key_store: Arc::new(super::cross_project::ProjectKeys::default()),
+        ..test_context_with_secret_value(&owner, "team-cli-first-synthetic-value")
+    };
     let mut log = Vec::new();
     for args in [
         vec!["locket", "init", "--name", "app"],
+        vec!["locket", "shared", "init"],
+        vec!["locket", "shared", "set", "PERSONAL_GLOBAL"],
+        vec!["locket", "link", "LOCAL_RPC", "@shared/PERSONAL_GLOBAL"],
         vec!["locket", "device", "init"],
         vec!["locket", "team", "init", "Synthetic team"],
         vec!["locket", "set", "API_KEY", "--source", "team-managed"],
@@ -5212,6 +5218,10 @@ fn authenticated_team_cli_joins_independent_store_and_receives_next_update()
     .map_err(|error| format!("folder: {error}"))?;
     run_with_context(Cli::try_parse_from(["locket", "team", "publish"])?, &owner_context, &mut log)
         .map_err(|error| format!("publish: {error}"))?;
+    assert!(
+        String::from_utf8_lossy(&log)
+            .contains("warning: Global Vault links in profile dev stay on this machine: LOCAL_RPC")
+    );
     // A joining device must choose the latest full snapshot, then ignore
     // older pre-anchor packages left in the same delivery folder.
     run_with_context(
@@ -5246,6 +5256,24 @@ fn authenticated_team_cli_joins_independent_store_and_receives_next_update()
     )
     .map_err(|error| format!("get: {error}"))?;
     assert_eq!(String::from_utf8(revealed)?, "team-cli-first-synthetic-value\n");
+    let receiver_profile = receiver_store
+        .get_profile_by_name(config.project_id.as_str(), "dev")?
+        .ok_or("receiver profile missing")?;
+    assert_eq!(
+        receiver_store.list_active_secret_links_by_profile(
+            config.project_id.as_str(),
+            &receiver_profile.id,
+        )?,
+        Vec::new(),
+    );
+    assert_eq!(
+        receiver_store.list_secrets_by_name(
+            config.project_id.as_str(),
+            &receiver_profile.id,
+            "LOCAL_RPC",
+        )?,
+        Vec::new(),
+    );
     let next_context = RuntimeContext {
         secret_value_reader: Arc::new(StaticSecretValueReader::new(
             "team-cli-second-synthetic-value",

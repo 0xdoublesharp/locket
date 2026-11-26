@@ -55,16 +55,12 @@ Secret names must use portable environment variable syntax by default: `^[A-Z_][
 
 Profile names must match `^[a-z][a-z0-9_-]{0,63}$` so they appear unambiguously in `lk://profile/KEY` references and on every surface. Reserved profile names: `_default` (reserved for tool internals).
 
-Secret paths provide a reusable, SSM-like namespace above project scope. A canonical secret path starts with `/`, contains slash-separated portable path segments, and identifies one logical secret independently of any project that consumes it. Examples: `/personal/github/token`, `/work/acme/aws/dev/db-password`, and `/shared/npm/publish-token`. The underlying secret value and per-version DEK live once under that path; projects attach links/aliases to consume it as local environment variable names. Project-local secrets continue to use portable `KEY` names and remain private to the current project/profile.
-
 Core commands:
 
 ```bash
 locket init [--name <name>] [--profile <name>] [--recovery-code]
 locket identity init
 locket set <KEY> [--source user-local|machine-local|team-managed] [--description <text>] [--owner <name>] [--tag <tag>] [--required]
-locket secret put <PATH> [--description <text>] [--owner <name>] [--tag <tag>]
-locket link <PATH> <KEY> [--profile <name>] [--source user-local|machine-local|team-managed]
 locket get <KEY>
 locket get <KEY> --reveal
 locket get <KEY> --copy
@@ -81,8 +77,6 @@ locket passkey remove <passkey>
 `locket identity init` creates or verifies the machine/user-scoped local identity: OS keychain master key, local device private keys, passphrase fallback when needed, and the local recovery envelope. It displays the recovery code only when creating a new local identity. Re-running it on a machine with a valid identity is idempotent and never creates project records.
 
 `locket init` is atomic: either `locket.toml`, local store project records, trusted root, default profile, project/profile keys, local identity bootstrap when needed, `.gitignore` changes, `.env.example` block, and audit row all succeed, or the operation rolls back every Locket-owned change it can safely remove. Default init does not force an offline recovery-code ceremony for every new project; pass `--recovery-code` to create and display one during setup, or run `locket recovery rotate` later while the vault is still accessible. If a local identity already exists, `init` reuses it and must not create a project-specific master key or project-specific recovery code. If `locket.toml` already exists and its `project_id` matches an existing local project, `init` exits successfully with a notice, writes no new rows, and never re-displays the recovery code. If a prior failed init left `locket.toml` without a matching local store project record, the next `locket init` treats that file as resumable partial state: it validates the file, completes missing store/key/profile setup, and either commits the full init or leaves the file unchanged with a typed error.
-
-`locket secret put <PATH>` creates or rotates a reusable global secret under the canonical path. The value is stored once with its own per-version DEK and path-bound metadata. `locket link <PATH> <KEY>` records that the current project/profile may consume the global secret as local secret name `KEY`; links may have project-specific source, profile, policy, and env-mapping metadata. Linking never copies plaintext values, private device keys, or local identity master key material into the project directory. `locket get <KEY>` resolves local project secrets first according to source precedence, then resolves linked global paths only when the active policy/profile grants that link.
 
 `locket set <KEY>` creates version `1` for a selected source and fails with `SecretAlreadyExists` if that `(profile, key, source)` already exists with `SecretState::Active`. If the row exists with `SecretState::Deleted`, `set` fails with `SecretDeleted`; it must not silently reactivate tombstoned history. Reactivation requires an explicit future restore command, not v1 `set`. Secret values are collected only through a secure no-echo TTY prompt, an explicitly configured secure editor flow, or piped stdin when stdin is not a TTY. v1 has no `--value` flag and does not accept secret values through argv, environment variables, shell history-friendly prompts, or logs. If stdin is not a TTY, exactly one UTF-8 secret value is read from stdin; empty input, multiple NUL-separated values, or no input fails with `ConfigError`. If stdin is a TTY and no secure prompt/editor is available, `set` fails closed. Metadata flags populate `SecretMeta` at creation time; `--tag` may be repeated. Updating an existing active source requires `locket rotate <KEY> --source <source>`. Without `--source`, `set` targets `user-local` but refuses to proceed when the same logical key already exists in another source, forcing the user to choose an explicit override source. `team-managed` writes require an appropriate team role.
 
@@ -205,6 +199,8 @@ locket install-hooks
 ```
 
 `locket import .env` imports into the active profile by default. `--profile <name>` overrides the target profile. Imported secrets are stored as `user-local` by default with `origin = Imported`; `--source <source>` overrides the target runtime source. Duplicate keys are skipped by default with a metadata-only warning. `--overwrite` rotates each duplicate key in the target source, marks the prior version `Deprecated` with no grace window, updates `SecretMeta.last_rotated_at`, and writes `ROTATE` audit rows. When `--overwrite` targets a dangerous profile, import requires typed confirmation of the dangerous profile name before any rotation begins; failure aborts the entire import before decrypting or writing values. Multiline values are rejected by default unless a future explicit multiline mode is added. Invalid names, duplicate keys, `export` prefixes, quoted values, comments, and conflicts must be handled explicitly in the import report without printing values.
+
+Use `locket import .env --link-shared` to link entries that exactly match an indexed Global Vault value. Use `locket import .env --promote-duplicates` to create a Global Vault entry and link the incoming variable when its value is already indexed in a project and has no Global Vault match. Existing copies keep their values. Run `locket promote <KEY> --consolidate-duplicates` to convert eligible existing copies to links.
 
 Secret values for `set`, `rotate`, and import overwrite prompts must be entered through secure prompt, editor, or non-echo stdin flows only. v1 must not accept secret values as positional arguments, CLI flags, environment variables, shell history-friendly prompts, or debug logs. Metadata flags are allowed on the command line because they are metadata, but they are still validated by the metadata privacy rules in [data-model.md](data-model.md).
 
@@ -369,6 +365,30 @@ Policy TTL and gates:
 - If either gate fails, execution stops before decryption, no child process is spawned, and a denied `RUN` or `EXEC` audit row is written when project context is available.
 
 Command parsing must avoid shell expansion unless the policy explicitly uses `shell`.
+
+## Global Vault links and duplicate values
+
+Use a link when several projects need one personal credential under different environment variable names. Create a Global Vault entry with `locket shared set ALCHEMY_MAINNET_RPC`, then run `locket link RPC_URL @shared/ALCHEMY_MAINNET_RPC` from each consuming project. A command policy can declare `RPC_URL` in `required_secrets`. Once approved, `locket run` injects the current value under `RPC_URL` whenever the Global Vault is accessible.
+
+```bash
+locket promote RPC_URL --as ALCHEMY_MAINNET_RPC
+locket promote RPC_URL --as ALCHEMY_MAINNET_RPC --consolidate-duplicates
+locket link RPC_URL @shared/ALCHEMY_MAINNET_RPC
+locket unlink RPC_URL
+locket duplicates [--reindex]
+locket shared usages ALCHEMY_MAINNET_RPC
+locket shared rotate ALCHEMY_MAINNET_RPC
+locket shared rm ALCHEMY_MAINNET_RPC --unlink-all
+```
+
+- `promote` copies the current value to `@shared` and creates a live link in the current profile. It retires the original `user-local` copy and preserves its encrypted history. Use `--keep-local` to copy without linking. Any existing machine-local or user-local override takes precedence over the link.
+- `--consolidate-duplicates` also replaces indexed, matching `user-local` copies in accessible, non-dangerous profiles with links. Each consumer keeps its existing variable name. Review `locket duplicates` first. When a project rotation leaves indexed copies of the old value elsewhere, `locket rotate` reports where they still exist.
+- `unlink` removes the current profile's pointer. The Global Vault value remains available to its other consumers. `shared usages` shows each consumer's project, profile, and variable name. `shared rm --unlink-all` removes all of those links and tombstones the Global Vault entry in one operation. Use `--use-dangerous` to confirm a CLI write that affects a dangerous profile.
+- `duplicates` groups indexed active secret versions with exactly equal values, even when the names differ. Reports contain metadata only. `--reindex` refreshes tags for current values the CLI can decrypt. Use it after unlocking vaults with values written before the index was available.
+
+For a name in one profile, Locket resolves **machine-local**, **user-local**, **shared-link**, and then **team-managed**. A selected link reads the current Global Vault version. Unlock the Global Vault if the value is unavailable.
+
+`secret_links` and `local_value_fingerprints` live in the local database. The duplicate index uses keyed tags derived with the Global Vault fingerprint key. Locket excludes both tables from Git-tracked configuration, Team Sync packages, sealed bundle and recovery exports, and CI packages. A CLI sealed export with explicit audit history can include metadata about link operations. Teammates and CI need a separately supplied value for variables satisfied only by a personal link.
 
 ## Onboarding Flows
 

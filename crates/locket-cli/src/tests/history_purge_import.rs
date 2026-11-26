@@ -26,7 +26,7 @@ fn rotate_history_and_purge_keep_values_hidden() -> Result<(), Box<dyn std::erro
 
     let rotate_args = test_rotate_args("DATABASE_URL", Some("24h"));
     let grace_until = crate::grace_until_from_args(rotate_args.grace_ttl.as_deref(), 2_000)?;
-    let (_source, version) = crate::rotate_secret_value(
+    let crate::RotationResult { version, .. } = crate::rotate_secret_value(
         &context,
         &rotate_args,
         "postgres://localhost/new",

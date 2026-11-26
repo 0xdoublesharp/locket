@@ -22,7 +22,7 @@ use super::{
 const CANARY: &str = "cross-project-fixture-value-673";
 
 #[derive(Default)]
-struct ProjectKeys(Mutex<BTreeMap<String, Zeroizing<KeyBytes>>>);
+pub(super) struct ProjectKeys(Mutex<BTreeMap<String, Zeroizing<KeyBytes>>>);
 
 impl MasterKeyStore for ProjectKeys {
     fn store_master_key(&self, id: &str, key: &KeyBytes) -> Result<(), PlatformError> {
@@ -994,13 +994,25 @@ fn mcp_roundtrip_lists_tools_and_never_returns_values() -> Result<(), Box<dyn Er
     assert_eq!(replies.len(), 16);
     assert_eq!(replies[0]["result"]["protocolVersion"], "2025-03-26");
     let tools = replies[1]["result"]["tools"].as_array().ok_or("expected tools")?;
-    assert_eq!(tools.len(), 11);
-    for name in [
-        "locket_inspect_env_keys",
-        "locket_scan_env_files",
-        "locket_import_env",
+    let expected_tools = [
         "locket_detect_commands",
-    ] {
+        "locket_discover_secrets",
+        "locket_find_duplicates",
+        "locket_generate_secret",
+        "locket_get_secret_metadata",
+        "locket_import_env",
+        "locket_inspect_env_keys",
+        "locket_link_secret",
+        "locket_list_project_policies",
+        "locket_list_projects",
+        "locket_list_shared_usages",
+        "locket_scan_env_files",
+        "locket_store_secret",
+        "locket_unlink_secret",
+        "locket_update_secret_metadata",
+    ];
+    assert_eq!(tools.len(), expected_tools.len());
+    for name in expected_tools {
         assert!(tools.iter().any(|tool| tool["name"] == name), "missing {name}");
     }
     let payload = |id: usize| -> Result<Value, Box<dyn Error>> {
@@ -1030,7 +1042,7 @@ fn mcp_roundtrip_lists_tools_and_never_returns_values() -> Result<(), Box<dyn Er
     Ok(())
 }
 
-fn mcp_call(
+pub(super) fn mcp_call(
     context: &RuntimeContext,
     tool: &str,
     args: &Value,

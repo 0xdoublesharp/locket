@@ -347,6 +347,28 @@ pub fn publish_guarded(
     now: i64,
     authorization: Option<&CommitAuthorization>,
 ) -> Result<usize> {
+    Ok(publish_with_warnings(store, project, master, signer, now, authorization)?.queued)
+}
+
+/// Local publication result. Warnings are separate from the signed statement.
+#[derive(Debug)]
+pub struct PublicationResult {
+    pub queued: usize,
+    pub warnings: Vec<String>,
+}
+
+/// Publishes and reports which Global Vault links stay on the publishing machine.
+///
+/// # Errors
+/// Rejects unauthorized publishers, changed predecessors and invalid storage or crypto.
+pub fn publish_with_warnings(
+    store: &mut Store,
+    project: &str,
+    master: &KeyBytes,
+    signer: &SigningKey,
+    now: i64,
+    authorization: Option<&CommitAuthorization>,
+) -> Result<PublicationResult> {
     let (team, owner) = local_owner(store, project)?;
     if signer.verifying_key().to_bytes() != owner.signing_key {
         return Err(reject("protected signing key does not match owner pin"));
@@ -462,7 +484,27 @@ pub fn publish_guarded(
         }
         store.connection().execute("INSERT INTO team_sync_publications VALUES (?1,?2,?3) ON CONFLICT(project_id) DO UPDATE SET members_json=excluded.members_json,keys_json=excluded.keys_json",params![project,serde_json::to_string(&members)?,serde_json::to_string(&keys)?])?;
         if !packages.is_empty() {audit_event(store,project,master,"TEAM_SYNC_PUBLISH",now,&serde_json::json!({"package_count":packages.len()}))?;}
-        Ok(packages.len())
+        let mut warnings = Vec::new();
+        for profile in &profiles {
+            if !members.iter().any(|member| {
+                !member.removed && member.device != owner && member.profiles.contains(&profile.id)
+            }) {
+                continue;
+            }
+            let names = store
+                .list_active_secret_links_by_profile(project, &profile.id)?
+                .into_iter()
+                .map(|resolved| resolved.link.local_name)
+                .collect::<Vec<_>>();
+            if !names.is_empty() {
+                warnings.push(format!(
+                    "Global Vault links in profile {} stay on this machine: {}. Teammates and CI need team-managed or local values for these variables.",
+                    profile.name,
+                    names.join(", "),
+                ));
+            }
+        }
+        Ok(PublicationResult { queued: packages.len(), warnings })
     })
 }
 

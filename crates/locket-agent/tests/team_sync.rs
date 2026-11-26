@@ -406,7 +406,7 @@ fn owner_poll_publishes_only_changes_and_offboarding_rotates_keys()
     use locket_platform::{LocalDevicePrivateKeyStorage, MasterKeyStore};
     let dir = tempfile::tempdir()?;
     let mut owner_store = receiver(&dir.path().join("owner.db"))?;
-    let (statement, signer, _) = fixture()?;
+    let (statement, signer, receiver_sealing) = fixture()?;
     insert_local(&owner_store, &statement.publisher)?;
     owner_store.insert_team(&locket_store::TeamRecord {
         id: "team".into(),
@@ -549,7 +549,40 @@ fn owner_poll_publishes_only_changes_and_offboarding_rotates_keys()
         Err(team_sync::SyncError::Rejected(message)) if message.contains("explicit folder consent")));
     assert_eq!(std::fs::read_dir(&folder)?.count(), 0);
     team_sync::configure_folder(&owner_store, "project", &folder, &key_root, true)?;
-    assert_eq!(team_sync::sync_folder(&mut owner_store, "project", &[22; 32], 150)?.published, 2);
+    seed_local_only_publication_rows(&mut owner_store)?;
+    let published = team_sync::sync_folder(&mut owner_store, "project", &[22; 32], 150)?;
+    assert_eq!(published.published, 2);
+    assert_eq!(published.warnings.len(), 1);
+    assert!(published.warnings[0].contains("profile dev"));
+    assert!(published.warnings[0].contains("LOCAL_RPC"));
+    assert!(!published.warnings[0].contains("GLOBAL_RPC"));
+    assert!(serde_json::to_value(&published)?["warnings"].is_array());
+    assert!(serde_json::to_value(team_sync::SyncStatus::default())?.get("warnings").is_none());
+
+    let bytes: Vec<u8> = owner_store.connection().query_row(
+        "SELECT ciphertext FROM team_sync_outbox WHERE project_id='project' AND recipient=?1",
+        [&statement.recipient.fingerprint],
+        |row| row.get(0),
+    )?;
+    let envelope = SignedStatement::open(&bytes, &receiver_sealing)?;
+    let verified =
+        envelope.verify(&statement.publisher.fingerprint, "project", &statement.recipient, 150)?;
+    assert_eq!(verified.statement.profiles[0].secrets.len(), 1);
+    assert_eq!(verified.statement.profiles[0].secrets[0].name, "TOKEN");
+    assert_eq!(verified.statement.profiles[0].secrets[0].version, 2);
+    let signed_json = std::str::from_utf8(&envelope.statement)?;
+    for omitted in [
+        "secret_links",
+        "local_value_fingerprints",
+        "dedup_tag",
+        "warnings",
+        "LOCAL_RPC",
+        "GLOBAL_RPC",
+        "lk_link_local_rpc",
+        &serde_json::to_string(&[251_u8; 32])?,
+    ] {
+        assert!(!signed_json.contains(omitted), "{omitted} appeared in the published statement");
+    }
     assert_eq!(team_sync::sync_folder(&mut owner_store, "project", &[22; 32], 151)?.published, 0);
     let original_files = std::fs::read_dir(&folder)?
         .map(|entry| {
@@ -720,6 +753,35 @@ fn owner_poll_publishes_only_changes_and_offboarding_rotates_keys()
     )?;
     assert_eq!(epoch, 4, "stale profile snapshot must not publish after concurrent mutation");
     assert!(owner_store.verify_audit_chain_read_only("project", &[23; 32])?.hmac_ok);
+    Ok(())
+}
+
+fn seed_local_only_publication_rows(store: &mut Store) -> Result<(), Box<dyn std::error::Error>> {
+    let shared = "lk_proj_shared_team_isolation";
+    let shared_profile = "lk_prof_shared_team_isolation";
+    let shared_secret = "lk_sec_shared_team_isolation";
+    store.insert_project_if_absent(shared, "@shared", 1)?;
+    store.insert_profile_if_absent(shared_profile, shared, "default", false, 1)?;
+    store.connection().execute(
+        "INSERT INTO secrets(id,project_id,profile_id,name,source,origin,required,current_version,state,created_at,updated_at)
+         VALUES (?1,?2,?3,'GLOBAL_RPC','user-local','manual',0,1,'active',1,1)",
+        (shared_secret, shared, shared_profile),
+    )?;
+    store.upsert_secret_link_with_audit(
+        &locket_store::SecretLinkRecord {
+            id: "lk_link_local_rpc".into(),
+            project_id: "project".into(),
+            profile_id: "profile".into(),
+            local_name: "LOCAL_RPC".into(),
+            target_project_id: shared.into(),
+            target_profile_id: shared_profile.into(),
+            target_secret_id: shared_secret.into(),
+            created_at: 1,
+            updated_at: 1,
+        },
+        None,
+    )?;
+    store.upsert_local_value_fingerprint("secret", 2, &[251; 32], 1)?;
     Ok(())
 }
 

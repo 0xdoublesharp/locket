@@ -16,7 +16,7 @@ fn dotenv_import_rejects_symlinked_source() -> Result<(), Box<dyn std::error::Er
     );
     Ok(())
 }
-use crate::{GrantRecord, GrantRecordFields, UnlockEntry, UnlockMethod};
+use crate::{AgentMethod, GrantRecord, GrantRecordFields, UnlockEntry, UnlockMethod};
 use locket_crypto::{
     HkdfWrapInfo, KeyPurpose, KeyWrapAad, KeyWrapPurpose, derive_wrapping_key_v1, key_wrap_aad_v1,
     wrap_key_material_v1,
@@ -112,21 +112,25 @@ impl Fixture {
         state
     }
     async fn grant(&self, state: &crate::AgentSocketState, action: GrantAction) {
-        state.grants.lock().await.insert(GrantRecord::new(GrantRecordFields {
-            grant_id: "lk_grant_mutation".into(),
-            project_id: self.scope.project_id.clone(),
-            profile_id: self.scope.profile_id.clone(),
-            action,
-            binding: self.scope.binding.clone().unwrap(),
-            issued_at_unix_nanos: 0,
-            ttl_seconds: 30,
-            expires_at_unix_nanos: 30_000_000_000,
-        }));
+        grant_scope(state, &self.scope, action).await;
     }
     fn store(&self) -> Store {
         Store::open(&self.scope.store_path).unwrap()
     }
 }
+async fn grant_scope(state: &crate::AgentSocketState, scope: &MutationScope, action: GrantAction) {
+    state.grants.lock().await.insert(GrantRecord::new(GrantRecordFields {
+        grant_id: scope.grant_id.clone().unwrap(),
+        project_id: scope.project_id.clone(),
+        profile_id: scope.profile_id.clone(),
+        action,
+        binding: scope.binding.clone().unwrap(),
+        issued_at_unix_nanos: 0,
+        ttl_seconds: 30,
+        expires_at_unix_nanos: 30_000_000_000,
+    }));
+}
+
 fn insert_wrapped_keys(
     store: &Store,
     project: &str,
@@ -1314,5 +1318,225 @@ async fn promote_links_under_alias_detects_import_duplicates_and_warns_before_sh
     assert_eq!(deleted["unlinked_count"], 1);
     assert_eq!(store.list_active_secret_metadata_by_profile(PROJECT, PROFILE)?.len(), 0);
     let _ = &mut shared_fixture;
+    Ok(())
+}
+
+async fn seed_shared_vault(
+    fixture: &Fixture,
+    state: &crate::AgentSocketState,
+) -> Result<MutationScope, Box<dyn std::error::Error>> {
+    let scope = MutationScope {
+        project_root: PathBuf::new(),
+        project_id: SHARED_PROJECT.into(),
+        profile_id: "lk_prof_global_default".into(),
+        ..fixture.scope.clone()
+    };
+    let store = fixture.store();
+    store.insert_project_if_absent(SHARED_PROJECT, "@shared", 1)?;
+    store.insert_profile_if_absent(&scope.profile_id, SHARED_PROJECT, "default", false, 1)?;
+    insert_wrapped_keys(&store, SHARED_PROJECT, &scope.profile_id, &MASTER, &AUDIT)?;
+    unlock_fixture(state, SHARED_PROJECT, &MASTER).await;
+    Ok(scope)
+}
+
+async fn set_link_fixture_value(
+    state: &crate::AgentSocketState,
+    scope: &MutationScope,
+    name: &str,
+    source: &str,
+    value: &str,
+) -> Value {
+    use crate::set_secret::handle_set_secret;
+
+    grant_scope(state, scope, GrantAction::SetSecret).await;
+    let request = crud_request(
+        AgentMethod::SetSecret,
+        scope,
+        json!({"secret_name": name, "source": source, "value": value}),
+    );
+    let result = success(handle_set_secret(&request, state, NOW).await);
+    assert!(!result.to_string().contains(value));
+    result
+}
+
+async fn link_fixture_token(state: &crate::AgentSocketState, fixture: &Fixture) -> Value {
+    fixture.grant(state, GrantAction::LinkSecret).await;
+    let request = crud_request(
+        AgentMethod::LinkSecret,
+        &fixture.scope,
+        json!({"local_name":"TOKEN", "target_secret_name":"GLOBAL_TOKEN", "confirmation":"dev"}),
+    );
+    success(call_crud(state, &request).await)
+}
+
+#[tokio::test]
+async fn shared_link_mutations_list_metadata_and_enforce_dangerous_confirmation()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::shared_links::{handle_list_duplicates, handle_list_shared_usages};
+    use locket_core::privacy_alias;
+
+    let fixture = Fixture::new()?;
+    let state = fixture.state(GrantAction::LinkSecret).await;
+    let shared = seed_shared_vault(&fixture, &state).await?;
+    let target =
+        set_link_fixture_value(&state, &shared, "GLOBAL_TOKEN", "user-local", CANARY).await;
+    let local =
+        set_link_fixture_value(&state, &fixture.scope, "REPEAT_TOKEN", "user-local", CANARY).await;
+    let store = fixture.store();
+    store.set_profile_dangerous(PROJECT, "dev", true)?;
+
+    let link = link_fixture_token(&state, &fixture).await;
+    assert_eq!(link["local_name"], "TOKEN");
+    assert_eq!(link["target_secret_id"], target["secret_id"]);
+
+    let usages = |redact_names| {
+        let request = envelope(
+            AgentMethod::ListSharedUsages,
+            &json!({
+                "store_path": fixture.scope.store_path,
+                "target_secret_id": target["secret_id"],
+                "redact_names": redact_names,
+            }),
+        );
+        let result = success(handle_list_shared_usages(&request, &state));
+        assert!(!result.to_string().contains(CANARY));
+        result
+    };
+    let visible = usages(false);
+    assert_eq!(visible["usages"][0]["link_id"], link["link_id"]);
+    assert_eq!(visible["usages"][0]["project_name"], "fixture");
+    assert_eq!(visible["usages"][0]["profile_name"], "dev");
+    assert_eq!(visible["usages"][0]["local_name"], "TOKEN");
+    assert_eq!(visible["usages"][0]["target_secret_name"], "GLOBAL_TOKEN");
+    let redacted = usages(true);
+    let usage = &redacted["usages"][0];
+    assert_eq!(usage["project_name"], privacy_alias("project", "fixture"));
+    assert_eq!(usage["profile_name"], privacy_alias("profile", "dev"));
+    assert_eq!(usage["local_name"], privacy_alias("secret", "TOKEN"));
+    assert_eq!(usage["target_secret_name"], privacy_alias("secret", "GLOBAL_TOKEN"));
+
+    for redact_names in [false, true] {
+        let request = envelope(
+            AgentMethod::ListDuplicates,
+            &json!({"store_path": fixture.scope.store_path, "redact_names": redact_names}),
+        );
+        let result = success(handle_list_duplicates(&request, &state));
+        let serialized = result.to_string();
+        assert!(!serialized.contains(CANARY));
+        assert!(!serialized.contains("dedup_tag"));
+        assert_eq!(result["groups"].as_array().unwrap().len(), 1);
+        let members = result["groups"][0]["members"].as_array().unwrap();
+        assert_eq!(members.len(), 2);
+        assert!(members.iter().any(|member| member["secret_id"] == target["secret_id"]));
+        let local_member = members.iter().find(|m| m["secret_id"] == local["secret_id"]).unwrap();
+        for (field, kind, name) in [
+            ("project_name", "project", "fixture"),
+            ("profile_name", "profile", "dev"),
+            ("name", "secret", "REPEAT_TOKEN"),
+        ] {
+            let expected = if redact_names { privacy_alias(kind, name) } else { name.into() };
+            assert_eq!(local_member[field], expected);
+        }
+    }
+
+    for confirmation in [None, Some("default"), Some("dev")] {
+        fixture.grant(&state, GrantAction::UnlinkSecret).await;
+        let request = crud_request(
+            AgentMethod::UnlinkSecret,
+            &fixture.scope,
+            json!({"local_name":"TOKEN", "confirmation":confirmation}),
+        );
+        let response = call_crud(&state, &request).await;
+        if confirmation == Some("dev") {
+            assert_eq!(success(response)["unlinked"], true);
+        } else {
+            assert_eq!(code(response), "ConfirmationFailed");
+            assert!(store.resolve_active_secret_link(PROJECT, PROFILE, "TOKEN")?.is_some());
+        }
+    }
+    assert_eq!(usages(false)["usages"], json!([]));
+
+    link_fixture_token(&state, &fixture).await;
+    for (unlink_all, confirmation, expected_error) in [
+        (false, None, Some("LinkedSecretInUse")),
+        (true, None, Some("ConfirmationFailed")),
+        (true, Some("default"), Some("ConfirmationFailed")),
+        (true, Some("dev"), None),
+    ] {
+        grant_scope(&state, &shared, GrantAction::DeleteSecret).await;
+        let request = crud_request(
+            AgentMethod::DeleteSecret,
+            &shared,
+            json!({
+                "secret_name":"GLOBAL_TOKEN", "source":"user-local",
+                "unlink_all":unlink_all, "confirmation":confirmation,
+            }),
+        );
+        let deletion = call_crud(&state, &request).await;
+        if let Some(error) = expected_error {
+            assert_eq!(code(deletion), error);
+            assert!(store.resolve_active_secret_link(PROJECT, PROFILE, "TOKEN")?.is_some());
+        } else {
+            assert_eq!(success(deletion)["unlinked_count"], 1);
+        }
+    }
+    assert_eq!(usages(false)["usages"], json!([]));
+    assert!(store.get_secret_link(PROJECT, PROFILE, "TOKEN")?.is_none());
+    assert!(
+        store
+            .get_active_secret(SHARED_PROJECT, &shared.profile_id, "GLOBAL_TOKEN", "user-local")?
+            .is_none()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn resolve_reference_obeys_shared_link_precedence_and_global_vault_lock()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::resolve::handle_resolve;
+
+    let fixture = Fixture::new()?;
+    apply_policy_with_master(&fixture.policy(), &MASTER, 1)?;
+    let state = fixture.state(GrantAction::SetSecret).await;
+    let shared = seed_shared_vault(&fixture, &state).await?;
+    set_link_fixture_value(&state, &shared, "GLOBAL_TOKEN", "user-local", CANARY).await;
+    link_fixture_token(&state, &fixture).await;
+    let store = fixture.store();
+    for (source, value) in [
+        ("team-managed", "team-fixture"),
+        ("user-local", "personal-fixture"),
+        ("machine-local", "machine-fixture"),
+    ] {
+        set_link_fixture_value(&state, &fixture.scope, "TOKEN", source, value).await;
+    }
+    fixture.grant(&state, GrantAction::ResolveReference).await;
+    let resolve = crud_request(
+        AgentMethod::ResolveReference,
+        &fixture.scope,
+        json!({"reference":"lk://dev/TOKEN", "policy_name":"dev"}),
+    );
+    for (source, expected) in
+        [("machine-local", "machine-fixture"), ("user-local", "personal-fixture")]
+    {
+        let result = success(handle_resolve(&resolve, &state, NOW).await);
+        assert_eq!(result["value"], expected);
+        let secret = store.get_active_secret(PROJECT, PROFILE, "TOKEN", source)?.unwrap();
+        store.tombstone_secret(&secret.id, 2_000)?;
+    }
+    let linked = success(handle_resolve(&resolve, &state, NOW).await);
+    assert_eq!(linked["value"], CANARY);
+
+    state.unlock_cache.lock().await.evict(SHARED_PROJECT);
+    let locked = handle_resolve(&resolve, &state, NOW).await;
+    assert!(!serde_json::to_string(&locked)?.contains(CANARY));
+    assert_eq!(code(locked), "UnlockRequired");
+
+    fixture.grant(&state, GrantAction::UnlinkSecret).await;
+    let unlink =
+        crud_request(AgentMethod::UnlinkSecret, &fixture.scope, json!({"local_name":"TOKEN"}));
+    assert_eq!(success(call_crud(&state, &unlink).await)["unlinked"], true);
+    fixture.grant(&state, GrantAction::ResolveReference).await;
+    let team = success(handle_resolve(&resolve, &state, NOW).await);
+    assert_eq!(team["value"], "team-fixture");
     Ok(())
 }

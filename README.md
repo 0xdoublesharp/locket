@@ -56,7 +56,7 @@ Start with a personal Global Vault (`@shared`) in one click, or connect any repo
 ## Why Locket
 
 - 🔐 **Encrypted local vault**: Your secrets stay sealed at rest and unlock only when you ask.
-- 🌐 **Global Vault (`@shared`) and MCP**: Store personal API keys once and use them across projects, terminals, and AI tools via `locket mcp`.
+- 🌐 **Global Vault (`@shared`) and MCP**: Store personal API keys once, link them under each project’s variable names, and use them from terminals and AI tools via `locket mcp`.
 - 🎯 **Capability-scoped delivery**: `locket run`, `locket exec`, Docker, and Compose helpers inject secrets into one child process.
 - 📋 **Explicit command policies**: Declare which secrets a command may receive, and Locket enforces the rule.
 - 🧭 **Project and profile workflows**: Keep `dev`, `staging`, and per-machine secrets cleanly separated.
@@ -182,6 +182,22 @@ locket use staging
 ```
 
 Secret names use portable environment-variable syntax, such as `DATABASE_URL` or `STRIPE_SECRET_KEY`. Secret values are not accepted as command-line arguments; use stdin for writes so values do not land in shell history or process listings.
+
+### Share One Value Across Projects
+
+If two projects use the same RPC credential, promote one copy to your Global Vault and link both projects to it. Initialize `@shared` once and run the remaining commands from a project that already has `RPC_URL`.
+
+```bash
+locket shared init
+locket duplicates
+locket promote RPC_URL --as ALCHEMY_MAINNET_RPC --consolidate-duplicates
+locket shared usages ALCHEMY_MAINNET_RPC
+locket shared rotate ALCHEMY_MAINNET_RPC
+```
+
+Each linked project keeps its own variable name. A command policy that requires `RPC_URL` gets the current Global Vault value on its next run. Add another project with `locket link RPC_URL @shared/ALCHEMY_MAINNET_RPC`, or remove its link with `locket unlink RPC_URL`.
+
+In the desktop app, open **Secrets** in the project environment to promote a local value or link to an existing Global Vault entry. Switch to **Global Vault** to inspect linked projects and rotate the value. Personal links and the keyed duplicate index stay on the machine where they were created. [Shared links, import options, and source precedence](docs/specs/project-cli.md#global-vault-links-and-duplicate-values)
 
 ### Policies And Execution
 

@@ -38,6 +38,8 @@ pub struct SyncStatus {
     pub credential_mode: Option<String>,
     pub owner_fingerprint: Option<String>,
     pub published: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     pub applied: usize,
 }
 /// # Errors
@@ -293,7 +295,7 @@ pub fn sync_folder_guarded(
         let signing = storage.for_signing().load(&local.fingerprint)?;
         // Retry already queued ciphertext even when a newer publication cannot be prepared.
         let initial_delivery = flush_to(store, project, transport)?;
-        super::publish_guarded(
+        let publication = super::publish_with_warnings(
             store,
             project,
             master,
@@ -308,6 +310,7 @@ pub fn sync_folder_guarded(
         )?;
         let mut result = status(store, project)?;
         result.published = published;
+        result.warnings = publication.warnings;
         return Ok(result);
     }
     let sealing = storage.load(&local.id)?;

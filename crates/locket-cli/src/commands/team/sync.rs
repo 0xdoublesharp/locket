@@ -348,8 +348,13 @@ pub fn publish(context: &RuntimeContext, output: &mut impl Write) -> Result<(), 
     .map_err(failure)?;
     let profiles = team_sync::shared_profile_ids(&store, project).map_err(failure)?;
     confirm_dangerous_sharing(context, output, &store, project, &profiles)?;
-    let queued =
-        team_sync::publish(&mut store, project, &master, &signer, now()?).map_err(failure)?;
+    let publication =
+        team_sync::publish_with_warnings(&mut store, project, &master, &signer, now()?, None)
+            .map_err(failure)?;
+    for warning in publication.warnings {
+        writeln!(output, "warning: {warning}")?;
+    }
+    let queued = publication.queued;
     let written =
         team_sync::flush_outbox_with_master(&store, project, Some(&master)).map_err(failure)?;
     writeln!(
@@ -572,7 +577,14 @@ pub fn remove_authenticated(
         writeln!(output, "Rotate credentials at their providers: {}", rotate.join(", "))?;
     }
     // Membership and key changes are committed. A failed upload leaves delivery pending.
-    match team_sync::publish(store, project, &master, &signer, now()?)
+    let publication =
+        team_sync::publish_with_warnings(store, project, &master, &signer, now()?, None);
+    if let Ok(result) = &publication {
+        for warning in &result.warnings {
+            writeln!(output, "warning: {warning}")?;
+        }
+    }
+    match publication
         .and_then(|_| team_sync::flush_outbox_with_master(store, project, Some(&master)))
     {
         Ok(count) => writeln!(

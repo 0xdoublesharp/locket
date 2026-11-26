@@ -19,9 +19,10 @@ pub use pending::{
 };
 pub use prune::{PruneResult, prune_remote_packages};
 pub use snapshot::{
-    add_recipient, apply_package, apply_package_guarded, apply_package_with_consent_guarded,
-    initialize_owner, join_package_checkpoint, publish, publish_guarded, remove_member,
-    resolve_conflict, resume_pending_profiles_guarded, shared_profile_ids,
+    PublicationResult, add_recipient, apply_package, apply_package_guarded,
+    apply_package_with_consent_guarded, initialize_owner, join_package_checkpoint, publish,
+    publish_guarded, publish_with_warnings, remove_member, resolve_conflict,
+    resume_pending_profiles_guarded, shared_profile_ids,
 };
 #[derive(Debug, thiserror::Error)]
 pub enum SyncError {

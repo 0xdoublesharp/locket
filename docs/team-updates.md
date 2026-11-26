@@ -125,6 +125,8 @@ locket team sync now
 locket team sync disable
 ```
 
+Publishing warns when a shared profile contains personal Global Vault links. The warning lists the local variable names. Supply team-managed values for variables teammates or CI should receive in the package. Teammates can also set their own local copies. [Global Vault links and duplicate values](specs/project-cli.md#global-vault-links-and-duplicate-values)
+
 Status reports the last verified update. The backend can withhold newer updates. The owner retains exact encrypted packages in the outbox, and `locket team publish` restores missing files that are still recorded there. First-join packages must be unexpired. Established devices can verify older predecessors while keeping their pinned history, so retain the owner pin and history when investigating a rollback warning.
 
 Dangerous profiles require explicit local consent to automatic delivery and retain their per-run confirmation. Signed membership and key updates still advance while values wait encrypted. Save `--allow-dangerous` when configuring the backend to consent to automatic delivery on this machine. Re-importing a duplicate join package never releases held values.

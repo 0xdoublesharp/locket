@@ -43,9 +43,13 @@ directory_grants
 audit_log
 imported_audit_chains
 fingerprints
+secret_links
+local_value_fingerprints
 runtime_sessions
 schema_migrations
 ```
+
+The `secret_links` table maps a project, profile, and local variable name to one active Global Vault target. It contains no secret value. The `local_value_fingerprints` table indexes secret versions with tags keyed by the Global Vault fingerprint key. Both tables stay in the local database and are excluded from Team Sync, CI packages, and recovery and sealed bundle exports.
 
 Plaintext secret values must never be stored in SQLite, `config.toml`, generated files, app state, VS Code state, shell hook files, crash logs, or debug logs.
 

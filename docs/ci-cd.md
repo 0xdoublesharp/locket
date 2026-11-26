@@ -12,6 +12,8 @@ locket ci init-device --label deploy-runner --output-key-file ./deploy-runner.ke
 
 Save the key file's contents as a protected CI secret named `LOCKET_CI_IDENTITY`. Locket creates a new file atomically with mode `0600` on Unix. On Windows, use a directory with a private ACL. If you pass `--print-private-identity` in place of `--output-key-file`, stdout contains the private token in the JSON field `ci_identity`. Keep the token out of source control and CI logs.
 
+Store the variables the runner needs as team-managed values in the deployment profile. Personal Global Vault links and the local duplicate index stay on the publisher's machine.
+
 On the owner's machine, verify the full device fingerprint independently, then enroll the device with read-only access to the deployment profile, configure delivery, and publish.
 
 ```sh

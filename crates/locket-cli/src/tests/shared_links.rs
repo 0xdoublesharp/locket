@@ -1,44 +1,14 @@
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use clap::Parser;
-use locket_crypto::KeyBytes;
-use locket_platform::{MasterKeyStore, PlatformError};
-use zeroize::Zeroizing;
+use locket_platform::MasterKeyStore;
 
-use super::*;
+use super::{cross_project::ProjectKeys, *};
 use crate::{
     Cli, CliError, LOCKET_TOML, RuntimeContext, invalid_reference_error, run_with_context,
 };
-
-#[derive(Default)]
-struct SharedMemoryKeys(Mutex<BTreeMap<String, Zeroizing<KeyBytes>>>);
-
-impl MasterKeyStore for SharedMemoryKeys {
-    fn store_master_key(&self, id: &str, key: &KeyBytes) -> Result<(), PlatformError> {
-        self.0
-            .lock()
-            .map_err(|_| PlatformError::MemoryPoisoned)?
-            .insert(id.to_owned(), Zeroizing::new(*key));
-        Ok(())
-    }
-
-    fn load_master_key(&self, id: &str) -> Result<Zeroizing<KeyBytes>, PlatformError> {
-        self.0
-            .lock()
-            .map_err(|_| PlatformError::MemoryPoisoned)?
-            .get(id)
-            .cloned()
-            .ok_or(PlatformError::MasterKeyNotFound)
-    }
-
-    fn delete_master_key(&self, id: &str) -> Result<(), PlatformError> {
-        self.0.lock().map_err(|_| PlatformError::MemoryPoisoned)?.remove(id);
-        Ok(())
-    }
-}
 
 fn run_cli_args(context: &RuntimeContext, args: &[&str]) -> Result<String, CliError> {
     let mut output = Vec::new();
@@ -49,29 +19,29 @@ fn run_cli_args(context: &RuntimeContext, args: &[&str]) -> Result<String, CliEr
     Ok(String::from_utf8_lossy(&output).into_owned())
 }
 
-fn add_echo_policy(root: &Path, var_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let toml_path = root.join(LOCKET_TOML);
-    let mut content = fs::read_to_string(&toml_path)?;
-    #[cfg(unix)]
-    let cmd = format!(
-        "\n[commands.check]\nshell = \"printf '%s' \\\"${var_name}\\\"\"\nrequired_secrets = [\"{var_name}\"]\n"
-    );
-    #[cfg(windows)]
-    let cmd = format!(
-        "\n[commands.check]\nshell = \"echo %{var_name}%\"\nrequired_secrets = [\"{var_name}\"]\n"
-    );
-    content.push_str(&cmd);
-    fs::write(toml_path, content)?;
+fn add_check_policy(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let path = root.join(LOCKET_TOML);
+    let policy = fs::read_to_string(&path)?;
+    let argv = toml::Value::try_from(vec![
+        test_shell(),
+        "-c",
+        r#"printf '%s' "$RPC_URL" > received-rpc"#,
+    ])?;
+    fs::write(
+        path,
+        format!("{policy}\n[commands.check]\nargv={argv}\nrequired_secrets=['RPC_URL']\n"),
+    )?;
     Ok(())
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // Keep the cross-project sequence in one fixture.
 fn rpc_url_multi_repo_dedup_promote_rotate_import_link_and_unlink_delete()
 -> Result<(), Box<dyn std::error::Error>> {
     let workspace = tempfile::tempdir()?;
     let store_path = workspace.path().join("store.db");
     let config_path = workspace.path().join("config.toml");
-    let key_store: Arc<dyn MasterKeyStore + Send + Sync> = Arc::new(SharedMemoryKeys::default());
+    let key_store: Arc<dyn MasterKeyStore + Send + Sync> = Arc::new(ProjectKeys::default());
     let repo_a = workspace.path().join("foundry");
     let repo_b = workspace.path().join("frontend");
     let repo_c = workspace.path().join("indexer");
@@ -100,9 +70,9 @@ fn rpc_url_multi_repo_dedup_promote_rotate_import_link_and_unlink_delete()
     run_cli_args(&ctx_a, &["init", "--name", "foundry"])?;
     run_cli_args(&ctx_b, &["init", "--name", "frontend"])?;
     run_cli_args(&ctx_c, &["init", "--name", "indexer"])?;
-    add_echo_policy(&repo_a, "RPC_URL")?;
-    add_echo_policy(&repo_b, "MAINNET_RPC_URL")?;
-    add_echo_policy(&repo_c, "ETH_RPC_URL")?;
+    add_check_policy(&repo_a)?;
+    approve_test_policy(&ctx_a, "check")?;
+    let policy = fs::read(repo_a.join(LOCKET_TOML))?;
 
     // 1. Import identical RPC URL under different env var names in Repo A and Repo B.
     fs::write(repo_a.join(".env"), format!("RPC_URL={rpc_v1}\n"))?;
@@ -144,8 +114,16 @@ fn rpc_url_multi_repo_dedup_promote_rotate_import_link_and_unlink_delete()
         rpc_v1
     );
 
-    // 5. Rotate ONCE in @shared -> immediately reflected in BOTH Repo A and Repo B!
+    let received = repo_a.join("received-rpc");
+    run_cli_args(&ctx_a, &["run", "check"])?;
+    assert_eq!(fs::read_to_string(&received)?, rpc_v1);
+    fs::remove_file(&received)?;
+
+    // The same approved policy picks up the current Global Vault version.
     run_cli_args(&ctx_a, &["shared", "rotate", "ALCHEMY_MAINNET_RPC"])?;
+    run_cli_args(&ctx_a, &["run", "check"])?;
+    assert_eq!(fs::read_to_string(&received)?, rpc_v2);
+    assert_eq!(fs::read(repo_a.join(LOCKET_TOML))?, policy);
     assert_eq!(run_cli_args(&ctx_a, &["get", "RPC_URL", "--reveal", "--force"])?.trim(), rpc_v2);
     assert_eq!(
         run_cli_args(&ctx_b, &["get", "MAINNET_RPC_URL", "--reveal", "--force"])?.trim(),
@@ -186,5 +164,125 @@ fn rpc_url_multi_repo_dedup_promote_rotate_import_link_and_unlink_delete()
     assert!(run_cli_args(&ctx_a, &["get", "RPC_URL", "--reveal", "--force"]).is_err());
     assert!(run_cli_args(&ctx_b, &["get", "MAINNET_RPC_URL", "--reveal", "--force"]).is_err());
     assert!(run_cli_args(&ctx_c, &["get", "ETH_RPC_URL", "--reveal", "--force"]).is_err());
+    Ok(())
+}
+
+#[test]
+fn rotate_warns_about_other_projects_with_the_previous_value()
+-> Result<(), Box<dyn std::error::Error>> {
+    let workspace = tempfile::tempdir()?;
+    let source = workspace.path().join("source");
+    let peer = workspace.path().join("peer");
+    fs::create_dir(&source)?;
+    fs::create_dir(&peer)?;
+    let prior = "rotation-previous-value-canary";
+    let replacement = "rotation-replacement-value-canary";
+    let context = RuntimeContext {
+        cwd: source,
+        key_store: Arc::new(ProjectKeys::default()),
+        secret_value_reader: Arc::new(StaticSecretValueReader::new(prior)),
+        ..test_context(&workspace)
+    };
+    let peer_context = RuntimeContext { cwd: peer, ..context.clone() };
+
+    run_cli_args(&context, &["shared", "init"])?;
+    run_cli_args(&context, &["init", "--name", "rotation-source"])?;
+    run_cli_args(&peer_context, &["init", "--name", "rotation-peer"])?;
+    run_cli_args(&context, &["set", "TOKEN"])?;
+    run_cli_args(&peer_context, &["set", "OTHER_TOKEN"])?;
+
+    let replacement_context = RuntimeContext {
+        secret_value_reader: Arc::new(StaticSecretValueReader::new(replacement)),
+        ..context
+    };
+    let output = run_cli_args(&replacement_context, &["rotate", "TOKEN"])?;
+    assert!(!output.contains(prior));
+    assert!(!output.contains(replacement));
+    assert!(output.contains("rotated TOKEN"));
+    assert!(output.contains("warning:"));
+    assert!(output.contains("rotation-peer (dev) -> OTHER_TOKEN"));
+    assert!(output.contains("locket promote TOKEN --consolidate-duplicates"));
+    let second_rotation = run_cli_args(&replacement_context, &["rotate", "TOKEN"])?;
+    assert!(!second_rotation.contains("warning:"));
+    assert_eq!(
+        run_cli_args(&peer_context, &["get", "OTHER_TOKEN", "--reveal", "--force"])?.trim(),
+        prior,
+    );
+    Ok(())
+}
+
+#[test]
+fn mcp_shared_links_use_metadata_only_and_import_modes() -> Result<(), Box<dyn std::error::Error>> {
+    use serde_json::json;
+
+    let workspace = tempfile::tempdir()?;
+    let source = workspace.path().join("source");
+    let peer = workspace.path().join("peer");
+    fs::create_dir(&source)?;
+    fs::create_dir(&peer)?;
+    let shared_value = "mcp-global-vault-canary";
+    let repeat_value = "mcp-repeat-value-canary";
+    let context = RuntimeContext {
+        cwd: source,
+        key_store: Arc::new(ProjectKeys::default()),
+        secret_value_reader: Arc::new(StaticSecretValueReader::new(shared_value)),
+        ..test_context(&workspace)
+    };
+    let peer_context = RuntimeContext { cwd: peer, ..context.clone() };
+    run_cli_args(&context, &["shared", "init"])?;
+    run_cli_args(&context, &["shared", "set", "GLOBAL_RPC"])?;
+    run_cli_args(&context, &["init", "--name", "mcp-source"])?;
+    run_cli_args(&peer_context, &["init", "--name", "mcp-peer"])?;
+    fs::write(context.cwd.join(".env"), format!("DUPLICATE={repeat_value}\n"))?;
+    fs::write(
+        peer_context.cwd.join(".env"),
+        format!("RPC_URL={shared_value}\nPEER_DUPLICATE={repeat_value}\n"),
+    )?;
+
+    let call = |tool, args: serde_json::Value| -> Result<_, Box<dyn std::error::Error>> {
+        let payload = super::cross_project::mcp_call(&peer_context, tool, &args, None)?;
+        let serialized = payload.to_string();
+        assert!(!serialized.contains(shared_value));
+        assert!(!serialized.contains(repeat_value));
+        assert!(payload.get("dedup_tag").is_none());
+        assert_eq!(payload["metadata_only"], true);
+        Ok(payload)
+    };
+    run_cli_args(&context, &["import", ".env", "--keep"])?;
+    run_cli_args(&peer_context, &["import", ".env", "--keep", "--only", "PEER_DUPLICATE"])?;
+    let duplicates = call("locket_find_duplicates", json!({}))?;
+    assert_eq!(duplicates["group_count"], 1);
+    assert_eq!(duplicates["groups"][0]["count"], 2);
+    assert!(!duplicates.to_string().contains("dedup_tag"));
+
+    let linked = call(
+        "locket_link_secret",
+        json!({"project":"mcp-peer", "local_name":"MANUAL_RPC", "target_secret_name":"@shared/GLOBAL_RPC"}),
+    )?;
+    let usages = || call("locket_list_shared_usages", json!({"name":"GLOBAL_RPC"}));
+    assert_eq!(usages()?["usages"][0]["link_id"], linked["link_id"]);
+    assert_eq!(usages()?["usages"][0]["local_name"], "MANUAL_RPC");
+    let removed =
+        call("locket_unlink_secret", json!({"project":"mcp-peer", "local_name":"MANUAL_RPC"}))?;
+    assert_eq!(removed["unlinked"], true);
+    assert_eq!(usages()?["usage_count"], 0);
+
+    let imported = call(
+        "locket_import_env",
+        json!({"project":"mcp-peer", "path":".env", "only":["RPC_URL"], "link_shared":true}),
+    )?;
+    assert_eq!(imported["linked"], 1);
+    assert_eq!(imported["imported"], 0);
+    assert_eq!(usages()?["usages"][0]["local_name"], "RPC_URL");
+
+    fs::write(peer_context.cwd.join("promote.env"), format!("PROMOTED={repeat_value}\n"))?;
+    let promoted = call(
+        "locket_import_env",
+        json!({"project":"mcp-peer", "path":"promote.env", "promote_duplicates":true}),
+    )?;
+    assert_eq!(promoted["promoted"], 1);
+    assert_eq!(promoted["imported"], 0);
+    let usages = call("locket_list_shared_usages", json!({"name":"PROMOTED"}))?;
+    assert_eq!(usages["usages"][0]["local_name"], "PROMOTED");
     Ok(())
 }

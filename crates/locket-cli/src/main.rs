@@ -2385,16 +2385,24 @@ fn rotate_target(
     Ok((store, secret))
 }
 
+struct RotationResult {
+    source: String,
+    version: u32,
+    duplicate_matches: Vec<locket_store::DuplicateSecretMemberRecord>,
+}
+
 fn rotate_secret_value(
     context: &RuntimeContext,
     args: &RotateArgs,
     value: &str,
     timestamp: i64,
     grace_until: Option<i64>,
-) -> Result<(String, u32), CliError> {
+) -> Result<RotationResult, CliError> {
     validate_secret_value_str(value)?;
     let (mut store, secret) = rotate_target(context, args)?;
     commands::secrets::set::validate_write_metadata(&args.metadata, Some(value))?;
+    let duplicate_matches =
+        commands::secrets::lifecycle::rotation_duplicate_matches(&store, &secret)?;
     let keys = commands::secrets::set::SecretWriteKeys::load(
         context,
         &store,
@@ -2417,7 +2425,7 @@ fn rotate_secret_value(
     commands::secrets::links::try_record_cli_dedup_tag(
         context, &store, &secret.id, version, value, timestamp,
     );
-    Ok((secret.source, version))
+    Ok(RotationResult { source: secret.source, version, duplicate_matches })
 }
 
 struct CopySecretResult {

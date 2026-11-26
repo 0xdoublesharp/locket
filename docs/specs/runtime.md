@@ -93,9 +93,10 @@ Secret precedence:
 
 1. Machine-local secret in the active profile.
 2. User-local secret in the active profile.
-3. Team-managed secret in the active profile.
+3. Shared link in the active profile, resolved from the local Global Vault.
+4. Team-managed secret in the active profile.
 
-Precedence applies only when the same secret name exists in the same profile with different sources. Locket must show the source in list/history/diff/UI metadata so overrides are visible. Team-managed secrets are the default for team bundles; user-local and machine-local secrets are not exported unless explicitly requested.
+Precedence applies when the same secret name exists in the same profile with different sources. A selected shared link requires access to the Global Vault. If the vault is locked, resolution fails with `UnlockRequired`. Locket shows the source in metadata so users can identify overrides. Team bundles default to team-managed values and can include user-local and machine-local values when explicitly requested. Global Vault links stay local.
 
 Required secrets:
 

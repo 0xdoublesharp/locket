@@ -4,7 +4,9 @@ use std::io::Write;
 
 use locket_core::SecretName;
 use locket_crypto::KeyPurpose;
-use locket_store::{AuditContext, AuditWrite, ProfileRecord, Store};
+use locket_store::{
+    AuditContext, AuditWrite, DuplicateSecretMemberRecord, ProfileRecord, SecretRecord, Store,
+};
 use serde_json::json;
 
 use super::set::{confirm_write, select_target};
@@ -164,13 +166,56 @@ pub fn rotate_command(
     preflight_rotate_secret_value(context, args)?;
     let prompt = format!("rotate secret value for {}", args.key);
     let value = context.secret_value_reader.read_secret_value(&prompt)?;
-    let (source, version) =
-        rotate_secret_value(context, args, value.as_str(), timestamp, grace_until)?;
+    let result = rotate_secret_value(context, args, value.as_str(), timestamp, grace_until)?;
     if args.project.is_none() {
         refresh_example_for_project_if_enabled(context)?;
     }
-    writeln!(output, "rotated {} ({source}) version={version}", args.key)?;
+    writeln!(output, "rotated {} ({}) version={}", args.key, result.source, result.version)?;
+    if !result.duplicate_matches.is_empty() {
+        let matches = result
+            .duplicate_matches
+            .iter()
+            .map(|member| {
+                format!("{} ({}) -> {}", member.project_name, member.profile_name, member.name)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(
+            output,
+            "warning: these entries still hold the previous value: {matches}. Before rotating matching copies, use `locket promote {} --consolidate-duplicates` to link them to the Global Vault.",
+            args.key,
+        )?;
+    }
     Ok(())
+}
+
+pub fn rotation_duplicate_matches(
+    store: &Store,
+    secret: &SecretRecord,
+) -> Result<Vec<DuplicateSecretMemberRecord>, CliError> {
+    if secret.project_id.starts_with(crate::commands::discovery::SHARED_PROJECT_PREFIX)
+        || store
+            .resolve_active_secret_link(&secret.project_id, &secret.profile_id, &secret.name)?
+            .is_some()
+    {
+        return Ok(Vec::new());
+    }
+    let secret_id = &secret.id;
+    let version = secret.current_version;
+    let matches = store
+        .list_duplicate_value_groups()?
+        .into_iter()
+        .find(|group| {
+            group
+                .members
+                .iter()
+                .any(|member| &member.secret_id == secret_id && member.current_version == version)
+        })
+        .into_iter()
+        .flat_map(|group| group.members)
+        .filter(|member| member.project_id != secret.project_id)
+        .collect();
+    Ok(matches)
 }
 
 pub fn copy_command(
