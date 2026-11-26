@@ -41,6 +41,7 @@ export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--cfg=chacha20_backend=\"soft\" --cfg
 # Run each harness individually with a bounded per-harness timeout so CI logs
 # always record per-harness timing and never silently lose logs to runner kills.
 harness_timeout="${KANI_HARNESS_TIMEOUT:-300}"
+failures=0
 run_harness() {
     local pkg="$1"
     local harness="$2"
@@ -48,10 +49,10 @@ run_harness() {
     if command -v timeout >/dev/null 2>&1; then
         timeout --foreground "${harness_timeout}s" \
             cargo kani -Z stubbing -p "$pkg" --lib --target-dir "$work" \
-                --harness "$harness" --exact --output-format terse -j 1
+                --harness "$harness" --exact --output-format terse -j 1 || failures=$((failures + 1))
     else
         cargo kani -Z stubbing -p "$pkg" --lib --target-dir "$work" \
-            --harness "$harness" --exact --output-format terse -j 1
+            --harness "$harness" --exact --output-format terse -j 1 || failures=$((failures + 1))
     fi
 }
 
@@ -63,3 +64,8 @@ run_harness locket-core kani_proofs::a_single_acl_mismatch_denies_an_explicitly_
 run_harness locket-core kani_proofs::bounded_secret_names_match_the_ascii_grammar
 run_harness locket-core kani_proofs::bounded_reference_suffixes_parse_without_panics
 run_harness locket-core kani_proofs::bounded_acl_matching_is_panic_free
+
+if (( failures > 0 )); then
+    printf 'kani-check: %d harness(es) failed\n' "$failures" >&2
+    exit 1
+fi

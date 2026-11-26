@@ -57,7 +57,7 @@ fn embedded_nonce_and_ciphertext_require_exact_lengths() {
 
 #[kani::proof]
 #[kani::stub(zeroize::optimization_barrier, kani_optimization_barrier)]
-#[kani::unwind(40)]
+#[kani::unwind(68)]
 fn fixed_wrap_round_trips_and_rejects_a_flipped_tag_bit() {
     let key = [7; KEY_LEN];
     let nonce = [11; NONCE_LEN];
