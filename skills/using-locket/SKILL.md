@@ -11,6 +11,7 @@ Locket stores project and Global Vault (`@shared`) secrets locally and injects t
 
 - Keep secret values out of prompts, tool output, shell arguments, and logs. Never run `locket get --reveal`, `locket get --copy`, `cat .env`, `env`, `printenv`, `echo $VAR`, or `set -x` on secret-bearing files or shells.
 - Use metadata-only commands to inspect state: `locket --version`, `locket context`, `locket status`, `locket list`, `locket env keys <FILE>`, `locket env scan`, `locket parity`, `locket duplicates`, `locket shared usages <KEY>`, and `locket policy doctor`.
+- After updating Locket, check `locket agent status` for an agent version mismatch. If the running version differs, `locket agent restart` starts the daemon from the current CLI and clears unlocks and live grants.
 - Prefer Locket's MCP tools when the host exposes them (`locket_list_projects`, `locket_discover_secrets`, `locket_get_secret_metadata`, `locket_inspect_env_keys`, `locket_scan_env_files`, `locket_detect_commands`, `locket_import_env`, `locket_find_duplicates`, `locket_list_shared_usages`, `locket_link_secret`, `locket_unlink_secret`, `locket_list_project_policies`, and `locket_generate_secret`). Run `locket mcp config` to print host configuration snippets for Claude, Codex, or generic stdio clients.
 - Export `LOCKET_NO_PROMPT=1` in agent shells so interactive passphrase or confirmation prompts fail immediately instead of hanging on a PTY.
 
@@ -42,7 +43,7 @@ locket parity
 - Pass `--link-shared` to link exact matches already stored in `@shared`, or `--promote-duplicates` to promote repeated values across projects into `@shared` and link them back. Both flags fail closed if `@shared` is unavailable or locked.
 - `--dry-run` uses the same classification planner as real execution and reports `would_link`, `would_promote`, `linked_names`, `promoted_names`, and `duplicate_matches`.
 - When the user chooses to archive the source, use `locket import .env --archive <DIR>` in place of `--keep`. Locket writes a private plaintext backup and removes the source after importing every key. Use a directory outside the project or one ignored by Git.
-- Add `--archive-if-matching` to archive an already imported file when every skipped value matches its active vault value. Verifying a shared link requires both vaults to be unlocked. Filtered keys block archiving. Add `--dry-run` to check eligibility without writing. A blocked preview reports `delete_env: kept` and gives the reason in `archive_blocked` in text or `archive_blocked_reason` in JSON.
+- Add `--archive-if-matching` to archive an already imported file when every skipped value matches its active vault value. If the running agent reports the project vault is locked, use `locket unlock` before verifying. For shared links, also use `locket unlock --shared`. Filtered keys block archiving. Add `--dry-run` to check eligibility without writing. A blocked preview reports `delete_env: kept` and gives the reason in `archive_blocked` in text or `archive_blocked_reason` in JSON.
 - To promote, link, or unlink individual secrets after import:
 
 ```sh

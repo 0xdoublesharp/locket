@@ -12,6 +12,7 @@ use locket_crypto::KeyPurpose;
 use locket_store::{AuditWrite, RuntimeSessionSecretNameRetention, SCHEMA_VERSION};
 use serde_json::{Value, json};
 
+use crate::commands::agent::{agent_snapshot_version, request_status_snapshot};
 use crate::commands::config::spec::{CONFIG_KEY_SPECS, config_get_value, read_user_config};
 use crate::runtime::error::corrupt_db_error;
 use crate::{
@@ -431,10 +432,12 @@ fn collect_diagnostics(
         }
     }
 
+    let agent_snapshot = diagnostic_agent_snapshot(context);
     checks.push(check_agent_placeholder(context));
+    checks.push(check_agent_version_match(agent_snapshot.as_ref()));
     checks.push(check_agent_socket_path_matches_spec(context));
     checks.push(check_degraded_audit_log_perms(context));
-    checks.push(check_hardening(context));
+    checks.push(check_hardening(agent_snapshot.as_ref()));
     checks.push(check_degraded_audit_log(context));
     for check in SKIPPED_LOCKED_CHECKS {
         checks.push(DiagnosticCheck::skip(check, "locked-safe metadata-only invocation"));
@@ -726,6 +729,27 @@ fn check_agent_placeholder(context: &RuntimeContext) -> DiagnosticCheck {
     DiagnosticCheck::pass("agent_placeholder", status)
 }
 
+fn diagnostic_agent_snapshot(context: &RuntimeContext) -> Option<Value> {
+    #[cfg(all(test, windows))]
+    if context.agent_data_dir.is_none() {
+        return None;
+    }
+    request_status_snapshot(&agent_socket_path(context)).ok()
+}
+
+fn check_agent_version_match(snapshot: Option<&Value>) -> DiagnosticCheck {
+    const NAME: &str = "agent_version_match";
+    match snapshot.map(agent_snapshot_version) {
+        Some(env!("CARGO_PKG_VERSION")) => {
+            DiagnosticCheck::pass(NAME, "running agent matches the CLI version")
+        }
+        Some(_) => {
+            DiagnosticCheck::warn(NAME, "run `locket agent restart` to update the running agent")
+        }
+        None => DiagnosticCheck::skip(NAME, "agent is not running"),
+    }
+}
+
 /// Confirms the agent socket path follows the platform-specific spec
 /// described in `docs/specs/agent.md:18-21`:
 ///
@@ -948,11 +972,12 @@ fn check_degraded_audit_log_perms(context: &RuntimeContext) -> DiagnosticCheck {
     }
 }
 
-fn check_hardening(context: &RuntimeContext) -> DiagnosticCheck {
+fn check_hardening(agent_snapshot: Option<&Value>) -> DiagnosticCheck {
     let core_dumps = locket_platform::core_dump_hardening_state();
-    let daemon_core_dumps = crate::commands::agent::probe_agent_core_dump_hardening(context);
+    let daemon_core_dumps =
+        agent_snapshot.and_then(|snapshot| snapshot["core_dump_hardening"].as_str());
     let memory_lock = locket_platform::memory_lock_hardening_state();
-    let detail = daemon_core_dumps.as_deref().map_or_else(
+    let detail = daemon_core_dumps.map_or_else(
         || format!("core_dumps={core_dumps} memory_lock={memory_lock}"),
         |daemon| {
             format!("core_dumps={core_dumps} daemon_core_dumps={daemon} memory_lock={memory_lock}")
@@ -962,7 +987,7 @@ fn check_hardening(context: &RuntimeContext) -> DiagnosticCheck {
         core_dumps,
         locket_platform::CoreDumpHardening::Active | locket_platform::CoreDumpHardening::Suppressed
     );
-    let daemon_degraded = daemon_core_dumps.as_deref() == Some("degraded");
+    let daemon_degraded = daemon_core_dumps == Some("degraded");
     let memory_active = matches!(memory_lock, locket_platform::MemoryLockHardening::Active);
     if core_active && !daemon_degraded && memory_active {
         DiagnosticCheck::pass("hardening", detail)

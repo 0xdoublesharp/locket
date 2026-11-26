@@ -720,7 +720,7 @@ fn doctor_reports_locked_safe_diagnostics_and_exit_codes() -> Result<(), Box<dyn
     assert_eq!(doctor_metadata["fail_count"], 0);
     // Windows validates its named-pipe path above; Unix skips the socket check
     // when this isolated test has no agent data directory.
-    assert_eq!(doctor_metadata["skip_count"], if cfg!(windows) { 5 } else { 6 });
+    assert_eq!(doctor_metadata["skip_count"], if cfg!(windows) { 6 } else { 7 });
     assert!(
         doctor_metadata["check_names"]
             .as_array()
@@ -743,6 +743,7 @@ fn doctor_reports_locked_safe_diagnostics_and_exit_codes() -> Result<(), Box<dyn
     );
     assert!(!doctor_metadata.to_string().contains(directory.path().to_string_lossy().as_ref()));
     assert!(doctor_output.contains("pass degraded_audit_log: absent"));
+    assert!(doctor_output.contains("skip agent_version_match: agent is not running"));
     Ok(())
 }
 

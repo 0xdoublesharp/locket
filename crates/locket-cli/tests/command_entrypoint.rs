@@ -244,7 +244,7 @@ mod unix_tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn agent_binary_starts_reports_locked_and_shuts_down_its_daemon()
+    fn agent_binary_starts_restarts_and_shuts_down_its_daemon()
     -> Result<(), Box<dyn std::error::Error>> {
         struct StopAgent<'a>(&'a Path);
 
@@ -279,6 +279,22 @@ mod unix_tests {
             assert!(status.lines().any(|actual| actual == line), "{status}");
         }
         assert!(status.contains(&format!("pid: {pid}\n")));
+
+        let restart = run(&["agent", "restart"])?;
+        assert!(restart.status.success(), "{}", String::from_utf8_lossy(&restart.stderr));
+        let restart = String::from_utf8(restart.stdout)?;
+        assert!(restart.contains("agent: running\n"));
+        let new_pid = restart
+            .lines()
+            .find_map(|line| line.strip_prefix("pid: "))
+            .ok_or("missing restarted daemon PID")?
+            .parse::<u32>()?;
+        assert_ne!(pid, new_pid);
+        let status = run(&["agent", "status"])?;
+        assert!(status.status.success());
+        let status = String::from_utf8(status.stdout)?;
+        assert!(status.contains(&format!("pid: {new_pid}\n")));
+        assert!(status.contains(concat!("agent_version: ", env!("CARGO_PKG_VERSION"), "\n")));
 
         let stop = run(&["agent", "stop"])?;
         assert!(stop.status.success(), "{}", String::from_utf8_lossy(&stop.stderr));

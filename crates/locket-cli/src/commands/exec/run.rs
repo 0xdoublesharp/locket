@@ -1050,6 +1050,7 @@ pub(super) fn require_shared_policy_vaults_unlocked(
             profile,
             "the policy's project vault",
             "executing with shared secrets",
+            false,
         )?;
     }
     Ok(())
@@ -1060,6 +1061,7 @@ pub(in crate::commands) fn require_linked_secret_access(
     store: &Store,
     consumer: &ProfileRecord,
     secret: &SecretRecord,
+    consumer_unlock_verified: bool,
 ) -> Result<(), CliError> {
     if secret.project_id != consumer.project_id {
         require_vault_unlocked(
@@ -1074,6 +1076,7 @@ pub(in crate::commands) fn require_linked_secret_access(
             consumer,
             "the consuming project vault",
             "accessing shared secrets",
+            consumer_unlock_verified,
         )?;
     }
     Ok(())
@@ -1085,8 +1088,11 @@ fn require_consumer_vault_access(
     profile: &ProfileRecord,
     vault_name: &str,
     action: &str,
+    unlock_verified: bool,
 ) -> Result<(), CliError> {
-    require_vault_unlocked(context, &profile.project_id, vault_name, action)?;
+    if !unlock_verified {
+        require_vault_unlocked(context, &profile.project_id, vault_name, action)?;
+    }
     load_profile_key(context, store, &profile.project_id, &profile.id, KeyPurpose::ProfileSecret)?;
     Ok(())
 }

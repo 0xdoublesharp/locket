@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, onUnmounted, ref, watch } from 'vue';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { version as desktopVersion } from '../package.json';
 
 import AppIcon from './components/AppIcon.vue';
 import { formatTime } from './utils/formatTime';
@@ -165,6 +166,12 @@ const status = computed(() =>
     ? agentStatus.value
     : null,
 );
+const mismatchedAgentVersion = computed(() => {
+  const version = agentStatus.value?.agent_version;
+  return connected.value && version && /^\d+\.\d+\.\d+$/.test(version) && version !== desktopVersion
+    ? version
+    : null;
+});
 const activeContext = computed(() =>
   scopedProjectContext(agentStatus.value, selectedProject.value, connected.value),
 );
@@ -3137,6 +3144,18 @@ onUnmounted(() => {
         @retry="error ? refresh() : retryVariables()"
         @start="startAgent"
       />
+      <p
+        v-if="mismatchedAgentVersion"
+        role="status"
+        class="shell__notice shell__notice--warning"
+        data-testid="agent-version-warning"
+      >
+        <AppIcon name="alert" />
+        <span>
+          Running agent ({{ mismatchedAgentVersion }}) differs from Locket Desktop
+          ({{ desktopVersion }}). Run <code>locket agent restart</code> to update the agent.
+        </span>
+      </p>
       <p
         v-if="connected && agentStatus && !agentStatus.session_monitoring?.startsWith('active:')"
         role="status"

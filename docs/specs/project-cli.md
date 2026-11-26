@@ -179,6 +179,7 @@ Agent and shell:
 ```bash
 locket agent start
 locket agent status
+locket agent restart
 locket agent stop
 locket agent logs
 locket shellenv
@@ -189,7 +190,9 @@ locket deny
 
 `locket agent start` is idempotent. If a trusted agent for the current user is already running, it exits successfully after printing metadata-only status. If an agent socket or pid file exists but no live trusted process owns it, Locket removes the stale endpoint and starts a fresh agent. If another live or untrusted process owns the endpoint, it fails with `AgentSocketInUse`. Starting the agent does not unlock the vault by itself.
 
-`locket agent status` prints metadata only: running state, agent version, pid, socket or pipe path, lock state, unlock TTL remaining when available, live grant count, active project/profile when a project context is resolved, degraded hardening flags, and last error summary. `locket agent stop` asks the running trusted agent to clear unwrapped keys, revoke live grants, close subscriptions, remove its socket/pipe and pid file, and exit. It writes `LOCK` if key material was held and `AGENT_REVOKE` audit rows for grants revoked because of stop when project context is available. `locket agent logs` prints local redacted agent logs and does not require unlock; detailed log flags and retention live in [operations.md](operations.md).
+`locket agent status` prints metadata only: running state, agent and CLI versions, pid, socket or pipe path, lock state, unlock TTL remaining when available, live grant count, active project/profile when a project context is resolved, degraded hardening flags, and last error summary. After an update, `locket agent status`, `locket status`, and `locket doctor` surface a running agent version mismatch. Locket Desktop also warns when its version differs from the running agent.
+
+`locket agent restart` stops the running agent and starts a fresh daemon using the current CLI binary. Vaults start locked. `locket agent stop` asks the running trusted agent to clear unwrapped keys, revoke live grants, close subscriptions, remove its socket/pipe and pid file, and exit. It writes `LOCK` if key material was held and `AGENT_REVOKE` audit rows for grants revoked because of stop when project context is available. `locket agent logs` prints local redacted agent logs and does not require unlock. Detailed log flags and retention live in [operations.md](operations.md).
 
 Import and scanning:
 
@@ -209,7 +212,7 @@ locket install-hooks
 
 Use `locket import .env --link-shared` to link entries that exactly match an indexed Global Vault value. Use `--promote-duplicates` to create a Global Vault entry and link the incoming name when its value matches another project and the name is available in the Global Vault. Both options require an initialized Global Vault and access to its fingerprint key, including during `--dry-run`. The preview reports the same plan as a real import from the same starting state.
 
-Use `--archive <DIR>` to move the plaintext input into a uniquely named backup after importing every key. Add `--archive-if-matching` to allow skipped keys when every skipped value matches its active vault value, including when the entire file was already imported. Verifying a shared link requires both vaults to be unlocked. Filtered keys block archiving.
+Use `--archive <DIR>` to move the plaintext input into a uniquely named backup after importing every key. Add `--archive-if-matching` to allow skipped keys when every skipped value matches its active vault value, including when the entire file was already imported. If the running agent reports that the project vault is locked, run `locket unlock` before verifying values, including in a dry run. For a shared link, also unlock the Global Vault with `locket unlock --shared`. Filtered keys block archiving.
 
 With `--dry-run`, `delete_env` is `would-archive` when the file is eligible, and the filesystem stays unchanged. A blocked archive reports `delete_env: kept` and gives the reason in `archive_blocked` in text or `archive_blocked_reason` in JSON. Verification reports match counts and mismatch names without exposing values.
 

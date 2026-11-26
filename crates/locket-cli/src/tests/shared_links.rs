@@ -564,7 +564,7 @@ fn linked_cli_value_access_checks_the_live_agent_even_with_both_keys_available()
                 ),
             );
             for request in 0..9 {
-                if request == 5 {
+                if request == 6 {
                     let mut cache = state.unlock_cache.lock().await;
                     cache.evict(&consumer);
                     cache.insert(
@@ -602,8 +602,7 @@ fn linked_cli_value_access_checks_the_live_agent_even_with_both_keys_available()
     let source = workspace.path().join(".env");
     fs::write(&source, "RPC_URL=linked-fixture-value\n")?;
     let archive_args = ["import", ".env", "--archive", "backups", "--archive-if-matching"];
-    let preview_args = [&archive_args[..], &["--dry-run"]].concat();
-    let preview = run_cli_args(&context, &preview_args);
+    let preview = run_cli_args(&context, &[&archive_args[..], &["--dry-run"]].concat());
     let consumer_locked = run_cli_args(&context, &["get", "RPC_URL", "--reveal", "--force"]);
     let archive = run_cli_args(&context, &archive_args);
     server.join().map_err(|_| "agent socket fixture panicked")??;
@@ -611,14 +610,14 @@ fn linked_cli_value_access_checks_the_live_agent_even_with_both_keys_available()
         assert!(matches!(
             error,
             Some(CliError::Typed { kind: locket_core::LocketError::UnlockRequired, message })
-                if message.contains("Global Vault") && !message.contains("linked-fixture-value"),
+                if message.contains("locket unlock --shared") && !message.contains("linked-fixture-value"),
         ));
     }
-    for result in [consumer_locked, archive] {
+    for (result, hint) in [(consumer_locked, "consuming project"), (archive, "`locket unlock`")] {
         assert!(matches!(
             result,
             Err(CliError::Typed { kind: locket_core::LocketError::UnlockRequired, message })
-                if message.contains("consuming project") && !message.contains("linked-fixture-value"),
+                if message.contains(hint) && !message.contains("linked-fixture-value"),
         ));
     }
     assert!(source.is_file() && !workspace.path().join("backups").exists());

@@ -1,3 +1,4 @@
+import { version as desktopVersion } from '../../package.json';
 import type {
   AgentClientError,
   AgentConfigSettings,
@@ -292,7 +293,7 @@ export function createMockRuntime(params: URLSearchParams) {
       project_id: selected?.project_id ?? null,
       profile_name: selected?.profile_name ?? null,
       live_grant_count: ttl === null ? 0 : 1,
-      agent_version: '0.3.3',
+      agent_version: desktopVersion,
       unlock_ttl_seconds: ttl,
       running_session_count: selected
         ? sessions.filter((session) => session.state === 'running').length

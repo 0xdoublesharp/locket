@@ -1126,6 +1126,9 @@ fn import_archive_if_matching_previews_and_archives_an_already_imported_file()
         1000,
     )?;
 
+    // A missing endpoint still allows direct key access on Unix.
+    #[cfg(unix)]
+    let context = RuntimeContext { agent_data_dir: Some(outside.path().join("agent")), ..context };
     let args = [
         "import",
         ".env",
@@ -1137,6 +1140,15 @@ fn import_archive_if_matching_previews_and_archives_an_already_imported_file()
     ];
     let mut preview = args.to_vec();
     preview.extend(["--dry-run", "--json"]);
+    let no_key =
+        RuntimeContext { key_store: Arc::new(UnavailableMasterKeyStore), ..context.clone() };
+    let (code, report) = run_env_json(&no_key, &preview, &canaries)?;
+    assert_eq!(code, 72);
+    assert_eq!(report["error"]["code"], "UnlockRequired");
+    assert_eq!(
+        report["error"]["message"],
+        "unlock the project vault with `locket unlock` before verifying skipped values against the vault"
+    );
     let (code, report) = run_env_json(&context, &preview, &canaries)?;
     assert_eq!(code, 0);
     assert_eq!(report["skipped"], 2);
@@ -1168,6 +1180,121 @@ fn import_archive_if_matching_previews_and_archives_an_already_imported_file()
         use std::os::unix::fs::PermissionsExt as _;
         assert_eq!(fs::metadata(archived)?.permissions().mode() & 0o777, 0o600);
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct ImportTestKeyStore {
+    keys: MemoryMasterKeyStore,
+    loads: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(unix)]
+impl MasterKeyStore for ImportTestKeyStore {
+    fn store_master_key(
+        &self,
+        project_id: &str,
+        key: &locket_crypto::KeyBytes,
+    ) -> Result<(), PlatformError> {
+        self.keys.store_master_key(project_id, key)
+    }
+
+    fn load_master_key(
+        &self,
+        project_id: &str,
+    ) -> Result<zeroize::Zeroizing<locket_crypto::KeyBytes>, PlatformError> {
+        self.loads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.keys.load_master_key(project_id)
+    }
+
+    fn delete_master_key(&self, project_id: &str) -> Result<(), PlatformError> {
+        self.keys.delete_master_key(project_id)
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn import_archive_if_matching_refuses_a_live_locked_vault()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    let project = tempdir()?;
+    let archive = project.path().join("backups");
+    let source = project.path().join(".env");
+    let contents = b"TOKEN=archive-locked-fixture\n";
+    fs::write(&source, contents)?;
+    let key_store = Arc::new(ImportTestKeyStore::default());
+    let context = test_context_with_key_store(&project, key_store.clone());
+    // Seed shared metadata first so a premature fingerprint lookup will hit
+    // the test key store. The project created next retains an accessible key.
+    run_with_context(
+        Cli::try_parse_from(["locket", "shared", "init"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--no-device", "--no-passkey"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    run_with_context(
+        Cli::try_parse_from(["locket", "import", ".env", "--keep"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+
+    let agent = tempfile::Builder::new().prefix("a").rand_bytes(4).tempdir()?;
+    fs::set_permissions(agent.path(), fs::Permissions::from_mode(0o700))?;
+    let context = RuntimeContext { agent_data_dir: Some(agent.path().into()), ..context };
+    let socket = crate::agent_socket_path(&context);
+    let server =
+        super::agent_lifecycle::serve_status_requests(socket.clone(), env!("CARGO_PKG_VERSION"), 4);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !socket.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let project_id = crate::require_project(&context)?.config.project_id;
+    drop(key_store.load_master_key(project_id.as_str())?);
+    key_store.loads.store(0, Ordering::Relaxed);
+    let snapshot =
+        crate::commands::agent::request_project_status_snapshot(&socket, project_id.as_str())?;
+    assert_eq!(snapshot["project_id"], project_id.as_str());
+    assert_eq!(snapshot["lock_state"], "locked");
+
+    let args = ["locket", "import", ".env", "--archive", "backups", "--archive-if-matching"];
+    for extra in [&["--dry-run"][..], &["--dry-run", "--json"][..], &[][..]] {
+        let mut output = Vec::new();
+        let result = run_with_context(
+            Cli::try_parse_from(args.into_iter().chain(extra.iter().copied()))?,
+            &context,
+            &mut output,
+        );
+        if extra.contains(&"--json") {
+            assert_eq!(result?, 72);
+            let report: serde_json::Value = serde_json::from_slice(&output)?;
+            assert_eq!(report["error"]["code"], "UnlockRequired");
+            assert!(report["error"]["message"].as_str().is_some_and(|message| {
+                message.contains("unlock the project vault with `locket unlock`")
+            }));
+        } else {
+            let Err(error) = result else {
+                return Err("expected the live locked vault to block verification".into());
+            };
+            assert_eq!(error.exit_code(), 72);
+            assert!(matches!(
+                error,
+                crate::CliError::Typed { kind: locket_core::LocketError::UnlockRequired, .. }
+            ));
+            assert!(error.to_string().contains("unlock the project vault with `locket unlock`"));
+        }
+        assert!(fs::read(&source)?.as_slice() == contents, "source changed");
+        assert!(!archive.exists());
+        assert_eq!(key_store.loads.load(Ordering::Relaxed), 0);
+    }
+    server.join().map_err(|_| "serve thread panicked")??;
     Ok(())
 }
 

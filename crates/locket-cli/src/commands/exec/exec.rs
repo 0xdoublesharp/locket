@@ -159,7 +159,7 @@ fn resolve_exec_secrets(
                 error
             }
         })?;
-        require_linked_secret_access(context, store, profile, &secret)?;
+        require_linked_secret_access(context, store, profile, &secret, false)?;
         let source = if secret.project_id == profile.project_id {
             secret.source.clone()
         } else {

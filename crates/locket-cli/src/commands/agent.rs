@@ -1,4 +1,4 @@
-//! Agent command implementation (start/status/stop/logs).
+//! Agent command implementation (start/restart/status/stop/logs).
 
 use std::fs;
 use std::io::{self, Read, Seek, Write};
@@ -31,6 +31,10 @@ pub fn agent_command(
 ) -> Result<(), CliError> {
     match command {
         AgentCommand::Start(args) => agent_start_command(context, output, &args),
+        AgentCommand::Restart(args) => {
+            agent_stop_command(context, &mut io::sink())?;
+            agent_start_command(context, output, &args)
+        }
         AgentCommand::Status => agent_status_command(context, output),
         AgentCommand::Stop => agent_stop_command(context, output),
         AgentCommand::Logs(args) => agent_logs_command(context, output, &args),
@@ -377,13 +381,6 @@ fn session_monitoring_from_snapshot(snapshot: &Value) -> Option<String> {
     snapshot.get("session_monitoring").and_then(Value::as_str).map(str::to_owned)
 }
 
-pub fn probe_agent_core_dump_hardening(context: &RuntimeContext) -> Option<String> {
-    let _pid = read_running_pid(context).ok()??;
-    let socket_path = agent_socket_path(context);
-    let snapshot = request_status_snapshot(&socket_path).ok()?;
-    snapshot.get("core_dump_hardening").and_then(Value::as_str).map(ToOwned::to_owned)
-}
-
 fn agent_status_command(context: &RuntimeContext, output: &mut impl Write) -> Result<(), CliError> {
     let pid_path = agent_pid_path(context);
     let socket_path = agent_socket_path(context);
@@ -651,6 +648,19 @@ fn read_recorded_pid(context: &RuntimeContext) -> Result<Option<u32>, CliError> 
     Ok(raw.as_deref().and_then(parse_pid))
 }
 
+pub(super) fn agent_snapshot_version(snapshot: &Value) -> &str {
+    snapshot.get("agent_version").and_then(Value::as_str).unwrap_or("unknown")
+}
+
+pub(super) fn agent_version_mismatch_warning(agent_version: &str) -> Option<String> {
+    let cli_version = env!("CARGO_PKG_VERSION");
+    (!agent_version.is_empty() && agent_version != "unknown" && agent_version != cli_version).then(
+        || format!(
+            "running agent ({agent_version}) differs from CLI ({cli_version}); run `locket agent restart` to update the running daemon"
+        ),
+    )
+}
+
 fn write_agent_status_snapshot(output: &mut impl Write, snapshot: &Value) -> Result<(), io::Error> {
     let lock_state = snapshot.get("lock_state").and_then(Value::as_str).unwrap_or("unknown");
     writeln!(output, "lock_state: {lock_state}")?;
@@ -659,12 +669,17 @@ fn write_agent_status_snapshot(output: &mut impl Write, snapshot: &Value) -> Res
     }
     let live_grants = snapshot.get("live_grant_count").and_then(Value::as_u64).unwrap_or(0);
     writeln!(output, "live_grants: {live_grants}")?;
-    let version = snapshot.get("agent_version").and_then(Value::as_str).unwrap_or("unknown");
+    let version = agent_snapshot_version(snapshot);
     writeln!(output, "agent_version: {version}")?;
     write_session_monitoring_status(
         output,
         snapshot.get("session_monitoring").and_then(Value::as_str),
     )?;
+    writeln!(output, "cli_version: {}", env!("CARGO_PKG_VERSION"))?;
+    if let Some(warning) = agent_version_mismatch_warning(version) {
+        writeln!(output, "agent_version_mismatch: yes")?;
+        writeln!(output, "warning: {warning}")?;
+    }
     Ok(())
 }
 
@@ -775,7 +790,7 @@ pub fn request_project_status_snapshot(
     #[cfg(not(any(unix, target_os = "windows")))]
     {
         let _ = (endpoint, project_id);
-        Err(io::Error::other("agent transport is unavailable"))
+        Err(io::Error::new(io::ErrorKind::Unsupported, "agent transport is unavailable"))
     }
 }
 

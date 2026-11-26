@@ -16,8 +16,9 @@ use super::*;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
-fn serve_status_requests(
+pub(super) fn serve_status_requests(
     socket_path: PathBuf,
+    version: &'static str,
     count: usize,
 ) -> std::thread::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
     std::thread::spawn(move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -27,12 +28,16 @@ fn serve_status_requests(
 
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         runtime.block_on(async move {
-            let listener =
-                bind_socket_listener(&AgentSocketConfig::new(socket_path, "test-version"))?;
-            let state = AgentSocketState::locked("test-version");
+            let listener = bind_socket_listener(&AgentSocketConfig::new(socket_path, version))?;
+            let state = AgentSocketState::locked(version);
             for _ in 0..count {
-                let (stream, _) = listener.accept().await?;
-                let _outcome = handle_connection(stream, state.clone()).await;
+                let (stream, _) =
+                    tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
+                let _outcome = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    handle_connection(stream, state.clone()),
+                )
+                .await?;
             }
             Ok(())
         })
@@ -92,7 +97,7 @@ fn status_json_reports_a_running_agent_and_project_lock_state()
         &mut Vec::new(),
     )?;
     let socket_path = crate::agent_socket_path(&outside);
-    let serve_thread = serve_status_requests(socket_path.clone(), 2);
+    let serve_thread = serve_status_requests(socket_path.clone(), "test-version", 2);
     let deadline = Instant::now() + Duration::from_secs(3);
     while !socket_path.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(25));
@@ -131,7 +136,7 @@ fn agent_start_preserves_live_socket_without_pid_file()
     let socket_path = crate::agent_socket_path(&context);
     let pid_path = crate::agent_pid_path(&context);
 
-    let serve_thread = serve_status_requests(socket_path.clone(), 2);
+    let serve_thread = serve_status_requests(socket_path.clone(), "test-version", 2);
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
         if socket_path.exists() {
@@ -172,7 +177,7 @@ fn agent_status_reports_a_live_endpoint_without_a_pid_file()
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))?;
     let context = test_context(&directory);
     let socket = crate::agent_socket_path(&context);
-    let server = serve_status_requests(socket.clone(), 2);
+    let server = serve_status_requests(socket.clone(), "test-version", 2);
     let deadline = Instant::now() + Duration::from_secs(3);
     while !socket.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
@@ -187,6 +192,66 @@ fn agent_status_reports_a_live_endpoint_without_a_pid_file()
     assert!(output.contains("lock_state: locked"), "{output}");
     read_status_snapshot(&socket)?;
     server.join().map_err(|_| "serve thread panicked")??;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn running_agent_version_is_checked_by_status_and_doctor()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = tempdir()?;
+    let context = test_context(&project);
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--no-device", "--no-passkey"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+
+    for (version, mismatched) in [("0.3.0", true), (env!("CARGO_PKG_VERSION"), false)] {
+        let agent = tempfile::Builder::new().prefix("a").rand_bytes(4).tempdir()?;
+        fs::set_permissions(agent.path(), fs::Permissions::from_mode(0o700))?;
+        let context =
+            RuntimeContext { agent_data_dir: Some(agent.path().into()), ..context.clone() };
+        let socket = crate::agent_socket_path(&context);
+        let server = serve_status_requests(socket.clone(), version, 3);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !socket.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(socket.exists(), "test agent did not bind socket within deadline");
+
+        let run = |args: &[&str]| -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+            let mut output = Vec::new();
+            run_with_context(
+                Cli::try_parse_from(std::iter::once("locket").chain(args.iter().copied()))?,
+                &context,
+                &mut output,
+            )?;
+            Ok(String::from_utf8(output)?)
+        };
+        let agent_status = run(&["agent", "status"][..])?;
+        assert!(agent_status.contains(&format!("agent_version: {version}\n")));
+        assert!(agent_status.contains(concat!("cli_version: ", env!("CARGO_PKG_VERSION"), "\n")));
+        assert_eq!(agent_status.contains("agent_version_mismatch: yes\n"), mismatched);
+        let project_status = run(&["status"][..])?;
+        assert!(project_status.contains(&format!("agent_version: {version}\n")));
+        let warning = format!("warning: running agent ({version}) differs from CLI");
+        for output in [&agent_status, &project_status] {
+            assert_eq!(output.contains(&warning), mismatched);
+            assert_eq!(output.contains("run `locket agent restart`"), mismatched);
+        }
+        let doctor = run(&["doctor"][..])?;
+        if mismatched {
+            assert!(doctor.contains(
+                "warn agent_version_match: run `locket agent restart` to update the running agent\n"
+            ));
+        } else {
+            assert!(doctor.contains("pass agent_version_match:"));
+        }
+        server.join().map_err(|_| "serve thread panicked")??;
+    }
     Ok(())
 }
 

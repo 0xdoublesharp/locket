@@ -6,7 +6,10 @@ use std::path::Path;
 use locket_store::ProfileRecord;
 use serde_json::{Value, json};
 
-use crate::commands::agent::{request_project_status_snapshot, request_status_snapshot};
+use crate::commands::agent::{
+    agent_snapshot_version, agent_version_mismatch_warning, request_project_status_snapshot,
+    request_status_snapshot,
+};
 use crate::commands::config::spec::read_user_config;
 use crate::commands::discovery::{global_vault_project, read_metadata_store};
 use crate::commands::scan::scanner;
@@ -171,6 +174,13 @@ pub fn status_with_scan(
     let agent_state = if snapshot.is_some() { "running" } else { "unavailable" };
     writeln!(output, "agent: {agent_state}")?;
     writeln!(output, "agent_state: {agent_state}")?;
+    if let Some(snapshot) = &snapshot {
+        let version = agent_snapshot_version(snapshot);
+        writeln!(output, "agent_version: {version}")?;
+        if let Some(warning) = agent_version_mismatch_warning(version) {
+            writeln!(output, "warning: {warning}")?;
+        }
+    }
     writeln!(output, "running_sessions: {running_sessions}")?;
     write_secret_expiry_summary(&store, resolved.config.project_id.as_str(), output)?;
     match scan_warning_count {

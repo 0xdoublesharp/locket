@@ -36,6 +36,7 @@ use super::set::{
     NewSecret, Rotation, SecretWriteKeys, WriteTarget, confirm_write, create_value, rotate_value,
     select_target,
 };
+use crate::commands::agent::request_project_status_snapshot;
 use crate::commands::discovery::{
     require_metadata_store, trusted_project_configs, write_json_result,
 };
@@ -507,13 +508,14 @@ fn run_import(
     // Plan from the same pre-write snapshot for both reports. Real imports keep
     // the plan and its writes in a single transaction.
     let plan_and_apply = |store: &mut Store| {
-        let planner = ImportPlanner::load(context, store, target, source, options)?;
+        let mut planner = ImportPlanner::load(context, store, target, source, options)?;
         let mut profile_names =
             active_profile_secret_names(store, &target.project.id, &target.profile.id)?;
-        let plan = planner.plan(store, &values)?;
+        let mut plan = planner.plan(store, &values)?;
         let verify_skipped = matches!(options.archive, Some(ArchivePolicy::VerifySkipped))
             && filtered_out_names.is_empty();
         let counts = planner.summarize(context, store, &values, &plan.actions, verify_skipped)?;
+        planner.collect_passive_duplicate_matches(context, store, &values, &mut plan)?;
         profile_names
             .extend(counts.imported.iter().chain(&counts.linked).chain(&counts.promoted).cloned());
         if !options.dry_run {
@@ -631,7 +633,9 @@ impl<'a> ImportPlanner<'a> {
         } else {
             None
         };
-        let shared_fp_key = try_load_shared_fingerprint_key_non_interactive(context, store);
+        let shared_fp_key = shared_profile
+            .as_ref()
+            .and_then(|_| try_load_shared_fingerprint_key_non_interactive(context, store));
         if shared_profile.is_some() && shared_fp_key.is_none() {
             return Err(typed_cli_error(
                 LocketError::UnlockRequired,
@@ -652,16 +656,7 @@ impl<'a> ImportPlanner<'a> {
             let project_id = &self.target.project.id;
             let profile_id = &self.target.profile.id;
             let existing = store.get_secret_by_source(project_id, profile_id, name, self.source)?;
-            let mut matches = self
-                .shared_fp_key
-                .as_ref()
-                .map(|key| {
-                    find_duplicate_matches_for_value(
-                        store, key, project_id, profile_id, name, value,
-                    )
-                })
-                .transpose()?
-                .unwrap_or_default();
+            let matches = self.duplicate_matches(store, name, value)?;
             let action = match &self.shared_profile {
                 Some(profile) => self.plan_shared(store, profile, name, &matches)?,
                 None => None,
@@ -686,9 +681,46 @@ impl<'a> ImportPlanner<'a> {
                 }
                 (None, None) => ImportAction::Import,
             });
-            plan.duplicate_matches.append(&mut matches);
+            plan.duplicate_matches.extend(matches);
         }
         Ok(plan)
+    }
+
+    fn collect_passive_duplicate_matches(
+        &mut self,
+        context: &RuntimeContext,
+        store: &Store,
+        values: &[(String, Zeroizing<String>)],
+        plan: &mut ImportPlan,
+    ) -> Result<(), CliError> {
+        // Optional duplicate hints do not affect the plan. Defer their keychain lookup
+        // until skipped values have passed the vault unlock checks.
+        if self.shared_profile.is_none() {
+            self.shared_fp_key = try_load_shared_fingerprint_key_non_interactive(context, store);
+            if self.shared_fp_key.is_some() {
+                for (name, value) in values {
+                    plan.duplicate_matches.extend(self.duplicate_matches(store, name, value)?);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn duplicate_matches(
+        &self,
+        store: &Store,
+        name: &str,
+        value: &str,
+    ) -> Result<Vec<CliDuplicateMatch>, CliError> {
+        let Some(key) = &self.shared_fp_key else { return Ok(Vec::new()) };
+        find_duplicate_matches_for_value(
+            store,
+            key,
+            &self.target.project.id,
+            &self.target.profile.id,
+            name,
+            value,
+        )
     }
 
     fn plan_shared(
@@ -767,12 +799,23 @@ impl<'a> ImportPlanner<'a> {
         verify_skipped: bool,
     ) -> Result<ImportNames, CliError> {
         let mut names = ImportNames::default();
+        let mut consumer_unlock_verified = None;
+        let mut checked_shared_projects = BTreeSet::new();
         for ((name, value), action) in values.iter().zip(actions) {
             match action {
                 ImportAction::Import => &mut names.imported,
                 ImportAction::Overwrite(_) => &mut names.overwritten,
                 ImportAction::Skip(target) => {
                     if verify_skipped {
+                        let consumer = &self.target.profile;
+                        let unlock_verified = if let Some(verified) = consumer_unlock_verified {
+                            verified
+                        } else {
+                            let verified =
+                                verify_import_vault_unlock(context, &consumer.project_id)?;
+                            consumer_unlock_verified = Some(verified);
+                            verified
+                        };
                         let resolved;
                         let secret = match target {
                             SkipTarget::Source(secret) => secret.as_ref(),
@@ -788,7 +831,18 @@ impl<'a> ImportPlanner<'a> {
                                 &resolved
                             }
                         };
-                        require_linked_secret_access(context, store, &self.target.profile, secret)?;
+                        if secret.project_id != consumer.project_id
+                            && checked_shared_projects.insert(secret.project_id.clone())
+                        {
+                            require_linked_secret_access(
+                                context,
+                                store,
+                                consumer,
+                                secret,
+                                unlock_verified,
+                            )
+                            .map_err(import_verification_key_error)?;
+                        }
                         let vault_value = decrypt_secret_version(
                             context,
                             store,
@@ -796,7 +850,8 @@ impl<'a> ImportPlanner<'a> {
                             &secret.profile_id,
                             secret,
                             secret.current_version,
-                        )?;
+                        )
+                        .map_err(import_verification_key_error)?;
                         if equal_value_bytes(value.as_bytes(), vault_value.as_bytes()) {
                             names.verified_matching.insert(name.clone());
                         } else {
@@ -812,6 +867,55 @@ impl<'a> ImportPlanner<'a> {
         }
         Ok(names)
     }
+}
+
+fn verify_import_vault_unlock(
+    context: &RuntimeContext,
+    project_id: &str,
+) -> Result<bool, CliError> {
+    #[cfg(test)]
+    if context.agent_data_dir.is_none() {
+        return Ok(false);
+    }
+    match request_project_status_snapshot(&crate::agent_socket_path(context), project_id) {
+        Ok(snapshot)
+            if snapshot["project_id"].as_str() == Some(project_id)
+                && snapshot["lock_state"].as_str() == Some("unlocked") =>
+        {
+            Ok(true)
+        }
+        Ok(_) => Err(import_verification_unlock_required()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound
+                    | io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::Unsupported
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(_) => Err(typed_cli_error(
+            LocketError::AgentUnavailable,
+            "could not verify the project vault unlock with the running agent",
+        )),
+    }
+}
+
+fn import_verification_key_error(error: CliError) -> CliError {
+    match error {
+        CliError::Platform(locket_platform::PlatformError::MasterKeyNotFound) => {
+            import_verification_unlock_required()
+        }
+        _ => error,
+    }
+}
+
+fn import_verification_unlock_required() -> CliError {
+    typed_cli_error(
+        LocketError::UnlockRequired,
+        "unlock the project vault with `locket unlock` before verifying skipped values against the vault",
+    )
 }
 
 fn equal_value_bytes(left: &[u8], right: &[u8]) -> bool {

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { invoke, type InvokeArgs } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { version as desktopVersion } from '../package.json';
 import App from './App.vue';
 import type {
   AgentStatus,
@@ -113,6 +114,7 @@ const revealed = (value = 'fixture-plaintext'): RevealResponse => ({ value, ttl_
 
 let nativeSelection: DesktopProjectContext | null;
 let lockState: AgentStatus['lock_state'];
+let agentVersion: string;
 let sessionMonitoring: string | undefined;
 let windowEvents: EventTarget;
 let calls: string[];
@@ -141,7 +143,7 @@ async function nativeInvoke(command: string, args?: InvokeArgs): Promise<unknown
         project_id: nativeSelection?.project_id ?? null,
         profile_name: nativeSelection?.profile_name ?? null,
         live_grant_count: 0,
-        agent_version: 'test',
+        agent_version: agentVersion,
         unlock_ttl_seconds: 900,
         running_session_count: 0,
         scan_warning_count: 0,
@@ -204,6 +206,7 @@ beforeEach(() => {
   vi.resetAllMocks();
   nativeSelection = null;
   lockState = 'unlocked';
+  agentVersion = 'test';
   sessionMonitoring = 'active: macOS native notifications';
   calls = [];
   overrides = new Map();
@@ -939,6 +942,28 @@ describe('vault unlock in the mounted app', () => {
     expect(findNode(dialog!, (node) => node.props.role === 'alert')).toBeUndefined();
     expect(calls).not.toContain('agent_unlock');
   });
+});
+
+it('warns about an outdated agent until it reports the desktop version', async () => {
+  agentVersion = '0.3.0';
+  const app = await connectedApp();
+  const warning = () =>
+    findNode(app.root, (node) => node.props['data-testid'] === 'agent-version-warning');
+  expect(warning()).toBeDefined();
+  expect(nodeText(warning()!)).toContain(
+    `Running agent (0.3.0) differs from Locket Desktop (${desktopVersion}).`,
+  );
+  expect(nodeText(warning()!)).toContain('locket agent restart');
+
+  agentVersion = desktopVersion;
+  await app.state.refresh();
+  await settle();
+  expect(warning()).toBeUndefined();
+
+  agentVersion = 'isolated-desktop-agent';
+  await app.state.refresh();
+  await settle();
+  expect(warning()).toBeUndefined();
 });
 
 describe('automatic locking availability', () => {

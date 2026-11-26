@@ -1135,6 +1135,8 @@ pub(crate) struct CopyArgs {
 enum AgentCommand {
     /// Start the local agent.
     Start(AgentStartArgs),
+    /// Restart the local agent using this CLI binary.
+    Restart(AgentStartArgs),
     /// Print agent status.
     Status,
     /// Stop the local agent.

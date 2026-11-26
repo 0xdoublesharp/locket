@@ -214,6 +214,7 @@ fn decrypt_access_secret(
         &store,
         &target.profile,
         secret,
+        false,
     )?;
     decrypt_secret_version(
         context,
