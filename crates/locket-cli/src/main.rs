@@ -29,9 +29,9 @@ pub(crate) use runtime::prompts::{
 };
 
 pub(crate) use support::project_files::{
-    EXAMPLE_FILE, GITIGNORE_ENTRIES, GITIGNORE_FILE, collect_example_secret_names,
-    config_bool_value, ensure_gitignore, refresh_example_for_project_if_enabled,
-    write_example_block, write_example_block_for_emit, write_example_emit_audit,
+    EXAMPLE_FILE, GITIGNORE_FILE, collect_example_secret_names, config_bool_value,
+    ensure_gitignore, refresh_example_for_project_if_enabled, write_example_block,
+    write_example_block_for_emit, write_example_emit_audit,
 };
 #[cfg(test)]
 pub(crate) use support::secret_helpers::resolve_pinned_version;
