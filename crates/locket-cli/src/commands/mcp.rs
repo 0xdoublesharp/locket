@@ -599,7 +599,15 @@ fn import_env(context: &RuntimeContext, args: ImportEnvArgs) -> Result<Value, Cl
         dry_run: args.dry_run,
         link_shared: args.link_shared,
         promote_duplicates: args.promote_duplicates,
-        confirmed_profile: args.confirm_dangerous.then(|| target.profile.name.clone()),
+        confirmed_profiles: if args.confirm_dangerous {
+            let mut profiles = vec![target.profile.name.clone()];
+            if args.promote_duplicates {
+                profiles.push("default".to_owned());
+            }
+            profiles
+        } else {
+            Vec::new()
+        },
         source,
     };
     import_env_to_target(context, &mut store, &target, open_scoped_file(&path)?, &options)

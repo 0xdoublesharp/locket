@@ -35,14 +35,47 @@ const ALLOWED_ROOT_KEYS: &[&str] = &[
     "bootstrap",
     "scan",
     "example",
+    "run",
     "variables",
 ];
+
+/// Whether a vault-backed command filters its child output.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+pub enum OutputRedaction {
+    /// Filter known secrets when either output stream is captured.
+    #[default]
+    Auto,
+    /// Filter known secrets and recognized provider tokens on all output streams.
+    Always,
+    /// Inherit child output without filtering.
+    Never,
+}
+
+impl OutputRedaction {
+    /// Supported configuration strings.
+    pub const VALUES: &'static [&'static str] = &["auto", "always", "never"];
+}
+
+impl FromStr for OutputRedaction {
+    type Err = PolicyParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "always" => Ok(Self::Always),
+            "never" => Ok(Self::Never),
+            _ => Err(PolicyParseError::InvalidRunRedaction),
+        }
+    }
+}
 
 /// Parsed command policies from a `locket.toml` document.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PolicyDocument {
     /// Schema version declared at the document root.
     pub schema_version: u64,
+    /// Project override for child output filtering.
+    pub output_redaction: Option<OutputRedaction>,
     /// Commit-safe variable contracts, separate from secret ACLs.
     pub variables: BTreeMap<String, super::VariableContract>,
     /// Command policies keyed by `[commands.<name>]`.
@@ -150,7 +183,15 @@ impl PolicyDocument {
         let secret_access = parse_secret_access(root)?;
 
         let variables = super::variable_contract::parse_variables(root.get("variables"))?;
-        Ok(Self { schema_version, variables, commands, path_scopes, secret_access })
+        let output_redaction = parse_run_redaction(root.get("run"))?;
+        Ok(Self {
+            schema_version,
+            output_redaction,
+            variables,
+            commands,
+            path_scopes,
+            secret_access,
+        })
     }
 
     /// Finds the path scope that best matches `cwd` under `project_root`.
@@ -168,6 +209,19 @@ impl PolicyDocument {
             .filter(|scope| scope.matches(relative_cwd))
             .max_by_key(|scope| scope.depth())
     }
+}
+
+fn parse_run_redaction(
+    value: Option<&toml::Value>,
+) -> Result<Option<OutputRedaction>, PolicyParseError> {
+    let Some(value) = value else { return Ok(None) };
+    let run = value.as_table().ok_or(PolicyParseError::InvalidRunRedaction)?;
+    if run.keys().any(|key| key != "redact_output") {
+        return Err(PolicyParseError::InvalidRunRedaction);
+    }
+    run.get("redact_output")
+        .map(|mode| mode.as_str().ok_or(PolicyParseError::InvalidRunRedaction)?.parse())
+        .transpose()
 }
 
 fn parse_secret_access(

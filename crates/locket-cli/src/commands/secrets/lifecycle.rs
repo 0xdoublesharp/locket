@@ -167,7 +167,7 @@ pub fn rm_command(
         store.tombstone_secret_with_audit(&secret.id, timestamp, delete_audit)?;
     }
     if args.project.is_none() {
-        refresh_example_for_project_if_enabled(context)?;
+        refresh_example_for_project_if_enabled(context);
     }
     if usages.is_empty() {
         writeln!(output, "removed {} ({source})", args.key)?;
@@ -194,7 +194,7 @@ pub fn rotate_command(
     let value = context.secret_value_reader.read_secret_value(&prompt)?;
     let result = rotate_secret_value(context, args, value.as_str(), timestamp, grace_until)?;
     if args.project.is_none() {
-        refresh_example_for_project_if_enabled(context)?;
+        refresh_example_for_project_if_enabled(context);
     }
     writeln!(output, "rotated {} ({}) version={}", args.key, result.source, result.version)?;
     if !result.duplicate_matches.is_empty() {
@@ -250,7 +250,7 @@ pub fn copy_command(
     args: &CopyArgs,
 ) -> Result<(), CliError> {
     let result = copy_secret_value(context, args, now_unix_nanos()?)?;
-    refresh_example_for_project_if_enabled(context)?;
+    refresh_example_for_project_if_enabled(context);
     writeln!(
         output,
         "copied {} from={} source={} from_version={} to={} target_source={} version={} prior_target_version={} operation={} metadata_only=yes",
@@ -373,7 +373,7 @@ pub fn purge_command(
         timestamp,
         Some(AuditContext { key: audit_key.as_ref(), write: &audit }),
     )?;
-    refresh_example_for_project_if_enabled(context)?;
+    refresh_example_for_project_if_enabled(context);
     if changed {
         writeln!(
             output,

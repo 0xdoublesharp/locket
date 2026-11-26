@@ -7,6 +7,21 @@ use crate::runtime::error::{
     tty_required_error,
 };
 
+pub fn prompts_disabled() -> bool {
+    std::env::var("LOCKET_NO_PROMPT").is_ok_and(|value| {
+        ["1", "true", "yes"].iter().any(|enabled| value.eq_ignore_ascii_case(enabled))
+    })
+}
+
+fn require_prompts_enabled(reason: &str) -> Result<(), CliError> {
+    if prompts_disabled() {
+        return Err(tty_required_error(format!(
+            "{reason} requires interactive input (LOCKET_NO_PROMPT is set)"
+        )));
+    }
+    Ok(())
+}
+
 pub trait ConfirmationReader {
     fn read_confirmation(&self, prompt: &str) -> Result<String, CliError>;
 }
@@ -24,6 +39,7 @@ impl ConfirmationReader for StdinConfirmationReader {
 /// with the TTY check injected so tests can exercise the non-TTY guard
 /// regardless of how `cargo test` is launched.
 pub fn read_stdin_confirmation(prompt: &str, stdin_is_terminal: bool) -> Result<String, CliError> {
+    require_prompts_enabled(prompt)?;
     if !stdin_is_terminal {
         return Err(tty_required_error(format!("{prompt} requires interactive confirmation")));
     }
@@ -86,6 +102,7 @@ pub fn require_interactive_passphrase_with(
     stdin_is_terminal: bool,
     stderr_is_terminal: bool,
 ) -> Result<(), CliError> {
+    require_prompts_enabled(reason)?;
     if stdin_is_terminal && stderr_is_terminal {
         Ok(())
     } else {
@@ -94,6 +111,7 @@ pub fn require_interactive_passphrase_with(
 }
 
 pub fn read_hidden_passphrase(prompt: &str) -> Result<zeroize::Zeroizing<String>, CliError> {
+    require_prompts_enabled("passphrase entry")?;
     let passphrase = zeroize::Zeroizing::new(rpassword::prompt_password(prompt)?);
     if passphrase.is_empty() {
         return Err(invalid_reference_error("passphrase must not be empty"));
@@ -119,6 +137,7 @@ impl SecretValueReader for StdinOrPromptSecretValueReader {
 }
 
 pub fn read_secret_value_from_prompt(prompt: &str) -> Result<zeroize::Zeroizing<String>, CliError> {
+    require_prompts_enabled(prompt)?;
     let value = rpassword::prompt_password(format!("Enter {prompt}: "))?;
     validate_secret_value(zeroize::Zeroizing::new(value))
 }
@@ -167,6 +186,7 @@ pub fn validate_secret_value_str(value: &str) -> Result<(), CliError> {
 
 pub fn read_recovery_code(prompt: &str) -> Result<zeroize::Zeroizing<String>, CliError> {
     if io::stdin().is_terminal() {
+        require_prompts_enabled(prompt)?;
         let value = rpassword::prompt_password(format!("Enter {prompt}: "))?;
         return Ok(zeroize::Zeroizing::new(value));
     }

@@ -74,7 +74,7 @@ pub fn set_command(
             now_unix_nanos()?,
         )?;
         if args.target.project.is_none() {
-            refresh_example_for_project_if_enabled(context)?;
+            refresh_example_for_project_if_enabled(context);
         }
         Ok(result)
     })();

@@ -3122,3 +3122,63 @@ inherit_env = ['PATH', 'DOCKER_CONFIG']
     assert_eq!(statuses, ["SUCCESS", "FAILED"]);
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn exec_redacts_captured_long_values_and_leaves_short_values_visible()
+-> Result<(), Box<dyn std::error::Error>> {
+    const MODE: &str = "LOCKET_TEST_EXEC_REDACTION";
+    const CANARY: &str = "synthetic-etherscan-value";
+    let Some(mode) = std::env::var_os(MODE) else {
+        for mode in ["auto", "never", "strict"] {
+            let child = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "tests::exec::exec_redacts_captured_long_values_and_leaves_short_values_visible", "--nocapture"])
+                .env(MODE, mode)
+                .env_remove("LOCKET_REDACT_OUTPUT")
+                .output()?;
+            let stdout = String::from_utf8(child.stdout)?;
+            let stderr = String::from_utf8(child.stderr)?;
+            assert!(child.status.success(), "{stdout} {stderr}");
+            if mode == "never" {
+                assert!(stdout.contains(&format!("[env: ETHERSCAN_API_KEY={CANARY}]")));
+                assert!(stderr.contains(CANARY));
+            } else {
+                assert!(stdout.contains("[env: ETHERSCAN_API_KEY=[REDACTED:locket]]"));
+                assert!(!stdout.contains(CANARY));
+                assert!(!stderr.contains(CANARY));
+                assert!(stderr.contains("[REDACTED:locket]"));
+            }
+            assert_eq!(stdout.contains("PORT=3000"), mode != "strict", "{stdout}");
+        }
+        return Ok(());
+    };
+
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--no-device", "--no-passkey"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    for (name, fixture) in [("ETHERSCAN_API_KEY", CANARY), ("PORT", "3000")] {
+        crate::set_secret_value(
+            &context,
+            &super::test_secret_write_args(name),
+            fixture,
+            "manual",
+            1_000,
+        )?;
+    }
+    let mut args = vec!["locket", "exec", "--secret", "ETHERSCAN_API_KEY", "--secret", "PORT"];
+    if mode == "never" {
+        args.push("--no-redact-output");
+    } else if mode == "strict" {
+        args.push("--redact-output");
+    }
+    args.extend([
+        "--", "/bin/sh", "-c",
+        r#"printf '[env: ETHERSCAN_API_KEY=%s]\nPORT=%s\n' "$ETHERSCAN_API_KEY" "$PORT"; printf %s "$ETHERSCAN_API_KEY" >&2"#,
+    ]);
+    run_with_context(Cli::try_parse_from(args)?, &context, &mut Vec::new())?;
+    Ok(())
+}

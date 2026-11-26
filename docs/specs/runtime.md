@@ -96,7 +96,7 @@ Secret precedence:
 3. Shared link in the active profile, resolved from the local Global Vault.
 4. Team-managed secret in the active profile.
 
-Precedence applies when the same secret name exists in the same profile with different sources. A selected shared link requires access to the Global Vault. If the vault is locked, resolution fails with `UnlockRequired`. Locket shows the source in metadata so users can identify overrides. Team bundles default to team-managed values and can include user-local and machine-local values when explicitly requested. Global Vault links stay local.
+Precedence applies when the same secret name exists in the same profile with different sources. Both `locket run` and `locket exec` deliver a selected shared link under its local alias. The consuming project and the Global Vault must each be unlocked in the agent before delivery. A locked vault causes `UnlockRequired` with the unlock command for that vault. Team bundles default to team-managed values and can include user-local and machine-local values when explicitly requested. Global Vault links stay local.
 
 Required secrets:
 
@@ -122,6 +122,14 @@ Component checks:
 - Each external source layers between `inherit_env` and Locket secrets per the precedence list and is recorded as a metadata-only audit entry.
 
 Exec audit metadata must include the command policy name where present, the argv program (`argv[0]`) and argument count for ad-hoc `locket exec` invocations (the full argv is never stored because it may contain user-pasted literal values), profile id, exit status where available, and the list of secret names injected or resolved. It must never include secret values.
+
+### Child output
+
+`locket run` and `locket exec` default to `run.redact_output = "auto"`. In this mode, both output streams go through a streaming filter when either stdout or stderr is redirected or captured. When both streams are terminals, the child inherits them directly. Set `run.redact_output` to `"always"` to filter all output or `"never"` to inherit the streams.
+
+Set the user default with `locket config set run.redact_output <auto|always|never>`. A project's `[run]` table in `locket.toml` overrides that setting. `LOCKET_REDACT_OUTPUT` overrides both and also accepts `1` and `true` for `always`, or `0` and `false` for `never`. The mutually exclusive `--redact-output` and `--no-redact-output` flags take precedence over the environment. For `locket run`, `--egress-host` always enables strict redaction. See [scan-redaction.md](scan-redaction.md) for what each mode filters.
+
+CLI agent requests for execution use a 15-second deadline for ordinary requests and a 120-second deadline for unlock. During interactive unlock the CLI prints a notice while it waits.
 
 ## Reference URIs (`lk://`)
 

@@ -14,7 +14,7 @@ pub use variable_contract::{
 };
 
 pub use command::{CommandPolicy, CommandSpec, MAX_COMMAND_POLICY_TTL_SECONDS, PolicyFieldSource};
-pub use document::PolicyDocument;
+pub use document::{OutputRedaction, PolicyDocument};
 pub use edit::{
     PolicyEditError, command_policy_value, policy_source_digest, render_policy_document,
 };

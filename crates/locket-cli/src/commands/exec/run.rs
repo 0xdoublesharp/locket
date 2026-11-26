@@ -3,14 +3,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::Path;
 use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
 use std::str::FromStr;
 
 use locket_core::{
-    CommandPolicy, CommandSpec, ExternalEnvSource, LkReferenceUri, LocketError, PolicyDocument,
-    SecretName, SessionId,
+    CommandPolicy, CommandSpec, ExternalEnvSource, LkReferenceUri, LocketError, OutputRedaction,
+    PolicyDocument, SecretName, SessionId,
 };
 use locket_crypto::KeyPurpose;
 use locket_exec::{
@@ -66,7 +66,7 @@ pub struct RuntimeExecutionRequest<'a> {
     /// Optional live grant request for policy-driven `locket run`.
     pub run_policy_grant: Option<RunPolicyGrantRequest<'a>>,
     /// Global Vault unlock scope required for shared-secret delivery.
-    pub shared_project: Option<&'a str>,
+    pub shared_projects: BTreeSet<&'a str>,
 }
 
 /// Policy-grant data needed before spawning a runtime child.
@@ -160,6 +160,63 @@ impl ProtectionInputs {
     }
 }
 
+pub(super) fn child_output_redaction(
+    context: &RuntimeContext,
+    flags: &crate::OutputRedactionArgs,
+    project_mode: Option<OutputRedaction>,
+    egress: bool,
+) -> Result<Option<OutputRedaction>, CliError> {
+    let mode = if egress || flags.redact_output {
+        OutputRedaction::Always
+    } else if flags.no_redact_output {
+        OutputRedaction::Never
+    } else if let Some(value) = std::env::var_os("LOCKET_REDACT_OUTPUT") {
+        match value.to_str().unwrap_or_default().to_ascii_lowercase().as_str() {
+            "1" | "true" | "always" => OutputRedaction::Always,
+            "0" | "false" | "never" => OutputRedaction::Never,
+            "auto" => OutputRedaction::Auto,
+            _ => {
+                return Err(metadata_invalid_error(
+                    "LOCKET_REDACT_OUTPUT must be auto, always, or never",
+                ));
+            }
+        }
+    } else if let Some(mode) = project_mode {
+        mode
+    } else {
+        let config = read_user_config(context)?;
+        config_get_value(&config, "run.redact_output")
+            .map(|value| {
+                value.as_str().unwrap_or_default().parse().map_err(|_| {
+                    metadata_invalid_error("run.redact_output must be auto, always, or never")
+                })
+            })
+            .transpose()?
+            .unwrap_or_default()
+    };
+    match mode {
+        OutputRedaction::Always => Ok(Some(mode)),
+        OutputRedaction::Auto if !io::stdout().is_terminal() || !io::stderr().is_terminal() => {
+            Ok(Some(mode))
+        }
+        OutputRedaction::Auto | OutputRedaction::Never => Ok(None),
+    }
+}
+
+pub(super) fn child_redactor(
+    mode: OutputRedaction,
+    known_secrets: Vec<(String, Zeroizing<String>)>,
+) -> StreamingRedactorConfig {
+    let strict = mode == OutputRedaction::Always;
+    StreamingRedactorConfig {
+        known_secrets,
+        include_encoded_variants: true,
+        redact_generic_patterns: strict,
+        min_secret_len: if strict { 1 } else { 8 },
+        ..StreamingRedactorConfig::default()
+    }
+}
+
 struct RunProtection {
     redactor: StreamingRedactorConfig,
     broker: Option<EgressProxyBroker>,
@@ -169,9 +226,10 @@ impl RunProtection {
     fn configure(
         args: &RunArgs,
         policy: &mut PreparedPolicyExecution,
+        redaction: Option<OutputRedaction>,
     ) -> Result<Option<Self>, CliError> {
-        let Some(ProtectionInputs { injected_env_names, mut known_secrets }) =
-            policy.protection_inputs.take()
+        let (Some(ProtectionInputs { injected_env_names, mut known_secrets }), Some(mode)) =
+            (policy.protection_inputs.take(), redaction)
         else {
             return Ok(None);
         };
@@ -224,16 +282,7 @@ impl RunProtection {
             }
             Some(broker)
         };
-        Ok(Some(Self {
-            redactor: StreamingRedactorConfig {
-                known_secrets,
-                include_encoded_variants: true,
-                redact_generic_patterns: true,
-                min_secret_len: 1,
-                ..StreamingRedactorConfig::default()
-            },
-            broker,
-        }))
+        Ok(Some(Self { redactor: child_redactor(mode, known_secrets), broker }))
     }
 }
 
@@ -344,6 +393,12 @@ pub fn run_command_with_diagnostics(
             "warning: secret values in process argv are visible via ps or /proc"
         )?;
     }
+    let redaction = child_output_redaction(
+        context,
+        &run_args.output_redaction,
+        approved.source.document.output_redaction,
+        !run_args.egress_host.is_empty(),
+    )?;
     let mut prepared_policy = match prepare_policy_execution(
         context,
         output,
@@ -351,7 +406,7 @@ pub fn run_command_with_diagnostics(
         &resolved,
         &profile,
         &approved,
-        run_args.redact_output || !run_args.egress_host.is_empty(),
+        redaction.is_some(),
     ) {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -368,7 +423,7 @@ pub fn run_command_with_diagnostics(
             return Err(error);
         }
     };
-    let protection = RunProtection::configure(run_args, &mut prepared_policy)?;
+    let protection = RunProtection::configure(run_args, &mut prepared_policy, redaction)?;
     let outcome = execute_runtime_child(
         context,
         &RuntimeExecutionRequest {
@@ -383,7 +438,7 @@ pub fn run_command_with_diagnostics(
                 source: &approved.source,
                 ttl_seconds: policy.ttl.as_secs(),
             }),
-            shared_project: shared_project(&prepared_policy.selections),
+            shared_projects: shared_projects(&prepared_policy.selections),
         },
         protection,
     )?;
@@ -963,14 +1018,14 @@ fn check_policy_secret_availability(
     Ok(())
 }
 
-fn shared_project(selections: &[PolicySecretSelection]) -> Option<&str> {
-    selections.iter().find_map(|selection| {
-        selection
-            .selected
-            .as_ref()
-            .filter(|_| selection.shared)
-            .map(|secret| secret.project_id.as_str())
-    })
+fn shared_projects(selections: &[PolicySecretSelection]) -> BTreeSet<&str> {
+    selections
+        .iter()
+        .filter(|selection| selection.shared)
+        .filter_map(|selection| {
+            selection.selected.as_ref().map(|secret| secret.project_id.as_str())
+        })
+        .collect()
 }
 
 pub(super) fn require_shared_policy_vaults_unlocked(
@@ -979,11 +1034,7 @@ pub(super) fn require_shared_policy_vaults_unlocked(
     profile: &ProfileRecord,
     selections: &[PolicySecretSelection],
 ) -> Result<(), CliError> {
-    let shared_projects = selections
-        .iter()
-        .filter(|selection| selection.shared)
-        .filter_map(|selection| selection.selected.as_ref().map(|secret| &secret.project_id))
-        .collect::<std::collections::BTreeSet<_>>();
+    let shared_projects = shared_projects(selections);
     if !shared_projects.is_empty() {
         for project_id in shared_projects {
             require_vault_unlocked(
@@ -1068,9 +1119,14 @@ fn require_vault_unlocked(
     if snapshot["project_id"].as_str() != Some(project_id)
         || snapshot["lock_state"].as_str() != Some("unlocked")
     {
+        let command = if project_id.starts_with(crate::commands::discovery::SHARED_PROJECT_PREFIX) {
+            "locket unlock --shared".to_owned()
+        } else {
+            format!("locket unlock --project {project_id}")
+        };
         return Err(typed_cli_error(
             LocketError::UnlockRequired,
-            format!("unlock {vault_name} before {action}"),
+            format!("unlock {vault_name} with `{command}` before {action}"),
         ));
     }
     Ok(())
@@ -1586,7 +1642,16 @@ fn unlock_agent_for_policy(
         locket_agent::AgentMethod::Unlock,
         &payload,
         "unlock agent for policy execution",
-    )?;
+    ).map_err(|error| {
+        if let CliError::Typed { kind: LocketError::UnlockRequired, message } = error {
+            typed_cli_error(
+                LocketError::UnlockRequired,
+                format!("unlock the policy's project vault with `locket unlock --project {}` before executing: {message}", resolved.config.project_id),
+            )
+        } else {
+            error
+        }
+    })?;
     Ok(())
 }
 
@@ -1771,8 +1836,16 @@ fn agent_invoke_endpoint_value(
 ) -> Result<serde_json::Value, CliError> {
     use locket_agent::{RequestEnvelope, ResponseEnvelope};
 
+    let timeout = if method == locket_agent::AgentMethod::Unlock {
+        if io::stdin().is_terminal() && !crate::runtime::prompts::prompts_disabled() {
+            let _ = writeln!(io::stderr(), "locket: waiting for vault unlock...");
+        }
+        std::time::Duration::from_secs(120)
+    } else {
+        std::time::Duration::from_secs(15)
+    };
     let request = RequestEnvelope::new(format!("run-{operation}"), method, payload);
-    match crate::commands::agent::exchange_agent_request(socket_path, request, None)
+    match crate::commands::agent::exchange_agent_request(socket_path, request, Some(timeout))
         .map_err(|error| agent_unavailable(operation, &error))?
     {
         ResponseEnvelope::Success(success) => Ok(success.payload),
@@ -1952,11 +2025,28 @@ fn shell_argv(script: &str) -> Vec<String> {
     vec!["cmd.exe".to_owned(), "/C".to_owned(), script.to_owned()]
 }
 
-pub fn execute_prepared_with_runtime_session(
+pub(super) fn execute_exec_child(
     context: &RuntimeContext,
     request: &RuntimeExecutionRequest<'_>,
-) -> Result<RuntimeExecutionOutcome, CliError> {
-    execute_runtime_child(context, request, None)
+    redactor: Option<StreamingRedactorConfig>,
+) -> Result<ExitStatus, CliError> {
+    if !request.secret_names.is_empty() {
+        let protection = redactor.map(|redactor| RunProtection { redactor, broker: None });
+        return execute_runtime_child(context, request, protection).map(|outcome| outcome.status);
+    }
+    let mut command = request.prepared.command();
+    if let Some(current_dir) = request.current_dir {
+        command.current_dir(current_dir);
+    }
+    let Some(redactor) = redactor else { return Ok(command.status()?) };
+    let mut child = command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let redaction = redact_child_output(&mut child, io::stdout(), io::stderr(), redactor);
+    if redaction.is_err() {
+        let _ignored = child.kill();
+    }
+    let status = child.wait();
+    redaction?;
+    Ok(status?)
 }
 
 fn execute_runtime_child(
@@ -1981,21 +2071,9 @@ fn execute_runtime_child(
         .run_policy_grant
         .map(|grant| request_run_policy_grant(context, request, grant))
         .transpose()?;
-    if let Some(project) = request.shared_project {
-        let unlock = if request.run_policy_grant.is_some() {
-            require_vault_unlocked(
-                context,
-                &request.profile.project_id,
-                "the policy's project vault",
-                "executing with shared secrets",
-            )
-        } else {
-            Ok(())
-        };
-        if let Err(error) = unlock.and_then(|()| require_shared_vault_unlocked(context, project)) {
-            revoke_run_policy_grant(context, run_policy_grant.as_ref());
-            return Err(error);
-        }
+    if let Err(error) = recheck_execution_vaults(context, request) {
+        revoke_run_policy_grant(context, run_policy_grant.as_ref());
+        return Err(error);
     }
     let mut child = match spawn_runtime_child(&mut command, request) {
         Ok(child) => child,
@@ -2063,6 +2141,24 @@ fn execute_runtime_child(
         status,
         run_policy_grant: run_policy_grant.map(|grant| grant.metadata),
     })
+}
+
+fn recheck_execution_vaults(
+    context: &RuntimeContext,
+    request: &RuntimeExecutionRequest<'_>,
+) -> Result<(), CliError> {
+    for project in &request.shared_projects {
+        require_shared_vault_unlocked(context, project)?;
+    }
+    if request.shared_projects.iter().any(|project| *project != request.profile.project_id) {
+        require_vault_unlocked(
+            context,
+            &request.profile.project_id,
+            "the consuming project vault",
+            "executing with shared secrets",
+        )?;
+    }
+    Ok(())
 }
 
 fn spawn_runtime_child(

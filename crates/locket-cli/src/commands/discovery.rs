@@ -66,6 +66,12 @@ pub enum SharedCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Unlock the Global Vault in the running agent.
+    Unlock {
+        /// Override the agent unlock lifetime in seconds.
+        #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..=86_400))]
+        ttl: Option<u64>,
+    },
     /// List secrets in the Global Vault.
     List(ListArgs),
     /// Store a secret in the Global Vault.
@@ -287,6 +293,18 @@ pub fn shared_command(
 ) -> Result<u8, CliError> {
     let (name, json) = match command {
         SharedCommand::Init { name, json } => (name, json),
+        SharedCommand::Unlock { ttl } => {
+            super::vault::lock::unlock_command(
+                context,
+                output,
+                &crate::UnlockArgs {
+                    project: Some(GLOBAL_VAULT.to_owned()),
+                    ttl,
+                    ..Default::default()
+                },
+            )?;
+            return Ok(0);
+        }
         SharedCommand::List(mut args) => {
             select_global_vault(&mut args.project)?;
             return secrets::lifecycle::list_command(context, output, &args).map(|()| 0);

@@ -66,7 +66,7 @@ pub fn generate_command(
             now_unix_nanos()?,
         )?;
         if args.target.project.is_none() {
-            crate::refresh_example_for_project_if_enabled(context)?;
+            crate::refresh_example_for_project_if_enabled(context);
         }
         Ok(result)
     })();

@@ -5,7 +5,7 @@ use std::io;
 use std::path::Path;
 use std::str::FromStr;
 
-use locket_core::Duration as LocketDuration;
+use locket_core::{Duration as LocketDuration, OutputRedaction};
 use locket_crypto::KeyPurpose;
 use locket_scan::{FindingKind, scan_text};
 use locket_store::{AuditWrite, RuntimeSessionSecretNameRetention};
@@ -99,6 +99,14 @@ pub const CONFIG_KEY_SPECS: &[ConfigKeySpec] = &[
     },
     ConfigKeySpec { key: "updates.manifest_url", kind: ConfigValueKind::HttpsUrl, audit: true },
     ConfigKeySpec { key: "example.auto_refresh", kind: ConfigValueKind::Bool, audit: false },
+    ConfigKeySpec {
+        key: "run.redact_output",
+        kind: ConfigValueKind::Enum {
+            values: OutputRedaction::VALUES,
+            message: "run.redact_output must be auto, always, or never",
+        },
+        audit: true,
+    },
     ConfigKeySpec {
         key: "user_verification_required_for.unlock",
         kind: ConfigValueKind::Bool,

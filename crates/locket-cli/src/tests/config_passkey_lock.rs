@@ -962,6 +962,59 @@ fn passkey_remove_requires_fresh_user_verification_before_revocation()
 }
 
 #[test]
+fn run_redaction_config_accepts_only_the_three_modes() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    for mode in ["auto", "always", "never"] {
+        run_with_context(
+            Cli::try_parse_from(["locket", "config", "set", "run.redact_output", mode])?,
+            &context,
+            &mut Vec::new(),
+        )?;
+        let mut get = Vec::new();
+        run_with_context(
+            Cli::try_parse_from(["locket", "config", "get", "run.redact_output"])?,
+            &context,
+            &mut get,
+        )?;
+        assert_eq!(String::from_utf8(get)?.trim(), mode);
+        let document = locket_core::PolicyDocument::from_toml_str(&format!(
+            "schema_version = 1\n[run]\nredact_output = '{mode}'\n"
+        ))?;
+        assert_eq!(document.output_redaction, Some(mode.parse()?));
+    }
+    assert!(
+        locket_core::PolicyDocument::from_toml_str(
+            "schema_version = 1\n[run]\nredact_output = 'sometimes'\n"
+        )
+        .is_err()
+    );
+    let bad = run_with_context(
+        Cli::try_parse_from(["locket", "config", "set", "run.redact_output", "sometimes"])?,
+        &context,
+        &mut Vec::new(),
+    );
+    assert!(matches!(
+        bad,
+        Err(crate::CliError::Typed { kind: locket_core::LocketError::MetadataInvalid, .. })
+    ));
+    for command in ["run", "exec"] {
+        assert!(
+            Cli::try_parse_from([
+                "locket",
+                command,
+                "--redact-output",
+                "--no-redact-output",
+                "--",
+                "true"
+            ])
+            .is_err()
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn lock_and_unlock_use_direct_metadata_only_mode() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempdir()?;
     let context = test_context(&directory);
@@ -986,6 +1039,15 @@ fn lock_and_unlock_use_direct_metadata_only_mode() -> Result<(), Box<dyn std::er
     assert!(unlock_output.contains("unlock_method: OsKeychain"));
     assert!(unlock_output.contains("cached_keys: no"));
     assert!(unlock_output.contains("verify_user: not requested"));
+    let mut fallback = Vec::new();
+    run_with_context(
+        Cli::try_parse_from(["locket", "unlock", "--shared"])?,
+        &context,
+        &mut fallback,
+    )?;
+    let fallback = String::from_utf8(fallback)?;
+    assert!(fallback.contains("metadata-only direct CLI unlock succeeded"));
+    assert!(fallback.contains("start the agent with `locket agent start`"));
     Ok(())
 }
 

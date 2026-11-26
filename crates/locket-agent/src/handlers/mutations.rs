@@ -554,30 +554,22 @@ fn import_dotenv_in_store(
     }
 
     if request.dry_run {
-        for entry in &document.entries {
-            let existing = store.get_secret_by_source(
-                &request.scope.project_id,
-                &request.scope.profile_id,
-                &entry.key,
-                "user-local",
-            )?;
-            if let Some(existing) = existing {
-                if existing.state == "deleted" {
-                    return Err(failure("SecretDeleted", "an imported name has a deleted source"));
+        let planned = (|| {
+            for entry in &document.entries {
+                match plan_import_entry(&store, request, &entry.key)? {
+                    ImportEntryAction::Link { .. } => result.linked += 1,
+                    ImportEntryAction::Promote(_) => result.promoted += 1,
+                    ImportEntryAction::Skip => result.skipped += 1,
+                    ImportEntryAction::Write { rotate: true } => result.overwritten += 1,
+                    ImportEntryAction::Write { rotate: false } => result.imported += 1,
                 }
-                if request.overwrite {
-                    result.overwritten += 1;
-                } else {
-                    result.skipped += 1;
-                }
-            } else {
-                result.imported += 1;
             }
-        }
+            Ok::<_, MutationError>(result)
+        })();
         for entry in &mut document.entries {
             zeroize::Zeroize::zeroize(&mut entry.value);
         }
-        return Ok(result);
+        return planned;
     }
 
     let write_result = store.with_atomic_write(|store| {
@@ -599,33 +591,10 @@ fn import_dotenv_in_store(
             )?;
         }
         for entry in &document.entries {
+            let action = plan_import_entry(store, request, &entry.key)?;
             let value = Zeroizing::new(entry.value.clone());
 
-            if !is_shared_project_id(&request.scope.project_id)
-                && let Some(target_shared_name) = request.link_to_shared.get(&entry.key)
-            {
-                let target_project = store
-                    .list_projects()?
-                    .into_iter()
-                    .filter(|project| is_shared_project_id(&project.id))
-                    .min_by_key(|project| project.name != "@shared")
-                    .ok_or_else(|| {
-                        failure("ProjectNotFound", "set up the Global Vault before linking secrets")
-                    })?;
-                let target_profile =
-                    store.get_profile_by_name(&target_project.id, "default")?.ok_or_else(|| {
-                        failure("ProfileNotFound", "the Global Vault default profile is missing")
-                    })?;
-                let target_secret = store
-                    .get_active_secret(
-                        &target_project.id,
-                        &target_profile.id,
-                        target_shared_name,
-                        "user-local",
-                    )?
-                    .ok_or_else(|| {
-                        failure("SecretNotFound", "target Global Vault secret not found")
-                    })?;
+            if let ImportEntryAction::Link { target_secret } = action {
                 let link_id = format!(
                     "lk_link_{}",
                     SecretId::generate().map_err(|_| storage())?.into_string()
@@ -635,8 +604,8 @@ fn import_dotenv_in_store(
                     project_id: request.scope.project_id.clone(),
                     profile_id: request.scope.profile_id.clone(),
                     local_name: entry.key.clone(),
-                    target_project_id: target_project.id.clone(),
-                    target_profile_id: target_profile.id.clone(),
+                    target_project_id: target_secret.project_id.clone(),
+                    target_profile_id: target_secret.profile_id.clone(),
                     target_secret_id: target_secret.id.clone(),
                     created_at: timestamp,
                     updated_at: timestamp,
@@ -650,8 +619,8 @@ fn import_dotenv_in_store(
                     "status": "SUCCESS",
                     "secret_name": entry.key,
                     "profile_id": request.scope.profile_id,
-                    "target_project_id": target_project.id,
-                    "target_profile_id": target_profile.id,
+                    "target_project_id": target_secret.project_id,
+                    "target_profile_id": target_secret.profile_id,
                     "target_secret_id": target_secret.id,
                     "target_secret_name": target_secret.name,
                 });
@@ -669,17 +638,25 @@ fn import_dotenv_in_store(
                     &link,
                     Some(AuditContext { key: source_key.as_ref(), write: &link_audit }),
                 )?;
+                tombstone_import_shadows(
+                    store,
+                    request,
+                    &entry.key,
+                    source_key.as_ref(),
+                    timestamp,
+                )?;
                 result.linked += 1;
                 continue;
             }
 
-            if let Some(promotion) = promotion
-                && let Some(target_shared_name) = request.promote_to_shared.get(&entry.key)
-            {
+            if let ImportEntryAction::Promote(target_shared_name) = action {
+                let promotion = promotion.ok_or_else(|| {
+                    failure("GrantRequired", "a matching Global Vault promotion grant is required")
+                })?;
                 let target_profile = &promotion.profile;
                 let target_project_id = &target_profile.project_id;
                 let target_master = &promotion.master;
-                let target_name = SecretName::new(target_shared_name.clone()).map_err(|_| {
+                let target_name = SecretName::new(target_shared_name).map_err(|_| {
                     failure("InvalidSecretName", "invalid Global Vault secret name")
                 })?;
                 let existing_shared = store.get_secret_by_source(
@@ -809,25 +786,21 @@ fn import_dotenv_in_store(
                     &link,
                     Some(AuditContext { key: source_key.as_ref(), write: &link_audit }),
                 )?;
+                tombstone_import_shadows(
+                    store,
+                    request,
+                    &entry.key,
+                    source_key.as_ref(),
+                    timestamp,
+                )?;
                 result.promoted += 1;
                 continue;
             }
 
-            let existing = store.get_secret_by_source(
-                &request.scope.project_id,
-                &request.scope.profile_id,
-                &entry.key,
-                "user-local",
-            )?;
-            if let Some(existing) = &existing {
-                if existing.state == "deleted" {
-                    return Err(failure("SecretDeleted", "an imported name has a deleted source"));
-                }
-                if !request.overwrite {
-                    result.skipped += 1;
-                    continue;
-                }
-            }
+            let ImportEntryAction::Write { rotate } = action else {
+                result.skipped += 1;
+                continue;
+            };
             let operation = SetSecretOperation {
                 project_id: &request.scope.project_id,
                 profile_id: &request.scope.profile_id,
@@ -835,7 +808,7 @@ fn import_dotenv_in_store(
                 source: "user-local",
                 source_was_omitted: false,
                 value: &value,
-                rotate: existing.is_some(),
+                rotate,
                 grace_until: None,
                 master_key: master,
                 timestamp: i128::from(timestamp),
@@ -853,7 +826,7 @@ fn import_dotenv_in_store(
                     timestamp,
                 );
             }
-            if existing.is_some() {
+            if rotate {
                 result.overwritten += 1;
             } else {
                 result.imported += 1;
@@ -871,6 +844,113 @@ fn import_dotenv_in_store(
         result.maintenance_warning = Some("Import committed, but .gitignore could not be updated. Review plaintext env-file exclusions.".into());
     }
     Ok(result)
+}
+
+enum ImportEntryAction<'a> {
+    Write { rotate: bool },
+    Skip,
+    Link { target_secret: Box<locket_store::SecretRecord> },
+    Promote(&'a str),
+}
+
+fn plan_import_entry<'a>(
+    store: &Store,
+    request: &'a ImportDotenvRequest,
+    name: &str,
+) -> Result<ImportEntryAction<'a>, MutationError> {
+    let project_id = &request.scope.project_id;
+    let profile_id = &request.scope.profile_id;
+    let existing = store.get_secret_by_source(project_id, profile_id, name, "user-local")?;
+    if !is_shared_project_id(project_id) {
+        let target_name = request.link_to_shared.get(name);
+        let promote_name = request.promote_to_shared.get(name);
+        if let Some(shared_name) = target_name.or(promote_name) {
+            let profile = import_promotion_profile(store)?;
+            let shared_name = SecretName::new(shared_name.as_str())
+                .map_err(|_| failure("InvalidSecretName", "invalid Global Vault secret name"))?;
+            let target = store.get_active_secret(
+                &profile.project_id,
+                &profile.id,
+                shared_name.as_str(),
+                "user-local",
+            )?;
+            let link = store.get_secret_link(project_id, profile_id, name)?;
+            if !request.overwrite
+                && (link.as_ref().is_some_and(|link| {
+                    target.as_ref().is_none_or(|target| link.target_secret_id != target.id)
+                }) || !import_shadows(store, request, name)?.is_empty())
+            {
+                return Ok(ImportEntryAction::Skip);
+            }
+            if target_name.is_some() {
+                let target = target.ok_or_else(|| {
+                    failure("SecretNotFound", "target Global Vault secret not found")
+                })?;
+                return Ok(ImportEntryAction::Link { target_secret: Box::new(target) });
+            }
+            if let Some(name) = promote_name {
+                return Ok(ImportEntryAction::Promote(name));
+            }
+        }
+    }
+    match existing {
+        Some(secret) if secret.state == "deleted" => {
+            Err(failure("SecretDeleted", "an imported name has a deleted source"))
+        }
+        Some(_) if !request.overwrite => Ok(ImportEntryAction::Skip),
+        _ => Ok(ImportEntryAction::Write { rotate: existing.is_some() }),
+    }
+}
+
+fn import_shadows(
+    store: &Store,
+    request: &ImportDotenvRequest,
+    name: &str,
+) -> Result<Vec<locket_store::SecretRecord>, MutationError> {
+    Ok(store
+        .list_secrets_by_name(&request.scope.project_id, &request.scope.profile_id, name)?
+        .into_iter()
+        .filter(|secret| {
+            secret.state == "active"
+                && matches!(secret.source.as_str(), "machine-local" | "user-local")
+        })
+        .collect())
+}
+
+fn tombstone_import_shadows(
+    store: &mut Store,
+    request: &ImportDotenvRequest,
+    name: &str,
+    audit_key: &[u8],
+    timestamp: i64,
+) -> Result<(), MutationError> {
+    for secret in import_shadows(store, request, name)? {
+        let metadata = json!({
+            "schema_version": 1,
+            "action": "DELETE",
+            "status": "SUCCESS",
+            "secret_name": name,
+            "profile_id": secret.profile_id,
+            "source": secret.source,
+            "version": secret.current_version,
+        });
+        let audit = AuditWrite {
+            project_id: &secret.project_id,
+            profile_id: Some(&secret.profile_id),
+            action: "DELETE",
+            status: "SUCCESS",
+            secret_name: Some(name),
+            command: None,
+            metadata_json: &metadata,
+            timestamp,
+        };
+        store.tombstone_current_secret_with_audit(
+            &secret,
+            timestamp,
+            AuditContext { key: audit_key, write: &audit },
+        )?;
+    }
+    Ok(())
 }
 
 fn read_dotenv(

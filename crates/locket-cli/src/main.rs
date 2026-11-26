@@ -13,8 +13,8 @@ pub(crate) use runtime::error::{
     metadata_looks_like_secret_error, policy_not_found_error, profile_not_found_error,
     project_not_found_error, project_root_untrusted_error, scan_finding_blocked_error,
     secret_already_exists_error, secret_deleted_error, secret_not_found_error,
-    secret_version_overflow_error, team_role_denied_error, tty_required_error,
-    unimplemented_in_build_error, unlock_required_error, user_verification_failed_error,
+    secret_version_overflow_error, team_role_denied_error, unimplemented_in_build_error,
+    unlock_required_error, user_verification_failed_error,
 };
 pub(crate) use runtime::key_access::{
     MasterKeySource, default_profile, ensure_project_exists, load_master_key,
@@ -306,7 +306,11 @@ enum Command {
     /// Revoke shell integration consent for the active profile or project.
     Deny(DenyArgs),
     /// Regenerate .env.example.
-    EmitExample,
+    EmitExample {
+        /// Replace an unmanaged file after interactive confirmation.
+        #[arg(long)]
+        replace: bool,
+    },
     /// Install Git hooks.
     InstallHooks,
     /// Scan project files.
@@ -543,7 +547,7 @@ struct ImportSelectionArgs {
     /// Keep the plaintext input file without prompting.
     #[arg(long)]
     keep: bool,
-    /// Plan the import without unlocking or writing.
+    /// Plan the import without writing. Shared deduplication needs the Global Vault fingerprint key.
     #[arg(long)]
     dry_run: bool,
     /// Emit a metadata-only JSON report and keep the input file.
@@ -555,9 +559,9 @@ struct ImportSelectionArgs {
     /// Promote imported keys whose exact value matches another project to @shared and link.
     #[arg(long)]
     promote_duplicates: bool,
-    /// Confirm an overwrite in a dangerous profile by supplying its exact name.
-    #[arg(long, value_name = "PROFILE", requires = "overwrite")]
-    confirm_dangerous: Option<String>,
+    /// Confirm a dangerous profile by its exact name. Repeat for both vaults if needed.
+    #[arg(long, value_name = "PROFILE")]
+    confirm_dangerous: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -668,6 +672,17 @@ struct ListArgs {
     all: bool,
 }
 
+/// Child output overrides shared by run and exec.
+#[derive(Debug, Default, Args)]
+pub struct OutputRedactionArgs {
+    /// Redact resolved secrets and recognized provider tokens from child output.
+    #[arg(long, conflicts_with = "no_redact_output")]
+    redact_output: bool,
+    /// Inherit child output without redaction.
+    #[arg(long, conflicts_with = "redact_output")]
+    no_redact_output: bool,
+}
+
 /// Arguments for the `locket exec` command.
 #[derive(Debug, Args)]
 pub struct ExecArgs {
@@ -692,6 +707,9 @@ pub struct ExecArgs {
     /// names are still recorded in the EXEC audit row.
     #[arg(long)]
     pub force: bool,
+    /// Child output redaction flags.
+    #[command(flatten)]
+    pub output_redaction: OutputRedactionArgs,
     /// Command and arguments after `--`.
     #[arg(last = true, required = true)]
     pub command: Vec<String>,
@@ -709,9 +727,9 @@ pub struct RunArgs {
     /// Permit lk:// substitution into process arguments visible to ps and /proc.
     #[arg(long)]
     pub allow_insecure_argv: bool,
-    /// Redact resolved secrets and recognized provider tokens from child output.
-    #[arg(long, env = "LOCKET_REDACT_OUTPUT", value_parser = clap::builder::BoolishValueParser::new())]
-    pub redact_output: bool,
+    /// Child output redaction flags.
+    #[command(flatten)]
+    pub output_redaction: OutputRedactionArgs,
     /// Replace a secret env value with a host-bound HTTP proxy token. Repeat for more hosts.
     #[arg(long, value_name = "SECRET_NAME=HOST_PATTERN")]
     pub egress_host: Vec<String>,
@@ -853,11 +871,20 @@ pub struct ComposeRunArgs {
     pub command: Vec<String>,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Default, Args)]
 struct UnlockArgs {
     /// Require local user verification before unlock.
     #[arg(long)]
     verify_user: bool,
+    /// Also unlock the Global Vault. Outside a project, unlock it on its own.
+    #[arg(long)]
+    shared: bool,
+    /// Select a registered project by ID or name, including @shared.
+    #[arg(long)]
+    project: Option<String>,
+    /// Override the agent unlock lifetime in seconds.
+    #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..=86_400))]
+    ttl: Option<u64>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1990,7 +2017,9 @@ fn run_with_context(
         Command::Audit { command } => audit::audit_command(context, output, command)?,
         Command::Lock => vault::lock::lock_command(context, output)?,
         Command::Unlock(args) => vault::lock::unlock_command(context, output, &args)?,
-        Command::EmitExample => project::emit_example::emit_example_command(context, output)?,
+        Command::EmitExample { replace } => {
+            project::emit_example::emit_example_command(context, output, replace)?;
+        }
         Command::InstallHooks => project::install_hooks::install_hooks_command(context, output)?,
         Command::Profile { command } => trust::profile::profile_command(context, output, command)?,
         Command::Policy { command } => policy::command(context, output, command)?,

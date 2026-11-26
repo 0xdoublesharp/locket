@@ -31,6 +31,9 @@ pub enum PolicyParseError {
     /// The top-level `secrets` value was not a table.
     #[error("secrets must be a table")]
     SecretsMustBeTable,
+    /// The run settings contain an unknown key or malformed value.
+    #[error("run must be a table containing only redact_output set to auto, always, or never")]
+    InvalidRunRedaction,
     /// A command table key was empty.
     #[error("command name must not be empty")]
     EmptyCommandName,

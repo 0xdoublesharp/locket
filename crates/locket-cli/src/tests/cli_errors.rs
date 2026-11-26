@@ -545,3 +545,32 @@ fn exec_passthrough_preserves_child_exit_code() -> Result<(), Box<dyn std::error
     assert!(matches!(error, crate::CliError::ChildExit(7)));
     Ok(())
 }
+
+#[test]
+fn no_prompt_refuses_confirmation_and_passphrase_even_with_interactive_streams()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::runtime::prompts::{read_stdin_confirmation, require_interactive_passphrase_with};
+
+    if std::env::var_os("LOCKET_TEST_NO_PROMPT").is_none() {
+        for value in ["1", "TrUe", "YES"] {
+            let child = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "tests::cli_errors::no_prompt_refuses_confirmation_and_passphrase_even_with_interactive_streams"])
+                .env("LOCKET_TEST_NO_PROMPT", "1")
+                .env("LOCKET_NO_PROMPT", value)
+                .stdin(std::process::Stdio::null())
+                .output()?;
+            assert!(child.status.success(), "{:?}", String::from_utf8_lossy(&child.stdout));
+        }
+        return Ok(());
+    }
+    for error in [
+        read_stdin_confirmation("profile deletion", true).err(),
+        require_interactive_passphrase_with("vault unlock", true, true).err(),
+    ] {
+        assert!(matches!(error, Some(crate::CliError::Typed {
+            kind: locket_core::LocketError::TtyRequired,
+            message,
+        }) if message.contains("LOCKET_NO_PROMPT")));
+    }
+    Ok(())
+}

@@ -68,7 +68,8 @@ locket rm <KEY> [--source user-local|machine-local|team-managed]
 locket purge <KEY> [--source user-local|machine-local|team-managed] [--version N | --all-versions]
 locket list [--all]
 locket lock
-locket unlock [--verify-user]
+locket unlock [--project <PROJECT>] [--shared] [--ttl <SECONDS>] [--verify-user]
+locket shared unlock [--ttl <SECONDS>]
 locket passkey register
 locket passkey list [--all]
 locket passkey remove <passkey>
@@ -84,7 +85,11 @@ locket passkey remove <passkey>
 
 `locket rm <KEY>` tombstones the selected source in the target profile by setting `SecretState::Deleted`, setting `SecretMeta.deleted_at = now`, and preserving encrypted history. `locket purge <KEY>` is the destructive operation: it permanently removes selected encrypted value versions and keyed fingerprints for the selected source after typed confirmation of the profile, source, secret name, and version scope. `purge --version N` on an active source may target only versions already in `SecretVersionState::Deprecated`; it must not purge the current version of an active source. `purge --version N` on a deleted source may target `Current` or `Deprecated` versions because the source is already retired. Targeting an already `Purged` version is an idempotent metadata-only no-op: it exits successfully, prints an already-purged notice, and writes no new `PURGE` row. `purge --all-versions` requires the source to already be `SecretState::Deleted`; it purges every encrypted version for the selected source and keeps metadata tombstones for audit/history. The `secrets` row remains `Deleted`; `secret_versions` rows remain present with `state = Purged` and `purged_at` set, while blobs and keyed fingerprints are removed. Purge requires Owner or Maintainer role for team-managed secrets and local ownership for user/machine-local secrets. If more than one source exists for a key, `rm` and `purge` require `--source`; they do not silently delete whichever source currently wins precedence. Audit rows remain metadata-only and record `PURGE`; no purge flow prints or logs the value.
 
-`locket lock` and `locket unlock` operate on the local agent if it is running and on the direct CLI process otherwise. `locket unlock` performs OS keychain unlock or passphrase fallback; with the agent running it caches the unwrapped keys for the configured TTL, and without the agent it unwraps only for the current CLI invocation. `locket unlock --verify-user` additionally requires local user verification through the configured platform prompt, hardware key, or passphrase fallback before unwrapping keys. `locket lock` clears agent-held keys and live grants; without the agent it is a no-op that exits successfully and writes a `LOCK` audit row only when keys were actually cleared.
+`locket lock` clears agent-held keys and live grants. Without the agent it is a no-op that exits successfully. The `LOCK` audit records key and grant cleanup.
+
+`locket unlock` unlocks the current project in the running agent. Use `--project` to select a registered vault by ID or name, including `@shared`. Inside a project, `--shared` unlocks the project and the Global Vault through independent requests. Outside a project, it unlocks only the Global Vault, as does `locket shared unlock`. The agent caches each vault separately for `--ttl` seconds or the configured `agent.unlock_ttl` (15 minutes by default). `--verify-user` requires fresh local user verification before unlocking.
+
+Without a running agent, project unlock uses the OS keychain or passphrase fallback for the current CLI invocation. Start the agent with `locket agent start` to cache keys and unlock the Global Vault. Setting `LOCKET_NO_PROMPT=1` makes CLI passphrase and confirmation prompts fail with `TtyRequired`, including when stdin is a terminal. The values `true` and `yes` also work, case-insensitively.
 
 `locket passkey register` registers a platform authenticator or hardware authenticator only for optional CTAP2/WebAuthn PRF key-wrapping or explicit authenticator identity flows. It requires fresh local user verification before registration, verifies the platform supports the requested PRF/hmac-secret or identity capability, stores only public credential metadata in `passkey_credentials`, records backup eligibility/state when the platform exposes it, and writes a `PASSKEY_REGISTER` audit row. If the platform cannot provide the required PRF/hmac-secret capability, registration fails with `ConfigError`; if the verification ceremony fails, registration fails with `LocalUserVerificationFailed`. Locket must not silently register a weaker approval-only credential for a key-wrapping request.
 
@@ -120,7 +125,7 @@ locket new --from-template <name>
 locket project trust-root
 locket project list-roots
 locket project untrust-root <root-hash>
-locket emit-example
+locket emit-example [--replace]
 locket completion <shell>
 ```
 
@@ -128,7 +133,9 @@ Bare `locket` behaves as `locket status`. It shows active project, active profil
 
 `locket project trust-root` records the current resolved project root hash for the active project after showing the canonical path and requiring confirmation. If the current root is already trusted, it exits successfully with a notice and updates `last_seen_at` without creating a duplicate root row. `locket project list-roots` prints trusted root hashes, display paths where known, creation timestamps, and last-seen timestamps; it never prints secret values. `locket project untrust-root <root-hash>` requires typed confirmation of the root hash, removes durable trust for that root, revokes live grants bound to that root, invalidates shell/editor grants for that root, writes a `TRUST_ROOT` audit row with removal metadata, and prevents new secret access from that path. It does not terminate already spawned child processes because their environments are already outside Locket's control.
 
-`locket emit-example` regenerates `.env.example` from active secret names across profiles and sources using the same rules as automatic refresh. It does not require unlock because it reads metadata only. The Locket-managed block markers are exactly `# --- BEGIN LOCKET MANAGED ---` and `# --- END LOCKET MANAGED ---`. If `.env.example` already exists, Locket rewrites only the content between those marker lines when they are present; otherwise it shows a metadata-only summary and requires confirmation before replacing the file. v1 has no `--force` flag for this command and no silent overwrite. Successful emission writes an `EXAMPLE_EMIT` audit row when project context is available. Store or project-resolution failures return the normal typed error and leave the existing file unchanged.
+`locket init` creates a managed `.env.example` if the file is missing and preserves an existing unmanaged template byte-for-byte. `locket emit-example` refreshes the managed block using active names across profiles, including shared-link aliases. If the file has no managed block, it appends one below the existing template. The block omits keys already documented outside it, including commented-out assignments. The file keeps its existing line endings and surrounding content.
+
+Use `locket emit-example --replace` and type `replace .env.example` to replace an unmanaged template. Duplicate or incomplete markers and symlinks outside the project root cause the command to fail. Emission requires access to the audit key before it changes the file and writes a metadata-only `EXAMPLE_EMIT` audit row after success.
 
 Configuration:
 
@@ -200,7 +207,9 @@ locket install-hooks
 
 `locket import .env` imports into the active profile by default. `--profile <name>` overrides the target profile. Imported secrets are stored as `user-local` by default with `origin = Imported`; `--source <source>` overrides the target runtime source. Duplicate keys are skipped by default with a metadata-only warning. `--overwrite` rotates each duplicate key in the target source, marks the prior version `Deprecated` with no grace window, updates `SecretMeta.last_rotated_at`, and writes `ROTATE` audit rows. When `--overwrite` targets a dangerous profile, import requires typed confirmation of the dangerous profile name before any rotation begins; failure aborts the entire import before decrypting or writing values. Multiline values are rejected by default unless a future explicit multiline mode is added. Invalid names, duplicate keys, `export` prefixes, quoted values, comments, and conflicts must be handled explicitly in the import report without printing values.
 
-Use `locket import .env --link-shared` to link entries that exactly match an indexed Global Vault value. Use `locket import .env --promote-duplicates` to create a Global Vault entry and link the incoming variable when its value is already indexed in a project and has no Global Vault match. Existing copies keep their values. Run `locket promote <KEY> --consolidate-duplicates` to convert eligible existing copies to links.
+Use `locket import .env --link-shared` to link entries that exactly match an indexed Global Vault value. Use `--promote-duplicates` to create a Global Vault entry and link the incoming name when its value matches another project and the name is available in the Global Vault. Both options require an initialized Global Vault and access to its fingerprint key, including during `--dry-run`. The preview reports the same plan as a real import from the same starting state.
+
+Import skips a candidate link or promotion when it would replace an active local value or retarget a link. With `--overwrite`, it tombstones any active local source that would take precedence over the link. Use `--confirm-dangerous <PROFILE>` to confirm overwrites and links in a dangerous consuming profile, or promotion into a dangerous Global Vault profile. Promotion records `SECRET_PROMOTE` in the consuming project and the Global Vault. Other projects keep their copies. Run `locket promote <KEY> --consolidate-duplicates` to convert eligible copies to links.
 
 Secret values for `set`, `rotate`, and import overwrite prompts must be entered through secure prompt, editor, or non-echo stdin flows only. v1 must not accept secret values as positional arguments, CLI flags, environment variables, shell history-friendly prompts, or debug logs. Metadata flags are allowed on the command line because they are metadata, but they are still validated by the metadata privacy rules in [data-model.md](data-model.md).
 

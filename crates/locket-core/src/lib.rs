@@ -53,8 +53,8 @@ pub use pgp_word_list::{
     EVEN_SYLLABLE_WORDS, ODD_SYLLABLE_WORDS, SAFETY_WORD_COUNT, safety_words_from_fingerprint_hex,
 };
 pub use policy::{
-    CommandPolicy, CommandSpec, ExternalEnvSource, MAX_COMMAND_POLICY_TTL_SECONDS, PathEnvSet,
-    PolicyDocument, PolicyFieldSource, PolicyParseError, SecretAccessPolicy,
+    CommandPolicy, CommandSpec, ExternalEnvSource, MAX_COMMAND_POLICY_TTL_SECONDS, OutputRedaction,
+    PathEnvSet, PolicyDocument, PolicyFieldSource, PolicyParseError, SecretAccessPolicy,
     VariableClassification, VariableContract, VariableReadinessRow, VariableReadinessState,
     VariableType, variable_exposure_warning,
 };

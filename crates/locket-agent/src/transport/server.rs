@@ -1258,6 +1258,8 @@ struct UnlockPayload {
     passphrase: Option<Zeroizing<String>>,
     #[serde(default)]
     reuse_cached: bool,
+    #[serde(default)]
+    verify_user: bool,
     ttl_seconds: u64,
     /// Hint from the client for forward-compatibility. The agent
     /// derives the actual cached method from the path it took during
@@ -1624,6 +1626,7 @@ async fn handle_unlock(
     // Execution reuses an existing authorization without re-prompting or extending
     // its lifetime. An explicit unlock still authenticates through the key store.
     if payload.reuse_cached
+        && !payload.verify_user
         && payload.passphrase.is_none()
         && state.unlock_cache.lock().await.lookup(&payload.project_id, now).is_some()
     {
@@ -1644,7 +1647,7 @@ async fn handle_unlock(
             "could not read unlock verification policy",
         );
     };
-    let verification = if verification_required {
+    let verification = if payload.verify_user || verification_required {
         match state.verify_local_user(envelope, "unlock", "Unlock the Locket vault").await {
             Ok(verification) => verification,
             Err(response) => return response,

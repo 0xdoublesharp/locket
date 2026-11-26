@@ -394,6 +394,45 @@ fn emit_example_uses_all_profiles_rewrites_managed_block_and_audits()
 }
 
 #[test]
+fn emit_example_adopts_and_deduplicates_documented_names() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--no-device", "--no-passkey"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    std::fs::write(
+        directory.path().join("import.env"),
+        "DATABASE_URL=database-value\nAPI_KEY=api-value\nPORT=3000\nLOCAL_ONLY=fixture\n",
+    )?;
+    let example = directory.path().join(".env.example");
+    let original = b"  export DATABASE_URL = sample\r\n # export API_KEY = sample\r\n # PORT=3000";
+    std::fs::write(&example, original)?;
+    run_with_context(
+        Cli::try_parse_from(["locket", "import", "import.env"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    assert_eq!(std::fs::read(&example)?, original);
+    let emit = || {
+        run_with_context(
+            Cli::try_parse_from(["locket", "emit-example"])?,
+            &context,
+            &mut Vec::new(),
+        )?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    };
+    emit()?;
+    let expected = b"  export DATABASE_URL = sample\r\n # export API_KEY = sample\r\n # PORT=3000\r\n# --- BEGIN LOCKET MANAGED ---\r\nLOCAL_ONLY=\r\n# --- END LOCKET MANAGED ---\r\n";
+    assert_eq!(std::fs::read(&example)?, expected);
+    emit()?;
+    assert_eq!(std::fs::read(&example)?, expected);
+    Ok(())
+}
+
+#[test]
 fn emit_example_confirms_unmanaged_replacement_without_value_leakage()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempdir()?;
@@ -418,7 +457,11 @@ fn emit_example_confirms_unmanaged_replacement_without_value_leakage()
     std::fs::write(directory.path().join(".env.example"), "DATABASE_URL=manual-value\n")?;
 
     let mut emit_output = Vec::new();
-    run_with_context(Cli::try_parse_from(["locket", "emit-example"])?, &context, &mut emit_output)?;
+    run_with_context(
+        Cli::try_parse_from(["locket", "emit-example", "--replace"])?,
+        &context,
+        &mut emit_output,
+    )?;
     let emit_output = String::from_utf8(emit_output)?;
     assert!(emit_output.contains(".env.example: unmanaged"));
     assert!(!emit_output.contains("manual-value"));
@@ -510,7 +553,7 @@ fn automatic_example_refresh_respects_user_and_project_config()
 }
 
 #[test]
-fn automatic_example_refresh_refuses_unmanaged_example_file()
+fn automatic_example_refresh_preserves_unmanaged_example_file()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempdir()?;
     let context = test_context(&directory);
@@ -536,10 +579,7 @@ fn automatic_example_refresh_refuses_unmanaged_example_file()
     let mut names = BTreeSet::new();
     names.insert("DATABASE_URL".to_owned());
 
-    assert_error_contains(
-        crate::write_example_block(directory.path(), &names).map(|_| ()),
-        "refusing automatic overwrite",
-    );
+    crate::write_example_block(directory.path(), &names)?;
     assert_eq!(std::fs::read_to_string(&example_path)?, "MANUAL=kept\n");
     Ok(())
 }
@@ -2123,14 +2163,16 @@ fn init_resumes_valid_locket_toml_without_store_project_and_creates_keys()
 }
 
 #[test]
-fn init_failure_on_unmanaged_env_example_rolls_back_owned_changes()
--> Result<(), Box<dyn std::error::Error>> {
+fn init_preserves_unmanaged_env_example() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempdir()?;
     let context = test_context(&directory);
-    std::fs::write(directory.path().join(".env.example"), "MANUAL=kept\n")?;
+    std::fs::write(
+        directory.path().join(".env.example"),
+        "MANUAL=kept\r\n# Retain the final line",
+    )?;
     let mut output = Vec::new();
 
-    let result = run_with_context(
+    run_with_context(
         Cli::try_parse_from([
             "locket",
             "init",
@@ -2143,18 +2185,24 @@ fn init_failure_on_unmanaged_env_example_rolls_back_owned_changes()
         ])?,
         &context,
         &mut output,
-    );
+    )?;
 
-    assert_error_contains(result, "refusing silent overwrite");
-    assert!(!directory.path().join("locket.toml").exists());
-    assert!(!directory.path().join(".gitignore").exists());
-    assert_eq!(std::fs::read_to_string(directory.path().join(".env.example"))?, "MANUAL=kept\n");
+    assert!(String::from_utf8(output)?.contains(".env.example: preserved (existing template)"));
+    assert!(directory.path().join("locket.toml").exists());
+    assert!(directory.path().join(".gitignore").exists());
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join(".env.example"))?,
+        "MANUAL=kept\r\n# Retain the final line"
+    );
     assert!(!directory.path().join(".locket/recovery/kdf.toml").exists());
     assert!(!directory.path().join(".locket/recovery/envelope.bin").exists());
     let store = crate::open_store(&context)?;
-    let project_count: i64 =
-        store.connection().query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))?;
-    assert_eq!(project_count, 0);
+    let metadata: String = store.connection().query_row(
+        "SELECT metadata_json FROM audit_log WHERE action = 'INIT'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert!(!metadata.contains(".env.example"));
     Ok(())
 }
 
@@ -2171,7 +2219,10 @@ fn init_resume_failure_rolls_back_new_store_rows_and_master_key()
     );
     crate::write_project_config(&directory.path().join("locket.toml"), &config)?;
     let original_config_text = std::fs::read_to_string(directory.path().join("locket.toml"))?;
-    std::fs::write(directory.path().join(".env.example"), "MANUAL=kept\n")?;
+    std::fs::write(
+        directory.path().join(".env.example"),
+        "MANUAL=kept\n# --- BEGIN LOCKET MANAGED ---\n",
+    )?;
 
     let store = crate::open_store(&context)?;
     store.insert_project_if_absent(config.project_id.as_str(), &config.name, 1_000)?;
@@ -2183,12 +2234,15 @@ fn init_resume_failure_rolls_back_new_store_rows_and_master_key()
         &mut Vec::new(),
     );
 
-    assert_error_contains(result, "refusing silent overwrite");
+    assert_error_contains(result, "unterminated Locket managed block");
     assert_eq!(
         std::fs::read_to_string(directory.path().join("locket.toml"))?,
         original_config_text
     );
-    assert_eq!(std::fs::read_to_string(directory.path().join(".env.example"))?, "MANUAL=kept\n");
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join(".env.example"))?,
+        "MANUAL=kept\n# --- BEGIN LOCKET MANAGED ---\n"
+    );
     assert!(!directory.path().join(".locket/recovery/kdf.toml").exists());
     assert!(!directory.path().join(".locket/recovery/envelope.bin").exists());
     assert!(matches!(
@@ -5772,5 +5826,94 @@ fn team_invite_authority_and_revocation_are_enforced_before_mutation()
     );
     assert_typed_error(result, LocketError::SecretNotFound, "team invite not found")?;
     assert_eq!(fs::read_to_string(path)?.trim(), signed.encode()?);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn init_rejects_an_example_symlink_outside_the_project() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let outside = tempdir()?;
+    let target = outside.path().join("template");
+    std::fs::write(&target, "OUTSIDE=kept")?;
+    std::os::unix::fs::symlink(&target, directory.path().join(".env.example"))?;
+    let context = test_context(&directory);
+    let result = run_with_context(
+        Cli::try_parse_from(["locket", "init", "--no-device", "--no-passkey"])?,
+        &context,
+        &mut Vec::new(),
+    )
+    .map(|_| ());
+    assert_error_contains(result, "symlink points outside the project root");
+    assert_eq!(std::fs::read_to_string(target)?, "OUTSIDE=kept");
+    assert!(!directory.path().join("locket.toml").exists());
+    Ok(())
+}
+
+#[test]
+fn failed_example_refresh_warns_after_committing_the_secret()
+-> Result<(), Box<dyn std::error::Error>> {
+    const FIXTURE: &str = "LOCKET_TEST_MALFORMED_EXAMPLE";
+    const CANARY: &str = "synthetic-refresh-secret";
+    if std::env::var_os(FIXTURE).is_none() {
+        let child = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", "tests::init_template_device::failed_example_refresh_warns_after_committing_the_secret", "--nocapture"])
+            .env(FIXTURE, "1")
+            .output()?;
+        assert!(child.status.success(), "{:?}", String::from_utf8_lossy(&child.stdout));
+        let stderr = String::from_utf8(child.stderr)?;
+        assert!(
+            stderr.contains("locket: warning: secret saved, but .env.example was not refreshed")
+        );
+        assert!(stderr.contains("unterminated Locket managed block"));
+        assert!(!stderr.contains(CANARY));
+        return Ok(());
+    }
+    let directory = tempdir()?;
+    let context = super::test_context_with_secret_value(&directory, CANARY);
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--no-device", "--no-passkey"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    let file = directory.path().join(".env.example");
+    let invalid = "# --- BEGIN LOCKET MANAGED ---\n";
+    std::fs::write(&file, invalid)?;
+    run_with_context(Cli::try_parse_from(["locket", "set", "CANARY"])?, &context, &mut Vec::new())?;
+    assert_eq!(std::fs::read_to_string(file)?, invalid);
+    let mut revealed = Vec::new();
+    run_with_context(
+        Cli::try_parse_from(["locket", "get", "CANARY", "--reveal", "--force"])?,
+        &context,
+        &mut revealed,
+    )?;
+    assert_eq!(String::from_utf8(revealed)?.trim(), CANARY);
+    Ok(())
+}
+
+#[test]
+fn emit_example_leaves_unmanaged_file_untouched_if_audit_key_is_unavailable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--no-device", "--no-passkey"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    let file = directory.path().join(".env.example");
+    std::fs::write(&file, "MANUAL=value")?;
+    let project = crate::require_project(&context)?;
+    context.key_store.delete_master_key(project.config.project_id.as_str())?;
+    context.master_key_cache.clear();
+    let error = run_with_context(
+        Cli::try_parse_from(["locket", "emit-example"])?,
+        &context,
+        &mut Vec::new(),
+    )
+    .err()
+    .ok_or("expected a locked vault")?;
+    assert_eq!(error.exit_code(), locket_core::LocketError::UnlockRequired.exit_code());
+    assert_eq!(std::fs::read_to_string(file)?, "MANUAL=value");
     Ok(())
 }

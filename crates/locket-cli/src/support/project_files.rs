@@ -6,7 +6,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use locket_crypto::KeyPurpose;
+use locket_core::SecretName;
 use locket_store::{AuditWrite, Store};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -14,8 +14,7 @@ use sha2::{Digest, Sha256};
 use crate::commands::config::spec::{read_user_config, split_config_key};
 use crate::{
     CliError, LOCKET_TOML, ResolvedProject, RuntimeContext, confirmation_failed_error, format_hex,
-    load_project_key, metadata_invalid_error, now_unix_nanos, open_store, require_project,
-    tty_required_error,
+    metadata_invalid_error, now_unix_nanos, open_store, require_project,
 };
 
 pub const EXAMPLE_FILE: &str = ".env.example";
@@ -31,23 +30,25 @@ pub struct ExampleWriteResult {
     pub replaced_unmanaged: bool,
 }
 
-#[derive(Clone, Copy)]
-pub enum UnmanagedExamplePolicy {
-    Refuse,
-    Confirm,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExampleInitState {
+    Created,
+    UpdatedManaged,
+    PreservedUnmanaged,
+}
+
+enum UnmanagedExamplePolicy<'a> {
+    Preserve,
+    Adopt,
+    Replace(&'a RuntimeContext, &'a mut dyn Write),
 }
 
 pub fn write_example_emit_audit(
-    context: &RuntimeContext,
     store: &mut Store,
     resolved: &ResolvedProject,
+    audit_key: &[u8],
     result: &ExampleWriteResult,
 ) -> Result<(), CliError> {
-    if store.get_project(resolved.config.project_id.as_str())?.is_none() {
-        return Ok(());
-    }
-    let audit_key =
-        load_project_key(context, store, resolved.config.project_id.as_str(), KeyPurpose::Audit)?;
     let path_hash = Sha256::digest(EXAMPLE_FILE.as_bytes());
     let metadata = json!({
         "schema_version": 1,
@@ -72,7 +73,7 @@ pub fn write_example_emit_audit(
         metadata_json: &metadata,
         timestamp: now_unix_nanos()?,
     };
-    store.append_audit(audit_key.as_ref(), &audit)?;
+    store.append_audit(audit_key, &audit)?;
     Ok(())
 }
 
@@ -81,47 +82,34 @@ pub fn ensure_gitignore(root: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
-pub fn ensure_example_file(root: &Path) -> Result<(), CliError> {
-    let path = root.join(EXAMPLE_FILE);
-    let names = BTreeSet::new();
-    let managed_block = managed_example_block(&names);
-    let existing = match fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs::write(path, managed_block)?;
-            return Ok(());
-        }
-        Err(error) => return Err(error.into()),
-    };
-
-    let Some(begin) = existing.find(EXAMPLE_BEGIN) else {
-        return Err(metadata_invalid_error(
-            ".env.example exists without Locket managed markers; refusing silent overwrite",
-        ));
-    };
-    let Some(relative_end) = existing[begin..].find(EXAMPLE_END) else {
-        return Err(metadata_invalid_error(
-            ".env.example has an unterminated Locket managed block",
-        ));
-    };
-    let end = begin + relative_end + EXAMPLE_END.len();
-    let mut updated = String::new();
-    updated.push_str(&existing[..begin]);
-    updated.push_str(&managed_block);
-    updated.push_str(&existing[end..]);
-
-    if updated != existing {
-        fs::write(path, updated)?;
-    }
-    Ok(())
+pub fn ensure_example_file(root: &Path) -> Result<ExampleInitState, CliError> {
+    let (_, state) = render_example(root, &BTreeSet::new(), UnmanagedExamplePolicy::Preserve)?;
+    Ok(state)
 }
 
-pub fn refresh_example_for_project_if_enabled(context: &RuntimeContext) -> Result<(), CliError> {
-    let resolved = require_project(context)?;
-    if !example_auto_refresh_enabled(context, &resolved)? {
-        return Ok(());
+pub fn refresh_example_for_project_if_enabled(context: &RuntimeContext) {
+    if let Err(error) = refresh_example(context) {
+        // TOML diagnostics can quote the source line. Only report metadata here.
+        let reason = match error {
+            CliError::Typed { message, .. } => message,
+            CliError::Io(error) => error.to_string(),
+            CliError::TomlDe(_) => "invalid example configuration".to_owned(),
+            _ => "could not read secret metadata".to_owned(),
+        };
+        let _ = writeln!(
+            io::stderr(),
+            "locket: warning: secret saved, but .env.example was not refreshed: {reason}"
+        );
     }
-    refresh_example_for_resolved(context, &resolved)?;
+}
+
+fn refresh_example(context: &RuntimeContext) -> Result<(), CliError> {
+    let resolved = require_project(context)?;
+    if example_auto_refresh_enabled(context, &resolved)? {
+        let store = open_store(context)?;
+        let names = collect_example_secret_names(&store, &resolved)?;
+        write_example_block(&resolved.root, &names)?;
+    }
     Ok(())
 }
 
@@ -137,7 +125,7 @@ fn example_auto_refresh_enabled(
     Ok(config_bool_value(&user_config, "example.auto_refresh")?.unwrap_or(true))
 }
 
-fn read_config_table(path: &Path) -> Result<toml::Table, CliError> {
+pub fn read_config_table(path: &Path) -> Result<toml::Table, CliError> {
     let text = fs::read_to_string(path)?;
     toml::from_str::<toml::Table>(&text).map_err(CliError::from)
 }
@@ -161,24 +149,16 @@ pub fn config_bool_value(config: &toml::Table, key: &str) -> Result<Option<bool>
         .ok_or_else(|| metadata_invalid_error(format!("config key {key:?} must be boolean")))
 }
 
-fn refresh_example_for_resolved(
-    context: &RuntimeContext,
-    resolved: &ResolvedProject,
-) -> Result<ExampleWriteResult, CliError> {
-    let store = open_store(context)?;
-    let names = collect_example_secret_names(&store, resolved)?;
-    write_example_block(&resolved.root, &names)
-}
-
 pub fn collect_example_secret_names(
     store: &Store,
     resolved: &ResolvedProject,
 ) -> Result<BTreeSet<String>, CliError> {
     let mut names = BTreeSet::new();
     for profile in store.list_profiles(resolved.config.project_id.as_str())? {
-        for secret in store
-            .list_active_secrets_by_profile(resolved.config.project_id.as_str(), &profile.id)?
-        {
+        for secret in store.list_active_secret_metadata_by_profile(
+            resolved.config.project_id.as_str(),
+            &profile.id,
+        )? {
             names.insert(secret.name);
         }
     }
@@ -189,125 +169,202 @@ pub fn write_example_block(
     root: &Path,
     names: &BTreeSet<String>,
 ) -> Result<ExampleWriteResult, CliError> {
-    let path = root.join(EXAMPLE_FILE);
-    write_example_block_with_policy(&path, names, UnmanagedExamplePolicy::Refuse, None, None)
+    render_example(root, names, UnmanagedExamplePolicy::Preserve).map(|(result, _)| result)
 }
 
 pub fn write_example_block_for_emit(
     context: &RuntimeContext,
     root: &Path,
     names: &BTreeSet<String>,
+    replace: bool,
     output: &mut impl Write,
 ) -> Result<ExampleWriteResult, CliError> {
-    let path = root.join(EXAMPLE_FILE);
-    write_example_block_with_policy(
-        &path,
-        names,
-        UnmanagedExamplePolicy::Confirm,
-        Some(context),
-        Some(output as &mut dyn Write),
-    )
+    let policy = if replace {
+        UnmanagedExamplePolicy::Replace(context, output)
+    } else {
+        UnmanagedExamplePolicy::Adopt
+    };
+    render_example(root, names, policy).map(|(result, _)| result)
 }
 
-fn write_example_block_with_policy(
-    path: &Path,
-    names: &BTreeSet<String>,
-    unmanaged_policy: UnmanagedExamplePolicy,
-    runtime_context: Option<&RuntimeContext>,
-    output: Option<&mut dyn Write>,
-) -> Result<ExampleWriteResult, CliError> {
-    let managed_block = managed_example_block(names);
-    let existing = match fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs::write(path, managed_block)?;
-            return Ok(ExampleWriteResult {
-                path: path.to_path_buf(),
-                secret_name_count: names.len(),
-                replaced_unmanaged: false,
-            });
+pub fn example_path(root: &Path) -> Result<PathBuf, CliError> {
+    let root = root.canonicalize()?;
+    let path = root.join(EXAMPLE_FILE);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_symlink() => {
+            let target = path.canonicalize()?;
+            if !target.starts_with(root) {
+                return Err(metadata_invalid_error(
+                    ".env.example symlink points outside the project root",
+                ));
+            }
+            Ok(target)
         }
+        Ok(_) => Ok(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(path),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn render_example(
+    root: &Path,
+    names: &BTreeSet<String>,
+    policy: UnmanagedExamplePolicy<'_>,
+) -> Result<(ExampleWriteResult, ExampleInitState), CliError> {
+    let path = example_path(root)?;
+    let existing = match fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
-    let Some(begin) = existing.find(EXAMPLE_BEGIN) else {
-        return replace_unmanaged_example(
-            path,
-            names,
-            &managed_block,
-            unmanaged_policy,
-            runtime_context,
-            output,
-        );
-    };
-    let Some(relative_end) = existing[begin..].find(EXAMPLE_END) else {
-        return Err(metadata_invalid_error(
-            ".env.example has an unterminated Locket managed block",
-        ));
-    };
-    let end = begin + relative_end + EXAMPLE_END.len();
-    let mut updated = String::new();
-    updated.push_str(&existing[..begin]);
-    updated.push_str(&managed_block);
-    updated.push_str(&existing[end..]);
-    if updated != existing {
-        fs::write(path, updated)?;
-    }
-    Ok(ExampleWriteResult {
-        path: path.to_path_buf(),
-        secret_name_count: names.len(),
+    let mut result = ExampleWriteResult {
+        path: root.join(EXAMPLE_FILE),
+        secret_name_count: 0,
         replaced_unmanaged: false,
+    };
+    let Some(existing) = existing else {
+        let mut block = managed_example_block(names, b"\n");
+        block.push(b'\n');
+        replace_example(&path, None, &block)?;
+        result.secret_name_count = names.len();
+        return Ok((result, ExampleInitState::Created));
+    };
+
+    let new = if let Some((begin, end)) = managed_range(&existing)? {
+        let documented = documented_names(&existing[..begin])
+            .chain(documented_names(&existing[end..]))
+            .collect::<BTreeSet<_>>();
+        let names = names.difference(&documented).cloned().collect::<BTreeSet<_>>();
+        result.secret_name_count = names.len();
+        let newline = newline_style(&existing[begin..end]);
+        [&existing[..begin], &managed_example_block(&names, newline), &existing[end..]].concat()
+    } else {
+        let mut prefix = match policy {
+            UnmanagedExamplePolicy::Preserve => {
+                return Ok((result, ExampleInitState::PreservedUnmanaged));
+            }
+            UnmanagedExamplePolicy::Adopt => existing.clone(),
+            UnmanagedExamplePolicy::Replace(context, output) => {
+                confirm_replace(context, output, names.len())?;
+                result.replaced_unmanaged = true;
+                Vec::new()
+            }
+        };
+        let newline = newline_style(&existing);
+        let documented = documented_names(&prefix).collect::<BTreeSet<_>>();
+        let names = names.difference(&documented).cloned().collect::<BTreeSet<_>>();
+        result.secret_name_count = names.len();
+        if !prefix.is_empty() && !prefix.ends_with(b"\n") {
+            prefix.extend_from_slice(newline);
+        }
+        prefix.extend_from_slice(&managed_example_block(&names, newline));
+        prefix.extend_from_slice(newline);
+        prefix
+    };
+    if new != existing {
+        if example_path(root)? != path {
+            return Err(metadata_invalid_error(".env.example changed while preparing the update"));
+        }
+        replace_example(&path, Some(&existing), &new)?;
+    }
+    Ok((result, ExampleInitState::UpdatedManaged))
+}
+
+fn replace_example(path: &Path, original: Option<&[u8]>, updated: &[u8]) -> Result<(), CliError> {
+    let directory =
+        path.parent().ok_or_else(|| metadata_invalid_error("missing .env.example directory"))?;
+    let mut staged = tempfile::Builder::new().prefix(".locket-example-").tempfile_in(directory)?;
+    staged.write_all(updated)?;
+    if let Some(original) = original {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_file() || fs::read(path)? != original {
+            return Err(metadata_invalid_error(".env.example changed while preparing the update"));
+        }
+        staged.as_file().set_permissions(metadata.permissions())?;
+        staged.persist(path).map_err(|error| error.error)?;
+    } else {
+        staged.persist_noclobber(path).map_err(|error| error.error)?;
+    }
+    Ok(())
+}
+
+fn managed_range(bytes: &[u8]) -> Result<Option<(usize, usize)>, CliError> {
+    let mut begin = None;
+    let mut end = None;
+    let mut offset = 0;
+    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        let content = line.strip_suffix(b"\n").unwrap_or(line);
+        let content = content.strip_suffix(b"\r").unwrap_or(content);
+        if content == EXAMPLE_BEGIN.as_bytes() {
+            if begin.is_some() || end.is_some() {
+                return Err(metadata_invalid_error(
+                    ".env.example has duplicate or misplaced Locket markers",
+                ));
+            }
+            begin = Some(offset);
+        }
+        if content == EXAMPLE_END.as_bytes() {
+            if begin.is_none() || end.is_some() {
+                return Err(metadata_invalid_error(
+                    ".env.example has duplicate or misplaced Locket markers",
+                ));
+            }
+            end = Some(offset + content.len());
+        }
+        offset += line.len();
+    }
+    match (begin, end) {
+        (Some(begin), Some(end)) => Ok(Some((begin, end))),
+        (None, None) => Ok(None),
+        _ => Err(metadata_invalid_error(".env.example has an unterminated Locket managed block")),
+    }
+}
+
+fn documented_names(bytes: &[u8]) -> impl Iterator<Item = String> + '_ {
+    bytes.split(|byte| *byte == b'\n').filter_map(|line| {
+        let equals = line.iter().position(|byte| *byte == b'=')?;
+        let key = std::str::from_utf8(&line[..equals]).ok()?.trim();
+        let key = key.strip_prefix('#').unwrap_or(key).trim_start();
+        let key = key
+            .strip_prefix("export")
+            .filter(|rest| rest.starts_with(char::is_whitespace))
+            .unwrap_or(key)
+            .trim();
+        SecretName::new(key).ok().map(SecretName::into_string)
     })
 }
 
-fn replace_unmanaged_example(
-    path: &Path,
-    names: &BTreeSet<String>,
-    managed_block: &str,
-    unmanaged_policy: UnmanagedExamplePolicy,
-    runtime_context: Option<&RuntimeContext>,
-    output: Option<&mut dyn Write>,
-) -> Result<ExampleWriteResult, CliError> {
-    match unmanaged_policy {
-        UnmanagedExamplePolicy::Refuse => Err(metadata_invalid_error(
-            ".env.example exists without Locket managed markers; refusing automatic overwrite",
-        )),
-        UnmanagedExamplePolicy::Confirm => {
-            let Some(output) = output else {
-                return Err(tty_required_error(
-                    ".env.example replacement requires interactive confirmation",
-                ));
-            };
-            let Some(runtime_context) = runtime_context else {
-                return Err(tty_required_error(
-                    ".env.example replacement requires interactive confirmation",
-                ));
-            };
-            writeln!(output, ".env.example: unmanaged")?;
-            writeln!(output, "secret_name_count: {}", names.len())?;
-            writeln!(output, "metadata_only: yes")?;
-            writeln!(output, "type 'replace .env.example' to replace the unmanaged file")?;
-            let confirmation =
-                runtime_context.confirmation_reader.read_confirmation("replace .env.example")?;
-            if confirmation.trim_end() != "replace .env.example" {
-                return Err(confirmation_failed_error("confirmation did not match"));
-            }
-            fs::write(path, managed_block)?;
-            Ok(ExampleWriteResult {
-                path: path.to_path_buf(),
-                secret_name_count: names.len(),
-                replaced_unmanaged: true,
-            })
-        }
+fn newline_style(bytes: &[u8]) -> &'static [u8] {
+    match bytes.iter().position(|byte| *byte == b'\n') {
+        Some(position) if position > 0 && bytes[position - 1] == b'\r' => b"\r\n",
+        _ => b"\n",
     }
 }
 
-pub fn managed_example_block(names: &BTreeSet<String>) -> String {
-    let mut block = format!("{EXAMPLE_BEGIN}\n");
-    for name in names {
-        block.push_str(name);
-        block.push_str("=\n");
+fn confirm_replace(
+    context: &RuntimeContext,
+    output: &mut dyn Write,
+    name_count: usize,
+) -> Result<(), CliError> {
+    writeln!(output, ".env.example: unmanaged")?;
+    writeln!(output, "secret_name_count: {name_count}")?;
+    writeln!(output, "metadata_only: yes")?;
+    writeln!(output, "type 'replace .env.example' to replace the unmanaged file")?;
+    let confirmation = context.confirmation_reader.read_confirmation("replace .env.example")?;
+    if confirmation.trim_end() != "replace .env.example" {
+        return Err(confirmation_failed_error("confirmation did not match"));
     }
-    block.push_str(EXAMPLE_END);
-    block.push('\n');
+    Ok(())
+}
+
+fn managed_example_block(names: &BTreeSet<String>, newline: &[u8]) -> Vec<u8> {
+    let mut block = EXAMPLE_BEGIN.as_bytes().to_vec();
+    block.extend_from_slice(newline);
+    for name in names {
+        block.extend_from_slice(name.as_bytes());
+        block.push(b'=');
+        block.extend_from_slice(newline);
+    }
+    block.extend_from_slice(EXAMPLE_END.as_bytes());
     block
 }

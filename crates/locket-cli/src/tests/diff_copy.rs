@@ -754,7 +754,7 @@ fn copy_refreshes_env_example_after_creating_secret_in_target_profile()
     let args = test_secret_write_args("API_KEY");
     crate::set_secret_value(&context, &args, "initial-value", "manual", 1_000)?;
     // Mirror the `set` CLI's example-refresh side-effect.
-    crate::refresh_example_for_project_if_enabled(&context)?;
+    crate::refresh_example_for_project_if_enabled(&context);
     run_with_context(
         Cli::try_parse_from(["locket", "profile", "create", "staging"])?,
         &context,

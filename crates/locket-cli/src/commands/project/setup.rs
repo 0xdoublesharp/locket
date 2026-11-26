@@ -15,7 +15,10 @@ pub fn setup_command(
     output: &mut impl Write,
     command: Option<SetupCommand>,
 ) -> Result<(), CliError> {
-    if command.is_none() && io::stdin().is_terminal() {
+    if command.is_none()
+        && io::stdin().is_terminal()
+        && !crate::runtime::prompts::prompts_disabled()
+    {
         offer_interactive_setup(context, output)?;
     }
     match command.unwrap_or(SetupCommand::Status) {

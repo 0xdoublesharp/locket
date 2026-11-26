@@ -341,6 +341,81 @@ require_agent = true
     }
 
     #[test]
+    fn run_redacts_captured_output_with_config_env_and_flag_overrides()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let project = tempfile::tempdir()?;
+        let root = project.path();
+        let mut store = initialize_project_store(root)?;
+        let canary = "synthetic-run-etherscan-value";
+        fs::write(root.join(".settings"), format!("ETHERSCAN_API_KEY={canary}\nPORT=3000\n"))?;
+        let policy = format!(
+            r#"
+schema_version = 1
+project_id = "{PROJECT}"
+name = "mutation"
+default_profile = "dev"
+
+[commands.serve]
+shell = '''printf '[env: ETHERSCAN_API_KEY=%s]\nPORT=%s\n' "$ETHERSCAN_API_KEY" "$PORT"; printf %s "$ETHERSCAN_API_KEY" >&2'''
+required_secrets = ["ETHERSCAN_API_KEY", "PORT"]
+external_env_sources = [{{file = ".settings"}}]
+require_agent = true
+"#,
+        );
+        cache_policy(&mut store, root, &policy)?;
+        let _fixture = start_fixture_agent(root)?;
+        let session_store = Store::open(vault_dir(root)?.join("store.db"))?;
+        let check = |flags: &[&str],
+                     env: Option<&str>,
+                     redact: bool,
+                     strict: bool|
+         -> Result<(), Box<dyn std::error::Error>> {
+            let mut child = command(root);
+            child.args(["run"]).args(flags).arg("serve").env_remove("LOCKET_REDACT_OUTPUT");
+            if let Some(env) = env {
+                child.env("LOCKET_REDACT_OUTPUT", env);
+            }
+            let output = child.output()?;
+            let stdout = String::from_utf8(output.stdout)?;
+            let stderr = String::from_utf8(output.stderr)?;
+            // The fixture has no OS keychain entry for the CLI's post-run audit.
+            // The runtime session records the actual child status independently.
+            let child_status: i32 = session_store.connection().query_row(
+                "SELECT exit_status FROM runtime_sessions ORDER BY started_at DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(child_status, 0, "{stdout} {stderr}");
+            let shown = if redact { "[REDACTED:locket]" } else { canary };
+            assert!(stdout.contains(&format!("[env: ETHERSCAN_API_KEY={shown}]")), "{stdout}");
+            assert!(stderr.contains(shown), "{stderr}");
+            assert_eq!(stdout.contains("PORT=3000"), !strict, "{stdout}");
+            assert_eq!(stdout.contains(canary), !redact);
+            assert_eq!(stderr.contains(canary), !redact);
+            Ok(())
+        };
+        check(&[], None, true, false)?;
+        check(&["--no-redact-output"], None, false, false)?;
+        cache_policy(&mut store, root, &format!("{policy}\n[run]\nredact_output = 'never'\n"))?;
+        check(&[], None, false, false)?;
+        check(&[], Some("auto"), true, false)?;
+        check(&[], Some("always"), true, true)?;
+        check(&["--redact-output"], Some("0"), true, true)?;
+        check(
+            &[
+                "--no-redact-output",
+                "--egress-host",
+                "ETHERSCAN_API_KEY=example.test",
+                "--allow-uncontained-egress",
+            ],
+            None,
+            true,
+            true,
+        )?;
+        Ok(())
+    }
+
+    #[test]
     fn redaction_covers_a_preserved_short_value_and_provider_tokens()
     -> Result<(), Box<dyn std::error::Error>> {
         let project = tempfile::tempdir()?;
@@ -551,17 +626,18 @@ shared_secrets = ["SHARED_SETTING"]
         );
         cache_policy(&mut store, root, &policy)?;
         let _fixture = start_fixture_agent(root)?;
-        for (fault, denied_vault) in [
-            ("shared-locked", "the Global Vault"),
-            ("project-locked", "the policy's project vault"),
-            ("shared-wrong-project", "the Global Vault"),
+        let project_unlock = format!("locket unlock --project {PROJECT}");
+        for (fault, denied_vault, unlock) in [
+            ("shared-locked", "the Global Vault", "locket unlock --shared"),
+            ("project-locked", "the policy's project vault", project_unlock.as_str()),
+            ("shared-wrong-project", "the Global Vault", "locket unlock --shared"),
         ] {
             fs::write(root.join(".fixture-status-fault"), fault)?;
             let output = command(root).args(["run", "serve"]).output()?;
             let stderr = String::from_utf8(output.stderr)?;
             assert_eq!(output.status.code(), Some(72), "{fault}: {stderr}");
             assert!(
-                stderr.contains(&format!("unlock {denied_vault} before executing")),
+                stderr.contains(&format!("unlock {denied_vault} with `{unlock}` before executing")),
                 "{fault}: {stderr}"
             );
             assert!(!String::from_utf8(output.stdout)?.contains("child-started"));

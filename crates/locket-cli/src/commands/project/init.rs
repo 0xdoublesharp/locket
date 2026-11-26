@@ -27,7 +27,8 @@ use crate::runtime::key_access::{
     store_master_key_with_fallback,
 };
 use crate::support::project_files::{
-    EXAMPLE_FILE, GITIGNORE_FILE, ensure_example_file, ensure_gitignore,
+    EXAMPLE_FILE, ExampleInitState, GITIGNORE_FILE, ensure_example_file, ensure_gitignore,
+    example_path,
 };
 use crate::support::style::{self, Tone};
 use crate::{
@@ -86,8 +87,8 @@ pub fn init(
                 return Err(error);
             }
         };
-        write_init_summary(output, &resolved.config, completion.master_key_source, true)?;
-        if io::stdin().is_terminal() {
+        write_init_summary(output, &resolved.config, completion, true)?;
+        if io::stdin().is_terminal() && !crate::runtime::prompts::prompts_disabled() {
             super::setup::offer_interactive_setup(context, output)?;
         }
         return Ok(());
@@ -133,8 +134,8 @@ pub fn init(
             return Err(error);
         }
     };
-    write_init_summary(output, &config, completion.master_key_source, false)?;
-    if io::stdin().is_terminal() {
+    write_init_summary(output, &config, completion, false)?;
+    if io::stdin().is_terminal() && !crate::runtime::prompts::prompts_disabled() {
         super::setup::offer_interactive_setup(context, output)?;
     }
     Ok(())
@@ -161,9 +162,10 @@ impl InitState {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct InitCompletion {
     master_key_source: MasterKeySource,
+    example_state: ExampleInitState,
 }
 
 #[derive(Debug)]
@@ -188,7 +190,9 @@ impl FileSnapshot {
                 if let Some(parent) = self.path.parent() {
                     let _ignored = fs::create_dir_all(parent);
                 }
-                let _ignored = fs::write(&self.path, bytes);
+                if fs::read(&self.path).as_deref().ok() != Some(bytes.as_slice()) {
+                    let _ignored = fs::write(&self.path, bytes);
+                }
             }
             None => {
                 let _ignored = fs::remove_file(&self.path);
@@ -277,7 +281,7 @@ impl InitRollback {
         let snapshots = vec![
             FileSnapshot::capture(root.join(LOCKET_TOML))?,
             FileSnapshot::capture(root.join(GITIGNORE_FILE))?,
-            FileSnapshot::capture(root.join(EXAMPLE_FILE))?,
+            FileSnapshot::capture(example_path(root)?)?,
             FileSnapshot::capture(recovery_dir.join("envelope.bin"))?,
         ];
         Ok(Self {
@@ -419,7 +423,7 @@ fn complete_init(
     };
     maybe_register_passkey(context, output, register_passkey, no_passkey);
     ensure_gitignore(root)?;
-    ensure_example_file(root)?;
+    let example_state = ensure_example_file(root)?;
     if let Some(code_bytes) = recovery_code_bytes {
         display_initial_recovery_code(context, output, config, &code_bytes)?;
     }
@@ -430,9 +434,9 @@ fn complete_init(
         timestamp,
         recovery_code_bytes.is_some(),
         root.join(GITIGNORE_FILE).exists(),
-        root.join(EXAMPLE_FILE).exists(),
+        example_state,
     )?;
-    Ok(InitCompletion { master_key_source: key_material.source })
+    Ok(InitCompletion { master_key_source: key_material.source, example_state })
 }
 
 /// Run `device init` automatically as part of `init`, swallowing any
@@ -517,9 +521,10 @@ fn maybe_register_passkey(
 fn write_init_summary(
     output: &mut impl Write,
     config: &ProjectConfig,
-    master_key_source: MasterKeySource,
+    completion: InitCompletion,
     resumed: bool,
 ) -> Result<(), CliError> {
+    let InitCompletion { master_key_source, example_state } = completion;
     if style::enabled() {
         let status = if resumed { "resumed" } else { "initialized" };
         style::write_banner(output, "project", status)?;
@@ -535,6 +540,9 @@ fn write_init_summary(
         }
         writeln!(output, "default_profile: {}", config.default_profile)?;
         writeln!(output, "master_key_source: {}", master_key_source.as_str())?;
+    }
+    if example_state == ExampleInitState::PreservedUnmanaged {
+        writeln!(output, ".env.example: preserved (existing template)")?;
     }
     Ok(())
 }
@@ -716,7 +724,7 @@ fn write_init_audit(
     timestamp: i64,
     recovery_code_displayed: bool,
     gitignore_exists: bool,
-    example_exists: bool,
+    example_state: ExampleInitState,
 ) -> Result<(), CliError> {
     let audit_key =
         load_project_key(context, store, config.project_id.as_str(), KeyPurpose::Audit)?;
@@ -725,7 +733,7 @@ fn write_init_audit(
     if gitignore_exists {
         generated_files.push(GITIGNORE_FILE);
     }
-    if example_exists {
+    if example_state != ExampleInitState::PreservedUnmanaged {
         generated_files.push(EXAMPLE_FILE);
     }
     let metadata = json!({

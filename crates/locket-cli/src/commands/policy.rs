@@ -450,7 +450,16 @@ fn doctor(context: &RuntimeContext, output: &mut impl Write) -> Result<(), CliEr
         }
     }
     if matches!(validation.fatal_error.as_ref(), Some(FatalDoctorError::UnlockRequired)) {
-        writeln!(output, "next_step: run `locket unlock`, then `locket policy doctor`")?;
+        let unlock = if validation
+            .exit_error
+            .as_ref()
+            .is_some_and(|error| error.to_string().contains("Global Vault"))
+        {
+            "locket unlock --shared"
+        } else {
+            "locket unlock"
+        };
+        writeln!(output, "next_step: run `{unlock}`, then `locket policy doctor`")?;
     }
     if !refreshes.is_empty() {
         return Err(typed_cli_error(
@@ -1346,7 +1355,11 @@ fn pump_policies_endpoint(
 
     let request =
         RequestEnvelope::new("cli-pump-policies", AgentMethod::RegisterCommandPolicies, payload);
-    match crate::commands::agent::exchange_agent_request(&socket_path, request, None)? {
+    match crate::commands::agent::exchange_agent_request(
+        &socket_path,
+        request,
+        Some(std::time::Duration::from_secs(15)),
+    )? {
         ResponseEnvelope::Success(_) => Ok(()),
         ResponseEnvelope::Error(error) => {
             Err(io::Error::other(format!("agent error {}: {}", error.error, error.message)))

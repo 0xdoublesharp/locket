@@ -77,6 +77,12 @@ No secret values included.
 
 For streaming output, every nonempty line of a known multiline value is redacted independently. This also removes standalone occurrences of those lines, so line boundaries cannot expose pieces of a credential.
 
+### Child output redaction
+
+`locket run` and `locket exec` filter stdout and stderr in the default `auto` mode when either stream is captured. The filter matches known values of at least eight bytes and their encoded variants. It uses a sliding match window without buffering whole lines for provider-token scanning, so short settings such as `PORT=3000` remain visible.
+
+Strict redaction, enabled by `always`, `--redact-output`, or `--egress-host`, matches nonempty known values of any length, their encoded variants, and recognized provider tokens. The provider-token scan can buffer partial lines and suppress lines over 64 KiB. See [runtime.md](runtime.md#child-output) for configuration and precedence.
+
 ## Inline Suppressions
 
 Findings can be suppressed in source via inline directives. Three forms:

@@ -109,6 +109,8 @@ pub struct CliDuplicateMatch {
     pub matched_project_name: String,
     pub matched_profile_name: String,
     pub matched_secret_name: String,
+    #[serde(skip)]
+    pub matched_secret_id: String,
     pub is_shared: bool,
 }
 
@@ -169,14 +171,11 @@ pub fn find_duplicate_matches_for_value(
     profile_id: &str,
     local_name: &str,
     value: &str,
-) -> Vec<CliDuplicateMatch> {
-    let Ok(tag) = local_dedup_tag_v1(shared_fp_key, value) else {
-        return Vec::new();
-    };
-    let Ok(rows) = store.find_active_secrets_by_dedup_tag(&tag) else {
-        return Vec::new();
-    };
-    rows.into_iter()
+) -> Result<Vec<CliDuplicateMatch>, CliError> {
+    let tag = local_dedup_tag_v1(shared_fp_key, value)?;
+    let rows = store.find_active_secrets_by_dedup_tag(&tag)?;
+    Ok(rows
+        .into_iter()
         .filter(|row| {
             !(row.project_id == project_id
                 && row.profile_id == profile_id
@@ -189,9 +188,10 @@ pub fn find_duplicate_matches_for_value(
             matched_project_name: row.project_name,
             matched_profile_name: row.profile_name,
             matched_secret_name: row.name,
+            matched_secret_id: row.secret_id,
             is_shared: row.is_shared,
         })
-        .collect()
+        .collect())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -292,7 +292,7 @@ pub fn link_command(
             &target_secret,
             timestamp,
         )?;
-        refresh_example_for_project_if_enabled(context)?;
+        refresh_example_for_project_if_enabled(context);
         Ok(json!({
             "link_id": link_id,
             "local_name": local_name.as_str(),
@@ -373,7 +373,7 @@ pub fn unlink_command(
                 Some(AuditContext { key: audit_key.as_ref(), write: &audit }),
             )?
             .ok_or_else(missing_link)?;
-        refresh_example_for_project_if_enabled(context)?;
+        refresh_example_for_project_if_enabled(context);
         Ok(json!({
             "local_name": local_name.as_str(),
             "profile": profile.name,
@@ -663,7 +663,7 @@ pub fn promote_command(
                 "skipped_projects": skipped_projects,
             }))
         })?;
-        refresh_example_for_project_if_enabled(context)?;
+        refresh_example_for_project_if_enabled(context);
         Ok(summary)
     })();
     if args.json {

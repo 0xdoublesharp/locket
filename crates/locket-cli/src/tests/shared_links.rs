@@ -336,10 +336,20 @@ fn rpc_url_multi_repo_dedup_promote_rotate_import_link_and_unlink_delete()
 
     // 6. Import same URL into Repo C under ETH_RPC_URL with --link-shared -> links directly!
     fs::write(repo_c.join(".env"), format!("ETH_RPC_URL={rpc_v2}\n"))?;
-    let import_c: serde_json::Value = serde_json::from_str(&run_cli_args(
-        &ctx_c,
-        &["import", ".env", "--keep", "--link-shared", "--json"],
-    )?)?;
+    let mut dry =
+        cli_json(&ctx_c, &["import", ".env", "--keep", "--link-shared", "--dry-run", "--json"], 0)?;
+    assert_eq!(dry["dry_run"], true);
+    let import_c = cli_json(&ctx_c, &["import", ".env", "--keep", "--link-shared", "--json"], 0)?;
+    dry["dry_run"] = json!(false);
+    assert_eq!(dry, import_c);
+    assert_eq!(import_c["linked_names"], json!(["ETH_RPC_URL"]));
+    for (repo, name) in [(&repo_a, "RPC_URL"), (&repo_c, "ETH_RPC_URL")] {
+        assert!(
+            fs::read_to_string(repo.join(".env.example"))?
+                .lines()
+                .any(|line| line == format!("{name}="))
+        );
+    }
     assert_eq!(import_c["linked"], 1);
     assert_eq!(import_c["imported"], 0);
     assert_eq!(
@@ -665,6 +675,243 @@ fn cli_promote_audits_created_reused_and_rotated_targets_in_both_projects()
             assert_eq!(metadata["to_project_id"], target.project_id);
             assert_eq!(metadata["to_profile_id"], target.id);
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn import_shared_requires_an_available_vault_and_overwrite_for_collisions()
+-> Result<(), Box<dyn std::error::Error>> {
+    let workspace = tempfile::tempdir()?;
+    let context = RuntimeContext {
+        key_store: Arc::new(ProjectKeys::default()),
+        ..test_context_with_secret_value(&workspace, "old-local-value")
+    };
+    let changed = RuntimeContext {
+        secret_value_reader: Arc::new(StaticSecretValueReader::new("incoming-fixture-value")),
+        ..context.clone()
+    };
+    run_cli_args(&context, &["init", "--name", "consumer"])?;
+    fs::write(
+        workspace.path().join(".env"),
+        "SHADOW=incoming-fixture-value\nRETARGET=incoming-fixture-value\n",
+    )?;
+    for flag in ["--link-shared", "--promote-duplicates"] {
+        let failure = cli_json(
+            &context,
+            &["import", ".env", flag, "--dry-run", "--json"],
+            LocketError::ProjectNotFound.exit_code(),
+        )?;
+        assert_eq!(failure["error"]["code"], "ProjectNotFound");
+    }
+
+    run_cli_args(&context, &["shared", "init"])?;
+    run_cli_args(&context, &["shared", "set", "OLD_TARGET"])?;
+    run_cli_args(&changed, &["shared", "set", "NEW_TARGET"])?;
+    run_cli_args(&context, &["set", "SHADOW", "--source", "machine-local"])?;
+    run_cli_args(&context, &["link", "RETARGET", "OLD_TARGET"])?;
+
+    for args in [
+        &["import", ".env", "--link-shared", "--dry-run", "--json"][..],
+        &["import", ".env", "--link-shared", "--json"][..],
+    ] {
+        let outcome = cli_json(&context, args, 0)?;
+        assert_eq!(outcome["skipped_names"], json!(["RETARGET", "SHADOW"]));
+    }
+    for name in ["SHADOW", "RETARGET"] {
+        assert_eq!(
+            run_cli_args(&context, &["get", name, "--reveal", "--force"])?.trim(),
+            "old-local-value"
+        );
+    }
+    let outcome =
+        cli_json(&context, &["import", ".env", "--link-shared", "--overwrite", "--json"], 0)?;
+    assert_eq!(outcome["linked_names"], json!(["RETARGET", "SHADOW"]));
+    for name in ["SHADOW", "RETARGET"] {
+        assert_eq!(
+            run_cli_args(&context, &["get", name, "--reveal", "--force"])?.trim(),
+            "incoming-fixture-value"
+        );
+    }
+
+    let (shared, _) =
+        crate::commands::secrets::links::shared_vault_target(&crate::open_store(&context)?)?;
+    context.key_store.delete_master_key(&shared.id)?;
+    context.master_key_cache.clear();
+    for flag in ["--link-shared", "--promote-duplicates"] {
+        let failure = cli_json(
+            &context,
+            &["import", ".env", flag, "--json"],
+            LocketError::UnlockRequired.exit_code(),
+        )?;
+        assert_eq!(failure["error"]["code"], "UnlockRequired");
+    }
+    Ok(())
+}
+
+#[test]
+fn import_promotes_with_matching_preview_and_audits_both_vaults()
+-> Result<(), Box<dyn std::error::Error>> {
+    let workspace = tempfile::tempdir()?;
+    let context = RuntimeContext {
+        key_store: Arc::new(ProjectKeys::default()),
+        ..test_context_with_secret_value(&workspace, "promotion-fixture-value")
+    };
+    run_cli_args(&context, &["init", "--name", "prior-match"])?;
+    run_cli_args(&context, &["shared", "init"])?;
+    run_cli_args(&context, &["set", "SOURCE_TOKEN"])?;
+    let consumer_root = tempfile::tempdir()?;
+    let consumer = RuntimeContext { cwd: consumer_root.path().into(), ..context };
+    run_cli_args(&consumer, &["init", "--name", "consumer"])?;
+    let store = crate::open_store(&consumer)?;
+    let (shared, _) = crate::commands::secrets::links::shared_vault_target(&store)?;
+    assert!(store.set_profile_dangerous(&shared.id, "default", true)?);
+    let local = crate::require_project(&consumer)?.config.project_id;
+    fs::write(consumer_root.path().join(".env"), "NEW_TOKEN=promotion-fixture-value\n")?;
+    let mut preview =
+        cli_json(&consumer, &["import", ".env", "--promote-duplicates", "--dry-run", "--json"], 0)?;
+    assert_eq!(preview["promoted_names"], json!(["NEW_TOKEN"]));
+    let denial = cli_json(
+        &consumer,
+        &["import", ".env", "--promote-duplicates", "--json"],
+        LocketError::DangerousProfileConfirmationRequired.exit_code(),
+    )?;
+    assert_eq!(denial["error"]["code"], "DangerousProfileConfirmationRequired");
+
+    let imported = cli_json(
+        &consumer,
+        &["import", ".env", "--promote-duplicates", "--confirm-dangerous", "default", "--json"],
+        0,
+    )?;
+    preview["dry_run"] = json!(false);
+    assert_eq!(preview, imported);
+    assert_eq!(
+        run_cli_args(&consumer, &["get", "NEW_TOKEN", "--reveal", "--force"])?.trim(),
+        "promotion-fixture-value"
+    );
+    for project_id in [local.as_str(), shared.id.as_str()] {
+        let rows = store.list_exportable_audit_rows(project_id)?;
+        let promoted = rows.iter().filter(|row| row.action == "SECRET_PROMOTE").collect::<Vec<_>>();
+        assert_eq!(promoted.len(), 1);
+        assert!(!promoted[0].metadata_json.contains("promotion-fixture-value"));
+        let key = crate::load_project_key(
+            &consumer,
+            &store,
+            project_id,
+            locket_crypto::KeyPurpose::Audit,
+        )?;
+        assert!(store.verify_audit_chain_read_only(project_id, key.as_ref())?.hmac_ok);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_unlocks_each_vault_and_exec_delivers_the_local_alias()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::net::UnixListener;
+    use std::time::Duration;
+
+    let workspace = tempfile::tempdir()?;
+    let socket = tempfile::tempdir()?;
+    let context = RuntimeContext {
+        key_store: Arc::new(ProjectKeys::default()),
+        ..test_context_with_secret_value(&workspace, "linked-fixture-value")
+    };
+    run_cli_args(&context, &["init", "--name", "consumer", "--no-device", "--no-passkey"])?;
+    run_cli_args(&context, &["shared", "init"])?;
+    run_cli_args(&context, &["shared", "set", "UPSTREAM_TOKEN"])?;
+    run_cli_args(&context, &["link", "RPC_URL", "UPSTREAM_TOKEN"])?;
+    let local = crate::require_project(&context)?.config.project_id.to_string();
+    let store = crate::open_store(&context)?;
+    let (shared, _) = crate::commands::secrets::links::shared_vault_target(&store)?;
+    let context = RuntimeContext { agent_data_dir: Some(socket.path().into()), ..context };
+    let endpoint = crate::agent_socket_path(&context);
+    let listener = UnixListener::bind(&endpoint)?;
+    listener.set_nonblocking(true)?;
+    let state = locket_agent::AgentSocketState::with_stores(
+        "test",
+        locket_agent::current_process_uid(),
+        Arc::clone(&context.key_store),
+        Arc::new(context.passphrase_store.clone()),
+    )
+    .with_canonical_store_path(context.store_path.clone());
+
+    let (shutdown, mut stop) = tokio::sync::oneshot::channel::<()>();
+    let server = std::thread::spawn(move || -> std::io::Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        runtime.block_on(async {
+            let listener = tokio::net::UnixListener::from_std(listener)?;
+            loop {
+                tokio::select! {
+                    _ = &mut stop => return Ok(()),
+                    accepted = listener.accept() => {
+                        let (stream, _) = accepted?;
+                        let _ = tokio::time::timeout(Duration::from_secs(5), locket_agent::handle_connection(stream, state.clone())).await?;
+                    }
+                }
+            }
+        })
+    });
+
+    let verify = || -> Result<(), Box<dyn std::error::Error>> {
+        let status = |project: &str| {
+            crate::commands::agent::request_project_status_snapshot(&endpoint, project)
+        };
+        let unlocked = run_cli_args(&context, &["unlock", "--ttl", "90"])?;
+        assert!(unlocked.contains("agent: unlocked\ncached_keys: yes\nttl_seconds: 90"));
+        assert_eq!(status(&local)?["lock_state"], "unlocked");
+        assert_eq!(status(&shared.id)?["lock_state"], "locked");
+
+        let exec = &[
+            "exec",
+            "--secret",
+            "RPC_URL",
+            "--",
+            "/bin/sh",
+            "-c",
+            r#"test -z "$UPSTREAM_TOKEN" && printf %s "$RPC_URL" > received"#,
+        ];
+        let denial = run_cli_args(&context, exec);
+        assert!(matches!(
+            denial,
+            Err(CliError::Typed { kind: LocketError::UnlockRequired, message })
+            if message.contains("Global Vault") && message.contains("locket unlock --shared")
+        ));
+        assert!(!workspace.path().join("received").exists());
+
+        let unlocked = run_cli_args(&context, &["unlock", "--shared", "--ttl", "120"])?;
+        assert_eq!(unlocked.matches("cached_keys: yes").count(), 2);
+        assert_eq!(unlocked.matches("ttl_seconds: 120").count(), 2);
+        run_cli_args(&context, exec)?;
+        assert_eq!(fs::read_to_string(workspace.path().join("received"))?, "linked-fixture-value");
+
+        let other = tempfile::tempdir()?;
+        let outside = RuntimeContext { cwd: other.path().into(), ..context.clone() };
+        for args in [
+            &["unlock", "--shared", "--ttl", "121"][..],
+            &["shared", "unlock", "--ttl", "121"][..],
+            &["unlock", "--project", "@shared", "--ttl", "121"][..],
+        ] {
+            let unlocked = run_cli_args(&outside, args)?;
+            assert_eq!(unlocked.matches("cached_keys: yes").count(), 1);
+            assert!(unlocked.contains(&shared.id));
+        }
+        let unlocked = run_cli_args(&outside, &["unlock", "--project", "consumer"])?;
+        assert!(unlocked.contains(&local));
+        Ok(())
+    };
+    let checked = verify();
+    drop(shutdown);
+    server.join().map_err(|_| "agent socket fixture panicked")??;
+    checked?;
+    for project in [local, shared.id] {
+        let rows = store.list_exportable_audit_rows(&project)?;
+        assert!(
+            rows.iter()
+                .any(|row| row.action == "UNLOCK"
+                    && row.metadata_json.contains("\"ttl_seconds\":120"))
+        );
     }
     Ok(())
 }

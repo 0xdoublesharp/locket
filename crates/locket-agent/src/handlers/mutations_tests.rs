@@ -1576,7 +1576,9 @@ async fn dotenv_promotion_requires_both_grants_pinned_unlocks_and_target_confirm
     };
 
     request.dry_run = true;
-    assert!(success(call(&request).await).get("promoted").is_none());
+    let preview = success(call(&request).await);
+    assert_eq!(preview["promoted"], 1);
+    assert_eq!(preview["imported"], 1);
     request.dry_run = false;
     assert_eq!(code(call(&request).await), "GrantRequired");
 
@@ -1598,7 +1600,10 @@ async fn dotenv_promotion_requires_both_grants_pinned_unlocks_and_target_confirm
     request.target_confirmation = Some("default".into());
     assert_eq!(code(call(&request).await), "GrantRequired");
     grant_scope(&state, &shared, GrantAction::CopySecretToShared).await;
-    assert_eq!(success(call(&request).await)["promoted"], 1);
+    let applied = success(call(&request).await);
+    for key in ["imported", "overwritten", "skipped", "linked", "promoted"] {
+        assert_eq!(applied[key], preview[key], "{key}");
+    }
 
     // The source confirmation also works as a fallback for older clients.
     request.target_confirmation = None;
@@ -1763,5 +1768,33 @@ async fn shared_cascade_rejects_stale_review_and_locked_consumer_before_audited_
         assert_eq!(rows.last().ok_or("missing unlink audit")?.action, "SECRET_UNLINK");
         assert_eq!(rows.last().and_then(|row| row.secret_name.as_deref()), Some(local_name));
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn dotenv_explicit_link_preview_matches_application() -> Result<(), Box<dyn std::error::Error>>
+{
+    let fixture = Fixture::new()?;
+    let state = fixture.state(GrantAction::SetSecret).await;
+    let shared = seed_shared_vault(&fixture, &state).await?;
+    set_link_fixture_value(&state, &shared, "GLOBAL_TOKEN", "user-local", CANARY).await;
+    fixture.grant(&state, GrantAction::ImportDotenv).await;
+    let mut request = fixture.import("TOKEN=any-value\n", false);
+    request.link_to_shared.insert("TOKEN".into(), "GLOBAL_TOKEN".into());
+    request.dry_run = true;
+    let preview = success(
+        handle_import_dotenv(&envelope(AgentMethod::ImportDotenv, &request), &state, NOW).await,
+    );
+    assert_eq!(preview["linked"], 1);
+    assert_eq!(preview["imported"], 0);
+    assert!(fixture.store().get_secret_link(PROJECT, PROFILE, "TOKEN")?.is_none());
+    request.dry_run = false;
+    let applied = success(
+        handle_import_dotenv(&envelope(AgentMethod::ImportDotenv, &request), &state, NOW).await,
+    );
+    for key in ["imported", "overwritten", "skipped", "linked", "promoted"] {
+        assert_eq!(applied[key], preview[key], "{key}");
+    }
+    assert!(fixture.store().get_secret_link(PROJECT, PROFILE, "TOKEN")?.is_some());
     Ok(())
 }

@@ -74,15 +74,14 @@ Component checks:
 .locketignore
 ```
 
-`.env.example` must be generated automatically from imported or stored secret names with empty placeholder values. When multiple profiles define different names, `.env.example` must contain the project-wide union of secret names, never profile-specific values.
+Locket generates empty placeholders in `.env.example` for the union of active names across project profiles, including active shared-link aliases.
 
-Example generation:
+- Locket updates the block delimited by `# --- BEGIN LOCKET MANAGED ---` and `# --- END LOCKET MANAGED ---`. It preserves the surrounding bytes and line endings. Assignments outside the block count as documentation, including `export NAME=` and `# NAME=`.
+- `set`, `rotate`, `rm`, `purge`, `import`, `copy`, `generate`, `link`, `unlink`, `promote`, and `team accept` refresh the managed block, unless `example.auto_refresh = false` is set. `locket.toml` overrides `config.toml`. An unmanaged file stays untouched. If refresh fails after a vault mutation commits, the command reports a metadata-only warning on stderr and the mutation succeeds.
+- A tombstoned secret stops contributing its name. The name remains if another active source, profile, or link still provides it.
+- `locket emit-example` creates or refreshes the managed block on demand. For an unmanaged template it appends the block. Use `--replace` with typed confirmation to replace the whole unmanaged file.
+- Generated entries contain names and empty placeholders. Keep project documentation and sample settings outside the managed block.
 
-- Locket-managed `.env.example` blocks use exact marker lines `# --- BEGIN LOCKET MANAGED ---` and `# --- END LOCKET MANAGED ---`. Implementations must rewrite only the content between those markers when they are present.
-- `set`, `rotate`, `rm`, `purge`, `import`, `copy`, and `team accept` refresh `.env.example` unless `example.auto_refresh = false` is set in `config.toml` or `locket.toml`. Project-level config wins over user-level config for this setting.
-- Tombstoned secrets do not contribute names to `.env.example`. A name removed from one profile remains in `.env.example` only if another profile still has an active secret with that name.
-- `locket emit-example` regenerates `.env.example` on demand.
-- `.env.example` may include comments for description, required/optional status, owner, tags, and example format. It must never include values.
 
 Pre-commit integration:
 

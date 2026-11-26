@@ -1026,7 +1026,7 @@ fn env_import_dry_run_keeps_vault_and_project_files_untouched()
         assert_eq!(report["overwritten"], usize::from(overwrite));
         assert_eq!(report["filtered_out"], 1);
         assert_eq!(report["filtered_out_names"], serde_json::json!(["EXCLUDE_ME"]));
-        assert_eq!(report["missing_in_profile"], serde_json::json!(["NEW"]));
+        assert_eq!(report["missing_in_profile"], serde_json::json!([]));
         assert_eq!(report["delete_env"], "kept");
     }
     let store_unchanged = std::fs::read(&locked.store_path)? == original_store;
@@ -1212,7 +1212,7 @@ fn import_overwrite_checks_the_current_profile_policy_before_mutating()
         dry_run: false,
         link_shared: false,
         promote_duplicates: false,
-        confirmed_profile: None,
+        confirmed_profiles: Vec::new(),
         source: SecretSourceArg::UserLocal,
     };
     import_env_to_target(&context, &mut store, &target, std::fs::File::open(&path)?, &options)?;
@@ -1233,7 +1233,7 @@ fn import_overwrite_checks_the_current_profile_policy_before_mutating()
         .get_secret_by_source(&target.project.id, &target.profile.id, "TOKEN", "user-local")?
         .ok_or("missing fixture secret")?;
     assert_eq!(current.current_version, 1);
-    options.confirmed_profile = Some(target.profile.name.clone());
+    options.confirmed_profiles = vec![target.profile.name.clone()];
     let report =
         import_env_to_target(&context, &mut store, &target, std::fs::File::open(&path)?, &options)?;
     assert_eq!(report["overwritten"], 1);

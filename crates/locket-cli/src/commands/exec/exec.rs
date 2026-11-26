@@ -1,6 +1,6 @@
 //! Implementation of the `locket exec` command and its private helpers.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::Path;
 
@@ -10,8 +10,8 @@ use locket_store::{AuditWrite, ProfileRecord, Store};
 use serde_json::json;
 
 use super::run::{
-    RuntimeExecutionRequest, execute_prepared_with_runtime_session, require_shared_vault_unlocked,
-    unique_secret_names,
+    RuntimeExecutionRequest, child_output_redaction, child_redactor, execute_exec_child,
+    require_linked_secret_access, require_shared_vault_unlocked, unique_secret_names,
 };
 use crate::commands::agent::ensure_agent_running_for_execution;
 use crate::commands::discovery::{SHARED_PROJECT_PREFIX, select_project, trusted_project_configs};
@@ -24,11 +24,11 @@ use crate::runtime::error::{
 };
 use crate::runtime::key_access::load_project_key;
 use crate::support::secret_helpers::{
-    decrypt_secret_version, select_highest_precedence_secret, summarize_names,
+    decrypt_secret_version, resolve_active_secret_in_profile, summarize_names,
 };
 use crate::{
-    ExecArgs, ResolvedProject, active_secrets_by_name, ensure_trusted_project_root, now_unix_nanos,
-    open_store, require_project,
+    ExecArgs, ResolvedProject, active_profile_secret_names, ensure_trusted_project_root,
+    now_unix_nanos, open_store, require_project,
 };
 
 pub fn exec_command(
@@ -54,35 +54,19 @@ pub fn exec_command(
     if args.project.is_some() || args.profile.is_some() {
         ensure_dangerous_profile_consent(&profile, args.use_dangerous)?;
     }
-    let mut active = active_secrets_by_name(&store, &project_id, &profile.id)?;
-    let secret_names =
-        if args.all { active.keys().cloned().collect::<Vec<_>>() } else { args.secrets.clone() };
+    let secret_names = if args.all {
+        active_profile_secret_names(&store, &project_id, &profile.id)?.into_iter().collect()
+    } else {
+        args.secrets.clone()
+    };
     let documents = load_exec_configurations(&configs, &cwd, &secret_names, &args.command)?;
 
     if args.all && !args.force {
         confirm_exec_all_scope(context, output, &profile, &args.command, &secret_names)?;
     }
 
-    let shared_project = authorize_exec_target(context, &project_id)?;
-
-    let mut locket_env = locket_exec::EnvMap::new();
-    let mut injected_sources = BTreeMap::new();
-    for name in unique_secret_names(secret_names.iter().map(String::as_str)) {
-        let secret = active
-            .remove(&name)
-            .and_then(select_highest_precedence_secret)
-            .ok_or_else(|| secret_not_found_error(format!("secret not found: {name}")))?;
-        let value = decrypt_secret_version(
-            context,
-            &store,
-            &project_id,
-            &profile.id,
-            &secret,
-            secret.current_version,
-        )?;
-        injected_sources.insert(name.clone(), secret.source);
-        locket_env.insert(name, value);
-    }
+    let ExecSecrets { env: locket_env, sources: injected_sources, shared_projects } =
+        resolve_exec_secrets(context, &store, &profile, &secret_names)?;
     let injected_names = injected_sources.keys().cloned().collect::<Vec<_>>();
 
     let argv_program = args.command.first().cloned().unwrap_or_default();
@@ -102,24 +86,28 @@ pub fn exec_command(
     for document in &documents {
         validate_exec_configuration(document, &secret_names, &prepared.env, output)?;
     }
-    let status = if injected_names.is_empty() {
-        prepared.command().status()?
-    } else {
-        execute_prepared_with_runtime_session(
-            context,
-            &RuntimeExecutionRequest {
-                store: &store,
-                profile: &profile,
-                policy_name: None,
-                secret_names: &injected_names,
-                prepared: &prepared,
-                current_dir: Some(&context.cwd),
-                run_policy_grant: None,
-                shared_project,
-            },
-        )?
-        .status
-    };
+    let redaction = child_output_redaction(
+        context,
+        &args.output_redaction,
+        documents.first().and_then(|document| document.output_redaction),
+        false,
+    )?;
+    let redactor =
+        redaction.map(|mode| child_redactor(mode, request.locket_env.into_iter().collect()));
+    let status = execute_exec_child(
+        context,
+        &RuntimeExecutionRequest {
+            store: &store,
+            profile: &profile,
+            policy_name: None,
+            secret_names: &injected_names,
+            prepared: &prepared,
+            current_dir: Some(&context.cwd),
+            run_policy_grant: None,
+            shared_projects: shared_projects.iter().map(String::as_str).collect(),
+        },
+        redactor,
+    )?;
     let exit_code = status.code();
 
     write_exec_audit_if_available(
@@ -142,16 +130,54 @@ pub fn exec_command(
     Err(child_exit_error(status))
 }
 
-fn authorize_exec_target<'a>(
+#[derive(Default)]
+struct ExecSecrets {
+    env: locket_exec::EnvMap,
+    sources: BTreeMap<String, String>,
+    shared_projects: BTreeSet<String>,
+}
+
+fn resolve_exec_secrets(
     context: &RuntimeContext,
-    project_id: &'a str,
-) -> Result<Option<&'a str>, CliError> {
+    store: &Store,
+    profile: &ProfileRecord,
+    names: &[String],
+) -> Result<ExecSecrets, CliError> {
     ensure_agent_running_for_execution(context)?;
-    if project_id.starts_with(SHARED_PROJECT_PREFIX) {
-        require_shared_vault_unlocked(context, project_id)?;
-        return Ok(Some(project_id));
+    let mut selected = ExecSecrets::default();
+    if profile.project_id.starts_with(SHARED_PROJECT_PREFIX) {
+        require_shared_vault_unlocked(context, &profile.project_id)?;
+        selected.shared_projects.insert(profile.project_id.clone());
     }
-    Ok(None)
+    for name in unique_secret_names(names.iter().map(String::as_str)) {
+        let key = SecretName::new(name.as_str())
+            .map_err(|_| invalid_reference_error("invalid selected secret name"))?;
+        let secret = resolve_active_secret_in_profile(store, profile, &key).map_err(|error| {
+            if error.exit_code() == locket_core::LocketError::SecretNotFound.exit_code() {
+                secret_not_found_error(format!("secret not found: {name}"))
+            } else {
+                error
+            }
+        })?;
+        require_linked_secret_access(context, store, profile, &secret)?;
+        let source = if secret.project_id == profile.project_id {
+            secret.source.clone()
+        } else {
+            selected.shared_projects.insert(secret.project_id.clone());
+            "shared-link".to_owned()
+        };
+        let value = decrypt_secret_version(
+            context,
+            store,
+            &secret.project_id,
+            &secret.profile_id,
+            &secret,
+            secret.current_version,
+        )?;
+        selected.sources.insert(name.clone(), source);
+        selected.env.insert(name, value);
+    }
+    Ok(selected)
 }
 
 fn resolve_exec_target(
