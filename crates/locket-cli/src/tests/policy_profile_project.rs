@@ -119,6 +119,48 @@ fn policy_detect_uses_lockfile_runners_and_marks_existing_commands_from_subdirec
 }
 
 #[test]
+fn policy_detect_prints_next_steps_only_for_unconfigured_commands()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let root = directory.path();
+    let context = test_context(&directory);
+    std::fs::write(root.join("package.json"), r#"{"scripts":{"dev":"serve","test":"check"}}"#)?;
+    let config_path = root.join("locket.toml");
+    let configured_dev = "schema_version=1\n[commands.dev]\nargv=['npm','run','dev']\n";
+    std::fs::write(&config_path, configured_dev)?;
+
+    let detect = || -> Result<String, Box<dyn std::error::Error>> {
+        let mut output = Vec::new();
+        run_with_context(
+            Cli::try_parse_from(["locket", "policy", "detect"])?,
+            &context,
+            &mut output,
+        )?;
+        Ok(String::from_utf8(output)?)
+    };
+    let next =
+        "next: grant required secrets explicitly with `locket policy require <name> <KEY>...`";
+    let tip = "tip: use finite check commands (such as test, typecheck, or build) with `locket import --verify-policy <name>`";
+    let output = detect()?;
+    assert!(
+        output.contains("test: npm run test (source_file=package.json, already_configured=false)")
+    );
+    assert!(output.ends_with(&format!("{next}\n{tip}\n")), "{output}");
+
+    std::fs::write(
+        &config_path,
+        format!("{configured_dev}[commands.test]\nargv=['npm','run','test']\n"),
+    )?;
+    let output = detect()?;
+    assert!(
+        output.contains("test: npm run test (source_file=package.json, already_configured=true)")
+    );
+    assert!(!output.contains(next), "{output}");
+    assert!(!output.contains(tip), "{output}");
+    Ok(())
+}
+
+#[test]
 fn policy_detect_resolves_package_managers_within_the_worktree()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempdir()?;

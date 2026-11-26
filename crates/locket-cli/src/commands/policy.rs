@@ -121,7 +121,7 @@ fn detect(
     } else if detected.is_empty() {
         writeln!(output, "No runnable commands detected.")?;
     } else {
-        for row in detected {
+        for row in &detected {
             writeln!(
                 output,
                 "{}: {} (source_file={}, already_configured={})",
@@ -130,6 +130,17 @@ fn detect(
             if !row.already_configured {
                 writeln!(output, "  add: {}", row.suggested_command)?;
             }
+        }
+        if detected.iter().any(|row| !row.already_configured) {
+            writeln!(
+                output,
+                "next: grant required secrets explicitly with `locket policy require <name> <KEY>...`"
+            )?;
+            writeln!(
+                output,
+                "tip: use finite check commands (such as test, typecheck, or build) \
+                 with `locket import --verify-policy <name>`"
+            )?;
         }
     }
     Ok(())

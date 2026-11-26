@@ -226,6 +226,24 @@ theorem batchUnlock_stop_on_first_failure (plan : BatchUnlockPlan) (authorize : 
   simp only [runBatchUnlock, prepared] at attempted ⊢
   exact executeBatch_first_failure authorize projects k inBounds attempted denied
 
+/-- Apply one authorization decision to the resolved, deduplicated plan. The state
+records whether each vault is unlocked. -/
+def applyUnlockBatch (approved : Bool) (maxBatch : Nat) (plan : List ProjectId)
+    (state : ProjectId → Bool) : ProjectId → Bool :=
+  if approved = true ∧ plan.length ≤ maxBatch ∧ plan.isEmpty = false then
+    fun project => if project ∈ plan then true else state project
+  else state
+
+theorem unlockBatch_cancelled_unlocks_none (maxBatch : Nat) (plan : List ProjectId)
+    (state : ProjectId → Bool) : applyUnlockBatch false maxBatch plan state = state := by
+  simp [applyUnlockBatch]
+
+theorem unlockBatch_scope_bounded (approved : Bool) (maxBatch : Nat) (plan : List ProjectId)
+    (state : ProjectId → Bool) (project : ProjectId) (outside : project ∉ plan) :
+    applyUnlockBatch approved maxBatch plan state project = state project := by
+  unfold applyUnlockBatch
+  split <;> simp [outside]
+
 /-- The Compose scanner supplies referenced keys. The overlap contains the sorted,
 unique dotenv keys that Compose references. -/
 def composeInterpolationOverlap (referencedKeys : List String) (doc : Document) : List String :=
@@ -242,39 +260,36 @@ theorem composeInterpolation_noninterference (referencedKeys : List String)
       composeInterpolationWarns referencedKeys doc := by
   simp [composeInterpolationWarns, composeInterpolationOverlap, inspectEnvKeys_noninterference]
 
+inductive VerifyOutcome where
+  | passed
+  | failed (code : Nat)
+  | timedOut
+  | notRun
+  deriving DecidableEq
+
 structure VerifyPolicyInput where
   policyExists : Bool
   policyApproved : Bool
   vaultUnlocked : Bool
-  -- `none` means the policy did not run.
-  exitCode : Option Nat
+  -- `passed` means the command exited with code zero before the deadline.
+  outcome : VerifyOutcome
 
 def verifyPolicyAllowsArchive (input : VerifyPolicyInput) : Bool :=
-  input.policyExists && input.policyApproved && input.vaultUnlocked && (input.exitCode == some 0)
+  input.policyExists && input.policyApproved && input.vaultUnlocked &&
+    decide (input.outcome = .passed)
 
-private theorem verifyPolicy_blocks_unapproved_or_locked (input : VerifyPolicyInput)
-    (blocked : input.policyExists = false ∨ input.policyApproved = false ∨ input.vaultUnlocked = false) :
+theorem verifyPolicy_timeout_blocks_archive (input : VerifyPolicyInput)
+    (timeout : input.outcome = .timedOut) :
     verifyPolicyAllowsArchive input = false := by
-  rcases blocked with missing | unapproved | locked <;>
-    simp [verifyPolicyAllowsArchive, *]
-
-private theorem verifyPolicy_blocks_nonzero_exit (input : VerifyPolicyInput)
-    (failed : input.exitCode ≠ some 0) : verifyPolicyAllowsArchive input = false := by
-  simp [verifyPolicyAllowsArchive, failed]
+  simp [verifyPolicyAllowsArchive, timeout]
 
 /-- A passing policy clears this gate. The archive destination and value-matching
 checks still apply independently. -/
 theorem verifyPolicy_gates_archive_on_approved_unlocked_zero_exit (input : VerifyPolicyInput) :
     verifyPolicyAllowsArchive input = true ↔
       input.policyExists = true ∧ input.policyApproved = true ∧ input.vaultUnlocked = true ∧
-        input.exitCode = some 0 := by
-  by_cases blocked :
-      input.policyExists = false ∨ input.policyApproved = false ∨ input.vaultUnlocked = false
-  · rw [verifyPolicy_blocks_unapproved_or_locked input blocked]
-    rcases blocked with missing | unapproved | locked <;> simp [*]
-  · by_cases passed : input.exitCode = some 0
-    · simp [verifyPolicyAllowsArchive, passed, and_assoc]
-    · simp [verifyPolicy_blocks_nonzero_exit input passed, passed]
+        input.outcome = .passed := by
+  simp [verifyPolicyAllowsArchive, and_assoc]
 
 structure FleetProgress where
   migrated : Nat

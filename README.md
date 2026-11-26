@@ -172,7 +172,7 @@ locket emit-example
 locket set <KEY> [--source user-local|machine-local|team-managed]
 locket env keys .env
 locket env scan [--remaining]
-locket import .env [--overwrite] [--literal] [--keep | --archive <DIR> [--archive-if-matching] [--verify-policy <POLICY>]]
+locket import .env [--overwrite] [--literal] [--keep | --archive <DIR> [--archive-if-matching] [--verify-policy <POLICY> [--verify-timeout <seconds>]]]
 locket list [--all]
 locket get <KEY>
 locket get <KEY> --reveal
@@ -185,7 +185,7 @@ locket use staging
 
 Secret names use portable environment-variable syntax, such as `DATABASE_URL` or `STRIPE_SECRET_KEY`. For `locket set`, supply values through stdin to keep them out of shell history and process listings. Locket rejects secret values passed as arguments.
 
-Use `locket env scan --remaining` to focus on dotenv files still in place while keeping the migrated, staged, and uninitialized project counts. Pass `--verify-policy <POLICY>` with `--archive` to run an approved saved policy with vault values before archiving. Locket leaves the `.env` in place if verification fails.
+Use `locket env scan --remaining` for a migration work queue. It lists `staged_project_roots` and `uninitialized_project_roots` alongside the migrated, staged, and uninitialized project counts. With `--archive`, pass `--verify-policy <POLICY> [--verify-timeout <seconds>]` to run an approved check with vault values before archiving. Choose a command that exits, such as a test or build. The timeout defaults to 60 seconds and can be set as high as 600. Locket keeps `.env` in place if the check fails or times out.
 
 ### Share One Value Across Projects
 
@@ -213,7 +213,7 @@ locket policy require dev API_TOKEN
 locket policy doctor
 ```
 
-`locket policy detect` prints `locket policy add <name> -- <argv>` commands you can review and approve.
+`locket policy detect` prints `locket policy add <name> -- <argv>` commands you can review and approve. Use `locket policy require <name> <KEY>...` to grant the secrets each command needs.
 
 If doctor reports an old or changed policy approval, review `locket.toml` and run
 `locket policy refresh dev`. Type the policy name to approve the current command,
@@ -347,7 +347,7 @@ locket recover
 locket recovery rotate
 ```
 
-`locket unlock` and `locket lock` accept repeated `--project` selectors (up to eight distinct vaults per batch) and resolve every selector before prompting. Each vault runs its own verification and audit handling and applies `--ttl` (1 to 86400 seconds, defaulting to `agent.unlock_ttl`).
+`locket unlock` and `locket lock` accept repeated `--project` selectors for up to eight distinct vaults and resolve the full batch before acting. On macOS, unlocking a batch uses one Touch ID prompt that names every selected vault. Each vault has its own unlock TTL and audit entry. `--ttl` accepts 1 to 86400 seconds and defaults to `agent.unlock_ttl`.
 
 Recovery and verification flows are local-first. Keep each project's recovery code separately from its encrypted recovery files in `.locket/recovery` and back up both the recovery files and local vault. The encrypted files are excluded from Git; one project's recovery code does not recover other projects.
 
