@@ -1661,7 +1661,8 @@ async fn pending_profiles_preserve_security_keys_and_local_values_until_explicit
             std::fs::create_dir(&folder)?;
             let config = locket_agent::TeamSyncConfigureRequest {
                 scope: agent.scope.clone(),
-                folder: folder.clone(),
+                folder: Some(folder.clone()),
+                transport: None,
                 allow_dangerous: false,
             };
             let configured =

@@ -35,8 +35,29 @@ pub fn initialize_schema(connection: &mut Connection) -> Result<(), StoreError> 
         }
         None => {}
     }
-    let transaction = connection.transaction()?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     transaction.execute_batch(SCHEMA_SQL)?;
+    // Existing vaults on this schema version retain their shared-folder rows.
+    for (column, sql) in [
+        (
+            "transport_kind",
+            "ALTER TABLE team_sync_folders ADD COLUMN transport_kind TEXT NOT NULL DEFAULT 'folder'",
+        ),
+        (
+            "transport_config_json",
+            "ALTER TABLE team_sync_folders ADD COLUMN transport_config_json TEXT",
+        ),
+    ] {
+        let exists = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('team_sync_folders') WHERE name = ?1)",
+            [column],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !exists {
+            transaction.execute_batch(sql)?;
+        }
+    }
     transaction.execute(
         "INSERT OR IGNORE INTO schema_migrations(version, applied_at)
          VALUES (?1, CAST(strftime('%s', 'now') AS INTEGER) * 1000000000)",
@@ -614,7 +635,15 @@ CREATE TABLE IF NOT EXISTS team_sync_pending_profiles (
 CREATE TABLE IF NOT EXISTS team_sync_folders (
  project_id TEXT PRIMARY KEY REFERENCES projects(id), path TEXT NOT NULL,
  device_key_root TEXT NOT NULL, allow_dangerous INTEGER NOT NULL DEFAULT 0,
- enabled INTEGER NOT NULL DEFAULT 1, last_error TEXT, scan_after TEXT
+ enabled INTEGER NOT NULL DEFAULT 1, last_error TEXT, scan_after TEXT,
+ transport_kind TEXT NOT NULL DEFAULT 'folder', transport_config_json TEXT
+);
+CREATE TABLE IF NOT EXISTS team_sync_credentials (
+ project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+ ciphertext BLOB NOT NULL,
+ nonce BLOB NOT NULL CHECK (length(nonce) = 24),
+ aad_schema_version INTEGER NOT NULL DEFAULT 1,
+ updated_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS team_sync_outbound (
  project_id TEXT NOT NULL, recipient TEXT NOT NULL, epoch INTEGER NOT NULL,

@@ -95,4 +95,176 @@ mod tests {
         assert!(encoded.get("value").is_none());
         Ok(())
     }
+    #[test]
+    fn transport_configure_wire_keeps_legacy_folder_and_redacts_credentials()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::team_sync::{CredentialMode, TransportConfig};
+        use crate::{AgentMethod, RequestEnvelope, TeamSyncConfigureRequest};
+
+        let legacy: TeamSyncConfigureRequest =
+            serde_json::from_value(json!({"project_id":"p","folder":"/share"}))?;
+        assert_eq!(legacy.folder.as_deref(), Some(std::path::Path::new("/share")));
+        assert!(legacy.transport.is_none());
+
+        let payload = json!({
+            "project_id": "p",
+            "transport": {
+                "kind": "s3", "bucket":"bucket", "region":"auto",
+                "endpoint":"http://localhost:9000", "credential_mode":"vault",
+                "access_key_id":"example-access-id","secret_access_key":"credential-to-redact",
+                "session_token":"session-token-to-redact"
+            }
+        });
+        let remote: TeamSyncConfigureRequest = serde_json::from_value(payload.clone())?;
+        let envelope = RequestEnvelope::new("sync", AgentMethod::TeamSyncConfigure, payload);
+        for debug in [format!("{remote:?}"), format!("{envelope:?}")] {
+            for credential in
+                ["example-access-id", "credential-to-redact", "session-token-to-redact"]
+            {
+                assert!(!debug.contains(credential));
+            }
+        }
+        let (config, credentials) =
+            remote.transport.ok_or("remote transport missing")?.into_parts()?;
+        assert!(matches!(
+            config,
+            TransportConfig::S3 { path_style: true, credential_mode: CredentialMode::Vault, .. }
+        ));
+        assert!(credentials.is_some());
+        assert_eq!(AgentMethod::TeamSyncTestRemote.as_str(), "team_sync.test_remote");
+        assert_eq!(
+            "team_sync.test_remote".parse::<AgentMethod>()?,
+            AgentMethod::TeamSyncTestRemote
+        );
+        Ok(())
+    }
+}
+
+/// Transport configuration accepted by the team sync configure RPC.
+///
+/// This request may carry explicit vault credentials. Its debug output is redacted.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(missing_docs)]
+pub enum TeamSyncTransportConfigureInput {
+    Folder {
+        path: String,
+    },
+    S3 {
+        bucket: String,
+        region: String,
+        #[serde(default)]
+        prefix: String,
+        #[serde(default)]
+        endpoint: Option<String>,
+        #[serde(default)]
+        path_style: Option<bool>,
+        credential_mode: crate::team_sync::CredentialMode,
+        #[serde(default, with = "secret_option")]
+        access_key_id: Option<zeroize::Zeroizing<String>>,
+        #[serde(default, with = "secret_option")]
+        secret_access_key: Option<zeroize::Zeroizing<String>>,
+        #[serde(default, with = "secret_option")]
+        session_token: Option<zeroize::Zeroizing<String>>,
+    },
+    WebDav {
+        url: String,
+        credential_mode: crate::team_sync::CredentialMode,
+        #[serde(default)]
+        auth_kind: Option<crate::team_sync::WebDavAuthKind>,
+        #[serde(default)]
+        username: Option<String>,
+        #[serde(default, with = "secret_option")]
+        secret: Option<zeroize::Zeroizing<String>>,
+    },
+}
+
+impl std::fmt::Debug for TeamSyncTransportConfigureInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("TeamSyncTransportConfigureInput([redacted])")
+    }
+}
+
+impl TeamSyncTransportConfigureInput {
+    /// Separate persistable transport metadata from the credentials sent over local IPC.
+    ///
+    /// # Errors
+    /// Rejects a partially specified pair of S3 credentials.
+    pub fn into_parts(
+        self,
+    ) -> crate::team_sync::Result<(
+        crate::team_sync::TransportConfig,
+        Option<crate::team_sync::TransportSecretInput>,
+    )> {
+        use crate::team_sync::{
+            CredentialMode, SyncError, TransportConfig, TransportSecretInput, WebDavAuthKind,
+        };
+        Ok(match self {
+            Self::Folder { path } => (TransportConfig::Folder { path }, None),
+            Self::S3 {
+                bucket,
+                region,
+                prefix,
+                endpoint,
+                path_style,
+                credential_mode,
+                access_key_id,
+                secret_access_key,
+                session_token,
+            } => {
+                let path_style = path_style.unwrap_or_else(|| endpoint.is_some());
+                let credentials = match (access_key_id, secret_access_key, session_token) {
+                    (None, None, None) => None,
+                    (Some(mut id), Some(secret_access_key), session_token) => {
+                        Some(TransportSecretInput::S3 {
+                            access_key_id: std::mem::take(&mut *id),
+                            secret_access_key,
+                            session_token,
+                        })
+                    }
+                    _ => return Err(SyncError::Rejected("incomplete S3 credentials".into())),
+                };
+                (
+                    TransportConfig::S3 {
+                        bucket,
+                        region,
+                        prefix,
+                        endpoint,
+                        path_style,
+                        credential_mode,
+                    },
+                    credentials,
+                )
+            }
+            Self::WebDav { url, credential_mode, auth_kind, username, secret } => {
+                let auth_kind = auth_kind.unwrap_or_else(|| match credential_mode {
+                    CredentialMode::None => WebDavAuthKind::None,
+                    _ if username.is_some() => WebDavAuthKind::Basic,
+                    _ => WebDavAuthKind::Bearer,
+                });
+                let credentials =
+                    secret.map(|secret| TransportSecretInput::WebDav { username: None, secret });
+                (TransportConfig::WebDav { url, credential_mode, auth_kind, username }, credentials)
+            }
+        })
+    }
+}
+
+mod secret_option {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use zeroize::Zeroizing;
+
+    #[allow(clippy::ref_option)]
+    pub(super) fn serialize<S: Serializer>(
+        secret: &Option<Zeroizing<String>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        secret.as_ref().map(|secret| secret.as_str()).serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Zeroizing<String>>, D::Error> {
+        Option::<String>::deserialize(deserializer).map(|secret| secret.map(Zeroizing::new))
+    }
 }

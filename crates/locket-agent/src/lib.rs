@@ -127,5 +127,7 @@ pub use handlers::team_sync::{TeamSyncConfigureRequest, TeamSyncRequest, spawn_t
 #[cfg(test)]
 use x25519_dalek as _;
 
-pub use protocol::team_sync::{TeamSyncAction, TeamSyncReconcileRequest};
+pub use protocol::team_sync::{
+    TeamSyncAction, TeamSyncReconcileRequest, TeamSyncTransportConfigureInput,
+};
 pub use team_sync::{PendingCollision, PendingProfileDetails};

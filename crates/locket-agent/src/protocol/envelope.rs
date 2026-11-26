@@ -8,7 +8,7 @@ use crate::error::ProtocolError;
 use crate::method::AgentMethod;
 
 /// JSON request envelope sent after the v1 length prefix.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RequestEnvelope {
     /// Protocol version.
     pub v: u16,
@@ -18,6 +18,18 @@ pub struct RequestEnvelope {
     pub kind: String,
     /// Method payload.
     pub payload: Value,
+}
+
+impl std::fmt::Debug for RequestEnvelope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RequestEnvelope")
+            .field("v", &self.v)
+            .field("id", &self.id)
+            .field("kind", &self.kind)
+            .field("payload", &"[redacted]")
+            .finish()
+    }
 }
 
 impl RequestEnvelope {

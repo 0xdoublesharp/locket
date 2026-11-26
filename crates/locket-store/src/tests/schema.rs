@@ -759,3 +759,29 @@ fn sqlite_file_header_corruption_maps_to_the_stable_database_failure() -> Result
     );
     Ok(())
 }
+
+#[test]
+fn upgrades_existing_team_sync_folder_rows() -> Result<(), Box<dyn std::error::Error>> {
+    let mut fixture = open_initialized_store()?;
+    fixture.store.insert_project_if_absent("legacy", "legacy", 1)?;
+    fixture.store.connection().execute_batch(
+        "DROP TABLE IF EXISTS team_sync_credentials;
+         DROP TABLE team_sync_folders;
+         CREATE TABLE team_sync_folders (
+             project_id TEXT PRIMARY KEY REFERENCES projects(id), path TEXT NOT NULL,
+             device_key_root TEXT NOT NULL, allow_dangerous INTEGER NOT NULL DEFAULT 0,
+             enabled INTEGER NOT NULL DEFAULT 1, last_error TEXT, scan_after TEXT
+         );
+         INSERT INTO team_sync_folders(project_id, path, device_key_root, scan_after)
+         VALUES ('legacy', '/shared', '/keys', 'cursor.lkpkg');",
+    )?;
+    fixture.store.initialize_schema()?;
+    fixture.store.initialize_schema()?;
+    let row: (String, Option<String>, String, String) = fixture.store.connection().query_row(
+        "SELECT transport_kind,transport_config_json,path,scan_after FROM team_sync_folders",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    assert_eq!(row, ("folder".into(), None, "/shared".into(), "cursor.lkpkg".into()));
+    Ok(())
+}

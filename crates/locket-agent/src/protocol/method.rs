@@ -9,10 +9,12 @@ use thiserror::Error;
 pub enum AgentMethod {
     /// Read team synchronization status.
     TeamSyncStatus,
-    /// Configure an explicitly selected encrypted exchange folder.
+    /// Configure an explicitly selected encrypted package transport.
     TeamSyncConfigure,
     /// Process encrypted team updates with a live local grant.
     TeamSyncNow,
+    /// Test listing the configured package transport with a live local grant.
+    TeamSyncTestRemote,
     /// Resolve a verified incoming profile collision using explicit local consent.
     TeamSyncReconcile,
     /// Return metadata-only agent status.
@@ -111,6 +113,7 @@ impl AgentMethod {
             Self::TeamSyncStatus => "TeamSyncStatus",
             Self::TeamSyncConfigure => "TeamSyncConfigure",
             Self::TeamSyncNow => "TeamSyncNow",
+            Self::TeamSyncTestRemote => "team_sync.test_remote",
             Self::TeamSyncReconcile => "TeamSyncReconcile",
             Self::Status => "Status",
             Self::Unlock => "Unlock",
@@ -167,6 +170,7 @@ impl FromStr for AgentMethod {
             "TeamSyncStatus" => Ok(Self::TeamSyncStatus),
             "TeamSyncConfigure" => Ok(Self::TeamSyncConfigure),
             "TeamSyncNow" => Ok(Self::TeamSyncNow),
+            "team_sync.test_remote" => Ok(Self::TeamSyncTestRemote),
             "TeamSyncReconcile" => Ok(Self::TeamSyncReconcile),
             "Status" => Ok(Self::Status),
             "Unlock" => Ok(Self::Unlock),

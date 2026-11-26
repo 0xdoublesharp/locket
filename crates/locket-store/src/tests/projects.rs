@@ -47,6 +47,8 @@ fn delete_project_removes_team_sync_state() -> Result<(), Box<dyn Error>> {
              INSERT INTO team_sync_pending_profiles VALUES ('{id}', 'profile', 'pending');
              INSERT INTO team_sync_folders(project_id, path, device_key_root)
                  VALUES ('{id}', 'folder', 'keys');
+             INSERT INTO team_sync_credentials(project_id, ciphertext, nonce, updated_at)
+                 VALUES ('{id}', x'00', zeroblob(24), 1);
              INSERT INTO team_sync_seen VALUES ('{id}', 'digest', 1, 'applied');
              INSERT INTO team_sync_values VALUES ('{id}', 'secret', 'digest');
              INSERT INTO team_sync_profile_epochs VALUES ('{id}', 'profile', 1);
@@ -85,6 +87,7 @@ fn delete_project_removes_team_sync_state() -> Result<(), Box<dyn Error>> {
         "team_sync_pending_packages",
         "team_sync_pending_profiles",
         "team_sync_folders",
+        "team_sync_credentials",
         "team_sync_seen",
         "team_sync_values",
         "team_sync_profile_epochs",

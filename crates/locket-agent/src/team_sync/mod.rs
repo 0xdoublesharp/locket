@@ -4,8 +4,9 @@ mod folder;
 mod keys;
 mod pending;
 mod snapshot;
+pub mod transport;
 pub use folder::{
-    SyncStatus, configure_folder, configure_folder_guarded, flush_outbox, read_package_file,
+    SyncStatus, configure_folder, configure_folder_guarded, flush_outbox, flush_outbox_with_master,
     status, sync_folder, sync_folder_guarded,
 };
 pub use keys::{load_key, store_key};
@@ -26,6 +27,8 @@ pub enum SyncError {
     Rejected(String),
     #[error("waiting for missing predecessor; restore encrypted earlier packages")]
     MissingPredecessor,
+    #[error("team transport response exceeds size limit")]
+    RemoteBodyTooLarge,
     #[error("team store operation failed: {0}")]
     Store(#[from] locket_store::StoreError),
     #[error("team database operation failed: {0}")]
@@ -77,3 +80,9 @@ pub struct ApplyResult {
 }
 
 pub use crate::handlers::team_sync::spawn_team_sync_poll;
+pub use transport::{
+    CredentialMode, JoinPackages, PutOutcome, RemoteTestResult, TeamTransport, TransportConfig,
+    TransportSecretInput, TransportSummary, WebDavAuthKind, clear_transport, configure_transport,
+    configure_transport_guarded, list_and_read_configured_join_packages,
+    list_and_read_join_packages, read_package_file, test_configured_transport, test_transport,
+};

@@ -196,6 +196,7 @@ impl Store {
                 "DELETE FROM team_sync_values WHERE project_id = ?1",
                 "DELETE FROM team_sync_profile_epochs WHERE project_id = ?1",
                 "DELETE FROM team_sync_conflicts WHERE project_id = ?1",
+                "DELETE FROM team_sync_credentials WHERE project_id = ?1",
                 "DELETE FROM team_sync_folders WHERE project_id = ?1",
                 "DELETE FROM team_sync_outbound WHERE project_id = ?1",
                 "DELETE FROM team_sync_outbox WHERE project_id = ?1",

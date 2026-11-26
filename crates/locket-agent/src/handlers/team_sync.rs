@@ -3,7 +3,7 @@
 use crate::team_sync::{self, SyncStatus};
 use crate::{
     AgentSocketState, ErrorEnvelope, GrantAction, GrantBinding, GrantValidation, RequestEnvelope,
-    ResponseEnvelope, SuccessEnvelope,
+    ResponseEnvelope, SuccessEnvelope, TeamSyncTransportConfigureInput,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -24,7 +24,10 @@ pub struct TeamSyncRequest {
 pub struct TeamSyncConfigureRequest {
     #[serde(flatten)]
     pub scope: TeamSyncRequest,
-    pub folder: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<TeamSyncTransportConfigureInput>,
     #[serde(default)]
     pub allow_dangerous: bool,
 }
@@ -119,8 +122,7 @@ pub async fn handle_team_sync_configure(
     request: &RequestEnvelope,
     state: &AgentSocketState,
 ) -> ResponseEnvelope {
-    let Ok(typed) = serde_json::from_value::<TeamSyncConfigureRequest>(request.payload.clone())
-    else {
+    let Ok(typed) = TeamSyncConfigureRequest::deserialize(&request.payload) else {
         return error(request, "ProtocolError", "invalid sync configuration");
     };
     if !granted(&typed.scope, state).await {
@@ -144,28 +146,45 @@ async fn configure_cached(
         commit_authorization(state, &project, &context.store_path, expiry, &key),
     );
     run_sync_worker(state, project, context.store_path.clone(), pin, move |store| {
-        configure_store(store, &request, &context.store_path, &authorization)
+        configure_store(store, request, &context.store_path, Some(&key), &authorization)
     })
     .await
 }
 fn configure_store(
     store: &locket_store::Store,
-    request: &TeamSyncConfigureRequest,
+    request: TeamSyncConfigureRequest,
     store_path: &std::path::Path,
+    master: Option<&locket_crypto::KeyBytes>,
     authorization: &team_sync::CommitAuthorization,
 ) -> team_sync::Result<SyncStatus> {
     check_selected_store(request.scope.store_path.as_deref(), store_path)?;
     let root = store_path
         .parent()
         .ok_or_else(|| team_sync::SyncError::Rejected("local key directory unavailable".into()))?;
-    team_sync::configure_folder_guarded(
-        store,
-        &request.scope.project_id,
-        &request.folder,
-        root,
-        request.allow_dangerous,
-        Some(authorization),
-    )?;
+    match (request.folder, request.transport) {
+        (Some(folder), None) => team_sync::configure_folder_guarded(
+            store,
+            &request.scope.project_id,
+            &folder,
+            root,
+            request.allow_dangerous,
+            Some(authorization),
+        )?,
+        (None, Some(transport)) => {
+            let (config, credentials) = transport.into_parts()?;
+            team_sync::configure_transport_guarded(
+                store,
+                &request.scope.project_id,
+                config,
+                credentials,
+                root,
+                master,
+                request.allow_dangerous,
+                Some(authorization),
+            )?;
+        }
+        _ => return Err(team_sync::SyncError::Rejected("select one team sync transport".into())),
+    }
     team_sync::status(store, &request.scope.project_id)
 }
 
@@ -201,6 +220,50 @@ pub async fn handle_team_sync_now(
         Ok(status) => response(request, status),
         Err(failure) => error(request, "TeamSyncRejected", &failure.to_string()),
     }
+}
+
+pub async fn handle_team_sync_test_remote(
+    request: &RequestEnvelope,
+    state: &AgentSocketState,
+) -> ResponseEnvelope {
+    let Ok(typed) = TeamSyncRequest::deserialize(&request.payload) else {
+        return error(request, "ProtocolError", "invalid remote test request");
+    };
+    if !granted(&typed, state).await {
+        return error(request, "GrantRequired", "explicit local grant required for team sync");
+    }
+    match test_cached_remote(state, typed).await {
+        Ok(result) => response(request, result),
+        Err(failure) => error(request, "TeamSyncRejected", &failure.to_string()),
+    }
+}
+
+async fn test_cached_remote(
+    state: &AgentSocketState,
+    request: TeamSyncRequest,
+) -> team_sync::Result<team_sync::RemoteTestResult> {
+    let project = request.project_id.clone();
+    let (key, context, expiry, pin) = cached_sync_context(state, &project).await?;
+    let authorization = granted_commit_authorization(
+        state,
+        &request,
+        commit_authorization(state, &project, &context.store_path, expiry, &key),
+    );
+    tokio::task::spawn_blocking({
+        let state = state.clone();
+        move || {
+            check_selected_store(request.store_path.as_deref(), &context.store_path)?;
+            let (store, _) = state
+                .open_store(&context.store_path, pin.as_ref(), true)
+                .map_err(locket_store::StoreError::from)?;
+            // Recheck authorization after opening the store, without holding a
+            // live unlock guard during network I/O.
+            drop(authorization()?);
+            team_sync::test_configured_transport(&store, &project, Some(&key))
+        }
+    })
+    .await
+    .map_err(|_| team_sync::SyncError::Rejected("team sync worker failed".into()))?
 }
 
 async fn run_cached_sync(
@@ -644,6 +707,7 @@ mod tests {
             AgentMethod::TeamSyncStatus,
             AgentMethod::TeamSyncConfigure,
             AgentMethod::TeamSyncNow,
+            AgentMethod::TeamSyncTestRemote,
             AgentMethod::TeamSyncReconcile,
         ] {
             assert!(matches!(rpc(method, Value::Null).await,
@@ -661,6 +725,7 @@ mod tests {
         for method in [
             AgentMethod::TeamSyncConfigure,
             AgentMethod::TeamSyncNow,
+            AgentMethod::TeamSyncTestRemote,
             AgentMethod::TeamSyncReconcile,
         ] {
             assert!(matches!(rpc(method, foreign.clone()).await,
@@ -673,6 +738,9 @@ mod tests {
             rpc(AgentMethod::TeamSyncConfigure, request.clone()).await,
             ResponseEnvelope::Success(_)
         ));
+        assert!(matches!(rpc(AgentMethod::TeamSyncTestRemote, request.clone()).await,
+            ResponseEnvelope::Success(result) if result.payload["ok"] == true
+                && result.payload["writable_checked"] == false));
         assert!(matches!(rpc(AgentMethod::TeamSyncReconcile, request.clone()).await,
             ResponseEnvelope::Error(error)
                 if error.error == "TeamSyncRejected" && error.message.contains("active local device missing")));
@@ -715,11 +783,12 @@ mod tests {
                 grant_id: None,
                 binding: None,
             },
-            folder,
+            folder: Some(folder),
+            transport: None,
             allow_dangerous: false,
         };
         let authorize: team_sync::CommitAuthorization = std::sync::Arc::new(|| Ok(Box::new(())));
-        let result = configure_store(&store, &request, &path, &authorize);
+        let result = configure_store(&store, request, &path, None, &authorize);
         assert!(
             matches!(result, Err(team_sync::SyncError::Rejected(reason)) if reason.contains("independent owner pin"))
         );
@@ -992,7 +1061,8 @@ mod tests {
                 grant_id: None,
                 binding: None,
             },
-            folder,
+            folder: Some(folder),
+            transport: None,
             allow_dangerous: false,
         };
         let (started, ready) = tokio::sync::oneshot::channel();
@@ -1000,7 +1070,7 @@ mod tests {
         let worker = tokio::task::spawn_blocking(move || {
             let _ = started.send(());
             let _ = parked.blocking_recv();
-            configure_store(&open_sync_store(&path)?, &request, &path, &authorize)
+            configure_store(&open_sync_store(&path)?, request, &path, None, &authorize)
         });
         ready.await?;
         let mut cache =

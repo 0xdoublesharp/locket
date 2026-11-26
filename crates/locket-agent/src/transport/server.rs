@@ -1370,6 +1370,9 @@ pub async fn dispatch_with_peer(
         Ok(AgentMethod::TeamSyncNow) => {
             crate::handlers::team_sync::handle_team_sync_now(envelope, state).await
         }
+        Ok(AgentMethod::TeamSyncTestRemote) => {
+            crate::handlers::team_sync::handle_team_sync_test_remote(envelope, state).await
+        }
         Ok(AgentMethod::TeamSyncReconcile) => {
             crate::handlers::team_sync::handle_team_sync_reconcile(envelope, state).await
         }
