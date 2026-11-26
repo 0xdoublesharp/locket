@@ -17,7 +17,7 @@ Locket stores project and Global Vault (`@shared`) secrets locally and injects t
 
 ## Onboarding a repository
 
-0. Before `locket init`, preview key names with `locket env keys .env` or list workspace environment files with `locket env scan` (skips template and non-dotenv suffixes and prints `locket=yes` or `locket=no`). `locket import --dry-run` requires an initialized `locket.toml`.
+0. Before `locket init`, preview key names with `locket env keys .env` or list workspace dotenv files with `locket env scan`. The scan skips templates and non-dotenv suffixes and prints `locket=yes` or `locket=no`. Use `locket env scan --remaining` to omit migrated project roots from the listing while keeping the fleet progress counts for `migrated`, `staged`, and `uninitialized` projects. `locket import --dry-run` requires an initialized `locket.toml`.
 1. Check the installed binary and repository context.
 
 ```sh
@@ -31,7 +31,7 @@ locket context
 
 ## Importing `.env` files and linking `@shared` secrets
 
-- Use a local import by default. `--link-shared` links exact matches already stored in `@shared`, and `--promote-duplicates` promotes repeated values across projects into `@shared` and links them back. Both flags require an initialized Global Vault. Run `locket shared list` first and use either flag only after confirming `@shared` is set up. If a shared import returns `UnlockRequired`, ask the user to unlock the vault. Never silently retry a failed shared import as a local import.
+- Use a local import by default. `--link-shared` links exact matches already stored in `@shared`, and `--promote-duplicates` promotes repeated values across projects into `@shared` and links them back. Run `locket shared list` first to confirm `@shared` is set up. Both flags return `SharedVaultNotInitialized` when `@shared` needs initialization. If a shared import returns `UnlockRequired`, ask the user to unlock the vault. Never silently retry a failed shared import as a local import.
 - `--dry-run` uses the same classification planner as real execution and reports `would_link`, `would_promote`, `linked_names`, `promoted_names`, and `duplicate_matches`.
 - To promote, link, or unlink individual secrets after import:
 
@@ -49,9 +49,10 @@ locket shared usages ALCHEMY_MAINNET_RPC
 
 1. Preview the local import with `locket import .env --dry-run --json`. If it returns `UnlockRequired`, follow the unlock instructions below before retrying.
 2. Import and keep the source with `locket import .env --keep`.
-3. Run `locket policy detect`, which resolves monorepo package managers (`packageManager` and parent lockfiles) and Foundry projects (`foundry.toml`). Give the user ready-to-run `locket policy add <name> -- <argv>` commands alongside the unlock command so they can review and approve each policy.
+3. Run `locket policy detect` to get ready-to-run `locket policy add <name> -- <argv>` commands. Detection uses `packageManager` and parent lockfiles in monorepos and `foundry.toml` in Foundry projects. Give the printed commands to the user alongside the unlock command so they can review and approve each policy.
 4. Verify the target app or command with `locket run <POLICY>` or a scoped `locket exec` invocation.
-5. When the user chooses to archive, run `locket import .env --archive <PRIVATE_DIR> --archive-if-matching --dry-run --json`. Review `archive_consumer_warnings` (Compose files including shallow subdirectories, Makefiles, `package.json` scripts and `dotenv` dependencies, `Cargo.toml` `dotenvy`/`dotenv` dependencies, and directly invoked local scripts), check framework loaders such as Vite, Next.js, and Prisma, and confirm `archive_directory`. Once the preview reports `delete_env: would-archive` and file consumers are addressed, repeat the command without `--dry-run`. Use a private directory outside any Git worktree or ignored by Git for the plaintext backup. If archiving fails after the import commits, Locket keeps the source in place, exits nonzero, and reports `archive_error` alongside the import summary.
+5. When the user chooses to archive, run `locket import .env --archive <PRIVATE_DIR> --archive-if-matching --dry-run --json`. Review `archive_consumer_warnings` for Compose files (including shallow subdirectories), Makefiles, `package.json` scripts and `dotenv` dependencies, `Cargo.toml` `dotenvy`/`dotenv` dependencies, and directly invoked local scripts. Compose interpolation warnings name up to 12 overlapping `.env` keys and show how many more matched. A Compose file with no matching keys produces no interpolation warning. Check framework loaders such as Vite, Next.js, and Prisma, and confirm `archive_directory`. Use a private directory outside any Git worktree or ignored by Git for the plaintext backup.
+6. Once the preview reports `delete_env: would-archive` and file consumers are addressed, repeat the command without `--dry-run`. To require verification immediately before archiving, run `locket import .env --archive <DIR> --archive-if-matching --verify-policy <POLICY>`. The flag accepts only the name of an existing, human-approved saved policy. Locket runs the policy with vault values and leaves `.env` untouched if verification fails. If archiving fails after the import commits, Locket keeps the source in place, exits nonzero, and reports `archive_error` alongside the import summary.
 
 `--archive-if-matching` compares skipped values with the values the app receives under runtime precedence. Filtered keys block archiving. If the preview reports `delete_env: kept`, check `archive_blocked_reason`.
 

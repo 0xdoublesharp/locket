@@ -171,8 +171,8 @@ locket emit-example
 ```bash
 locket set <KEY> [--source user-local|machine-local|team-managed]
 locket env keys .env
-locket env scan
-locket import .env [--overwrite] [--literal] [--keep | --archive <DIR> [--archive-if-matching]]
+locket env scan [--remaining]
+locket import .env [--overwrite] [--literal] [--keep | --archive <DIR> [--archive-if-matching] [--verify-policy <POLICY>]]
 locket list [--all]
 locket get <KEY>
 locket get <KEY> --reveal
@@ -183,7 +183,9 @@ locket profile create staging
 locket use staging
 ```
 
-Secret names use portable environment-variable syntax, such as `DATABASE_URL` or `STRIPE_SECRET_KEY`. Secret values are not accepted as command-line arguments; use stdin for writes so values do not land in shell history or process listings.
+Secret names use portable environment-variable syntax, such as `DATABASE_URL` or `STRIPE_SECRET_KEY`. For `locket set`, supply values through stdin to keep them out of shell history and process listings. Locket rejects secret values passed as arguments.
+
+Use `locket env scan --remaining` to focus on dotenv files still in place while keeping the migrated, staged, and uninitialized project counts. Pass `--verify-policy <POLICY>` with `--archive` to run an approved saved policy with vault values before archiving. Locket leaves the `.env` in place if verification fails.
 
 ### Share One Value Across Projects
 
@@ -204,11 +206,14 @@ In the desktop app, open **Secrets** in the project environment to promote a loc
 ### Policies And Execution
 
 ```bash
+locket policy detect
 locket policy add dev -- pnpm dev
 locket policy allow dev DATABASE_URL
 locket policy require dev API_TOKEN
 locket policy doctor
 ```
+
+`locket policy detect` prints `locket policy add <name> -- <argv>` commands you can review and approve.
 
 If doctor reports an old or changed policy approval, review `locket.toml` and run
 `locket policy refresh dev`. Type the policy name to approve the current command,

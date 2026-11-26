@@ -1,6 +1,8 @@
-import Std
+import LocketProofs.DotenvMetadataNonInterference
 
 namespace LocketProofs.MigrationSafety
+
+open DotenvMetadataNonInterference
 
 structure ArchiveDestInput where
   isSymlink : Bool
@@ -223,5 +225,77 @@ theorem batchUnlock_stop_on_first_failure (plan : BatchUnlockPlan) (authorize : 
       runBatchUnlock plan authorize = ⟨projects.take (k + 1), projects.take k⟩ := by
   simp only [runBatchUnlock, prepared] at attempted ⊢
   exact executeBatch_first_failure authorize projects k inBounds attempted denied
+
+/-- The Compose scanner supplies referenced keys. The overlap contains the sorted,
+unique dotenv keys that Compose references. -/
+def composeInterpolationOverlap (referencedKeys : List String) (doc : Document) : List String :=
+  (inspectEnvKeys doc).keys.filter referencedKeys.contains
+
+def composeInterpolationWarns (referencedKeys : List String) (doc : Document) : Bool :=
+  !(composeInterpolationOverlap referencedKeys doc).isEmpty
+
+theorem composeInterpolation_noninterference (referencedKeys : List String)
+    (doc : Document) (replacement : Entry → String) :
+    composeInterpolationOverlap referencedKeys (replaceValues doc replacement) =
+      composeInterpolationOverlap referencedKeys doc ∧
+    composeInterpolationWarns referencedKeys (replaceValues doc replacement) =
+      composeInterpolationWarns referencedKeys doc := by
+  simp [composeInterpolationWarns, composeInterpolationOverlap, inspectEnvKeys_noninterference]
+
+structure VerifyPolicyInput where
+  policyExists : Bool
+  policyApproved : Bool
+  vaultUnlocked : Bool
+  -- `none` means the policy did not run.
+  exitCode : Option Nat
+
+def verifyPolicyAllowsArchive (input : VerifyPolicyInput) : Bool :=
+  input.policyExists && input.policyApproved && input.vaultUnlocked && (input.exitCode == some 0)
+
+private theorem verifyPolicy_blocks_unapproved_or_locked (input : VerifyPolicyInput)
+    (blocked : input.policyExists = false ∨ input.policyApproved = false ∨ input.vaultUnlocked = false) :
+    verifyPolicyAllowsArchive input = false := by
+  rcases blocked with missing | unapproved | locked <;>
+    simp [verifyPolicyAllowsArchive, *]
+
+private theorem verifyPolicy_blocks_nonzero_exit (input : VerifyPolicyInput)
+    (failed : input.exitCode ≠ some 0) : verifyPolicyAllowsArchive input = false := by
+  simp [verifyPolicyAllowsArchive, failed]
+
+/-- A passing policy clears this gate. The archive destination and value-matching
+checks still apply independently. -/
+theorem verifyPolicy_gates_archive_on_approved_unlocked_zero_exit (input : VerifyPolicyInput) :
+    verifyPolicyAllowsArchive input = true ↔
+      input.policyExists = true ∧ input.policyApproved = true ∧ input.vaultUnlocked = true ∧
+        input.exitCode = some 0 := by
+  by_cases blocked :
+      input.policyExists = false ∨ input.policyApproved = false ∨ input.vaultUnlocked = false
+  · rw [verifyPolicy_blocks_unapproved_or_locked input blocked]
+    rcases blocked with missing | unapproved | locked <;> simp [*]
+  · by_cases passed : input.exitCode = some 0
+    · simp [verifyPolicyAllowsArchive, passed, and_assoc]
+    · simp [verifyPolicy_blocks_nonzero_exit input passed, passed]
+
+structure FleetProgress where
+  migrated : Nat
+  staged : Nat
+  uninitialized : Nat
+
+/-- Discovered dotenv files contribute their project root and configuration status.
+Configured roots without dotenv files count as migrated. -/
+def envScanProgress (configuredProjects : List String) (workspace : List WorkspaceFile) :
+    FleetProgress :=
+  let projectFiles := workspace.map fun file => (file.projectRoot, file.hasConfig)
+  let (stagedFiles, uninitializedFiles) := projectFiles.partition Prod.snd
+  let stagedRoots := (stagedFiles.map Prod.fst).eraseDups
+  let uninitializedRoots := (uninitializedFiles.map Prod.fst).eraseDups
+  let migratedRoots := configuredProjects.eraseDups.filter fun root => !stagedRoots.contains root
+  ⟨migratedRoots.length, stagedRoots.length, uninitializedRoots.length⟩
+
+theorem envScanProgress_noninterference (configuredProjects : List String)
+    (workspace : List WorkspaceFile) (replacement : WorkspaceFile → Entry → String) :
+    envScanProgress configuredProjects (replaceWorkspaceValues workspace replacement) =
+      envScanProgress configuredProjects workspace := by
+  simp [envScanProgress, replaceWorkspaceValues, List.map_map, Function.comp_def]
 
 end LocketProofs.MigrationSafety
