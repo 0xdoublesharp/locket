@@ -83,6 +83,8 @@ impl Fixture {
             overwrite,
             literal: false,
             confirmation: None,
+            target_confirmation: None,
+            target_grant_id: None,
             dry_run: false,
             link_to_shared: std::collections::BTreeMap::new(),
             promote_to_shared: std::collections::BTreeMap::new(),
@@ -172,6 +174,18 @@ async fn unlock_fixture(state: &crate::AgentSocketState, project: &str, master: 
         UnlockEntry::new(master.to_vec(), 0, Duration::from_secs(60), UnlockMethod::Passphrase),
     );
 }
+async fn unlock_pinned(
+    state: &crate::AgentSocketState,
+    scope: &MutationScope,
+    master: &KeyBytes,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut entry =
+        UnlockEntry::new(master.to_vec(), 0, Duration::from_secs(60), UnlockMethod::Passphrase);
+    entry.store_identity = Some(crate::keys::StoreFileIdentity::capture(&scope.store_path)?.1);
+    state.unlock_cache.lock().await.insert(scope.project_id.clone(), entry);
+    Ok(())
+}
+
 fn code(response: ResponseEnvelope) -> String {
     match response {
         ResponseEnvelope::Error(e) => e.error,
@@ -1298,7 +1312,8 @@ async fn promote_links_under_alias_detects_import_duplicates_and_warns_before_sh
         grant_id: fixture.scope.grant_id.clone(),
         binding: fixture.scope.binding.clone(),
     };
-    let mut shared_fixture = Fixture { directory: fixture.directory, scope: shared_scope.clone() };
+    unlock_pinned(&state, &fixture.scope, &MASTER).await?;
+    let shared_fixture = Fixture { directory: fixture.directory, scope: shared_scope.clone() };
     shared_fixture.grant(&state, GrantAction::DeleteSecret).await;
     let blocked_req = crud_request(
         crate::AgentMethod::DeleteSecret,
@@ -1317,7 +1332,6 @@ async fn promote_links_under_alias_detects_import_duplicates_and_warns_before_sh
     let deleted = success(call_crud(&state, &allow_req).await);
     assert_eq!(deleted["unlinked_count"], 1);
     assert_eq!(store.list_active_secret_metadata_by_profile(PROJECT, PROFILE)?.len(), 0);
-    let _ = &mut shared_fixture;
     Ok(())
 }
 
@@ -1457,6 +1471,7 @@ async fn shared_link_mutations_list_metadata_and_enforce_dangerous_confirmation(
     assert_eq!(usages(false)["usages"], json!([]));
 
     link_fixture_token(&state, &fixture).await;
+    unlock_pinned(&state, &fixture.scope, &MASTER).await?;
     for (unlink_all, confirmation, expected_error) in [
         (false, None, Some("LinkedSecretInUse")),
         (true, None, Some("ConfirmationFailed")),
@@ -1538,5 +1553,215 @@ async fn resolve_reference_obeys_shared_link_precedence_and_global_vault_lock()
     fixture.grant(&state, GrantAction::ResolveReference).await;
     let team = success(handle_resolve(&resolve, &state, NOW).await);
     assert_eq!(team["value"], "team-fixture");
+    Ok(())
+}
+
+#[tokio::test]
+async fn dotenv_promotion_requires_both_grants_pinned_unlocks_and_target_confirmation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = Fixture::new()?;
+    let state = fixture.state(GrantAction::ImportDotenv).await;
+    let mut shared = seed_shared_vault(&fixture, &state).await?;
+    shared.grant_id = Some("lk_grant_import_target".into());
+    let store = fixture.store();
+    store.set_profile_dangerous(SHARED_PROJECT, "default", true)?;
+    unlock_pinned(&state, &fixture.scope, &MASTER).await?;
+
+    let mut request = fixture.import("ORDINARY=ordinary\nTOKEN=first\n", false);
+    request.promote_to_shared.insert("TOKEN".into(), "GLOBAL_TOKEN".into());
+    let call = |request: &ImportDotenvRequest| {
+        let rpc = envelope(AgentMethod::ImportDotenv, request);
+        let state = state.clone();
+        async move { handle_import_dotenv(&rpc, &state, NOW).await }
+    };
+
+    request.dry_run = true;
+    assert!(success(call(&request).await).get("promoted").is_none());
+    request.dry_run = false;
+    assert_eq!(code(call(&request).await), "GrantRequired");
+
+    request.target_grant_id.clone_from(&shared.grant_id);
+    grant_scope(&state, &shared, GrantAction::CopySecretToShared).await;
+    assert_eq!(code(call(&request).await), "UnlockRequired");
+    unlock_pinned(&state, &shared, &MASTER).await?;
+    grant_scope(&state, &shared, GrantAction::CopySecretToShared).await;
+    assert_eq!(code(call(&request).await), "ConfirmationFailed");
+
+    request.target_confirmation = Some("dev".into());
+    grant_scope(&state, &shared, GrantAction::CopySecretToShared).await;
+    assert_eq!(code(call(&request).await), "ConfirmationFailed");
+    assert_eq!(store.list_active_secrets_by_profile(PROJECT, PROFILE)?, []);
+    assert_eq!(store.list_active_secrets_by_profile(SHARED_PROJECT, &shared.profile_id)?, []);
+    assert!(store.get_secret_link(PROJECT, PROFILE, "TOKEN")?.is_none());
+
+    // A grant is scoped to one promotion attempt.
+    request.target_confirmation = Some("default".into());
+    assert_eq!(code(call(&request).await), "GrantRequired");
+    grant_scope(&state, &shared, GrantAction::CopySecretToShared).await;
+    assert_eq!(success(call(&request).await)["promoted"], 1);
+
+    // The source confirmation also works as a fallback for older clients.
+    request.target_confirmation = None;
+    request.confirmation = Some("default".into());
+    grant_scope(&state, &shared, GrantAction::CopySecretToShared).await;
+    assert_eq!(success(call(&request).await)["promoted"], 1);
+
+    std::fs::write(&request.env_path, "TOKEN=second\n")?;
+    grant_scope(&state, &shared, GrantAction::CopySecretToShared).await;
+    assert_eq!(code(call(&request).await), "SecretAlreadyExists");
+    request.overwrite = true;
+    grant_scope(&state, &shared, GrantAction::CopySecretToShared).await;
+    assert_eq!(success(call(&request).await)["promoted"], 1);
+    assert_promotion_audits(
+        &store,
+        &shared.profile_id,
+        "GLOBAL_TOKEN",
+        &["create", "reuse", "rotate"],
+    )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn copy_and_link_audits_created_reused_and_rotated_targets()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = Fixture::new()?;
+    let state = fixture.state(GrantAction::SetSecret).await;
+    let shared = seed_shared_vault(&fixture, &state).await?;
+    for (name, value, operation) in
+        [("FIRST", "first", "create"), ("SECOND", "first", "reuse"), ("THIRD", "changed", "rotate")]
+    {
+        set_link_fixture_value(&state, &fixture.scope, name, "user-local", value).await;
+        fixture.grant(&state, GrantAction::CopySecretToShared).await;
+        let request = crud_request(
+            AgentMethod::CopySecretToShared,
+            &fixture.scope,
+            json!({
+                "secret_name": name, "target_name": "GLOBAL_TOKEN",
+                "replace_with_link": true, "overwrite": operation == "rotate",
+            }),
+        );
+        assert_eq!(success(call_crud(&state, &request).await)["action"], operation);
+    }
+    assert_promotion_audits(
+        &fixture.store(),
+        &shared.profile_id,
+        "GLOBAL_TOKEN",
+        &["create", "reuse", "rotate"],
+    )?;
+    Ok(())
+}
+
+fn assert_promotion_audits(
+    store: &Store,
+    target_profile: &str,
+    target_name: &str,
+    operations: &[&str],
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (project_id, profile_id) in [(PROJECT, PROFILE), (SHARED_PROJECT, target_profile)] {
+        assert!(store.verify_audit_chain_read_only(project_id, &AUDIT)?.hmac_ok);
+        let rows: Vec<_> = store
+            .list_exportable_audit_rows(project_id)?
+            .into_iter()
+            .filter(|row| row.action == "SECRET_PROMOTE")
+            .collect();
+        assert_eq!(rows.len(), operations.len());
+        for (row, operation) in rows.iter().zip(operations) {
+            let metadata: Value = serde_json::from_str(&row.metadata_json)?;
+            assert_eq!(row.profile_id.as_deref(), Some(profile_id));
+            assert_eq!(metadata["secret_name"], target_name);
+            assert_eq!(metadata["operation"], *operation);
+            assert_eq!(metadata["from_project_id"], PROJECT);
+            assert_eq!(metadata["from_profile_id"], PROFILE);
+            assert_eq!(metadata["to_project_id"], SHARED_PROJECT);
+            assert_eq!(metadata["to_profile_id"], target_profile);
+            assert_eq!(metadata["target_version"], if *operation == "rotate" { 2 } else { 1 });
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn shared_cascade_rejects_stale_review_and_locked_consumer_before_audited_deletion()
+-> Result<(), Box<dyn std::error::Error>> {
+    const OTHER: &str = "lk_proj_other_consumer";
+    const OTHER_PROFILE: &str = "lk_prof_other_consumer";
+    const OTHER_AUDIT: KeyBytes = [18; 32];
+    let fixture = Fixture::new()?;
+    let state = fixture.state(GrantAction::SetSecret).await;
+    let shared = seed_shared_vault(&fixture, &state).await?;
+    unlock_pinned(&state, &fixture.scope, &MASTER).await?;
+    let target =
+        set_link_fixture_value(&state, &shared, "GLOBAL_TOKEN", "user-local", CANARY).await;
+    let target_id = target["secret_id"].as_str().ok_or("missing target ID")?;
+    let first_link = link_fixture_token(&state, &fixture).await;
+    let store = fixture.store();
+    let mut other_store = fixture.store();
+    store.insert_project_if_absent(OTHER, "second consumer", 1)?;
+    store.insert_profile_if_absent(OTHER_PROFILE, OTHER, "dev", false, 1)?;
+    insert_wrapped_keys(&store, OTHER, OTHER_PROFILE, &MASTER, &OTHER_AUDIT)?;
+    let other = MutationScope {
+        project_id: OTHER.into(),
+        profile_id: OTHER_PROFILE.into(),
+        ..fixture.scope.clone()
+    };
+    let mut reviewed = vec![first_link["link_id"].as_str().ok_or("missing first link ID")?];
+    // The second consumer linked the secret after Desktop reviewed the list.
+    other_store.upsert_secret_link_with_audit(
+        &SecretLinkRecord {
+            id: "lk_link_second_consumer".into(),
+            project_id: OTHER.into(),
+            profile_id: OTHER_PROFILE.into(),
+            local_name: "SECOND_TOKEN".into(),
+            target_project_id: SHARED_PROJECT.into(),
+            target_profile_id: shared.profile_id.clone(),
+            target_secret_id: target_id.into(),
+            created_at: 1,
+            updated_at: 1,
+        },
+        None,
+    )?;
+    let delete = |ids: &[&str]| {
+        let request = crud_request(
+            AgentMethod::DeleteSecret,
+            &shared,
+            json!({
+                "secret_name": "GLOBAL_TOKEN", "source": "user-local",
+                "unlink_all": true, "expected_link_ids": ids,
+            }),
+        );
+        let state = &state;
+        let shared = &shared;
+        async move {
+            grant_scope(state, shared, GrantAction::DeleteSecret).await;
+            call_crud(state, &request).await
+        }
+    };
+    assert_eq!(code(delete(&reviewed).await), "LinkSetChanged");
+    reviewed.push("lk_link_second_consumer");
+    let ResponseEnvelope::Error(error) = delete(&reviewed).await else {
+        return Err("locked consumer allowed deletion".into());
+    };
+    assert_eq!(error.error, "UnlockRequired");
+    assert!(error.message.contains("second consumer"));
+    assert_eq!(store.get_secret_by_id(target_id)?.ok_or("missing secret")?.state, "active");
+    assert_eq!(store.list_shared_secret_usages(target_id)?.len(), 2);
+    for project in [PROJECT, OTHER] {
+        assert!(
+            !store.list_recent_audit_actions(project, 10)?.iter().any(|a| a == "SECRET_UNLINK")
+        );
+    }
+
+    unlock_pinned(&state, &other, &MASTER).await?;
+    assert_eq!(success(delete(&reviewed).await)["unlinked_count"], 2);
+    assert_eq!(store.list_shared_secret_usages(target_id)?, []);
+    assert_eq!(store.get_secret_by_id(target_id)?.ok_or("missing secret")?.state, "deleted");
+    for (project, key, local_name) in
+        [(PROJECT, AUDIT, "TOKEN"), (OTHER, OTHER_AUDIT, "SECOND_TOKEN")]
+    {
+        assert!(store.verify_audit_chain_read_only(project, &key)?.hmac_ok);
+        let rows = store.list_exportable_audit_rows(project)?;
+        assert_eq!(rows.last().ok_or("missing unlink audit")?.action, "SECRET_UNLINK");
+        assert_eq!(rows.last().and_then(|row| row.secret_name.as_deref()), Some(local_name));
+    }
     Ok(())
 }

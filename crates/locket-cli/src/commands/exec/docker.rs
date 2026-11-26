@@ -234,6 +234,7 @@ pub fn resolve_policy_locket_env(
     }
     let profile = effective_policy_profile(store, resolved, effective)?;
     let selections = policy_secret_selections(store, resolved, &profile, policy)?;
+    super::run::require_shared_policy_vaults_unlocked(context, store, &profile, &selections)?;
 
     let mut locket_env = locket_exec::EnvMap::new();
     for selection in &selections {
@@ -241,12 +242,12 @@ pub fn resolve_policy_locket_env(
             let value = decrypt_secret_version(
                 context,
                 store,
-                resolved.config.project_id.as_str(),
-                &profile.id,
+                &secret.project_id,
+                &secret.profile_id,
                 secret,
                 secret.current_version,
             )?;
-            locket_env.insert(secret.name.clone(), value);
+            locket_env.insert(selection.name.clone(), value);
         }
     }
     Ok((profile, selections, locket_env))

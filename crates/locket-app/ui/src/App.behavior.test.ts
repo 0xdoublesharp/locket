@@ -1631,7 +1631,26 @@ describe('Global Vault workspace actions', () => {
       rows: !deleted && nativeSelection?.project_id === shared.project_id ? [row] : [],
     }));
     overrides.set('desktop_list_shared_usages', () => ({ usages: [...usages] }));
-    overrides.set('desktop_delete_secret', () => {
+    overrides.set('desktop_delete_secret', (args) => {
+      if (usages.length === 2) {
+        expect(args).toMatchObject({
+          request: { expected_link_ids: usages.map((entry) => entry.link_id) },
+        });
+        // Simulate a new link after App's last usage read but before the delete commits.
+        usages.push({
+          ...usage,
+          link_id: 'third',
+          project_name: 'Tasks',
+          profile_name: 'release',
+          profile_dangerous: true,
+          local_name: 'TASK_TOKEN',
+        });
+        return Promise.reject({
+          kind: 'rejected',
+          code: 'LinkSetChanged',
+          message: 'Linked projects changed while you were reviewing them.',
+        });
+      }
       deleted = true;
       return { deleted, unlinked_count: usages.length };
     });
@@ -1652,16 +1671,10 @@ describe('Global Vault workspace actions', () => {
     expect(renderedButton(inspector, 'Unlink all & delete').props.disabled).toBe(true);
     const confirmation = byProp(inspector, 'data-testid', 'secret-delete-confirmation');
     await input(confirmation, 'production');
-    usages.push({
-      ...usage,
-      link_id: 'third',
-      project_name: 'Tasks',
-      profile_name: 'release',
-      profile_dangerous: true,
-      local_name: 'TASK_TOKEN',
-    });
     await clickRendered(renderedButton(inspector, 'Unlink all & delete'));
-    expect(calls).not.toContain('desktop_delete_secret');
+    expect(calls).toContain('desktop_delete_secret');
+    expect(deleted).toBe(false);
+    expect(usages).toHaveLength(3);
     expect(nodeText(app.root)).toContain('Linked projects changed');
     const refreshed = byProp(app.root, 'id', 'variable-inspector');
     await clickRendered(renderedButton(refreshed, 'Delete'));
@@ -1678,6 +1691,7 @@ describe('Global Vault workspace actions', () => {
         secret_name: 'GLOBAL_TOKEN',
         source: 'user-local',
         unlink_all: true,
+        expected_link_ids: [usage.link_id, 'link-prod', 'third'],
         confirmation: 'GLOBAL_TOKEN',
       },
     });
@@ -1733,7 +1747,10 @@ describe('Global Vault workspace actions', () => {
     submitImport();
     await settle();
     expect(invoke).toHaveBeenCalledWith('desktop_import_env', {
-      request: expect.objectContaining({ project_id: shared.project_id, path: '/fixture/Downloads/.env' }),
+      request: expect.objectContaining({
+        project_id: shared.project_id,
+        path: '/fixture/Downloads/.env',
+      }),
     });
 
     await app.state.connectProject(false, b.root);
@@ -2087,7 +2104,9 @@ describe('connected desktop journeys through the preview fixture agent', () => {
     await clickRendered(renderedButton(root, 'Details for JWT_SIGNING_KEY'));
     await clickRendered(renderedButton(byProp(root, 'id', 'variable-inspector'), 'Rotate'));
     const rotate = byProp(root, 'aria-labelledby', 'secret-editor-rotate-heading');
-    expect(byProp(rotate, 'data-testid', 'secret-editor-rotate-name').value).toBe('JWT_SIGNING_KEY');
+    expect(byProp(rotate, 'data-testid', 'secret-editor-rotate-name').value).toBe(
+      'JWT_SIGNING_KEY',
+    );
     expect(nodeText(rotate)).toContain('This machine');
     expect(focus).toHaveBeenCalledOnce();
     await input(byProp(rotate, 'data-testid', 'secret-editor-rotate-value'), 'fixture-rotation');
@@ -2120,7 +2139,10 @@ describe('connected desktop journeys through the preview fixture agent', () => {
     await clickRendered(trigger);
     expect(trigger.props.disabled).toBe(true);
     const projects = await invoke<DesktopProjectContext[]>('desktop_list_projects', {});
-    await state.connectProject(false, projects.find((project) => project.project_id === 'web-app')!.root);
+    await state.connectProject(
+      false,
+      projects.find((project) => project.project_id === 'web-app')!.root,
+    );
     selection.resolve('/fixture/old-vault/.env');
     await settle();
     expect(state.activeContext?.project_id).toBe('web-app');

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::error::Error;
 
 use crate::{
@@ -1022,8 +1023,82 @@ fn secret_links_resolve_list_count_and_unlink_on_shared_delete() -> Result<(), B
     assert_eq!(usages.len(), 1);
     assert_eq!(usages[0].local_name, "RPC_URL");
 
-    let unlinked = store.tombstone_secret_and_unlink_with_audit(&shared_secret, 50, None)?;
-    assert_eq!(unlinked.len(), 1);
+    assert_audited_shared_cascade(store, &shared_secret, link)
+}
+
+fn assert_audited_shared_cascade(
+    store: &mut Store,
+    shared_secret: &SecretRecord,
+    link: crate::SecretLinkRecord,
+) -> Result<(), Box<dyn Error>> {
+    store.insert_project_if_absent("lk_proj_other", "Other", 1)?;
+    store.insert_profile_if_absent("lk_prof_other", "lk_proj_other", "dev", false, 1)?;
+    store.upsert_secret_link_with_audit(
+        &crate::SecretLinkRecord {
+            id: "lk_link_other".into(),
+            project_id: "lk_proj_other".into(),
+            profile_id: "lk_prof_other".into(),
+            local_name: "OTHER_RPC".into(),
+            ..link
+        },
+        None,
+    )?;
+    let usages = store.list_shared_secret_usages(&shared_secret.id)?;
+    let metadata: Vec<_> =
+        usages.iter().map(|usage| usage.unlink_audit_metadata(shared_secret)).collect();
+    let writes: Vec<_> = usages
+        .iter()
+        .zip(&metadata)
+        .map(|(usage, metadata)| usage.unlink_audit(metadata, 50))
+        .collect();
+    let keys = [[11; 32], [12; 32]];
+    let audits: BTreeMap<_, _> = usages
+        .iter()
+        .zip(&writes)
+        .zip(&keys)
+        .map(|((usage, write), key)| (usage.link_id.as_str(), AuditContext { key, write }))
+        .collect();
+    assert!(matches!(
+        store.tombstone_secret_and_unlink_with_audit(
+            shared_secret,
+            50,
+            None,
+            &audits,
+            Some(&["lk_link_rpc".into()]),
+        ),
+        Err(StoreError::LinkSetChanged),
+    ));
+    assert_eq!(store.list_shared_secret_usages(&shared_secret.id)?, usages);
+    let mut bad_audits = audits.clone();
+    // Reject an invalid context after the first consumer's audit insert, rolling it back too.
+    bad_audits.insert(&usages[1].link_id, AuditContext { key: &[], write: &writes[1] });
+    assert!(matches!(
+        store.tombstone_secret_and_unlink_with_audit(shared_secret, 50, None, &bad_audits, None),
+        Err(StoreError::InvalidAuditKeyLength { .. }),
+    ));
+    for usage in &usages {
+        assert_eq!(store.list_exportable_audit_rows(&usage.project_id)?, []);
+    }
+    assert_eq!(store.get_secret_by_id(&shared_secret.id)?.as_ref(), Some(shared_secret));
+    assert_eq!(store.list_shared_secret_usages(&shared_secret.id)?, usages);
+
+    let reviewed = ["lk_link_rpc".into(), "lk_link_other".into()];
+    let unlinked = store.tombstone_secret_and_unlink_with_audit(
+        shared_secret,
+        50,
+        None,
+        &audits,
+        Some(&reviewed),
+    )?;
+    assert_eq!(unlinked, usages);
+    for (usage, key) in usages.iter().zip(keys) {
+        let chain = store.verify_audit_chain_read_only(&usage.project_id, &key)?;
+        assert!(chain.hmac_ok);
+        assert_eq!(chain.rows_verified, 1);
+        let rows = store.list_exportable_audit_rows(&usage.project_id)?;
+        assert_eq!(rows[0].action, "SECRET_UNLINK");
+        assert_eq!(rows[0].secret_name.as_deref(), Some(usage.local_name.as_str()));
+    }
     assert!(store.get_secret_link("lk_proj_test", "lk_prof_test", "RPC_URL")?.is_none());
     assert_eq!(
         store.list_active_secret_metadata_by_profile("lk_proj_test", "lk_prof_test")?.len(),

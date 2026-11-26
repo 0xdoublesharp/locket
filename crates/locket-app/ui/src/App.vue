@@ -226,6 +226,8 @@ const envPickerFailed = ref(false);
 const envPickerRequests = createRequestLifetime();
 const importOverwrite = ref(false);
 const importConfirmation = ref('');
+const importTargetConfirmation = ref('');
+const importTargetConfirmationRequired = ref(false);
 const importLiteral = ref(false);
 const importPreview = ref<DesktopImportEnvResponse | null>(null);
 const importSelections = ref<Record<string, { kind: 'link' | 'promote'; target: string }>>({});
@@ -2204,14 +2206,23 @@ async function handleDeleteSecret(
     secret_name: row.name,
     source: secretSourceWire(row.source),
     ...(confirmation && { confirmation }),
+    ...(reviewedUsages && { expected_link_ids: reviewedUsages.map((usage) => usage.link_id) }),
     ...(reviewedUsages?.length && { unlink_all: true }),
   });
   if (!isCurrent()) return;
   secretMutationBusy.value = false;
+  if (!result.ok && result.error.kind === 'rejected' && result.error.code === 'LinkSetChanged') {
+    secretMutationError.value = {
+      id: row.id,
+      message: 'Linked projects changed. Review the updated list before deleting.',
+    };
+    await refreshSecrets();
+    return;
+  }
   if (!result.ok || !result.value.deleted) {
     secretMutationError.value = {
       id: row.id,
-      message: result.ok ? 'The secret could not be deleted.' : actionError(result.error),
+      message: result.ok ? 'The secret could not be deleted.' : deletionError(result.error),
     };
     return;
   }
@@ -2220,6 +2231,17 @@ async function handleDeleteSecret(
   desktopNotice.value =
     `Deleted ${row.name}.` + (count ? ` Removed ${count} ${count === 1 ? 'link' : 'links'}.` : '');
   await Promise.all([refreshSecrets(), refreshVersions()]);
+}
+
+function deletionError(error: AgentClientError): string {
+  if (
+    error.kind === 'rejected' &&
+    error.code === 'UnlockRequired' &&
+    error.message.startsWith('Unlock the linked project vaults')
+  ) {
+    return error.message;
+  }
+  return actionError(error);
 }
 
 function copyToSharedError(error: AgentClientError, name: string): string {
@@ -2622,6 +2644,8 @@ function resetEnvImport(): void {
   envPath.value = selectedIsShared.value ? '' : '.env';
   importOverwrite.value = false;
   importConfirmation.value = '';
+  importTargetConfirmation.value = '';
+  importTargetConfirmationRequired.value = false;
   importLiteral.value = false;
 }
 
@@ -2700,6 +2724,10 @@ async function runEnvImport(dryRun: boolean): Promise<void> {
       overwrite: importOverwrite.value,
       literal: importLiteral.value,
       confirmation: importConfirmation.value || undefined,
+      ...(!dryRun &&
+        importTargetConfirmation.value && {
+          target_confirmation: importTargetConfirmation.value,
+        }),
       ...(dryRun
         ? { dry_run: true }
         : selection.length
@@ -2707,8 +2735,16 @@ async function runEnvImport(dryRun: boolean): Promise<void> {
           : {}),
     });
     if (context !== settingsContextKey.value) return;
-    if (!result.ok) desktopError.value = actionError(result.error);
-    else if (dryRun) {
+    if (!result.ok) {
+      if (
+        result.error.kind === 'rejected' &&
+        result.error.code === 'ConfirmationFailed' &&
+        result.error.message.includes('Global Vault')
+      ) {
+        importTargetConfirmationRequired.value = true;
+      }
+      desktopError.value = actionError(result.error);
+    } else if (dryRun) {
       if (envImportOpen.value && !settings.value.privacyRedactNames)
         importPreview.value = result.value;
     } else {
@@ -3167,6 +3203,20 @@ onUnmounted(() => {
             :disabled="desktopBusy"
             :overridden-names="importOverrideNames"
           />
+          <label
+            v-if="
+              importTargetConfirmationRequired &&
+              Object.values(importSelections).some((choice) => choice.kind === 'promote')
+            "
+          >
+            Type default to confirm promotion into the Global Vault
+            <input
+              v-model="importTargetConfirmation"
+              type="text"
+              autocomplete="off"
+              :disabled="desktopBusy"
+            />
+          </label>
           <p
             v-if="
               importOverwrite &&

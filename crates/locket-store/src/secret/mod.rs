@@ -12,7 +12,7 @@ pub use discovery::{DiscoveredSecretRecord, SecretDiscoveryFilter};
 pub use expiry::{SecretExpirationNotice, SecretExpiryPolicy, SecretExpiryStatus};
 pub use links::{
     DuplicateSecretMemberRecord, DuplicateValueGroupRecord, ResolvedSecretLink, SecretLinkRecord,
-    SharedSecretUsageRecord,
+    SecretTransferAudit, SharedSecretUsageRecord,
 };
 
 /// Secret metadata row.

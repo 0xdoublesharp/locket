@@ -63,6 +63,12 @@ pub struct ImportDotenvRequest {
     pub literal: bool,
     /// Actual profile name typed for dangerous overwrite.
     pub confirmation: Option<String>,
+    /// Exact Global Vault profile name for dangerous promotions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_confirmation: Option<String>,
+    /// Live `CopySecretToShared` grant scoped to the Global Vault default profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_grant_id: Option<String>,
     /// Inspect keys and detect duplicate values without writing to the store.
     #[serde(default)]
     pub dry_run: bool,
@@ -160,18 +166,18 @@ pub struct ApplyPolicyResponse {
     pub operation: String,
 }
 
-/// Fixed-code, fixed-message mutation failure. Never contains input plaintext.
+/// Typed mutation failure with a metadata-only message.
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 pub struct MutationError {
     /// Protocol error code.
     pub code: &'static str,
     /// Safe message for user display.
-    pub message: &'static str,
+    pub message: std::borrow::Cow<'static, str>,
 }
 
 const fn failure(code: &'static str, message: &'static str) -> MutationError {
-    MutationError { code, message }
+    MutationError { code, message: std::borrow::Cow::Borrowed(message) }
 }
 const fn metadata() -> MutationError {
     failure("MetadataInvalid", "project metadata is invalid or changed; refresh and retry")
@@ -180,8 +186,14 @@ const fn storage() -> MutationError {
     failure("CorruptDb", "mutation could not be committed")
 }
 impl From<locket_store::StoreError> for MutationError {
-    fn from(_: locket_store::StoreError) -> Self {
-        storage()
+    fn from(error: locket_store::StoreError) -> Self {
+        match error {
+            locket_store::StoreError::LinkSetChanged => failure(
+                "LinkSetChanged",
+                "Linked projects changed while you were reviewing them. Refresh and confirm again.",
+            ),
+            _ => storage(),
+        }
     }
 }
 
@@ -295,6 +307,67 @@ fn response<T: Serialize>(
     }
 }
 
+struct ImportPromotionTarget {
+    profile: locket_store::ProfileRecord,
+    master: Zeroizing<KeyBytes>,
+}
+
+fn import_promotion_profile(store: &Store) -> Result<locket_store::ProfileRecord, MutationError> {
+    let project = store
+        .list_projects()?
+        .into_iter()
+        .filter(|project| is_shared_project_id(&project.id))
+        .min_by_key(|project| project.name != "@shared")
+        .ok_or_else(|| {
+            failure("ProjectNotFound", "set up the Global Vault before promoting secrets")
+        })?;
+    store
+        .get_profile_by_name(&project.id, "default")?
+        .ok_or_else(|| failure("ProfileNotFound", "the Global Vault default profile is missing"))
+}
+
+async fn authorize_import_promotion(
+    state: &crate::AgentSocketState,
+    request: &ImportDotenvRequest,
+    profile: locket_store::ProfileRecord,
+    identity: &crate::keys::StoreFileIdentity,
+    cache: &crate::UnlockCache,
+    now: i128,
+) -> Result<ImportPromotionTarget, MutationError> {
+    let required =
+        || failure("GrantRequired", "a matching Global Vault promotion grant is required");
+    let grant_id = request.target_grant_id.as_deref().ok_or_else(required)?;
+    {
+        let mut grants = state.grants.lock().await;
+        if grants.validate(
+            grant_id,
+            &profile.project_id,
+            &profile.id,
+            GrantAction::CopySecretToShared,
+            now,
+            request.scope.binding.as_ref(),
+        ) != GrantValidation::Valid
+        {
+            return Err(required());
+        }
+        grants.revoke(grant_id);
+    }
+    if !cache
+        .lookup(&request.scope.project_id, now)
+        .is_some_and(|entry| entry.store_identity.as_ref() == Some(identity))
+    {
+        return Err(failure("UnlockRequired", "unlock the source vault before promoting secrets"));
+    }
+    let target_entry = cache
+        .lookup(&profile.project_id, now)
+        .filter(|entry| entry.store_identity.as_ref() == Some(identity))
+        .ok_or_else(|| {
+            failure("UnlockRequired", "unlock the Global Vault before promoting secrets")
+        })?;
+    let master = master_key_array(target_entry.key_bytes()).map_err(|_| storage())?;
+    Ok(ImportPromotionTarget { profile, master })
+}
+
 /// Handle an import using only a matching live grant and project unlock cache.
 pub async fn handle_import_dotenv(
     request: &RequestEnvelope,
@@ -312,11 +385,31 @@ pub async fn handle_import_dotenv(
         let (store, store_identity) = state
             .open_store(&typed.scope.store_path, pin, false)
             .map_err(|_| failure("AccessDenied", "could not verify mutation store"))?;
+        let promotion = if !typed.dry_run && !typed.promote_to_shared.is_empty() {
+            if is_shared_project_id(&typed.scope.project_id) {
+                return Err(failure("InvalidReference", "promote secrets from a project vault"));
+            }
+            let profile = import_promotion_profile(&store)?;
+            Some(
+                authorize_import_promotion(
+                    state,
+                    &typed,
+                    profile,
+                    &store_identity,
+                    &cache_guard,
+                    now,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
         import_dotenv_in_store(
             store,
             &typed,
             &master,
             Some((&cache_guard, &store_identity)),
+            promotion.as_ref(),
             i64::try_from(now).map_err(|_| storage())?,
         )
     }
@@ -369,7 +462,7 @@ pub fn import_dotenv_with_master(
 ) -> Result<ImportDotenvResponse, MutationError> {
     let (store, _) = crate::keys::open_verified_store(&request.scope.store_path, None)
         .map_err(locket_store::StoreError::from)?;
-    import_dotenv_in_store(store, request, master, None, timestamp)
+    import_dotenv_in_store(store, request, master, None, None, timestamp)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -378,6 +471,7 @@ fn import_dotenv_in_store(
     request: &ImportDotenvRequest,
     master: &KeyBytes,
     shared_ctx: Option<(&crate::UnlockCache, &crate::keys::StoreFileIdentity)>,
+    promotion: Option<&ImportPromotionTarget>,
     timestamp: i64,
 ) -> Result<ImportDotenvResponse, MutationError> {
     let _guard = MUTATION_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -490,6 +584,20 @@ fn import_dotenv_in_store(
         if context(store, &request.scope)? != verified {
             return Err(metadata());
         }
+        if !request.promote_to_shared.is_empty() {
+            let promotion = promotion.ok_or_else(|| {
+                failure("GrantRequired", "a matching Global Vault promotion grant is required")
+            })?;
+            let target_profile = import_promotion_profile(store)?;
+            if target_profile != promotion.profile {
+                return Err(metadata());
+            }
+            confirm_dangerous_profile(
+                &target_profile,
+                request.target_confirmation.as_deref().or(request.confirmation.as_deref()),
+                "Type default to confirm promotion into the Global Vault.",
+            )?;
+        }
         for entry in &document.entries {
             let value = Zeroizing::new(entry.value.clone());
 
@@ -565,111 +673,72 @@ fn import_dotenv_in_store(
                 continue;
             }
 
-            if !is_shared_project_id(&request.scope.project_id)
+            if let Some(promotion) = promotion
                 && let Some(target_shared_name) = request.promote_to_shared.get(&entry.key)
             {
-                let (cache, identity) = shared_ctx.ok_or_else(|| {
-                    failure("UnlockRequired", "unlock the Global Vault before promoting secrets")
-                })?;
-                let target_project = store
-                    .list_projects()?
-                    .into_iter()
-                    .filter(|project| is_shared_project_id(&project.id))
-                    .min_by_key(|project| project.name != "@shared")
-                    .ok_or_else(|| {
-                        failure(
-                            "ProjectNotFound",
-                            "set up the Global Vault before promoting secrets",
-                        )
-                    })?;
-                let target_entry =
-                    cache.lookup(&target_project.id, i128::from(timestamp)).ok_or_else(|| {
-                        failure(
-                            "UnlockRequired",
-                            "unlock the Global Vault before promoting secrets",
-                        )
-                    })?;
-                if target_entry.store_identity.as_ref().is_some_and(|pin| pin != identity) {
-                    return Err(failure(
-                        "AccessDenied",
-                        "the Global Vault does not match the selected store",
-                    ));
-                }
-                let target_master =
-                    master_key_array(target_entry.key_bytes()).map_err(|_| storage())?;
-                let target_profile =
-                    store.get_profile_by_name(&target_project.id, "default")?.ok_or_else(|| {
-                        failure("ProfileNotFound", "the Global Vault default profile is missing")
-                    })?;
+                let target_profile = &promotion.profile;
+                let target_project_id = &target_profile.project_id;
+                let target_master = &promotion.master;
                 let target_name = SecretName::new(target_shared_name.clone()).map_err(|_| {
                     failure("InvalidSecretName", "invalid Global Vault secret name")
                 })?;
                 let existing_shared = store.get_secret_by_source(
-                    &target_project.id,
+                    target_project_id,
                     &target_profile.id,
                     target_name.as_str(),
                     "user-local",
                 )?;
-                let (target_secret_id, target_version) = if let Some(existing_shared) =
-                    existing_shared
-                {
-                    if existing_shared.state == "deleted" {
-                        return Err(failure(
-                            "SecretDeleted",
-                            "the Global Vault secret source is deleted",
-                        ));
-                    }
-                    let same_value = crate::reveal::decrypt_secret(
+                if existing_shared.as_ref().is_some_and(|secret| secret.state == "deleted") {
+                    return Err(failure(
+                        "SecretDeleted",
+                        "the Global Vault secret source is deleted",
+                    ));
+                }
+                let prior_target_version =
+                    existing_shared.as_ref().map(|secret| secret.current_version);
+                let same_value = if let Some(existing) = &existing_shared {
+                    crate::reveal::decrypt_secret(
                         store,
-                        &existing_shared.project_id,
-                        &existing_shared.profile_id,
-                        &existing_shared,
-                        existing_shared.current_version,
-                        &target_master,
+                        target_project_id,
+                        &target_profile.id,
+                        existing,
+                        existing.current_version,
+                        target_master,
                     )
-                    .is_ok_and(|existing_val| existing_val.as_str() == value.as_str());
-                    if same_value {
-                        (existing_shared.id, existing_shared.current_version)
-                    } else if request.overwrite {
-                        let op = SetSecretOperation {
-                            project_id: &target_project.id,
-                            profile_id: &target_profile.id,
-                            name: target_name.as_str(),
-                            source: "user-local",
-                            source_was_omitted: false,
-                            value: &value,
-                            rotate: true,
-                            grace_until: None,
-                            master_key: target_master.as_slice(),
-                            timestamp: i128::from(timestamp),
-                            imported: true,
-                        };
-                        let written = set_secret_in_store(store, &op, &target_master, timestamp)
-                            .map_err(|error| failure(error.error, error.message))?;
-                        (written.secret_id, written.version)
-                    } else {
+                    .map_err(|_| storage())?
+                    .as_str()
+                        == value.as_str()
+                } else {
+                    false
+                };
+                let (target_secret_id, target_version, operation) = if let Some(existing) =
+                    existing_shared.filter(|_| same_value)
+                {
+                    (existing.id, existing.current_version, "reuse")
+                } else {
+                    let rotate = prior_target_version.is_some();
+                    if rotate && !request.overwrite {
                         return Err(failure(
                             "SecretAlreadyExists",
                             "a different value with this name already exists in the Global Vault",
                         ));
                     }
-                } else {
                     let op = SetSecretOperation {
-                        project_id: &target_project.id,
+                        project_id: target_project_id,
                         profile_id: &target_profile.id,
                         name: target_name.as_str(),
                         source: "user-local",
                         source_was_omitted: false,
                         value: &value,
-                        rotate: false,
+                        rotate,
                         grace_until: None,
                         master_key: target_master.as_slice(),
                         timestamp: i128::from(timestamp),
                         imported: true,
                     };
-                    let written = set_secret_in_store(store, &op, &target_master, timestamp)
+                    let written = set_secret_in_store(store, &op, target_master, timestamp)
                         .map_err(|error| failure(error.error, error.message))?;
-                    (written.secret_id, written.version)
+                    (written.secret_id, written.version, if rotate { "rotate" } else { "create" })
                 };
                 if let Some((_, _, fp_key)) = shared_fp.as_ref()
                     && let Ok(tag) = local_dedup_tag_v1(fp_key, &value)
@@ -690,7 +759,7 @@ fn import_dotenv_in_store(
                     project_id: request.scope.project_id.clone(),
                     profile_id: request.scope.profile_id.clone(),
                     local_name: entry.key.clone(),
-                    target_project_id: target_project.id.clone(),
+                    target_project_id: target_project_id.clone(),
                     target_profile_id: target_profile.id.clone(),
                     target_secret_id: target_secret_id.clone(),
                     created_at: timestamp,
@@ -699,13 +768,29 @@ fn import_dotenv_in_store(
                 let source_key =
                     unwrap_audit_key_with_master(store, &request.scope.project_id, master)
                         .map_err(|_| storage())?;
+                let target_key =
+                    unwrap_audit_key_with_master(store, target_project_id, target_master)
+                        .map_err(|_| storage())?;
+                locket_store::SecretTransferAudit {
+                    action: "SECRET_PROMOTE",
+                    operation,
+                    from_project_id: &request.scope.project_id,
+                    from_profile_id: &request.scope.profile_id,
+                    from_secret: None,
+                    target_profile,
+                    target_name: target_name.as_str(),
+                    prior_target_version,
+                    target_version,
+                    timestamp,
+                }
+                .append(store, source_key.as_ref(), target_key.as_ref())?;
                 let link_metadata = json!({
                     "schema_version": 1,
                     "action": "SECRET_LINK",
                     "status": "SUCCESS",
                     "secret_name": entry.key,
                     "profile_id": request.scope.profile_id,
-                    "target_project_id": target_project.id,
+                    "target_project_id": target_project_id,
                     "target_profile_id": target_profile.id,
                     "target_secret_id": target_secret_id,
                     "target_secret_name": target_name.as_str(),

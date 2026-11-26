@@ -1,5 +1,7 @@
 //! Single-use, metadata-only desktop mutations.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use locket_core::{KeyId, ProfileId, ProfileName, SecretId, SecretName, source_precedence};
 use locket_crypto::{
     HkdfWrapInfo, KeyBytes, KeyPurpose, KeyWrapAad, KeyWrapPurpose, derive_wrapping_key_v1,
@@ -7,7 +9,8 @@ use locket_crypto::{
 };
 use locket_store::{
     AuditContext, AuditWrite, KeyRecord, ProfileRecord, SecretCopyTarget, SecretFingerprintRecord,
-    SecretLinkRecord, SecretRecord, SecretVersionRecord, Store, VersionDeprecation,
+    SecretLinkRecord, SecretRecord, SecretTransferAudit, SecretVersionRecord, Store,
+    VersionDeprecation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -42,6 +45,8 @@ struct DeleteSecret {
     confirmation: Option<String>,
     #[serde(default)]
     unlink_all: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_link_ids: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -194,7 +199,9 @@ pub async fn handle_desktop_crud(
                 }
                 AgentMethod::DeleteSecret => {
                     let typed = DeleteSecret::deserialize(payload).map_err(|_| metadata())?;
-                    serde_json::to_value(delete_secret(store, &scope, typed, &master, timestamp)?)
+                    serde_json::to_value(delete_secret(
+                        store, &scope, typed, &master, &cache, &identity, timestamp,
+                    )?)
                 }
                 AgentMethod::CopySecretToShared => {
                     let typed = CopySecretToShared::deserialize(payload).map_err(|_| metadata())?;
@@ -337,6 +344,8 @@ fn delete_secret(
     scope: &MutationScope,
     request: DeleteSecret,
     master: &KeyBytes,
+    cache: &UnlockCache,
+    identity: &StoreFileIdentity,
     timestamp: i64,
 ) -> Result<DeleteSecretResponse, MutationError> {
     let profile = context(store, scope)?.profile;
@@ -351,32 +360,13 @@ fn delete_secret(
         .get_active_secret(&scope.project_id, &profile.id, name.as_str(), &request.source)?
         .ok_or_else(secret_not_found)?;
     let usages = store.list_shared_secret_usages(&secret.id)?;
-    if !usages.is_empty() {
-        if !request.unlink_all {
-            return Err(failure(
-                "LinkedSecretInUse",
-                "this Global Vault secret is linked by active projects; confirm unlinking all usages before deleting",
-            ));
-        }
-        let dangerous_profiles: std::collections::BTreeSet<&str> = usages
-            .iter()
-            .filter(|usage| usage.profile_dangerous)
-            .map(|usage| usage.profile_name.as_str())
-            .collect();
-        if !dangerous_profiles.is_empty() {
-            let expected = if dangerous_profiles.len() == 1 {
-                *dangerous_profiles.iter().next().unwrap_or(&secret.name.as_str())
-            } else {
-                secret.name.as_str()
-            };
-            if request.confirmation.as_deref() != Some(expected) {
-                return Err(failure(
-                    "ConfirmationFailed",
-                    "type the dangerous profile or secret name to confirm unlinking all linked usages",
-                ));
-            }
-        }
-    }
+    validate_deletion_usages(
+        &usages,
+        &secret.name,
+        request.unlink_all,
+        request.expected_link_ids.as_deref(),
+        request.confirmation.as_deref(),
+    )?;
     let key =
         unwrap_audit_key_with_master(store, &scope.project_id, master).map_err(|_| storage())?;
     let unlinked_count = u32::try_from(usages.len()).unwrap_or(u32::MAX);
@@ -402,18 +392,37 @@ fn delete_secret(
         metadata_json: &metadata,
         timestamp,
     };
-    if usages.is_empty() {
-        store.tombstone_current_secret_with_audit(
-            &secret,
-            timestamp,
-            AuditContext { key: key.as_ref(), write: &audit },
-        )?;
-    } else {
+    let delete_audit = AuditContext { key: key.as_ref(), write: &audit };
+    if !usages.is_empty()
+        || is_shared_project_id(&scope.project_id)
+        || request.expected_link_ids.is_some()
+    {
+        let consumer_keys =
+            consumer_audit_keys(store, &usages, cache, identity, i128::from(timestamp))?;
+        let unlink_metadata: Vec<_> =
+            usages.iter().map(|usage| usage.unlink_audit_metadata(&secret)).collect();
+        let unlink_writes: Vec<_> = usages
+            .iter()
+            .zip(&unlink_metadata)
+            .map(|(usage, metadata)| usage.unlink_audit(metadata, timestamp))
+            .collect();
+        let unlink_audits = usages
+            .iter()
+            .zip(&unlink_writes)
+            .map(|(usage, write)| {
+                let key = consumer_keys[usage.project_id.as_str()].as_ref();
+                (usage.link_id.as_str(), AuditContext { key, write })
+            })
+            .collect();
         store.tombstone_secret_and_unlink_with_audit(
             &secret,
             timestamp,
-            Some(AuditContext { key: key.as_ref(), write: &audit }),
+            Some(delete_audit),
+            &unlink_audits,
+            request.expected_link_ids.as_deref(),
         )?;
+    } else {
+        store.tombstone_current_secret_with_audit(&secret, timestamp, delete_audit)?;
     }
     Ok(DeleteSecretResponse {
         secret_name: secret.name,
@@ -422,6 +431,92 @@ fn delete_secret(
         deleted: true,
         unlinked_count,
     })
+}
+
+fn validate_deletion_usages(
+    usages: &[locket_store::SharedSecretUsageRecord],
+    secret_name: &str,
+    unlink_all: bool,
+    expected_link_ids: Option<&[String]>,
+    confirmation: Option<&str>,
+) -> Result<(), MutationError> {
+    if let Some(expected) = expected_link_ids {
+        let actual: BTreeSet<_> = usages.iter().map(|usage| &usage.link_id).collect();
+        if actual.len() != expected.len() || !expected.iter().collect::<BTreeSet<_>>().eq(&actual) {
+            return Err(locket_store::StoreError::LinkSetChanged.into());
+        }
+    }
+    if !usages.is_empty() {
+        if !unlink_all {
+            return Err(failure(
+                "LinkedSecretInUse",
+                "this Global Vault secret is linked by active projects; confirm unlinking all usages before deleting",
+            ));
+        }
+        let dangerous_profiles: BTreeSet<&str> = usages
+            .iter()
+            .filter(|usage| usage.profile_dangerous)
+            .map(|usage| usage.profile_name.as_str())
+            .collect();
+        if !dangerous_profiles.is_empty() {
+            let expected = if dangerous_profiles.len() == 1 {
+                *dangerous_profiles.iter().next().unwrap_or(&secret_name)
+            } else {
+                secret_name
+            };
+            if confirmation != Some(expected) {
+                return Err(failure(
+                    "ConfirmationFailed",
+                    "type the dangerous profile or secret name to confirm unlinking all linked usages",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn consumer_audit_keys<'a>(
+    store: &Store,
+    usages: &'a [locket_store::SharedSecretUsageRecord],
+    cache: &UnlockCache,
+    identity: &StoreFileIdentity,
+    now: i128,
+) -> Result<BTreeMap<&'a str, zeroize::Zeroizing<KeyBytes>>, MutationError> {
+    let consumers: BTreeMap<_, _> = usages
+        .iter()
+        .map(|usage| (usage.project_id.as_str(), usage.project_name.as_str()))
+        .collect();
+    let mut unlocked = Vec::new();
+    let mut locked = BTreeSet::new();
+    for (project_id, project_name) in consumers {
+        if let Some(entry) = cache
+            .lookup(project_id, now)
+            .filter(|entry| entry.store_identity.as_ref() == Some(identity))
+        {
+            unlocked.push((project_id, entry));
+        } else {
+            locked.insert(project_name);
+        }
+    }
+    if !locked.is_empty() {
+        return Err(MutationError {
+            code: "UnlockRequired",
+            message: format!(
+                "Unlock the linked project vaults ({}) before deleting the secret.",
+                locked.into_iter().collect::<Vec<_>>().join(", "),
+            )
+            .into(),
+        });
+    }
+    unlocked
+        .into_iter()
+        .map(|(project_id, entry)| {
+            let master = master_key_array(entry.key_bytes()).map_err(|_| storage())?;
+            let key =
+                unwrap_audit_key_with_master(store, project_id, &master).map_err(|_| storage())?;
+            Ok((project_id, key))
+        })
+        .collect()
 }
 
 fn validated_name(input: String) -> Result<SecretName, MutationError> {
@@ -809,26 +904,6 @@ fn promote_secret(
             fingerprint,
             created_at: timestamp,
         };
-        let audit_action = if replace_with_link { "SECRET_PROMOTE" } else { "SECRET_COPY" };
-        let metadata = json!({
-            "schema_version": 1, "action": audit_action, "status": "SUCCESS", "secret_name": target_name,
-            "from_project_id": source.project_id, "from_profile_id": source.profile_id,
-            "from_source": source.source, "from_version": source.current_version,
-            "to_project_id": target.project_id, "to_profile_id": target.id, "to_source": USER_LOCAL,
-            "prior_target_version": existing.map(|record| record.current_version), "target_version": version,
-        });
-        let target_key = unwrap_audit_key_with_master(store, &target.project_id, target_master)
-            .map_err(|_| storage())?;
-        let target_audit = AuditWrite {
-            project_id: &target.project_id,
-            profile_id: Some(&target.id),
-            action: audit_action,
-            status: "SUCCESS",
-            secret_name: Some(target_name),
-            command: None,
-            metadata_json: &metadata,
-            timestamp,
-        };
         let (copy_target, action) =
             existing.map_or((SecretCopyTarget::Create(&new_secret), "create"), |secret| {
                 (
@@ -842,27 +917,27 @@ fn promote_secret(
                     "rotate",
                 )
             });
-        store.copy_secret_with_audit(
-            copy_target,
-            &new_version,
-            &blob,
-            &fingerprint,
-            Some(AuditContext { key: target_key.as_ref(), write: &target_audit }),
-        )?;
-        if source.project_id != target.project_id {
-            let source_key = unwrap_audit_key_with_master(store, &source.project_id, master)
-                .map_err(|_| storage())?;
-            store.append_audit(
-                source_key.as_ref(),
-                &AuditWrite {
-                    project_id: &source.project_id,
-                    profile_id: Some(&source.profile_id),
-                    ..target_audit
-                },
-            )?;
-        }
+        store.copy_secret_with_audit(copy_target, &new_version, &blob, &fingerprint, None)?;
         (secret_id, version, action)
     };
+
+    let target_key = unwrap_audit_key_with_master(store, &target.project_id, target_master)
+        .map_err(|_| storage())?;
+    let source_key =
+        unwrap_audit_key_with_master(store, &source.project_id, master).map_err(|_| storage())?;
+    SecretTransferAudit {
+        action: if replace_with_link { "SECRET_PROMOTE" } else { "SECRET_COPY" },
+        operation: action,
+        from_project_id: &source.project_id,
+        from_profile_id: &source.profile_id,
+        from_secret: Some(source),
+        target_profile: target,
+        target_name,
+        prior_target_version: existing.map(|record| record.current_version),
+        target_version: version,
+        timestamp,
+    }
+    .append(store, source_key.as_ref(), target_key.as_ref())?;
 
     let shared_fp_key = unwrap_profile_key_with_master(
         store,

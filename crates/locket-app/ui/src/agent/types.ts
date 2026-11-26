@@ -638,6 +638,7 @@ export interface DesktopImportEnvRequest {
   path: string;
   overwrite: boolean;
   literal: boolean;
+  target_confirmation?: string;
   dry_run?: boolean;
   link_to_shared?: Record<string, string>;
   promote_to_shared?: Record<string, string>;
@@ -680,6 +681,7 @@ export interface DesktopDeleteSecretRequest {
   source: VersionSourceWire;
   confirmation?: string;
   unlink_all?: boolean;
+  expected_link_ids?: string[];
 }
 export interface DesktopDeleteSecretResponse {
   secret_name: string;

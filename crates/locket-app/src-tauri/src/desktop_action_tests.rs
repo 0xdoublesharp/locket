@@ -1191,6 +1191,7 @@ async fn shared_vault_status_and_import_grants_use_the_selected_profile_and_revo
         overwrite: false,
         literal: false,
         confirmation: None,
+        target_confirmation: None,
         dry_run: false,
         link_to_shared: std::collections::BTreeMap::new(),
         promote_to_shared: std::collections::BTreeMap::new(),
@@ -1697,5 +1698,93 @@ fn project_open_rejects_invalid_folder_store_schema_and_profile_without_creating
         lookup(&fixture.root),
         "The configured profile is missing from this vault. Run `locket doctor`.",
     );
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn dotenv_promotion_acquires_and_revokes_both_profile_grants() -> Result<(), Box<dyn Error>> {
+    use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let fixture = Fixture::new()?;
+    let shared_id = "lk_proj_shared_import_test";
+    let db = Store::open(&fixture.store)?;
+    db.insert_project_if_absent(shared_id, "@shared", 2)?;
+    db.insert_profile_if_absent("shared-default", shared_id, "default", true, 2)?;
+    let context = open_project_at(&fixture.store, &fixture.root)?;
+    let source_id = context.project_id.clone();
+    let source_profile = context.profile_id.clone();
+    let socket = fixture.directory.path().join("import.sock");
+    let listener = tokio::net::UnixListener::bind(&socket)?;
+    let server = tokio::spawn(async move {
+        for (index, method) in
+            ["RequestGrant", "RequestGrant", "ImportDotenv", "RevokeGrant", "RevokeGrant"]
+                .into_iter()
+                .enumerate()
+        {
+            let (mut stream, _) = listener.accept().await?;
+            let length = stream.read_u32_le().await?;
+            let mut bytes = vec![0; length as usize];
+            stream.read_exact(&mut bytes).await?;
+            let request: locket_agent::RequestEnvelope = serde_json::from_slice(&bytes)?;
+            assert_eq!(request.kind, method);
+            let value = match index {
+                0 => {
+                    assert_eq!(request.payload["project_id"], shared_id);
+                    assert_eq!(request.payload["profile_id"], "shared-default");
+                    assert_eq!(request.payload["action"], "CopySecretToShared");
+                    assert_eq!(request.payload["confirm_dangerous"], true);
+                    json!({"grant_id": "target-grant"})
+                }
+                1 => {
+                    assert_eq!(request.payload["project_id"], source_id);
+                    assert_eq!(request.payload["profile_id"], source_profile);
+                    assert_eq!(request.payload["action"], "ImportDotenv");
+                    json!({"grant_id": "source-grant"})
+                }
+                2 => {
+                    assert_eq!(request.payload["grant_id"], "source-grant");
+                    assert_eq!(request.payload["target_grant_id"], "target-grant");
+                    assert_eq!(request.payload["confirmation"], "dev");
+                    assert_eq!(request.payload["target_confirmation"], "default");
+                    json!({"imported": 0, "overwritten": 0, "skipped": 0, "promoted": 1,
+                           "diagnostics": [], "original_preserved": true})
+                }
+                3 => {
+                    assert_eq!(request.payload["grant_id"], "source-grant");
+                    json!({})
+                }
+                _ => {
+                    assert_eq!(request.payload["grant_id"], "target-grant");
+                    json!({})
+                }
+            };
+            let response = locket_agent::ResponseEnvelope::Success(
+                locket_agent::SuccessEnvelope::new(request.id.as_str(), value),
+            );
+            stream
+                .write_all(&locket_agent::encode_frame(
+                    &response,
+                    locket_agent::DEFAULT_MAX_MESSAGE_SIZE,
+                )?)
+                .await?;
+        }
+        Ok::<(), Box<dyn Error + Send + Sync>>(())
+    });
+    let request = DesktopImportEnvRequest {
+        project_id: context.project_id.clone(),
+        path: ".env".into(),
+        overwrite: false,
+        literal: false,
+        confirmation: Some("dev".into()),
+        target_confirmation: Some("default".into()),
+        dry_run: false,
+        link_to_shared: std::collections::BTreeMap::new(),
+        promote_to_shared: [("TOKEN".into(), "GLOBAL_TOKEN".into())].into(),
+    };
+    let result = invoke_import_env_at(&socket, &fixture.store, &context, request).await?;
+    assert_eq!(result.promoted, 1);
+    server.await?.map_err(|error| error.to_string())?;
     Ok(())
 }

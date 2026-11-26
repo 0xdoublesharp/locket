@@ -16,7 +16,7 @@ use crate::runtime::error::{CliError, external_source_unavailable_error};
 use crate::runtime::user_verification::{UserVerificationAudit, require_user_verification};
 use crate::support::secret_helpers::{
     ValueAccessAudit, ValueAccessTarget, decrypt_secret_version, resolve_active_secret,
-    resolve_active_secret_for_source, reveal_ttl_seconds, select_highest_precedence_secret,
+    resolve_active_secret_for_source, resolve_active_secret_in_profile, reveal_ttl_seconds,
     write_value_access_audit_if_available,
 };
 use crate::{
@@ -184,19 +184,18 @@ fn resolve_value_access(
         args.project.as_deref(),
         args.profile.as_deref(),
     )?;
-    let (project_id, profile_id) = (&target.project.id, &target.profile.id);
     let secret = if let Some(source) = args.source.source {
-        store.get_secret_by_source(
-            project_id,
-            profile_id,
-            name.as_str(),
-            source_arg_to_str(source),
-        )?
+        store
+            .get_secret_by_source(
+                &target.project.id,
+                &target.profile.id,
+                name.as_str(),
+                source_arg_to_str(source),
+            )?
+            .ok_or_else(|| secret_not_found_error("secret not found"))?
     } else {
-        let rows = store.list_secrets_by_name(project_id, profile_id, name.as_str())?;
-        select_highest_precedence_secret(rows.into_iter().filter(|row| row.state == "active"))
-    }
-    .ok_or_else(|| secret_not_found_error("secret not found"))?;
+        resolve_active_secret_in_profile(&store, &target.profile, &name)?
+    };
     if secret.state != "active" {
         return Err(secret_deleted_error("secret source is deleted"));
     }
@@ -210,6 +209,12 @@ fn decrypt_access_secret(
     let store = crate::open_store(context)?;
     let secret = &target.secret;
     super::expiry::check_secret_expiry(&store, &secret.id)?;
+    crate::commands::exec::run::require_linked_secret_access(
+        context,
+        &store,
+        &target.profile,
+        secret,
+    )?;
     decrypt_secret_version(
         context,
         &store,

@@ -2,12 +2,13 @@
 
 use std::collections::BTreeMap;
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
+use serde_json::{Value, json};
 
-use crate::Store;
-use crate::audit::{AuditContext, append_optional_audit};
+use crate::audit::{AuditContext, AuditWrite, append_optional_audit};
 use crate::error::StoreError;
 use crate::secret::{SecretRecord, secret_record_from_row};
+use crate::{ProfileRecord, Store};
 
 /// Local pointer binding a project variable name to a Global Vault (`@shared`) secret.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,6 +67,112 @@ pub struct SharedSecretUsageRecord {
     pub created_at: i64,
     /// Last update timestamp in nanoseconds since the Unix epoch.
     pub updated_at: i64,
+}
+
+impl SharedSecretUsageRecord {
+    /// Canonical metadata for a consumer's authenticated cascade unlink entry.
+    #[must_use]
+    pub fn unlink_audit_metadata(&self, target: &SecretRecord) -> Value {
+        json!({
+            "schema_version": 1,
+            "action": "SECRET_UNLINK",
+            "status": "SUCCESS",
+            "secret_name": self.local_name,
+            "profile_id": self.profile_id,
+            "target_project_id": target.project_id,
+            "target_profile_id": target.profile_id,
+            "target_secret_id": self.target_secret_id,
+            "target_secret_name": self.target_secret_name,
+        })
+    }
+
+    /// Audit row for the consumer's project and profile.
+    #[must_use]
+    pub fn unlink_audit<'a>(&'a self, metadata: &'a Value, timestamp: i64) -> AuditWrite<'a> {
+        AuditWrite {
+            project_id: &self.project_id,
+            profile_id: Some(&self.profile_id),
+            action: "SECRET_UNLINK",
+            status: "SUCCESS",
+            secret_name: Some(&self.local_name),
+            command: None,
+            metadata_json: metadata,
+            timestamp,
+        }
+    }
+}
+
+/// Metadata for an audited cross-profile copy or promotion.
+pub struct SecretTransferAudit<'a> {
+    /// `SECRET_COPY` or `SECRET_PROMOTE`.
+    pub action: &'static str,
+    /// Whether the target was created, rotated, or reused.
+    pub operation: &'static str,
+    /// Source project ID.
+    pub from_project_id: &'a str,
+    /// Source profile ID.
+    pub from_profile_id: &'a str,
+    /// Source secret, when the value came from the store.
+    pub from_secret: Option<&'a SecretRecord>,
+    /// Destination profile.
+    pub target_profile: &'a ProfileRecord,
+    /// Destination name, which can differ from the source name.
+    pub target_name: &'a str,
+    /// Previous destination version, if any.
+    pub prior_target_version: Option<u32>,
+    /// Current destination version after the transfer.
+    pub target_version: u32,
+    /// Timestamp in nanoseconds since the Unix epoch.
+    pub timestamp: i64,
+}
+
+impl SecretTransferAudit<'_> {
+    /// Append the same transfer metadata to the source and destination project chains.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage or audit error if either append fails. Neither row is committed on failure.
+    pub fn append(
+        &self,
+        store: &mut Store,
+        source_key: &[u8],
+        target_key: &[u8],
+    ) -> Result<(), StoreError> {
+        let metadata = json!({
+            "schema_version": 1, "action": self.action, "status": "SUCCESS",
+            "operation": self.operation, "secret_name": self.target_name,
+            "from_project_id": self.from_project_id, "from_profile_id": self.from_profile_id,
+            "from_source": self.from_secret.map(|secret| &secret.source),
+            "from_version": self.from_secret.map(|secret| secret.current_version),
+            "to_project_id": self.target_profile.project_id, "to_profile_id": self.target_profile.id,
+            "to_source": "user-local", "prior_target_version": self.prior_target_version,
+            "target_version": self.target_version,
+        });
+        let target_write = AuditWrite {
+            project_id: &self.target_profile.project_id,
+            profile_id: Some(&self.target_profile.id),
+            action: self.action,
+            status: "SUCCESS",
+            secret_name: Some(self.target_name),
+            command: None,
+            metadata_json: &metadata,
+            timestamp: self.timestamp,
+        };
+        store.with_atomic_write(|store| {
+            store.append_audit(target_key, &target_write)?;
+            if self.from_project_id != self.target_profile.project_id {
+                store.append_audit(
+                    source_key,
+                    &AuditWrite {
+                        project_id: self.from_project_id,
+                        profile_id: Some(self.from_profile_id),
+                        ..target_write
+                    },
+                )?;
+            }
+            Ok(())
+        })
+    }
 }
 
 /// One active secret participating in a cross-project duplicate value group.
@@ -363,79 +470,54 @@ impl Store {
         &self,
         target_secret_id: &str,
     ) -> Result<Vec<SharedSecretUsageRecord>, StoreError> {
-        let mut statement = self.connection.prepare_cached(
-            "SELECT l.id, l.project_id, p.name, l.profile_id, pr.name, pr.dangerous,
-                    l.local_name, l.target_secret_id, s.name, l.created_at, l.updated_at
-             FROM secret_links l
-             JOIN projects p ON p.id = l.project_id
-             JOIN profiles pr ON pr.id = l.profile_id
-             JOIN secrets s ON s.id = l.target_secret_id
-             WHERE l.target_secret_id = ?1
-             ORDER BY p.name, pr.name, l.local_name",
-        )?;
-        let rows = statement
-            .query_map([target_secret_id], |row| {
-                Ok(SharedSecretUsageRecord {
-                    link_id: row.get(0)?,
-                    project_id: row.get(1)?,
-                    project_name: row.get(2)?,
-                    profile_id: row.get(3)?,
-                    profile_name: row.get(4)?,
-                    profile_dangerous: row.get(5)?,
-                    local_name: row.get(6)?,
-                    target_secret_id: row.get(7)?,
-                    target_secret_name: row.get(8)?,
-                    created_at: row.get(9)?,
-                    updated_at: row.get(10)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+        shared_secret_usages(&self.connection, target_secret_id)
     }
 
-    /// Atomically tombstones a secret, deletes all `secret_links` targeting it, and appends an audit row.
+    /// Atomically tombstones a secret, deletes its links, and appends the deletion and
+    /// consumer unlink audits. Each active link must have an audit context keyed by link ID.
     ///
     /// Returns the usages that were unlinked.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::SecretStateConflict`] if the secret is no longer active at its
-    /// expected version, or another [`StoreError`] on write failure.
+    /// Returns [`StoreError::LinkSetChanged`] if the reviewed IDs or unlink audit scopes
+    /// differ from the current links. Returns [`StoreError::SecretStateConflict`] if the
+    /// secret no longer matches its expected version, or another error on write failure.
     pub fn tombstone_secret_and_unlink_with_audit(
         &mut self,
         secret: &SecretRecord,
         deleted_at: i64,
         audit: Option<AuditContext<'_>>,
+        unlink_audits: &BTreeMap<&str, AuditContext<'_>>,
+        expected_link_ids: Option<&[String]>,
     ) -> Result<Vec<SharedSecretUsageRecord>, StoreError> {
         let transaction = self.connection.savepoint()?;
-        let usages = {
-            let mut stmt = transaction.prepare(
-                "SELECT l.id, l.project_id, p.name, l.profile_id, pr.name, pr.dangerous,
-                        l.local_name, l.target_secret_id, s.name, l.created_at, l.updated_at
-                 FROM secret_links l
-                 JOIN projects p ON p.id = l.project_id
-                 JOIN profiles pr ON pr.id = l.profile_id
-                 JOIN secrets s ON s.id = l.target_secret_id
-                 WHERE l.target_secret_id = ?1
-                 ORDER BY p.name, pr.name, l.local_name",
-            )?;
-            let mapped = stmt.query_map([secret.id.as_str()], |row| {
-                Ok(SharedSecretUsageRecord {
-                    link_id: row.get(0)?,
-                    project_id: row.get(1)?,
-                    project_name: row.get(2)?,
-                    profile_id: row.get(3)?,
-                    profile_name: row.get(4)?,
-                    profile_dangerous: row.get(5)?,
-                    local_name: row.get(6)?,
-                    target_secret_id: row.get(7)?,
-                    target_secret_name: row.get(8)?,
-                    created_at: row.get(9)?,
-                    updated_at: row.get(10)?,
-                })
-            })?;
-            mapped.collect::<Result<Vec<_>, _>>()?
-        };
+        let usages = shared_secret_usages(&transaction, &secret.id)?;
+        let mut current_ids: Vec<_> = usages.iter().map(|usage| usage.link_id.as_str()).collect();
+        current_ids.sort_unstable();
+        if let Some(expected) = expected_link_ids {
+            let mut expected_ids: Vec<_> = expected.iter().map(String::as_str).collect();
+            expected_ids.sort_unstable();
+            if expected_ids != current_ids {
+                return Err(StoreError::LinkSetChanged);
+            }
+        }
+        if !unlink_audits.keys().copied().eq(current_ids) {
+            return Err(StoreError::LinkSetChanged);
+        }
+        for usage in &usages {
+            let audit = unlink_audits[usage.link_id.as_str()];
+            if audit.write.project_id != usage.project_id
+                || audit.write.profile_id != Some(usage.profile_id.as_str())
+                || audit.write.action != "SECRET_UNLINK"
+                || audit.write.status != "SUCCESS"
+                || audit.write.secret_name != Some(usage.local_name.as_str())
+                || audit.write.metadata_json != &usage.unlink_audit_metadata(secret)
+            {
+                return Err(StoreError::LinkSetChanged);
+            }
+            append_optional_audit(&transaction, Some(audit))?;
+        }
         let updated = transaction.execute(
             "UPDATE secrets
              SET state = 'deleted', deleted_at = ?2, updated_at = ?2
@@ -576,4 +658,38 @@ impl Store {
             .optional()
             .map_err(StoreError::from)
     }
+}
+
+fn shared_secret_usages(
+    connection: &Connection,
+    target_secret_id: &str,
+) -> Result<Vec<SharedSecretUsageRecord>, StoreError> {
+    let mut statement = connection.prepare_cached(
+        "SELECT l.id, l.project_id, p.name, l.profile_id, pr.name, pr.dangerous,
+                l.local_name, l.target_secret_id, s.name, l.created_at, l.updated_at
+         FROM secret_links l
+         JOIN projects p ON p.id = l.project_id
+         JOIN profiles pr ON pr.id = l.profile_id
+         JOIN secrets s ON s.id = l.target_secret_id
+         WHERE l.target_secret_id = ?1
+         ORDER BY p.name, pr.name, l.local_name",
+    )?;
+    let rows = statement
+        .query_map([target_secret_id], |row| {
+            Ok(SharedSecretUsageRecord {
+                link_id: row.get(0)?,
+                project_id: row.get(1)?,
+                project_name: row.get(2)?,
+                profile_id: row.get(3)?,
+                profile_name: row.get(4)?,
+                profile_dangerous: row.get(5)?,
+                local_name: row.get(6)?,
+                target_secret_id: row.get(7)?,
+                target_secret_name: row.get(8)?,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
 }

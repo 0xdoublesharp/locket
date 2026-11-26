@@ -36,6 +36,10 @@ pub enum StoreError {
         expected_version: u32,
     },
 
+    /// The active usage set changed after the caller reviewed it.
+    #[error("linked projects changed while you were reviewing them; refresh and confirm again")]
+    LinkSetChanged,
+
     /// The selected versions include the current version of an active secret.
     #[error("cannot purge current version {version} of active secret {secret_id}")]
     ActiveSecretVersionPurge {
@@ -156,7 +160,7 @@ impl StoreError {
     pub fn locket_error(&self) -> LocketError {
         match self {
             Self::Sqlite(error) => sqlite_locket_error(error),
-            Self::SecretStateConflict { .. } => LocketError::StorageBusy,
+            Self::SecretStateConflict { .. } | Self::LinkSetChanged => LocketError::StorageBusy,
             Self::UnsupportedSchema { .. } => LocketError::SchemaNewerThanBinary,
             Self::AuditIntegrity { .. }
             | Self::InvalidAuditHmacLength { .. }

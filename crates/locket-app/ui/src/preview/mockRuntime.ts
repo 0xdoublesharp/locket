@@ -630,6 +630,16 @@ export function createMockRuntime(params: URLSearchParams) {
     );
     if (!row) fail('SecretNotFound', 'The secret was not found.', 'Refresh the secret list.');
     const { usages } = sharedUsages(row.id);
+    if (request.expected_link_ids) {
+      const current = usages.map((usage) => usage.link_id).sort();
+      const expected = [...request.expected_link_ids].sort();
+      if (expected.length !== current.length || expected.some((id, i) => id !== current[i]))
+        fail(
+          'LinkSetChanged',
+          'Linked projects changed while you were reviewing them.',
+          'Refresh and confirm again.',
+        );
+    }
     if (usages.length && !request.unlink_all)
       fail(
         'LinkedSecretInUse',
@@ -758,6 +768,28 @@ export function createMockRuntime(params: URLSearchParams) {
     let linked = 0;
     let promoted = 0;
     if (!request.dry_run) requireProfileConfirmation(project.profile_id, request.confirmation);
+    if (
+      !request.dry_run &&
+      !project.is_shared &&
+      Object.keys(request.promote_to_shared ?? {}).length
+    ) {
+      const shared = sharedProject();
+      if (!unlockedProjects.has(shared.project_id))
+        fail(
+          'UnlockRequired',
+          'Unlock the Global Vault before promoting.',
+          'Open Global Vault and unlock it.',
+        );
+      if (
+        profiles.get(shared.profile_id)?.dangerous &&
+        (request.target_confirmation ?? request.confirmation) !== 'default'
+      )
+        fail(
+          'ConfirmationFailed',
+          'Type default to confirm promotion into the Global Vault.',
+          'Enter the requested name.',
+        );
+    }
     for (const { name, fixture } of fixtures) {
       for (const row of secrets.filter((row) => fixture && fixtureGroups.get(row.id) === fixture)) {
         const profile = profiles.get(row.profile_id);
@@ -781,12 +813,6 @@ export function createMockRuntime(params: URLSearchParams) {
       if (useShared) {
         const shared = sharedProject();
         let target = findSharedSecret(useShared);
-        if (!linkName && !unlockedProjects.has(shared.project_id))
-          fail(
-            'UnlockRequired',
-            'Unlock the Global Vault before promoting.',
-            'Open Global Vault and unlock it.',
-          );
         if (!linkName && (!target || fixtureGroups.get(target.id) !== fixture)) {
           if (target && !request.overwrite)
             fail(

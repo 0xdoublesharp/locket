@@ -348,7 +348,7 @@ pub fn validate_write_metadata(
 }
 
 pub struct SecretWriteKeys {
-    audit: Zeroizing<KeyBytes>,
+    pub(super) audit: Zeroizing<KeyBytes>,
     secret: Zeroizing<KeyBytes>,
     pub(super) fingerprint: Zeroizing<KeyBytes>,
 }

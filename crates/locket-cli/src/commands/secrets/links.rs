@@ -6,7 +6,8 @@ use clap::Args;
 use locket_core::{LocketError, SecretId, SecretName};
 use locket_crypto::{KeyBytes, KeyPurpose, local_dedup_tag_v1};
 use locket_store::{
-    AuditContext, AuditWrite, ProfileRecord, ProjectRecord, SecretLinkRecord, SecretRecord, Store,
+    AuditContext, AuditWrite, ProfileRecord, ProjectRecord, SecretLinkRecord, SecretRecord,
+    SecretTransferAudit, Store,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -432,235 +433,253 @@ pub fn promote_command(
             "pass --use-dangerous to write into a dangerous Global Vault profile",
         )?;
         let project_id = resolved.config.project_id.as_str();
-        let source_secret = if let Some(source) = args.source.source {
-            let source_str = source_arg_to_str(source);
-            store
-                .get_active_secret(project_id, &source_profile.id, local_name.as_str(), source_str)?
-                .ok_or_else(|| secret_not_found_error("secret not found"))?
-        } else {
-            let rows =
-                store.list_secrets_by_name(project_id, &source_profile.id, local_name.as_str())?;
-            select_highest_precedence_secret(rows.into_iter().filter(|row| row.state == "active"))
-                .ok_or_else(|| secret_not_found_error("secret not found"))?
-        };
-        let value = decrypt_secret_version(
-            context,
-            &store,
-            project_id,
-            &source_profile.id,
-            &source_secret,
-            source_secret.current_version,
-        )?;
-
-        let timestamp = now_unix_nanos()?;
-        let shared_keys =
-            SecretWriteKeys::load(context, &store, &shared_project.id, &shared_profile.id)?;
-        let existing_shared = store.get_secret_by_source(
-            &shared_project.id,
-            &shared_profile.id,
-            target_name.as_str(),
-            "user-local",
-        )?;
-        let (target_secret, action) = if let Some(existing) = existing_shared {
-            if existing.state == "deleted" {
-                return Err(secret_deleted_error("the Global Vault secret source is deleted"));
-            }
-            let same_value = decrypt_secret_version(
+        let summary = store.with_atomic_write(|store| -> Result<Value, CliError> {
+            let source_secret = if let Some(source) = args.source.source {
+                let source_str = source_arg_to_str(source);
+                store
+                    .get_active_secret(project_id, &source_profile.id, local_name.as_str(), source_str)?
+                    .ok_or_else(|| secret_not_found_error("secret not found"))?
+            } else {
+                let rows =
+                    store.list_secrets_by_name(project_id, &source_profile.id, local_name.as_str())?;
+                select_highest_precedence_secret(rows.into_iter().filter(|row| row.state == "active"))
+                    .ok_or_else(|| secret_not_found_error("secret not found"))?
+            };
+            let value = decrypt_secret_version(
                 context,
-                &store,
+                store,
+                project_id,
+                &source_profile.id,
+                &source_secret,
+                source_secret.current_version,
+            )?;
+
+            let timestamp = now_unix_nanos()?;
+            let shared_keys =
+                SecretWriteKeys::load(context, store, &shared_project.id, &shared_profile.id)?;
+            let existing_shared = store.get_secret_by_source(
                 &shared_project.id,
                 &shared_profile.id,
-                &existing,
-                existing.current_version,
-            )
-            .is_ok_and(|existing_val| existing_val.as_str() == value.as_str());
-            if same_value {
-                (existing, "reuse")
-            } else if args.overwrite {
-                let flags = SecretMetadataFlags::default();
-                let new_ver = rotate_value(
-                    &mut store,
-                    &shared_keys,
+                target_name.as_str(),
+                "user-local",
+            )?;
+            let prior_target_version = existing_shared.as_ref().map(|secret| secret.current_version);
+            let (target_secret, action) = if let Some(existing) = existing_shared {
+                if existing.state == "deleted" {
+                    return Err(secret_deleted_error("the Global Vault secret source is deleted"));
+                }
+                let same_value = decrypt_secret_version(
+                    context,
+                    store,
+                    &shared_project.id,
+                    &shared_profile.id,
                     &existing,
-                    &Rotation {
+                    existing.current_version,
+                )
+                .is_ok_and(|existing_val| existing_val.as_str() == value.as_str());
+                if same_value {
+                    (existing, "reuse")
+                } else if args.overwrite {
+                    let flags = SecretMetadataFlags::default();
+                    let new_ver = rotate_value(
+                        store,
+                        &shared_keys,
+                        &existing,
+                        &Rotation {
+                            value: &value,
+                            origin: "profile-copy",
+                            timestamp,
+                            grace_until: None,
+                            metadata: &flags,
+                            action: "ROTATE",
+                        },
+                    )?;
+                    let mut updated = existing;
+                    updated.current_version = new_ver;
+                    (updated, "rotate")
+                } else {
+                    return Err(secret_already_exists_error(format!(
+                        "{GLOBAL_VAULT}/{} already exists with a different value; pass --as <NAME> or --overwrite",
+                        target_name.as_str()
+                    )));
+                }
+            } else {
+                let flags = SecretMetadataFlags::default();
+                create_value(
+                    store,
+                    &shared_keys,
+                    &NewSecret {
+                        project_id: &shared_project.id,
+                        profile_id: &shared_profile.id,
+                        name: target_name.as_str(),
+                        source: "user-local",
                         value: &value,
                         origin: "profile-copy",
                         timestamp,
-                        grace_until: None,
                         metadata: &flags,
-                        action: "ROTATE",
+                        action: "SET",
                     },
                 )?;
-                let mut updated = existing;
-                updated.current_version = new_ver;
-                (updated, "rotate")
-            } else {
-                return Err(secret_already_exists_error(format!(
-                    "{GLOBAL_VAULT}/{} already exists with a different value; pass --as <NAME> or --overwrite",
-                    target_name.as_str()
-                )));
+                let created = store
+                    .get_active_secret(
+                        &shared_project.id,
+                        &shared_profile.id,
+                        target_name.as_str(),
+                        "user-local",
+                    )?
+                    .ok_or_else(|| secret_not_found_error("promoted Global Vault secret missing"))?;
+                (created, "create")
+            };
+
+            let source_audit_key = load_project_key(context, store, project_id, KeyPurpose::Audit)?;
+            SecretTransferAudit {
+                action: "SECRET_PROMOTE",
+                operation: action,
+                from_project_id: project_id,
+                from_profile_id: &source_profile.id,
+                from_secret: Some(&source_secret),
+                target_profile: &shared_profile,
+                target_name: target_name.as_str(),
+                prior_target_version,
+                target_version: target_secret.current_version,
+                timestamp,
             }
-        } else {
-            let flags = SecretMetadataFlags::default();
-            create_value(
-                &mut store,
-                &shared_keys,
-                &NewSecret {
-                    project_id: &shared_project.id,
-                    profile_id: &shared_profile.id,
-                    name: target_name.as_str(),
-                    source: "user-local",
-                    value: &value,
-                    origin: "profile-copy",
-                    timestamp,
-                    metadata: &flags,
-                    action: "SET",
-                },
-            )?;
-            let created = store
-                .get_active_secret(
-                    &shared_project.id,
-                    &shared_profile.id,
-                    target_name.as_str(),
-                    "user-local",
-                )?
-                .ok_or_else(|| secret_not_found_error("promoted Global Vault secret missing"))?;
-            (created, "create")
-        };
+            .append(store, source_audit_key.as_ref(), shared_keys.audit.as_ref())?;
 
-        let dedup_tag = local_dedup_tag_v1(&shared_keys.fingerprint, &value)?;
-        store.upsert_local_value_fingerprint(
-            &target_secret.id,
-            target_secret.current_version,
-            &dedup_tag,
-            timestamp,
-        )?;
-
-        let linked = if args.keep_local {
-            false
-        } else {
-            create_link_record_with_audit(
-                context,
-                &mut store,
-                project_id,
-                &source_profile.id,
-                local_name.as_str(),
-                &shared_project.id,
-                &shared_profile.id,
-                &target_secret,
+            let dedup_tag = local_dedup_tag_v1(&shared_keys.fingerprint, &value)?;
+            store.upsert_local_value_fingerprint(
+                &target_secret.id,
+                target_secret.current_version,
+                &dedup_tag,
                 timestamp,
             )?;
-            if source_secret.source == "user-local" {
-                let audit_key = load_project_key(context, &store, project_id, KeyPurpose::Audit)?;
-                let metadata = secret_audit_metadata(
-                    "DELETE",
-                    &source_secret.name,
-                    &source_profile.id,
-                    &source_secret.source,
-                    Some(source_secret.current_version),
-                );
-                let audit = AuditWrite {
-                    project_id,
-                    profile_id: Some(&source_profile.id),
-                    action: "DELETE",
-                    status: "SUCCESS",
-                    secret_name: Some(&source_secret.name),
-                    command: None,
-                    metadata_json: &metadata,
-                    timestamp,
-                };
-                store.tombstone_current_secret_with_audit(
-                    &source_secret,
-                    timestamp,
-                    AuditContext { key: audit_key.as_ref(), write: &audit },
-                )?;
-            }
-            true
-        };
 
-        let mut consolidated = Vec::new();
-        let mut skipped_projects = 0_u32;
-        if args.consolidate_duplicates {
-            let matches = store.find_active_secrets_by_dedup_tag(&dedup_tag)?;
-            for member in matches {
-                if member.is_shared
-                    || member.secret_id == source_secret.id
-                    || member.secret_id == target_secret.id
-                    || member.source != "user-local"
-                {
-                    continue;
-                }
-                if member.profile_dangerous {
-                    skipped_projects += 1;
-                    continue;
-                }
-                let Some(other_record) = store.get_secret_by_id(&member.secret_id)? else {
-                    continue;
-                };
-                if other_record.state != "active" {
-                    continue;
-                }
-                let Ok(other_audit_key) =
-                    load_project_key(context, &store, &member.project_id, KeyPurpose::Audit)
-                else {
-                    skipped_projects += 1;
-                    continue;
-                };
+            let linked = if args.keep_local {
+                false
+            } else {
                 create_link_record_with_audit(
                     context,
-                    &mut store,
-                    &member.project_id,
-                    &member.profile_id,
-                    &member.name,
+                    store,
+                    project_id,
+                    &source_profile.id,
+                    local_name.as_str(),
                     &shared_project.id,
                     &shared_profile.id,
                     &target_secret,
                     timestamp,
                 )?;
-                let delete_meta = secret_audit_metadata(
-                    "DELETE",
-                    &other_record.name,
-                    &other_record.profile_id,
-                    &other_record.source,
-                    Some(other_record.current_version),
-                );
-                let delete_audit = AuditWrite {
-                    project_id: &member.project_id,
-                    profile_id: Some(&member.profile_id),
-                    action: "DELETE",
-                    status: "SUCCESS",
-                    secret_name: Some(&other_record.name),
-                    command: None,
-                    metadata_json: &delete_meta,
-                    timestamp,
-                };
-                store.tombstone_current_secret_with_audit(
-                    &other_record,
-                    timestamp,
-                    AuditContext { key: other_audit_key.as_ref(), write: &delete_audit },
-                )?;
-                consolidated.push(json!({
-                    "project_id": member.project_id,
-                    "project_name": member.project_name,
-                    "profile_name": member.profile_name,
-                    "local_name": member.name,
-                }));
-            }
-        }
+                if source_secret.source == "user-local" {
+                    let metadata = secret_audit_metadata(
+                        "DELETE",
+                        &source_secret.name,
+                        &source_profile.id,
+                        &source_secret.source,
+                        Some(source_secret.current_version),
+                    );
+                    let audit = AuditWrite {
+                        project_id,
+                        profile_id: Some(&source_profile.id),
+                        action: "DELETE",
+                        status: "SUCCESS",
+                        secret_name: Some(&source_secret.name),
+                        command: None,
+                        metadata_json: &metadata,
+                        timestamp,
+                    };
+                    store.tombstone_current_secret_with_audit(
+                        &source_secret,
+                        timestamp,
+                        AuditContext { key: source_audit_key.as_ref(), write: &audit },
+                    )?;
+                }
+                true
+            };
 
+            let mut consolidated = Vec::new();
+            let mut skipped_projects = 0_u32;
+            if args.consolidate_duplicates {
+                let matches = store.find_active_secrets_by_dedup_tag(&dedup_tag)?;
+                for member in matches {
+                    if member.is_shared
+                        || member.secret_id == source_secret.id
+                        || member.secret_id == target_secret.id
+                        || member.source != "user-local"
+                    {
+                        continue;
+                    }
+                    if member.profile_dangerous {
+                        skipped_projects += 1;
+                        continue;
+                    }
+                    let Some(other_record) = store.get_secret_by_id(&member.secret_id)? else {
+                        continue;
+                    };
+                    if other_record.state != "active" {
+                        continue;
+                    }
+                    let Ok(other_audit_key) =
+                        load_project_key(context, store, &member.project_id, KeyPurpose::Audit)
+                    else {
+                        skipped_projects += 1;
+                        continue;
+                    };
+                    create_link_record_with_audit(
+                        context,
+                        store,
+                        &member.project_id,
+                        &member.profile_id,
+                        &member.name,
+                        &shared_project.id,
+                        &shared_profile.id,
+                        &target_secret,
+                        timestamp,
+                    )?;
+                    let delete_meta = secret_audit_metadata(
+                        "DELETE",
+                        &other_record.name,
+                        &other_record.profile_id,
+                        &other_record.source,
+                        Some(other_record.current_version),
+                    );
+                    let delete_audit = AuditWrite {
+                        project_id: &member.project_id,
+                        profile_id: Some(&member.profile_id),
+                        action: "DELETE",
+                        status: "SUCCESS",
+                        secret_name: Some(&other_record.name),
+                        command: None,
+                        metadata_json: &delete_meta,
+                        timestamp,
+                    };
+                    store.tombstone_current_secret_with_audit(
+                        &other_record,
+                        timestamp,
+                        AuditContext { key: other_audit_key.as_ref(), write: &delete_audit },
+                    )?;
+                    consolidated.push(json!({
+                        "project_id": member.project_id,
+                        "project_name": member.project_name,
+                        "profile_name": member.profile_name,
+                        "local_name": member.name,
+                    }));
+                }
+            }
+
+            Ok(json!({
+                "local_name": local_name.as_str(),
+                "target_project_id": shared_project.id,
+                "target_secret_id": target_secret.id,
+                "target_secret_name": target_secret.name,
+                "version": target_secret.current_version,
+                "action": action,
+                "linked": linked,
+                "consolidated_count": consolidated.len(),
+                "consolidated": consolidated,
+                "skipped_projects": skipped_projects,
+            }))
+        })?;
         refresh_example_for_project_if_enabled(context)?;
-        Ok(json!({
-            "local_name": local_name.as_str(),
-            "target_project_id": shared_project.id,
-            "target_secret_id": target_secret.id,
-            "target_secret_name": target_secret.name,
-            "version": target_secret.current_version,
-            "action": action,
-            "linked": linked,
-            "consolidated_count": consolidated.len(),
-            "consolidated": consolidated,
-            "skipped_projects": skipped_projects,
-        }))
+        Ok(summary)
     })();
     if args.json {
         return write_json_result(output, result);

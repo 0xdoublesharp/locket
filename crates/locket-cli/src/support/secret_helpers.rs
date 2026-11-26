@@ -187,29 +187,28 @@ pub fn resolve_active_secret(
     let store = open_store(context)?;
     ensure_trusted_project_root(&store, &project)?;
     let profile = default_profile(&store, &project.config)?;
-    let secrets =
-        store.list_active_secrets_by_profile(project.config.project_id.as_str(), &profile.id)?;
-    let active_local = select_highest_precedence_secret(
-        secrets.into_iter().filter(|secret| secret.name == name.as_str()),
-    );
-    let active_link = store.resolve_active_secret_link(
-        project.config.project_id.as_str(),
-        &profile.id,
-        name.as_str(),
-    )?;
-    let secret = match (active_local, active_link) {
-        (Some(local), Some(link)) => {
-            if source_precedence("shared-link") > source_precedence(&local.source) {
-                link.target_secret
-            } else {
-                local
-            }
-        }
-        (Some(local), None) => local,
-        (None, Some(link)) => link.target_secret,
-        (None, None) => return Err(secret_not_found_error("secret not found")),
-    };
+    let secret = resolve_active_secret_in_profile(&store, &profile, &name)?;
     Ok(ResolvedSecret { project, profile, secret })
+}
+
+pub fn resolve_active_secret_in_profile(
+    store: &Store,
+    profile: &ProfileRecord,
+    name: &SecretName,
+) -> Result<SecretRecord, CliError> {
+    let rows = store.list_secrets_by_name(&profile.project_id, &profile.id, name.as_str())?;
+    let active_local = select_highest_precedence_secret(
+        rows.into_iter().filter(|secret| secret.state == "active"),
+    );
+    if let Some(link) =
+        store.resolve_active_secret_link(&profile.project_id, &profile.id, name.as_str())?
+        && active_local
+            .as_ref()
+            .is_none_or(|local| source_precedence("shared-link") > source_precedence(&local.source))
+    {
+        return Ok(link.target_secret);
+    }
+    active_local.ok_or_else(|| secret_not_found_error("secret not found"))
 }
 
 pub fn resolve_active_secret_for_source(

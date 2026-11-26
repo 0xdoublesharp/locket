@@ -12,12 +12,15 @@ use locket_core::{
     CommandPolicy, CommandSpec, ExternalEnvSource, LkReferenceUri, LocketError, PolicyDocument,
     SecretName, SessionId,
 };
+use locket_crypto::KeyPurpose;
 use locket_exec::{
     EgressEvent, EgressProxyBroker, EgressProxyConfig, EgressSecretBinding,
     StreamingRedactorConfig, redact_child_output,
 };
 use locket_platform::{LocalUserVerificationRequest, PlatformError};
-use locket_store::{ProfileRecord, RuntimeSessionRecord, RuntimeSessionSecretNameRetention, Store};
+use locket_store::{
+    ProfileRecord, RuntimeSessionRecord, RuntimeSessionSecretNameRetention, SecretRecord, Store,
+};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -34,7 +37,7 @@ use crate::runtime::error::{
     external_source_unavailable_error, ide_env_session_unavailable_error, invalid_policy_error,
     metadata_invalid_error, typed_cli_error, user_verification_failed_error,
 };
-use crate::runtime::key_access::default_profile;
+use crate::runtime::key_access::{default_profile, load_profile_key};
 use crate::support::secret_helpers::{
     PolicySecretSelection, decrypt_secret_version, policy_secret_selections,
 };
@@ -815,7 +818,6 @@ fn prepare_policy_execution(
     let selections = policy_secret_selections(store, resolved, profile, policy)?;
     check_policy_secret_availability(store, &selections)?;
     ensure_agent_running_for_execution(context)?;
-    require_shared_policy_vaults_unlocked(context, &selections, &profile.project_id)?;
     let parent_env = std::env::vars()
         .map(|(name, value)| (name, locket_exec::env_value(value)))
         .collect::<locket_exec::EnvMap>();
@@ -830,11 +832,8 @@ fn prepare_policy_execution(
     )?;
     write_configuration_warnings(document, policy, output)?;
 
-    let mut locket_env = policy_locket_env(
-        context,
-        store,
-        selections.iter().filter(|selection| selection.shared || agent_access.is_none()),
-    )?;
+    let mut locket_env =
+        policy_locket_env(context, store, profile, &selections, agent_access.is_some())?;
     if let Some(agent_access) = agent_access.as_ref() {
         locket_env.extend(policy_locket_env_via_agent(
             context,
@@ -974,15 +973,70 @@ fn shared_project(selections: &[PolicySecretSelection]) -> Option<&str> {
     })
 }
 
-fn require_shared_policy_vaults_unlocked(
+pub(super) fn require_shared_policy_vaults_unlocked(
     context: &RuntimeContext,
+    store: &Store,
+    profile: &ProfileRecord,
     selections: &[PolicySecretSelection],
-    project_id: &str,
 ) -> Result<(), CliError> {
-    if let Some(shared) = shared_project(selections) {
-        require_shared_vault_unlocked(context, shared)?;
-        require_vault_unlocked(context, project_id, "the policy's project vault")?;
+    let shared_projects = selections
+        .iter()
+        .filter(|selection| selection.shared)
+        .filter_map(|selection| selection.selected.as_ref().map(|secret| &secret.project_id))
+        .collect::<std::collections::BTreeSet<_>>();
+    if !shared_projects.is_empty() {
+        for project_id in shared_projects {
+            require_vault_unlocked(
+                context,
+                project_id,
+                "the Global Vault",
+                "executing with shared secrets",
+            )?;
+        }
+        require_consumer_vault_access(
+            context,
+            store,
+            profile,
+            "the policy's project vault",
+            "executing with shared secrets",
+        )?;
     }
+    Ok(())
+}
+
+pub(in crate::commands) fn require_linked_secret_access(
+    context: &RuntimeContext,
+    store: &Store,
+    consumer: &ProfileRecord,
+    secret: &SecretRecord,
+) -> Result<(), CliError> {
+    if secret.project_id != consumer.project_id {
+        require_vault_unlocked(
+            context,
+            &secret.project_id,
+            "the Global Vault",
+            "accessing shared secrets",
+        )?;
+        require_consumer_vault_access(
+            context,
+            store,
+            consumer,
+            "the consuming project vault",
+            "accessing shared secrets",
+        )?;
+    }
+    Ok(())
+}
+
+fn require_consumer_vault_access(
+    context: &RuntimeContext,
+    store: &Store,
+    profile: &ProfileRecord,
+    vault_name: &str,
+    action: &str,
+) -> Result<(), CliError> {
+    require_vault_unlocked(context, &profile.project_id, vault_name, action)?;
+    load_profile_key(context, store, &profile.project_id, &profile.id, KeyPurpose::ProfileSecret)?;
     Ok(())
 }
 
@@ -990,13 +1044,14 @@ pub(super) fn require_shared_vault_unlocked(
     context: &RuntimeContext,
     project_id: &str,
 ) -> Result<(), CliError> {
-    require_vault_unlocked(context, project_id, "the Global Vault")
+    require_vault_unlocked(context, project_id, "the Global Vault", "executing with shared secrets")
 }
 
 fn require_vault_unlocked(
     context: &RuntimeContext,
     project_id: &str,
     vault_name: &str,
+    action: &str,
 ) -> Result<(), CliError> {
     // In-process command fixtures without an agent exercise local decryption.
     #[cfg(test)]
@@ -1015,7 +1070,7 @@ fn require_vault_unlocked(
     {
         return Err(typed_cli_error(
             LocketError::UnlockRequired,
-            format!("unlock {vault_name} before executing with shared secrets"),
+            format!("unlock {vault_name} before {action}"),
         ));
     }
     Ok(())
@@ -1424,13 +1479,16 @@ fn compose_env_value_as_string(value: &serde_json::Value) -> Option<String> {
     }
 }
 
-fn policy_locket_env<'a>(
+fn policy_locket_env(
     context: &RuntimeContext,
     store: &Store,
-    selections: impl Iterator<Item = &'a PolicySecretSelection>,
+    profile: &ProfileRecord,
+    selections: &[PolicySecretSelection],
+    via_agent: bool,
 ) -> Result<locket_exec::EnvMap, CliError> {
+    require_shared_policy_vaults_unlocked(context, store, profile, selections)?;
     let mut locket_env = locket_exec::EnvMap::new();
-    for selection in selections {
+    for selection in selections.iter().filter(|selection| selection.shared || !via_agent) {
         if let Some(secret) = &selection.selected {
             let value = decrypt_secret_version(
                 context,
@@ -1929,6 +1987,7 @@ fn execute_runtime_child(
                 context,
                 &request.profile.project_id,
                 "the policy's project vault",
+                "executing with shared secrets",
             )
         } else {
             Ok(())

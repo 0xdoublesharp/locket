@@ -51,8 +51,8 @@ pub use secret::{
     ResolvedSecretLink, SecretBlobRecord, SecretCopyTarget, SecretDiscoveryFilter,
     SecretExpirationNotice, SecretExpiryPolicy, SecretExpiryStatus, SecretFingerprintRecord,
     SecretInitialMetadata, SecretLinkRecord, SecretMetadataRecord, SecretMetadataUpdate,
-    SecretMutableMetadata, SecretRecord, SecretVersionRecord, SharedSecretUsageRecord,
-    VersionDeprecation,
+    SecretMutableMetadata, SecretRecord, SecretTransferAudit, SecretVersionRecord,
+    SharedSecretUsageRecord, VersionDeprecation,
 };
 pub use team::{
     PendingTeamInviteRecord, StoredTeamInviteRecord, TeamInviteRecord, TeamMemberListRecord,

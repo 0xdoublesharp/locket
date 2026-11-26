@@ -1,5 +1,6 @@
 //! Secret lifecycle command implementations (list, rm, rotate, copy, history, purge).
 
+use std::collections::{BTreeMap, btree_map::Entry};
 use std::io::Write;
 
 use locket_core::SecretName;
@@ -127,18 +128,43 @@ pub fn rm_command(
         metadata_json: &metadata,
         timestamp,
     };
-    if usages.is_empty() {
-        store.tombstone_secret_with_audit(
-            &secret.id,
-            timestamp,
-            Some(AuditContext { key: audit_key.as_ref(), write: &audit }),
-        )?;
-    } else {
+    let delete_audit = Some(AuditContext { key: audit_key.as_ref(), write: &audit });
+    if args.project.is_some() || !usages.is_empty() {
+        let mut consumer_keys = BTreeMap::new();
+        for usage in &usages {
+            if let Entry::Vacant(entry) = consumer_keys.entry(usage.project_id.as_str()) {
+                entry.insert(load_project_key(
+                    context,
+                    &store,
+                    &usage.project_id,
+                    KeyPurpose::Audit,
+                )?);
+            }
+        }
+        let unlink_metadata: Vec<_> =
+            usages.iter().map(|usage| usage.unlink_audit_metadata(&secret)).collect();
+        let unlink_writes: Vec<_> = usages
+            .iter()
+            .zip(&unlink_metadata)
+            .map(|(usage, metadata)| usage.unlink_audit(metadata, timestamp))
+            .collect();
+        let unlink_audits = usages
+            .iter()
+            .zip(&unlink_writes)
+            .map(|(usage, write)| {
+                let key = consumer_keys[usage.project_id.as_str()].as_ref();
+                (usage.link_id.as_str(), AuditContext { key, write })
+            })
+            .collect();
         store.tombstone_secret_and_unlink_with_audit(
             &secret,
             timestamp,
-            Some(AuditContext { key: audit_key.as_ref(), write: &audit }),
+            delete_audit,
+            &unlink_audits,
+            None,
         )?;
+    } else {
+        store.tombstone_secret_with_audit(&secret.id, timestamp, delete_audit)?;
     }
     if args.project.is_none() {
         refresh_example_for_project_if_enabled(context)?;

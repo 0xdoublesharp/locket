@@ -105,6 +105,8 @@ pub(crate) struct DesktopImportEnvRequest {
     literal: bool,
     #[serde(default)]
     confirmation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_confirmation: Option<String>,
     #[serde(default)]
     dry_run: bool,
     #[serde(default)]
@@ -1082,20 +1084,11 @@ pub(crate) async fn desktop_initialize_project(
 #[tauri::command]
 pub(crate) async fn desktop_import_env(
     request: DesktopImportEnvRequest,
-) -> Result<DesktopImportSummary, String> {
-    let store = super::default_store_path().map_err(|error| error.to_string())?;
-    let context = project_context(&store, &request.project_id)?;
-    let payload = import_env_payload(&store, &context, request)?;
-    let result: locket_agent::ImportDotenvResponse = invoke_granted(
-        locket_agent::AgentMethod::ImportDotenv,
-        locket_agent::GrantAction::ImportDotenv,
-        payload,
-        &store,
-        &context.project_id,
-        &context.profile_id,
-    )
-    .await
-    .map_err(|error| error.to_string())?;
+) -> Result<DesktopImportSummary, AgentClientError> {
+    let store = super::default_store_path()?;
+    let context = granted_project_context(&store, &request.project_id, None)?;
+    let result =
+        invoke_import_env_at(&super::resolve_socket_path(), &store, &context, request).await?;
     let mut summary = if result.linked > 0 || result.promoted > 0 {
         format!(
             "Imported {}, linked {}, promoted {}, overwritten {}, skipped {}. Original file preserved.",
@@ -1122,6 +1115,67 @@ pub(crate) async fn desktop_import_env(
     })
 }
 
+async fn invoke_import_env_at(
+    socket: &Path,
+    store: &Path,
+    context: &DesktopProjectContext,
+    request: DesktopImportEnvRequest,
+) -> Result<locket_agent::ImportDotenvResponse, AgentClientError> {
+    let promote = !request.dry_run && !request.promote_to_shared.is_empty();
+    let mut payload = import_env_payload(store, context, request)
+        .map_err(|reason| AgentClientError::Protocol { reason })?;
+    let target_grant = if promote {
+        let target = find_shared_vault_at(store, None, None)
+            .map_err(|reason| AgentClientError::Protocol { reason })?
+            .filter(|target| target.profile_name == "default")
+            .ok_or_else(|| AgentClientError::Protocol {
+                reason: "Set up the Global Vault with its default environment before promoting."
+                    .into(),
+            })?;
+        let confirmed = matches_profile_confirmation(
+            payload["target_confirmation"].as_str().or(payload["confirmation"].as_str()),
+            &target.profile_name,
+        );
+        if target.profile_dangerous && !confirmed {
+            let message = "Type default to confirm promotion into the Global Vault.";
+            return Err(AgentClientError::Rejected {
+                code: "ConfirmationFailed".into(),
+                message: message.into(),
+                display_reason: message.into(),
+                next_action: String::new(),
+                retryable: false,
+            });
+        }
+        let grant = request_mutation_grant_at(
+            socket,
+            GrantAction::CopySecretToShared,
+            store,
+            &target,
+            &target.profile_id,
+            confirmed,
+            native_binding()?,
+        )
+        .await?;
+        payload["target_grant_id"] = serde_json::json!(grant.grant_id);
+        Some(grant)
+    } else {
+        None
+    };
+    let result = invoke_granted_at(
+        socket,
+        AgentMethod::ImportDotenv,
+        GrantAction::ImportDotenv,
+        payload,
+        store,
+        context,
+    )
+    .await;
+    if let Some(grant) = target_grant {
+        revoke_mutation_grant_at(socket, &grant).await;
+    }
+    result
+}
+
 fn import_env_payload(
     store: &Path,
     context: &DesktopProjectContext,
@@ -1130,13 +1184,17 @@ fn import_env_payload(
     if context.is_shared && !request.path.is_absolute() {
         return Err("Choose an absolute env file path when importing into the Global Vault.".into());
     }
-    Ok(serde_json::json!({
+    let mut payload = serde_json::json!({
         "store_path": store, "project_root": context.root, "project_id": context.project_id,
         "profile_id": context.profile_id, "env_path": request.path,
         "overwrite": request.overwrite, "literal": request.literal, "confirmation": request.confirmation,
         "dry_run": request.dry_run, "link_to_shared": request.link_to_shared,
         "promote_to_shared": request.promote_to_shared,
-    }))
+    });
+    if let Some(confirmation) = request.target_confirmation {
+        payload["target_confirmation"] = serde_json::json!(confirmation);
+    }
+    Ok(payload)
 }
 
 #[derive(Deserialize)]
@@ -1156,6 +1214,8 @@ pub(crate) struct DesktopDeleteSecretRequest {
     confirmation: Option<String>,
     #[serde(default)]
     unlink_all: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_link_ids: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -1382,7 +1442,7 @@ fn delete_secret_payload(
     context: &DesktopProjectContext,
     request: DesktopDeleteSecretRequest,
 ) -> serde_json::Value {
-    desktop_crud_payload(
+    let mut payload = desktop_crud_payload(
         store,
         context,
         serde_json::json!({
@@ -1391,7 +1451,11 @@ fn delete_secret_payload(
             "confirmation": request.confirmation,
             "unlink_all": request.unlink_all,
         }),
-    )
+    );
+    if let Some(ids) = request.expected_link_ids {
+        payload["expected_link_ids"] = serde_json::json!(ids);
+    }
+    payload
 }
 
 fn copy_to_shared_payload(
@@ -1903,36 +1967,61 @@ async fn invoke_granted_at<R: serde::de::DeserializeOwned>(
         }
     }
     let binding = native_binding()?;
+    let grant = request_mutation_grant_at(
+        socket,
+        action,
+        store,
+        context,
+        profile_id,
+        confirmed,
+        binding.clone(),
+    )
+    .await?;
+    payload.authorize(&grant, binding);
+    let result = super::invoke_method(socket, method, &payload).await;
+    // The grant belongs only to this explicit user action, including a failed action.
+    revoke_mutation_grant_at(socket, &grant).await;
+    result
+}
+
+async fn request_mutation_grant_at(
+    socket: &Path,
+    action: GrantAction,
+    store: &Path,
+    context: &DesktopProjectContext,
+    profile_id: &str,
+    confirmed: bool,
+    binding: locket_agent::GrantBinding,
+) -> Result<locket_agent::GrantIdPayload, AgentClientError> {
     let grant: locket_agent::GrantIdPayload = super::invoke_method(
         socket,
         locket_agent::AgentMethod::RequestGrant,
         &locket_agent::RequestGrantPayload {
-            project_id: project_id.into(),
+            project_id: context.project_id.clone(),
             profile_id: profile_id.into(),
             policy_name: None,
             action,
             confirm_dangerous: confirmed,
             ttl_seconds: 30,
-            binding: binding.clone(),
+            binding,
         },
     )
     .await?;
     let fresh = refresh_context_at(store, context);
     if fresh.as_ref() != Ok(context) {
-        let _: Result<serde_json::Value, _> =
-            super::invoke_method(socket, locket_agent::AgentMethod::RevokeGrant, &grant).await;
+        revoke_mutation_grant_at(socket, &grant).await;
         return Err(super::AgentClientError::Protocol {
             reason: fresh.err().unwrap_or_else(|| {
                 "Project metadata changed before authorization. Refresh and retry.".into()
             }),
         });
     }
-    payload.authorize(&grant, binding);
-    let result = super::invoke_method(socket, method, &payload).await;
-    // The grant belongs only to this explicit user action, including a failed action.
+    Ok(grant)
+}
+
+async fn revoke_mutation_grant_at(socket: &Path, grant: &locket_agent::GrantIdPayload) {
     let _: Result<serde_json::Value, _> =
-        super::invoke_method(socket, locket_agent::AgentMethod::RevokeGrant, &grant).await;
-    result
+        super::invoke_method(socket, AgentMethod::RevokeGrant, grant).await;
 }
 
 pub(crate) fn selected_project_id() -> Result<String, super::AgentClientError> {
