@@ -403,8 +403,8 @@ pub struct AgentSocketState {
     /// Serializes native session transitions with key/grant creation. Each
     /// block reason remains active until its matching OS resume notification.
     session_gate: Arc<Mutex<BTreeSet<&'static str>>>,
-    /// Per-project serializer covering team sync configure, clear, sync, and reconcile
-    /// so disconnecting a backend waits for any in-flight transport work to finish.
+    /// Serialize configuration, disconnect, sync, and reconciliation per project.
+    /// Disconnect waits for the active sync worker before clearing the backend.
     pub(crate) team_sync_locks: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
     /// Counts expiry work for deterministic idle-work regression checks.
     #[cfg(test)]

@@ -1,4 +1,4 @@
-//! Authenticated owner-published team onboarding and delivery.
+//! Join an owner-pinned team, publish packages, and apply verified updates.
 use super::{device, remote::RemoteSetup};
 use crate::runtime::key_access::load_master_key;
 use crate::{
@@ -139,6 +139,7 @@ fn select_join_package(
     let mut chosen: Option<(u64, String, Vec<u8>)> = None;
     let mut highest_equivocation = false;
     let checked_at = now()?;
+    // Check every candidate to detect conflicting packages at the highest verified epoch.
     for candidate in candidates {
         let bytes = candidate.map_err(failure)?;
         match team_sync::join_package_checkpoint(
@@ -570,7 +571,7 @@ pub fn remove_authenticated(
     if !rotate.is_empty() {
         writeln!(output, "Rotate credentials at their providers: {}", rotate.join(", "))?;
     }
-    // Revocation is already durable. Report delivery failure without claiming rollback.
+    // Membership and key changes are committed. A failed upload leaves delivery pending.
     match team_sync::publish(store, project, &master, &signer, now()?)
         .and_then(|_| team_sync::flush_outbox_with_master(store, project, Some(&master)))
     {

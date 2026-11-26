@@ -64,9 +64,9 @@ Start with a personal Global Vault (`@shared`) in one click, or connect any repo
 - 🔄 **Rotation, history, and diffs**: Rotate values safely and compare profiles without revealing plaintext.
 - 🧹 **Scanner, pre-commit, redaction, and AI-safe tools**: Keep secrets out of code, logs, and prompts before sharing context with local AI agents.
 - 🪪 **Recovery and device trust**: Local verification, recovery rotation, and sealed export/import without a hosted service.
-- 👥 **Zero-Trust Teams & Headless CI/CD**: Deliver signed, per-device encrypted updates over AWS S3, Cloudflare R2, Backblaze B2, MinIO, WebDAV, or a shared folder, and inject verified snapshots directly in CI pipelines with `locket ci exec` — no dedicated server or SaaS required. [Team setup guide](docs/team-updates.md) · [CI/CD guide](docs/ci-cd.md)
+- 👥 **Team sync and headless CI/CD**: Deliver signed, per-device encrypted updates through AWS S3, Cloudflare R2, Backblaze B2, MinIO, WebDAV, or a shared folder. Use `locket ci exec` to run a CI command with secrets from a verified snapshot. Both workflows use your storage and need no dedicated Locket server or SaaS account. [Team setup guide](docs/team-updates.md) · [CI/CD guide](docs/ci-cd.md)
 - 🧾 **Metadata-only audit and diagnostics**: Report what happened without exposing secret values.
-- 🚫 **No telemetry or analytics**: Network access is limited to opt-in update checks or explicit sealed sync, export, and import.
+- 🚫 **No telemetry or analytics**: Network access is limited to opt-in update checks and user-configured encrypted delivery.
 
 ## Project Files
 
@@ -76,13 +76,11 @@ Start with a personal Global Vault (`@shared`) in one click, or connect any repo
 - `.env.example` is maintained as a names-only contract for expected variables.
 - `.gitignore` is updated to keep plaintext local env files out of Git.
 
-> Locket targets local development workflows. Use platform-native secret stores for CI and production.
-
 ## Current Scope
 
 The desktop app opens a personal Global Vault (`@shared`) or connects project folders, unlocks the vault, imports env files, edits durable commands, and opens approved commands in a terminal. Imports and policy edits use the unlocked agent cache, including passphrase-only vaults. Native packages bundle a matching CLI, and the editor extension version matches the app and CLI.
 
-One pinned owner publishes shared values as signed `.lkpkg` files encrypted for each approved device. New devices verify the owner's full fingerprint over a separate trusted channel before joining. The unlocked agent publishes changed shared values and applies verified updates automatically. The delivery backend sees opaque files and can withhold them. Locket reports the last verified update. Owner handover and live cloud-provider acceptance remain open. [Team updates](docs/team-updates.md)
+One pinned owner publishes shared values as signed `.lkpkg` files encrypted for each approved device. New devices verify the owner's full fingerprint over a separate trusted channel before joining. Unlocked agents publish changed shared values or apply verified updates. Delivery storage can withhold encrypted packages, so status reports the last verified update. Owner handover is unavailable, and live cloud-provider acceptance remains open. [Team updates](docs/team-updates.md)
 
 Manual sealed export/import is also available. Sealed bundles encrypt for recipients but do **not** authenticate the issuer. Imported command proposals never grant local execution permission. Exports default to current shared values; personal overrides and history require explicit opt-in. Read [package validation](docs/distribution-validation.md) before preparing installers, because unsigned local artifacts do not establish signing or notarization.
 
@@ -359,9 +357,15 @@ locket team folder /path/to/shared-folder
 locket team publish
 ```
 
-The desktop lets owners choose **Publish updates now** and lets teammates resolve held values explicitly. Use **Disconnect backend** to stop delivery on this device and remove its stored backend credentials while preserving the owner pin and verified history. Use `locket team sync pending` to inspect held values from the CLI. See the team guide for S3-compatible and WebDAV setup. [Team onboarding and recovery guide](docs/team-updates.md)
+Use a shared folder, an S3-compatible bucket, or a WebDAV collection. When joining from storage, Locket lists package names and downloads packages addressed to your device, along with legacy packages. The owner can run `locket team remote prune --dry-run` to preview deletions. Pruning keeps the five newest delivered epochs per active recipient by default and removes all recorded remote packages for removed or revoked recipients. [Team onboarding and recovery guide](docs/team-updates.md)
+
+In **Team Sync**, owners can choose **Publish updates now**, and teammates can resolve held values. **Disconnect backend** stops delivery on this device and removes stored backend credentials. The owner pin and verified history stay on the device. Use `locket team sync pending` to inspect held values from the CLI.
 
 Manual `export --sealed` / `import-bundle` and the `team invite` / `team accept` commands are also available. Sealed bundles do not authenticate the issuer; use the signed team workflow for ongoing delivery.
+
+### CI/CD
+
+Run `locket ci init-device` to generate a machine identity for the owner to enroll. Save the private identity with `--output-key-file PATH`, or use `--print-private-identity` to include it in the JSON printed to stdout. The runner needs the private identity and read access to the encrypted packages. Use `locket ci verify` to check a profile and print only metadata, or `locket ci exec` to run a command with selected secrets. Both commands accept `--min-epoch EPOCH` and `--max-age-seconds SECONDS` to limit how old a snapshot the runner accepts. Use platform-native secret stores for production secret management. [CI/CD guide](docs/ci-cd.md)
 
 ### Audit And Diagnostics
 

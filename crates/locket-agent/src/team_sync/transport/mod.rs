@@ -359,7 +359,7 @@ pub fn configure_transport_guarded(
     Ok(())
 }
 
-/// Clear the configured transport and any stored credentials for a project.
+/// Disconnect this project's backend and clear its stored credentials. Keep the owner pin and history.
 /// # Errors
 /// Returns a database error if the transaction cannot be committed.
 pub fn clear_transport(store: &Store, project: &str) -> Result<()> {
@@ -413,9 +413,11 @@ pub fn list_and_read_configured_join_packages(
     JoinPackages::new(open_configured(store, project, master)?.0, None)
 }
 
-/// Stream packages addressed to the recipient newest first, then legacy packages.
+/// Filter the backend listing before downloading. Read packages addressed to
+/// the recipient in reverse filename order, then read legacy packages.
 /// # Errors
-/// Rejects invalid fingerprints and listing failures. Download errors are returned by the iterator.
+/// Returns errors for invalid fingerprints, transport setup, and listing failures.
+/// The iterator reports download errors.
 pub fn list_and_read_join_packages_for_recipient(
     config: &TransportConfig,
     secret: Option<TransportSecretInput>,
@@ -425,9 +427,11 @@ pub fn list_and_read_join_packages_for_recipient(
     JoinPackages::new(new_transport(config, secret)?, Some(&prefix))
 }
 
-/// Stream recipient-addressed and legacy packages from a configured transport.
+/// From the saved backend, read packages addressed to the recipient first,
+/// then read legacy packages.
 /// # Errors
-/// Rejects invalid fingerprints, configuration, and listing failures. Download errors are returned by the iterator.
+/// Returns errors for invalid fingerprints, backend configuration, and listing failures.
+/// The iterator reports download errors.
 pub fn list_and_read_configured_join_packages_for_recipient(
     store: &Store,
     project: &str,

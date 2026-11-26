@@ -256,7 +256,7 @@ fn init_device(output: &mut impl Write, args: &InitDeviceArgs) -> Result<(), Cli
         write_key_file(path, &token)?;
         serde_json::to_writer(&mut *output, &metadata)?;
     } else if args.print_private_identity {
-        // Stream the private field directly from its zeroizing buffer.
+        // With --print-private-identity, write ci_identity directly from its zeroizing buffer.
         #[derive(Serialize)]
         struct Output<'a> {
             #[serde(flatten)]
@@ -423,8 +423,7 @@ fn latest_snapshot(
     let latest = latest.ok_or_else(|| {
         bundle_verification_error("no CI package verified against the owner pin and project")
     })?;
-    // The stateful update verifier deliberately permits expired updates.
-    // A standalone reader has no saved checkpoint and requires a live head.
+    // Stateful sync can read expired predecessors. Require an unexpired head in CI.
     let verified_now = now_unix_nanos()? / 1_000_000_000;
     if verified_now >= latest.statement.expires_at {
         return Err(bundle_verification_error("latest CI package has expired"));
@@ -566,8 +565,7 @@ fn exec(cwd: &Path, args: &CiExecArgs) -> Result<u8, CliError> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
-        // Replace the locket process image in-place so the child cannot inspect
-        // a live parent process's original environment or heap memory.
+        // execve replaces Locket so no parent with the original environment or heap survives.
         Err(command.exec().into())
     }
     #[cfg(not(unix))]

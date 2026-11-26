@@ -121,7 +121,9 @@ Authorization matrix for team-managed state:
 
 Solo-developer projects with no `Team` record treat the local user as Owner for authorization, but still enforce typed confirmations, local user verification, audit logging, and source-selection rules.
 
-Team collaboration intentionally avoids live cloud state. For team sync, Locket uses repeated sealed bundles and explicit imports. Conflicts are detected by secret version and audit timestamp, then resolved by the bundle conflict policy; plaintext values are never used for conflict display.
+For ongoing team sync, one pinned owner publishes signed, per-device encrypted packages to a shared folder, an S3-compatible bucket, or a WebDAV collection. Joining devices filter package names by recipient while retaining support for legacy names. Unlocked agents verify and apply updates in checkpoint order. The owner can prune older delivered packages for active devices and all recorded remote packages for removed or revoked devices. See the [team guide](../team-updates.md) for configuration, retention, and conflict resolution.
+
+Manual sealed bundles use explicit imports. Locket detects bundle conflicts by secret version and audit timestamp, then applies the bundle conflict policy. Conflict displays omit plaintext values.
 
 Team local-development UX:
 

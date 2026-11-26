@@ -1,18 +1,18 @@
 # Read team secrets in CI
 
-Use a standalone Locket device to read an authorized profile from S3, Cloudflare R2, Backblaze B2, MinIO, WebDAV, or a shared folder. The runner needs the CLI, its CI identity, and read access to encrypted packages. Locket verifies and decrypts the profile in memory without a local vault or keyring.
+Give each CI runner a machine identity with access to its deployment profile. The runner needs the Locket CLI, its private identity, and read access to encrypted packages in AWS S3, Cloudflare R2, Backblaze B2, MinIO, WebDAV, or a shared folder. Locket verifies and decrypts the profile in memory without a local vault or keyring.
 
 ## Enroll and publish
 
-Generate the identity on a trusted machine.
+Generate the identity on a trusted machine. Use the public descriptor and fingerprint from the JSON output to enroll the device.
 
 ```sh
 locket ci init-device --label deploy-runner --output-key-file ./deploy-runner.key
 ```
 
-Save the contents of the key file as a protected CI secret named `LOCKET_CI_IDENTITY`. Locket creates the file atomically with mode `0600` on Unix. On Windows, use a directory with a private ACL. To print the private identity on stdout instead of writing a file, pass `--print-private-identity` explicitly. Keep the identity out of source control and CI logs.
+Save the key file's contents as a protected CI secret named `LOCKET_CI_IDENTITY`. Locket creates a new file atomically with mode `0600` on Unix. On Windows, use a directory with a private ACL. If you pass `--print-private-identity` in place of `--output-key-file`, stdout contains the private token in the JSON field `ci_identity`. Keep the token out of source control and CI logs.
 
-On the owner's machine, confirm the device fingerprint and enroll the CI device with read-only access to the deployment profile.
+On the owner's machine, verify the full device fingerprint independently, then enroll the device with read-only access to the deployment profile, configure delivery, and publish.
 
 ```sh
 locket team add ci-bot --device "$CI_DESCRIPTOR" \
@@ -25,11 +25,11 @@ locket team remote set s3 --bucket team-packages --prefix deploy \
 locket team publish
 ```
 
-Use the descriptor and fingerprint printed by `init-device`. Set the remote on the owner with credentials that can publish. For the runner, grant only package listing and downloads in the same bucket and prefix. Get the owner fingerprint independently from the owner, for example from `locket team sync status` on the owner's machine. Save that fingerprint in a protected CI variable.
+Use credentials that can publish on the owner's machine. Grant the runner only package listing and download access in the same bucket and prefix. Get the owner's full fingerprint through a trusted channel independent of the delivery backend. The owner can look it up with `locket team sync status`. Save it in a protected CI variable.
 
 ## GitHub Actions with R2
 
-This example assumes Locket is installed on the runner and the repository has a deployment script. Set the project and owner IDs in repository or environment variables. The project ID can also come from a checked-out `locket.toml` when `--project` is omitted. For AWS S3, omit the endpoint and path-style flags and use the bucket's AWS region.
+Install Locket on the runner and provide the deployment script in the repository. Set the project ID and owner fingerprint in repository or environment variables. If you omit `--project`, Locket reads the ID from the checked-out `locket.toml`. For AWS S3, omit the endpoint and path-style flags and use the bucket's AWS region.
 
 ```yaml
 name: Deploy
@@ -64,8 +64,10 @@ For a shared folder, use `--folder PATH`. For WebDAV, use `--webdav-url URL` and
 
 ## Verification and access
 
-`locket ci verify` takes the same project, owner, profile, and delivery flags. It decrypts the profile to check its integrity and prints JSON with the verified epoch and active secret names. Both commands require `--allow-dangerous` for a signed dangerous profile.
+`locket ci verify` takes the same project, owner, profile, and delivery flags as `locket ci exec`. It decrypts the profile to check its integrity and prints metadata as JSON, including the verified epoch and active secret names. Both commands require `--allow-dangerous` for a profile the owner marked dangerous.
 
-`locket ci exec` injects the named secrets and replaces the `locket` process image with the child command via `execve` on Unix so the child cannot inspect a live parent environment for `LOCKET_CI_IDENTITY` or delivery credentials. Repeat `--secret NAME` for each required value, or use `--all-profile-secrets` to opt into the full profile. Startup-control variable names such as `PATH`, `LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`, `BASH_ENV`, and `NODE_OPTIONS` are rejected. The deployment command controls what it writes and logs.
+`locket ci exec` injects the selected secrets into the command's environment. Repeat `--secret NAME` for each value you need, or use `--all-profile-secrets` for the full profile. Locket removes inherited CI identity and delivery credential variables and rejects secret names that control process startup, including `PATH`, `LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`, `BASH_ENV`, and `NODE_OPTIONS`. On Unix, `execve` replaces Locket with the command so no Locket parent remains for the command to inspect. The deployment command controls what it writes and logs.
 
-The runner accepts the highest authentic, unexpired snapshot available to its device and rejects conflicting snapshots at that epoch. Pass `--min-epoch EPOCH` and/or `--max-age-seconds SECONDS` to tighten freshness bounds on stateless runners. Delivery storage can withhold newer snapshots from a runner with no saved history. When offboarding, remove the device on the owner's machine, publish, run `locket team remote prune` (which deletes all remote packages for removed/revoked devices), and rotate credentials at their providers.
+The runner selects the highest authentic epoch available to its device. It fails if snapshots conflict at that epoch or the selected snapshot has expired. Storage can withhold newer snapshots from a runner with no saved history. Set `--min-epoch EPOCH` to require an epoch at or above a known value, `--max-age-seconds SECONDS` to limit the time since the owner issued the snapshot, or both.
+
+To offboard a runner, run `locket team revoke-device` for its device on the owner's machine. If delivery is pending, run `locket team publish`. Run `locket team remote prune` to delete its recorded packages from the backend, and rotate credentials at their providers.

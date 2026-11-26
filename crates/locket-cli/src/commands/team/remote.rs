@@ -439,7 +439,7 @@ impl RemoteSetup {
         &self,
         recipient_fingerprint: &str,
     ) -> Result<team_sync::JoinPackages, CliError> {
-        // The iterator owns its credentials. Keep the original for persistence after verification.
+        // Give the iterator its own credentials and save the originals only after verification.
         let secret = self.secret.as_ref().map(|secret| match secret {
             TransportSecretInput::S3 { access_key_id, secret_access_key, session_token } => {
                 TransportSecretInput::S3 {

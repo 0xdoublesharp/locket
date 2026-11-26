@@ -8,7 +8,9 @@ Keep product copy consistent with the shipped workflow and its acceptance limits
 
 Locket keeps values encrypted on your machine and injects approved names into the process you start. Project configuration can describe required variables and public defaults without containing secret values. Local execution needs no hosted service once the vault, keys, and project configuration are available.
 
-For teams, one owner publishes signed, device-encrypted updates through a folder the team already shares. Each developer keeps personal overrides and approves command access locally. First join requires comparing full device and owner fingerprints through a separate trusted channel.
+For teams, one owner publishes signed updates encrypted for each device through a shared folder, an S3-compatible bucket, or a WebDAV collection. Each developer keeps personal overrides and approves command access locally. First join requires comparing full device and owner fingerprints through a separate trusted channel.
+
+For CI, the owner grants a machine identity access to a team profile. A runner with read access to the delivery backend can verify the snapshot and run its command with selected secrets without opening a local vault. [CI/CD guide](ci-cd.md)
 
 ## Show the workflow
 
@@ -19,8 +21,8 @@ The desktop opens with a focused two-choice Welcome view (Global Vault or auto-d
 ## Claims that need care
 
 - Redaction and scanning are explicit tools. They do not intercept arbitrary AI requests or guarantee that a credential never leaves a process. Code that receives a value can disclose it.
-- Folder delivery encrypts contents for approved devices. The provider can still observe metadata, withhold updates, or delete files. Status reports the last verified update and cannot prove global freshness.
-- Removing a device cannot erase values it already received. Rotate credentials at their providers after offboarding.
+- Delivery packages are encrypted for approved devices. The provider can still observe metadata, withhold updates, or delete files. Status reports the last verified update.
+- After offboarding, prune the device's recorded packages from the backend and rotate credentials at their providers. Former recipients may still have copies of values they received.
 - Signed team delivery is implemented and tested with independent synthetic stores. Real provider delivery, independent human fingerprint comparisons, and observed onboarding still need acceptance runs.
 - Owner handover and trust-fork recovery are unsupported. Do not suggest resetting a pin to silence a warning.
 - Unsigned package checks do not establish release signing, notarization, or clean-machine usability. Follow the [distribution guide](distribution-validation.md) and [signing setup report](release-signing-setup.md).

@@ -1969,7 +1969,7 @@ enum TeamSyncTransportRequest {
     TestRemote(locket_agent::TeamSyncTestRemoteRequest),
 }
 
-// Keep credentials in the agent's zeroizing transport input until IPC encoding.
+// Serialize credentials for IPC directly from the zeroizing transport input.
 #[derive(Serialize)]
 struct TeamSyncGrantPayload {
     #[serde(flatten)]

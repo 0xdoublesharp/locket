@@ -367,8 +367,8 @@ async fn run_cached_sync(
     .await
 }
 
-/// Observe persisted security state even if the worker returned an error after
-/// committing a fork marker. Never retain authorization when that check fails.
+/// Serialize team sync changes per project. After the operation, check for
+/// persisted removal or forks even on error. Clear authorization if that check fails.
 async fn run_sync_worker(
     state: &AgentSocketState,
     project: String,
@@ -415,7 +415,7 @@ async fn run_sync_worker(
             .await
             .map(|_| ())
     };
-    // Preserve the original sync rejection after cleanup has completed.
+    // Report the original sync error after clearing invalidated authorization.
     let status = result?;
     invalidated?;
     lock?;

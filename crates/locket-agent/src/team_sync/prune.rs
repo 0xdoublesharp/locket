@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{Result, reject, snapshot::local_owner, transport};
 
-/// Counts known remote packages and identifies those pruned or selected in a dry run.
+/// Counts recorded remote packages and lists deletions or dry-run candidates.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 pub struct PruneResult {
     pub dry_run: bool,
@@ -29,8 +29,8 @@ fn active_recipients(store: &Store, project: &str) -> Result<BTreeSet<String>> {
     rows.collect::<std::result::Result<BTreeSet<_>, _>>().map_err(Into::into)
 }
 
-/// Prune superseded, delivered packages for active recipients and all remote packages
-/// belonging to removed or revoked recipients, restricted to the pinned local owner.
+/// Let the pinned owner prune recorded remote packages. Retain the newest
+/// delivered epochs for active recipients and none for removed or revoked recipients.
 /// # Errors
 /// Rejects unauthorized devices, zero retention, and storage or transport failures.
 pub fn prune_remote_packages(
@@ -50,8 +50,8 @@ pub fn prune_remote_packages(
     let mut result = PruneResult { dry_run, keep_epochs, ..PruneResult::default() };
     let mut candidates = Vec::new();
     {
-        // Outbox inserts follow each recipient's epoch order, including legacy
-        // filenames. Conflict retries update a row in place.
+        // Outbox rows follow epoch order per recipient, even with legacy names.
+        // Upload retries can change a filename without changing its row ID.
         let mut statement = store.connection().prepare(
             "SELECT rowid, filename, recipient, delivered FROM team_sync_outbox
              WHERE project_id=?1 ORDER BY recipient, rowid DESC",
@@ -72,7 +72,7 @@ pub fn prune_remote_packages(
             }
             let delivered: bool = row.get(3)?;
             if !active.contains(&recipient) {
-                // Zero retention for removed/revoked recipients, including crash-leftover rows.
+                // Delete these packages even if a prior upload never marked them delivered.
                 candidates.push((row.get::<_, i64>(0)?, filename, recipient.clone(), false));
             } else if delivered && retained_epochs == keep_epochs {
                 candidates.push((row.get::<_, i64>(0)?, filename, recipient.clone(), true));

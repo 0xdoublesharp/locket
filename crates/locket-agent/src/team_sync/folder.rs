@@ -152,16 +152,16 @@ pub fn configure_folder_guarded(
     )
 }
 
-/// Publish durable ciphertext using folder or environment credentials.
+/// Upload queued packages to the configured folder or with environment credentials.
 /// # Errors
 /// Returns an error if delivery fails or vault credentials are required.
 pub fn flush_outbox(store: &Store, project: &str) -> Result<usize> {
     flush_outbox_with_master(store, project, None)
 }
 
-/// Publish durable ciphertext, optionally opening configured vault credentials.
+/// Upload queued packages, using the master key if the backend needs vault credentials.
 /// # Errors
-/// Returns an error if transport, credentials or storage fail.
+/// Returns an error if the transport, credentials, or storage fail.
 pub fn flush_outbox_with_master(
     store: &Store,
     project: &str,
@@ -183,12 +183,11 @@ fn flush_to(store: &Store, project: &str, transport: &dyn TeamTransport) -> Resu
     let mut count = 0;
     for (mut name, bytes, recipient) in rows {
         transport::validate_filename(&name)?;
-        // A bounded retry also limits traffic to a hostile server that reports
-        // a conflicting object for every possible name.
+        // Bound upload attempts when the backend keeps reporting name conflicts.
         let mut delivered = false;
         for _ in 0..8 {
-            // Serialize this upload with pruning so a stale outbox scan cannot
-            // recreate a package after its row has been pruned.
+            // Hold the write transaction through the upload so pruning cannot
+            // delete a row between the eligibility check and upload.
             let tx =
                 Transaction::new_unchecked(store.connection(), TransactionBehavior::Immediate)?;
             let allowed: bool = tx.query_row(
@@ -200,8 +199,7 @@ fn flush_to(store: &Store, project: &str, transport: &dyn TeamTransport) -> Resu
                 |r| r.get(0),
             )?;
             if !allowed {
-                // The row may have been renamed or pruned, or its recipient
-                // may have been removed since we read the outbox.
+                // Skip rows renamed or pruned since the scan and recipients who lost access.
                 delivered = true;
                 break;
             }

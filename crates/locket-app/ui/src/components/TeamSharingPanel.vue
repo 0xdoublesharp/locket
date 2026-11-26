@@ -156,8 +156,7 @@ watch(
   { flush: 'sync' },
 );
 
-// Track draft changes independently of the draft values so clearing credentials
-// after a save never requires a second copy of the transport payload.
+// Track which drafts changed so we can clear credential inputs after saving without copying them.
 const savedTarget = computed(() =>
   activeBackend.value === 'folder' ? status.value?.folder : status.value?.remote_target,
 );

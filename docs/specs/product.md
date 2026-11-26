@@ -28,14 +28,14 @@ Normative language:
 - 1Password CLI (`op`): Locket should borrow reference-style resolution, but keep the vault local-first and project-policy aware.
 - Infisical and Doppler: Locket should borrow polished DX and environment management, but reject a hosted service as the default dependency.
 - Vault: Locket should borrow brokered secret access and TTL thinking, but target local development workflows instead of distributed infrastructure.
-- AWS SSM, GitHub Actions secrets, and CI secret stores: Locket should treat them as the right place for CI/production secrets, not as a replacement for local development control.
+- AWS SSM, GitHub Actions secrets, and other platform-native stores can hold CI bootstrap credentials and production secrets.
 
 ## CI Position
 
-Locket is scoped as a local development control plane. CI should use the platform's native secret store, such as GitHub Actions secrets, AWS/GCP/Azure secret managers, or the deployment platform's own secret facility. Locket may emit `.env.example` and policy metadata for CI parity, but it must never export CI plaintext secret values as part of normal workflows.
+CI runners can read an authorized team profile with `locket ci`. Store the machine identity and delivery credentials in the platform's protected secret store, such as GitHub Actions secrets, an AWS, GCP, or Azure secret manager, or the deployment platform's secret facility. Locket verifies packages and decrypts profile values in memory. It can emit `.env.example` and policy metadata for CI parity, and it must not export plaintext profile values in normal workflows. See the [CI/CD guide](../ci-cd.md) for enrollment and execution.
 
 ## Telemetry
 
-No telemetry, no analytics, and no remote calls except an opt-in update check or explicit user-initiated sealed sync/export/import operation.
+Locket collects no telemetry or analytics. Network calls are limited to opt-in update checks and user-directed delivery of encrypted packages, including automatic team sync after a user configures a backend.
 
-Opt-in update checks must not send project metadata, secret metadata, device identifiers, stable installation identifiers, local paths, hostnames, usernames, or unique tracking tokens. Sealed sync/export/import remains user-directed file exchange; Locket v1 does not phone home to coordinate sync, team membership, revocation, or diagnostics.
+Opt-in update checks must not send project metadata, secret metadata, device identifiers, stable installation identifiers, local paths, hostnames, usernames, or unique tracking tokens. Team sync exchanges encrypted packages through user-configured storage. Membership and revocation travel in owner-signed updates. Diagnostics stay local.
