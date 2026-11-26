@@ -4,16 +4,27 @@ namespace Locket.Sources
 
 inductive SecretSource where
   | teamManaged
+  | sharedLink
   | userLocal
   | machineLocal
   deriving DecidableEq
 
 def rank : SecretSource → Nat
   | .teamManaged => 1
-  | .userLocal => 2
-  | .machineLocal => 3
+  | .sharedLink => 2
+  | .userLocal => 3
+  | .machineLocal => 4
 
 def precedes (a b : SecretSource) : Prop := rank a < rank b
+
+theorem team_managed_precedes_shared_link : precedes .teamManaged .sharedLink := by
+  simp [precedes, rank]
+
+theorem shared_link_precedes_user_local : precedes .sharedLink .userLocal := by
+  simp [precedes, rank]
+
+theorem user_local_precedes_machine_local : precedes .userLocal .machineLocal := by
+  simp [precedes, rank]
 
 theorem precedence_irrefl (source : SecretSource) : ¬ precedes source source := Nat.lt_irrefl _
 

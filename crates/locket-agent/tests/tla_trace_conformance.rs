@@ -1072,6 +1072,391 @@ fn insert_local_device(store: &Store, device: &locket_core::team_package::Device
         .unwrap();
 }
 
+#[derive(Default)]
+struct SharedLinksTrace {
+    trace: Trace,
+    target: String,
+    reviewed: Option<SharedUsageReview>,
+    published: bool,
+}
+
+struct SharedUsageReview {
+    ids: Vec<String>,
+    projection: String,
+}
+
+impl SharedLinksTrace {
+    async fn record(
+        &mut self,
+        f: &Fixture,
+        action: &str,
+        input: impl Display + Send,
+        read: Option<Project>,
+    ) {
+        let cache = f.state.unlock_cache.lock().await;
+        let stamp = i128::from(now());
+        let unlocked = [A, B, SHARED]
+            .into_iter()
+            .filter(|project| cache.lookup(project.id, stamp).is_some())
+            .map(|project| format!("{:?}", project.label))
+            .collect::<Vec<_>>()
+            .join(", ");
+        drop(cache);
+        let store = f.store();
+        let shared_exists = store
+            .get_active_secret(SHARED.id, SHARED.profile, TOKEN, "user-local")
+            .unwrap()
+            .is_some();
+        // Read the link rows directly, including any dangling row hidden by a usage join.
+        let links = [A, B]
+            .into_iter()
+            .filter(|project| {
+                store.get_secret_link(project.id, project.profile, TOKEN).unwrap().is_some()
+            })
+            .map(|project| format!("{:?}", project.label))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let dangerous = [A, B, SHARED]
+            .into_iter()
+            .filter(|project| {
+                store.get_profile_by_name(project.id, "default").unwrap().unwrap().dangerous
+            })
+            .map(|project| format!("{:?}", project.label))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let [a_audits, b_audits] = [A, B].map(|project| self.unlink_count(f, project));
+        let review =
+            self.reviewed.as_ref().map_or(r#"{<<"none", 0>>}"#, |review| &review.projection);
+        let read = read.map_or("none", |project| project.label);
+        let publisher = if self.published { A.label } else { "none" };
+        self.trace.record(
+            action,
+            input,
+            &format!(
+                "[unlocked |-> {{{unlocked}}}, sessionLocked |-> {}, sharedExists |-> {}, \
+                 links |-> {{{links}}}, dangerous |-> {{{dangerous}}}, reviewedLinks |-> {review}, \
+                 unlinkAudits |-> [ProjA |-> {a_audits}, ProjB |-> {b_audits}], linkedRead |-> {read:?}, \
+                 teamExport |-> [project |-> {publisher:?}, links |-> {{}}, dedupTags |-> {{}}]]",
+                tla_bool(f.session_blocked().await),
+                tla_bool(shared_exists),
+            ),
+        );
+    }
+
+    fn unlink_count(&self, f: &Fixture, project: Project) -> usize {
+        let mut count = 0;
+        for (_, action, metadata) in f.audit_rows(project) {
+            if action != "SECRET_UNLINK" {
+                continue;
+            }
+            assert_eq!(metadata["status"], "SUCCESS");
+            assert_eq!(metadata["secret_name"], TOKEN);
+            assert_eq!(metadata["profile_id"], project.profile);
+            assert_eq!(metadata["target_secret_id"], self.target);
+            count += 1;
+        }
+        count
+    }
+
+    async fn unlock(&mut self, f: &Fixture, project: Project) {
+        success(f.unlock(project, 120).await);
+        self.record(f, "unlock", format!("<<{:?}>>", project.label), None).await;
+    }
+
+    async fn lock(&mut self, f: &Fixture, project: Project) {
+        success(f.rpc(AgentMethod::Lock, json!({"project_id": project.id})).await);
+        self.record(f, "lock", format!("<<{:?}>>", project.label), None).await;
+    }
+
+    async fn mutate_link(&mut self, f: &Fixture, project: Project, link: bool, confirmed: bool) {
+        let (method, action, label) = if link {
+            (AgentMethod::LinkSecret, GrantAction::LinkSecret, "link")
+        } else {
+            (AgentMethod::UnlinkSecret, GrantAction::UnlinkSecret, "unlink")
+        };
+        let grant = grant_id(f.grant(project, action, confirmed).await);
+        let mut payload = f.scope(project, &grant);
+        payload["local_name"] = json!(TOKEN);
+        payload["target_secret_name"] = json!(TOKEN);
+        payload["confirmation"] = json!(confirmed.then_some("default"));
+        let result = success(f.rpc(method, payload).await);
+        assert_eq!(result["local_name"], TOKEN);
+        if link {
+            assert_eq!(result["target_secret_id"], self.target);
+            let persisted =
+                f.store().get_secret_link(project.id, project.profile, TOKEN).unwrap().unwrap();
+            assert_eq!(result["link_id"], persisted.id);
+        } else {
+            assert_eq!(result["unlinked"], true);
+        }
+        self.record(f, label, format!("<<{:?}, {}>>", project.label, tla_bool(confirmed)), None)
+            .await;
+    }
+
+    async fn review(&mut self, f: &Fixture, expected: &[Project]) {
+        let result = success(
+            f.rpc(
+                AgentMethod::ListSharedUsages,
+                json!({"store_path": f.path, "target_secret_id": self.target}),
+            )
+            .await,
+        );
+        let usages = result["usages"].as_array().unwrap();
+        assert_eq!(usages.len(), expected.len());
+        let store = f.store();
+        let mut ids = Vec::new();
+        let mut projection = Vec::new();
+        for usage in usages {
+            let project =
+                expected.iter().find(|project| usage["project_id"] == project.id).unwrap();
+            let persisted =
+                store.get_secret_link(project.id, project.profile, TOKEN).unwrap().unwrap();
+            assert_eq!(usage["link_id"], persisted.id);
+            assert_eq!(usage["target_secret_id"], self.target);
+            assert_eq!(usage["local_name"], TOKEN);
+            assert!(!ids.contains(&persisted.id));
+            ids.push(persisted.id);
+            projection.push(format!("<<{:?}, {}>>", project.label, self.unlink_count(f, *project)));
+        }
+        self.reviewed =
+            Some(SharedUsageReview { ids, projection: format!("{{{}}}", projection.join(", ")) });
+        self.record(f, "review", "<<>>", None).await;
+    }
+
+    async fn read(&mut self, f: &Fixture, project: Project, reveal: bool, expected: Option<&str>) {
+        let (action, audit) = if reveal {
+            (GrantAction::Reveal, "REVEAL")
+        } else {
+            (GrantAction::ResolveReference, "RESOLVE_REFERENCE")
+        };
+        let response = match f.grant(project, action, true).await {
+            ResponseEnvelope::Error(error) => ResponseEnvelope::Error(error),
+            ResponseEnvelope::Success(result) => {
+                let id = result.payload["grant_id"].as_str().unwrap();
+                if reveal {
+                    let mut payload = f.scope(project, id);
+                    payload["secret_name"] = json!(TOKEN);
+                    f.rpc(AgentMethod::Reveal, payload).await
+                } else {
+                    f.resolve(project, id, "lk://default/TOKEN", &f.binding).await
+                }
+            }
+        };
+        let reader = match response {
+            ResponseEnvelope::Success(result) => {
+                assert_eq!(expected, None);
+                assert_eq!(result.payload["value"], A_VALUE);
+                let rows = f.audit_rows(project);
+                let (_, _, metadata) =
+                    rows.iter().rev().find(|(_, action, _)| action == audit).unwrap();
+                assert_eq!(metadata["source"], "shared-link");
+                Some(project)
+            }
+            ResponseEnvelope::Error(error) => {
+                assert_eq!(Some(error.error.as_str()), expected);
+                None
+            }
+        };
+        self.record(
+            f,
+            "read",
+            format!("<<{:?}, {}>>", project.label, tla_bool(reader.is_some())),
+            reader,
+        )
+        .await;
+    }
+
+    async fn delete(
+        &mut self,
+        f: &Fixture,
+        unlink_all: bool,
+        confirmed: bool,
+        expected: Result<u64, &str>,
+    ) {
+        let grant = f.grant_id(SHARED, GrantAction::DeleteSecret).await;
+        let mut payload = f.scope(SHARED, &grant);
+        payload["secret_name"] = json!(TOKEN);
+        payload["source"] = json!("user-local");
+        payload["unlink_all"] = json!(unlink_all);
+        payload["confirmation"] = json!(confirmed.then_some("default"));
+        if unlink_all {
+            payload["expected_link_ids"] = json!(self.reviewed.as_ref().unwrap().ids);
+        }
+        let response = f.rpc(AgentMethod::DeleteSecret, payload).await;
+        let accepted = match response {
+            ResponseEnvelope::Success(result) => {
+                assert_eq!(result.payload["unlinked_count"].as_u64(), Some(expected.unwrap()));
+                assert_eq!(result.payload["deleted"], true);
+                assert_eq!(
+                    f.store().get_secret_by_id(&self.target).unwrap().unwrap().state,
+                    "deleted"
+                );
+                true
+            }
+            ResponseEnvelope::Error(error) => {
+                assert_eq!(error.error, expected.unwrap_err());
+                if error.error == "UnlockRequired" {
+                    assert!(error.message.contains(B.label));
+                }
+                false
+            }
+        };
+        self.record(
+            f,
+            "delete",
+            format!(
+                "<<{}, {}, {}>>",
+                tla_bool(unlink_all),
+                tla_bool(confirmed),
+                tla_bool(accepted)
+            ),
+            None,
+        )
+        .await;
+    }
+}
+
+async fn publish_link_consumer(f: &Fixture, target_id: &str) {
+    use locket_agent::team_sync;
+    use locket_core::team_package::SignedStatement;
+
+    let grant = f.grant_id(A, GrantAction::SetSecret).await;
+    let mut payload = f.scope(A, &grant);
+    payload["secret_name"] = json!("MANAGED_CONFIG");
+    payload["source"] = json!("team-managed");
+    payload["value"] = json!(B_VALUE);
+    let managed = success(f.rpc(AgentMethod::SetSecret, payload).await);
+    let store = &mut f.store();
+    let managed_id = managed["secret_id"].as_str().unwrap();
+    let tag: Vec<u8> = store
+        .connection()
+        .query_row(
+            "SELECT dedup_tag FROM local_value_fingerprints WHERE secret_id = ?1 AND version = 1",
+            [managed_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(tag, locket_crypto::local_dedup_tag_v1(&FINGERPRINT_KEY, B_VALUE).unwrap());
+    let link = store.get_secret_link(A.id, A.profile, TOKEN).unwrap().unwrap();
+    let signer = ed25519_dalek::SigningKey::from_bytes(&[31; 32]);
+    let owner = team_device("owner", &signer, &[32; 32]);
+    let sealing = [33; 32];
+    let recipient =
+        team_device("recipient", &ed25519_dalek::SigningKey::from_bytes(&[34; 32]), &sealing);
+    insert_local_device(store, &owner);
+    store
+        .insert_team(&locket_store::TeamRecord {
+            id: "trace-team".into(),
+            project_id: A.id.into(),
+            name: "trace-team".into(),
+            created_at: 1,
+            updated_at: 1,
+        })
+        .unwrap();
+    store
+        .insert_team_member("owner-member", "trace-team", Some(&owner.id), "owner", "owner", 1)
+        .unwrap();
+    team_sync::initialize_owner(store, A.id, &owner, 100).unwrap();
+    team_sync::add_recipient(
+        store,
+        A.id,
+        &recipient,
+        "recipient",
+        "developer",
+        &[A.profile.to_owned()],
+        100,
+    )
+    .unwrap();
+    assert_eq!(team_sync::publish(store, A.id, &A.master(), &signer, 101).unwrap(), 1);
+    let ciphertext: Vec<u8> = store
+        .connection()
+        .query_row(
+            "SELECT ciphertext FROM team_sync_outbox WHERE project_id = ?1 AND recipient = ?2",
+            (A.id, &recipient.fingerprint),
+            |row| row.get(0),
+        )
+        .unwrap();
+    let package = SignedStatement::open(&ciphertext, &sealing).unwrap();
+    let verified = package.verify(&owner.fingerprint, A.id, &recipient, 101).unwrap();
+    assert_eq!(verified.statement.project_id, A.id);
+    let [profile] = verified.statement.profiles.as_slice() else {
+        panic!("expected one exported profile")
+    };
+    let [secret] = profile.secrets.as_slice() else { panic!("expected one team-managed secret") };
+    assert_eq!(secret.id, managed_id);
+    let signed_json = std::str::from_utf8(&package.statement).unwrap();
+    for omitted in [
+        "secret_links",
+        "local_value_fingerprints",
+        "dedup_tag",
+        TOKEN,
+        link.id.as_str(),
+        target_id,
+        &serde_json::to_string(&tag).unwrap(),
+    ] {
+        assert!(!signed_json.contains(omitted), "local-only data appeared in Team Sync");
+    }
+}
+
+#[tokio::test]
+async fn shared_secret_links() {
+    let f = Fixture::new(&[(A, false), (B, true), (SHARED, false)]);
+    let mut run = SharedLinksTrace::default();
+    run.record(&f, "init", "<<>>", None).await;
+    run.unlock(&f, SHARED).await;
+    let writer = f.grant_id(SHARED, GrantAction::SetSecret).await;
+    let created = success(f.set_secret(SHARED, &writer, "user-local", A_VALUE, None).await);
+    run.target = created["secret_id"].as_str().unwrap().to_owned();
+    run.record(&f, "create", "<<FALSE>>", None).await;
+    run.lock(&f, SHARED).await;
+    run.unlock(&f, A).await;
+    run.mutate_link(&f, A, true, false).await;
+    run.read(&f, A, false, Some("UnlockRequired")).await;
+    run.review(&f, &[A]).await;
+    run.unlock(&f, SHARED).await;
+    run.read(&f, A, false, None).await;
+    run.lock(&f, A).await;
+    run.read(&f, A, false, Some("UnlockRequired")).await;
+    run.unlock(&f, A).await;
+    run.unlock(&f, B).await;
+    run.mutate_link(&f, B, true, true).await;
+    run.read(&f, B, true, None).await;
+    run.delete(&f, false, true, Err("LinkedSecretInUse")).await;
+    run.delete(&f, true, true, Err("LinkSetChanged")).await;
+    run.review(&f, &[A, B]).await;
+    run.mutate_link(&f, B, false, true).await;
+    run.mutate_link(&f, B, true, true).await;
+    run.delete(&f, true, true, Err("LinkSetChanged")).await;
+    run.review(&f, &[A, B]).await;
+    publish_link_consumer(&f, &run.target).await;
+    run.published = true;
+    run.record(&f, "publish", r#"<< "ProjA" >>"#, None).await;
+
+    for (locked, action) in [(true, "nativeLock"), (false, "resume")] {
+        f.state
+            .lock_for_native_session_event(SessionLockSource::ScreenLock, locked, i128::from(now()))
+            .await
+            .unwrap();
+        run.record(&f, action, "<<>>", None).await;
+        if locked {
+            run.read(&f, B, true, Some("UnlockRequired")).await;
+        }
+    }
+    run.unlock(&f, SHARED).await;
+    run.unlock(&f, A).await;
+    run.delete(&f, true, true, Err("UnlockRequired")).await;
+    run.unlock(&f, B).await;
+    run.delete(&f, true, false, Err("ConfirmationFailed")).await;
+    run.delete(&f, true, true, Ok(2)).await;
+    run.read(&f, A, true, Some("SecretNotFound")).await;
+
+    for project in [A, B, SHARED] {
+        f.assert_audit_integrity(project);
+    }
+    assert_eq!([run.unlink_count(&f, A), run.unlink_count(&f, B)], [1, 2]);
+    run.trace.emit("SharedSecretLinks");
+}
+
 fn team_snapshot(owner: &Store, receiver: &Store, packages: &str) -> String {
     use rusqlite::OptionalExtension as _;
 

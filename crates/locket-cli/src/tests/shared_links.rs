@@ -3,7 +3,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use clap::Parser;
+use locket_core::LocketError;
 use locket_platform::MasterKeyStore;
+use serde_json::{Value, json};
 
 use super::{cross_project::ProjectKeys, *};
 use crate::{
@@ -11,12 +13,202 @@ use crate::{
 };
 
 fn run_cli_args(context: &RuntimeContext, args: &[&str]) -> Result<String, CliError> {
+    run_cli_result(context, args).map(|(_, output)| output)
+}
+
+fn run_cli_result(context: &RuntimeContext, args: &[&str]) -> Result<(u8, String), CliError> {
     let mut output = Vec::new();
     let mut full = vec!["locket"];
     full.extend_from_slice(args);
     let cli = Cli::try_parse_from(full).map_err(|err| invalid_reference_error(err.to_string()))?;
-    run_with_context(cli, context, &mut output)?;
-    Ok(String::from_utf8_lossy(&output).into_owned())
+    let code = run_with_context(cli, context, &mut output)?;
+    Ok((code, String::from_utf8_lossy(&output).into_owned()))
+}
+
+fn cli_json(
+    context: &RuntimeContext,
+    args: &[&str],
+    expected_code: u8,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let (code, output) = run_cli_result(context, args)?;
+    assert_eq!(code, expected_code, "{args:?}: {output}");
+    Ok(serde_json::from_str(&output)?)
+}
+
+#[test]
+fn link_and_unlink_report_mutations_denials_and_usage_changes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let workspace = tempfile::tempdir()?;
+    let initial_value = "first-fixture-value";
+    let changed_value = "second-fixture-value";
+    let context = RuntimeContext {
+        key_store: Arc::new(ProjectKeys::default()),
+        ..test_context_with_secret_value(&workspace, initial_value)
+    };
+    let changed = RuntimeContext {
+        secret_value_reader: Arc::new(StaticSecretValueReader::new(changed_value)),
+        ..context.clone()
+    };
+    run_cli_args(&context, &["init", "--name", "link-consumer", "--profile", "dev"])?;
+    run_cli_args(&context, &["shared", "init"])?;
+    run_cli_args(&context, &["shared", "set", "FIRST"])?;
+    run_cli_args(&changed, &["shared", "set", "SECOND"])?;
+
+    let missing = cli_json(
+        &context,
+        &["link", "RPC", "@shared/MISSING", "--json"],
+        LocketError::SecretNotFound.exit_code(),
+    )?;
+    assert_eq!(missing["error"]["code"], "SecretNotFound");
+    assert_eq!(missing["error"]["message"], "secret MISSING not found in @shared");
+    assert_eq!(
+        run_cli_args(&context, &["link", "RPC", "@shared/FIRST"])?.trim(),
+        "linked RPC -> @shared/FIRST (profile=dev)",
+    );
+    let usage = run_cli_args(&context, &["shared", "usages", "FIRST"])?;
+    assert_eq!(
+        usage,
+        "@shared/FIRST is used by 1 project link(s):\n  link-consumer (dev) -> RPC\n"
+    );
+    assert_eq!(
+        run_cli_args(&context, &["get", "RPC", "--reveal", "--force"])?.trim(),
+        initial_value,
+    );
+
+    let relink = cli_json(&context, &["link", "RPC", "SECOND", "--json"], 0)?;
+    assert_eq!(relink["local_name"], "RPC");
+    assert_eq!(relink["target_secret_name"], "SECOND");
+    assert_eq!(relink["profile"], "dev");
+    let old = cli_json(&context, &["shared", "usages", "FIRST", "--json"], 0)?;
+    assert_eq!(old["usage_count"], 0);
+    assert_eq!(old["usages"], json!([]));
+    assert_eq!(
+        run_cli_args(&context, &["get", "RPC", "--reveal", "--force"])?.trim(),
+        changed_value,
+    );
+    assert_eq!(run_cli_args(&context, &["unlink", "RPC"])?.trim(), "unlinked RPC");
+    assert_eq!(
+        run_cli_args(&context, &["shared", "usages", "SECOND"])?.trim(),
+        "@shared/SECOND: not linked by any project",
+    );
+
+    let missing = run_cli_args(&context, &["unlink", "RPC"]);
+    assert!(matches!(missing, Err(CliError::Typed { kind: LocketError::SecretNotFound, message })
+        if message == "no shared link found for RPC"));
+    let missing =
+        cli_json(&context, &["unlink", "RPC", "--json"], LocketError::SecretNotFound.exit_code())?;
+    assert_eq!(missing["error"]["code"], "SecretNotFound");
+
+    let project = crate::require_project(&context)?;
+    let store = crate::open_store(&context)?;
+    assert!(store.set_profile_dangerous(project.config.project_id.as_str(), "dev", true)?);
+    let denied = run_cli_args(&context, &["link", "RPC", "FIRST"]);
+    assert!(
+        matches!(denied, Err(CliError::Typed { kind: LocketError::DangerousProfileConfirmationRequired, message })
+        if message.contains("--use-dangerous"))
+    );
+    cli_json(&context, &["link", "RPC", "FIRST", "--use-dangerous", "--json"], 0)?;
+    let denied = cli_json(
+        &context,
+        &["unlink", "RPC", "--json"],
+        LocketError::DangerousProfileConfirmationRequired.exit_code(),
+    )?;
+    assert_eq!(denied["error"]["code"], "DangerousProfileConfirmationRequired");
+    let usage = run_cli_args(&context, &["shared", "usages", "FIRST"])?;
+    assert!(usage.contains("link-consumer (dev [dangerous]) -> RPC"));
+    let removed = cli_json(&context, &["unlink", "RPC", "--use-dangerous", "--json"], 0)?;
+    assert_eq!(removed, json!({"local_name": "RPC", "profile": "dev", "unlinked": true}));
+    let usage = cli_json(&context, &["shared", "usages", "FIRST", "--json"], 0)?;
+    assert_eq!(usage["usage_count"], 0);
+    Ok(())
+}
+
+#[test]
+fn promote_keeps_local_values_and_needs_overwrite_for_a_conflict()
+-> Result<(), Box<dyn std::error::Error>> {
+    let workspace = tempfile::tempdir()?;
+    let context = RuntimeContext {
+        key_store: Arc::new(ProjectKeys::default()),
+        ..test_context_with_secret_value(&workspace, "global-before-overwrite")
+    };
+    let changed = RuntimeContext {
+        secret_value_reader: Arc::new(StaticSecretValueReader::new("local-promotion-value")),
+        ..context.clone()
+    };
+    run_cli_args(&context, &["init", "--name", "promotion-source"])?;
+    run_cli_args(&context, &["shared", "init"])?;
+    run_cli_args(&context, &["shared", "set", "EXISTING"])?;
+    run_cli_args(&changed, &["set", "LOCAL"])?;
+
+    let missing = cli_json(
+        &context,
+        &["promote", "MISSING", "--json"],
+        LocketError::SecretNotFound.exit_code(),
+    )?;
+    assert_eq!(missing["error"]["code"], "SecretNotFound");
+    let conflict = run_cli_args(&context, &["promote", "LOCAL", "--as", "@shared/EXISTING"]);
+    assert!(
+        matches!(conflict, Err(CliError::Typed { kind: LocketError::SecretAlreadyExists, message })
+        if message.contains("--overwrite"))
+    );
+    let shared = || run_cli_args(&context, &["shared", "get", "EXISTING", "--reveal", "--force"]);
+    assert_eq!(shared()?.trim(), "global-before-overwrite");
+
+    let keep = run_cli_args(&context, &["promote", "LOCAL", "--keep-local"])?;
+    assert_eq!(keep.trim(), "promoted LOCAL -> @shared/LOCAL (create, v1) (kept local copy)");
+    let usages = cli_json(&context, &["shared", "usages", "LOCAL", "--json"], 0)?;
+    assert_eq!(usages["usage_count"], 0);
+    assert_eq!(
+        run_cli_args(&context, &["get", "LOCAL", "--reveal", "--force"])?.trim(),
+        "local-promotion-value",
+    );
+    let overwritten =
+        cli_json(&context, &["promote", "LOCAL", "--as", "EXISTING", "--overwrite", "--json"], 0)?;
+    assert_eq!(overwritten["action"], "rotate");
+    assert_eq!(overwritten["version"], 2);
+    assert_eq!(overwritten["linked"], true);
+    assert!(!overwritten.to_string().contains("local-promotion-value"));
+    assert_eq!(shared()?.trim(), "local-promotion-value");
+    let usages = cli_json(&context, &["shared", "usages", "EXISTING", "--json"], 0)?;
+    assert_eq!(usages["usages"][0]["local_name"], "LOCAL");
+    Ok(())
+}
+
+#[test]
+fn duplicates_reindex_backfills_an_older_secret_and_reports_only_metadata()
+-> Result<(), Box<dyn std::error::Error>> {
+    let workspace = tempfile::tempdir()?;
+    let value = "duplicate-secret-canary";
+    let context = RuntimeContext {
+        key_store: Arc::new(ProjectKeys::default()),
+        ..test_context_with_secret_value(&workspace, value)
+    };
+    run_cli_args(&context, &["init", "--name", "pre-index-project", "--profile", "dev"])?;
+    // This write predates the Global Vault fingerprint key.
+    run_cli_args(&context, &["set", "OLD_LOCAL"])?;
+    run_cli_args(&context, &["shared", "init"])?;
+    run_cli_args(&context, &["shared", "set", "CURRENT_SHARED"])?;
+    assert_eq!(
+        run_cli_args(&context, &["duplicates"])?.trim(),
+        "no duplicate secret values detected",
+    );
+    let empty = cli_json(&context, &["duplicates", "--json"], 0)?;
+    assert_eq!(empty, json!({"reindexed": 0, "group_count": 0, "groups": []}));
+
+    let reindexed = cli_json(&context, &["duplicates", "--reindex", "--json"], 0)?;
+    assert_eq!(reindexed["reindexed"], 2);
+    assert_eq!(reindexed["group_count"], 1);
+    assert_eq!(reindexed["groups"][0]["count"], 2);
+    assert!(!reindexed.to_string().contains("dedup_tag"));
+    assert!(!reindexed.to_string().contains(value));
+
+    let text = run_cli_args(&context, &["duplicates"])?;
+    assert!(text.contains("found 1 duplicate value group(s) (metadata only)"));
+    assert!(text.contains("dup-1 (2 copies)"));
+    assert!(text.contains("pre-index-project / dev / OLD_LOCAL (user-local)"));
+    assert!(text.contains("@shared / default / CURRENT_SHARED (user-local)"));
+    assert!(!text.contains(value));
+    Ok(())
 }
 
 fn add_check_policy(root: &Path) -> Result<(), Box<dyn std::error::Error>> {

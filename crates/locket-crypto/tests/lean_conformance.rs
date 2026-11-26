@@ -3,11 +3,14 @@
 
 use std::collections::BTreeSet;
 
+use hmac::{Hmac, KeyInit, Mac};
 use locket_crypto::{
     CryptoError, HkdfWrapInfo, KEY_LEN, KeyBytes, KeyPurpose, KeyWrapAad, KeyWrapPurpose,
-    SecretBlobAad, canonical_field, hkdf_wrap_info_v1, key_wrap_aad_v1, passkey_prf_wrap_aad_v1,
-    passphrase_fallback_aad_v1, recovery_entry_aad_v1, secret_blob_aad_v1,
+    SecretBlobAad, canonical_field, hkdf_wrap_info_v1, key_wrap_aad_v1, local_dedup_tag_v1,
+    passkey_prf_wrap_aad_v1, passphrase_fallback_aad_v1, recovery_entry_aad_v1, secret_blob_aad_v1,
+    secret_fingerprint_v1,
 };
+use sha2::Sha256;
 
 #[test]
 fn length_prefixes_distinguish_every_boundary_pair() -> Result<(), Box<dyn std::error::Error>> {
@@ -79,10 +82,27 @@ fn authentication_domains_have_no_common_prefix_at_the_shorter_length() -> Resul
     for (domain, encoded) in live_encodings {
         assert!(encoded.starts_with(domain));
     }
+    let key = [42; KEY_LEN];
+    let value = "dedup conformance 🦀";
+    // The keyed encoders return only their MAC. Verify their input prefixes
+    // by reproducing the MAC with the bytes modeled in Lean.
+    let keyed_encodings: &[(&[u8], [u8; 32])] = &[
+        (b"locket-secret-fingerprint-v1", secret_fingerprint_v1(&key, value)?),
+        (b"locket-local-dedup-v1", local_dedup_tag_v1(&key, value)?),
+    ];
+    for (domain, tag) in keyed_encodings {
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&key)
+            .map_err(|_| CryptoError::KeyDerivationFailed)?;
+        mac.update(domain);
+        mac.update(value.as_bytes());
+        let expected: [u8; 32] = mac.finalize().into_bytes().into();
+        assert_eq!(*tag, expected);
+    }
     // The audit, team package, and backup encoders are owned by other crates.
     let domains = live_encodings
         .iter()
         .map(|(domain, _)| *domain)
+        .chain(keyed_encodings.iter().map(|(domain, _)| *domain))
         .chain([
             b"locket-audit-v1".as_slice(),
             b"locket-team-state-v1\0",

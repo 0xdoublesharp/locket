@@ -10,11 +10,20 @@ use ed25519_dalek::{Signature, SigningKey};
 use locket_core::team_package::{DeviceIdentity, SignedStatement, TeamStatement};
 use locket_core::{
     AuditHmacInput, EnvMap, PolicyDocument, PolicyParseError, ProjectConfig, SecretName, Timestamp,
-    audit_hmac_v1_bytes, env_value, privacy_alias,
+    audit_hmac_v1_bytes, env_value, privacy_alias, source_precedence,
 };
 
 fn names(names: &[SecretName]) -> Vec<&str> {
     names.iter().map(SecretName::as_str).collect()
+}
+
+#[test]
+fn source_precedence_matches_all_four_lean_ranks() {
+    for (source, rank) in
+        [("team-managed", 1), ("shared-link", 2), ("user-local", 3), ("machine-local", 4)]
+    {
+        assert_eq!(source_precedence(source), rank, "{source}");
+    }
 }
 
 #[test]

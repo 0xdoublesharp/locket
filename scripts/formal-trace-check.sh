@@ -20,7 +20,9 @@ work=$(mktemp -d "$check_tmp/formal-trace-check.XXXXXXXX")
 trap 'rm -rf -- "$work"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-export TMPDIR="$check_tmp"
+if [[ ${TMPDIR:-} != "$scratch/locket/"* ]]; then
+    export TMPDIR="$check_tmp"
+fi
 
 jar=${TLA2TOOLS_JAR:-"$HOME/.local/share/tla2tools/tla2tools.jar"}
 [[ -f "$jar" && -r "$jar" ]] || die "TLA+ tools jar unavailable at $jar"
@@ -102,6 +104,7 @@ check_model AutomationClientAuth
 check_model SecretLifecycleAuditChain
 check_model BackupAndRecoveryLifecycle
 check_model SharedVaultIsolation
+check_model SharedSecretLinks
 check_model TeamSyncAndAuditWitness
 check_model EgressProxyAndRedaction
 check_model AgentDaemonLifecycle

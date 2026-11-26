@@ -94,6 +94,7 @@ check_model EgressProxyAndRedaction
 check_model TeamSyncAndAuditWitness
 check_model BackupAndRecoveryLifecycle
 check_model SharedVaultIsolation
+check_model SharedSecretLinks
 check_model AgentDaemonLifecycle
 check_model McpAndDesktopBoundary
 
@@ -106,4 +107,4 @@ printf 'Building Lean proofs\n'
     cd -- "$lean_project"
     lake --no-cache --wfail build
 )
-printf 'Formal checks passed for all ten TLC models and all eleven Lean modules.\n'
+printf 'Formal checks passed for all eleven TLC models and all eleven Lean modules.\n'

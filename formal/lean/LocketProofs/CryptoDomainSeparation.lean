@@ -81,6 +81,8 @@ inductive Purpose where
   | RecoveryEnvelope
   | TeamPackage
   | BackupBundle
+  | SecretFingerprint
+  | LocalDedupTag
   deriving DecidableEq
 
 /-- Leading bytes of the authenticated inputs. For backups this is the
@@ -92,6 +94,8 @@ def domainTag : Purpose → Bytes
   | .RecoveryEnvelope => utf8 "locket-recovery-envelope-v1"
   | .TeamPackage => utf8 "locket-team-state-v1" ++ [0]
   | .BackupBundle => utf8 "locket-bundle-audit-chain-v1" ++ [0]
+  | .SecretFingerprint => utf8 "locket-secret-fingerprint-v1"
+  | .LocalDedupTag => utf8 "locket-local-dedup-v1"
 
 private theorem common_prefix_bytes_differ (left right : Purpose) (distinct : left ≠ right) :
     let width := min (domainTag left).length (domainTag right).length

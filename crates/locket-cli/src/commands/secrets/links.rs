@@ -335,18 +335,11 @@ pub fn unlink_command(
             args.use_dangerous,
             "pass --use-dangerous to unlink a secret from a dangerous profile",
         )?;
-        let Some(existing) = store.get_secret_link(
-            resolved.config.project_id.as_str(),
-            &profile.id,
-            local_name.as_str(),
-        )?
-        else {
-            return Ok(json!({
-                "local_name": local_name.as_str(),
-                "profile": profile.name,
-                "unlinked": false,
-            }));
-        };
+        let missing_link =
+            || secret_not_found_error(format!("no shared link found for {}", local_name.as_str()));
+        let existing = store
+            .get_secret_link(resolved.config.project_id.as_str(), &profile.id, local_name.as_str())?
+            .ok_or_else(missing_link)?;
         let timestamp = now_unix_nanos()?;
         let audit_key = load_project_key(
             context,
@@ -374,12 +367,14 @@ pub fn unlink_command(
             metadata_json: &metadata,
             timestamp,
         };
-        store.delete_secret_link_with_audit(
-            resolved.config.project_id.as_str(),
-            &profile.id,
-            local_name.as_str(),
-            Some(AuditContext { key: audit_key.as_ref(), write: &audit }),
-        )?;
+        store
+            .delete_secret_link_with_audit(
+                resolved.config.project_id.as_str(),
+                &profile.id,
+                local_name.as_str(),
+                Some(AuditContext { key: audit_key.as_ref(), write: &audit }),
+            )?
+            .ok_or_else(missing_link)?;
         refresh_example_for_project_if_enabled(context)?;
         Ok(json!({
             "local_name": local_name.as_str(),
@@ -391,15 +386,7 @@ pub fn unlink_command(
         return write_json_result(output, result);
     }
     let row = result?;
-    if row["unlinked"].as_bool() == Some(true) {
-        writeln!(output, "unlinked {}", row["local_name"].as_str().unwrap_or_default())?;
-    } else {
-        writeln!(
-            output,
-            "no shared link found for {}",
-            row["local_name"].as_str().unwrap_or_default()
-        )?;
-    }
+    writeln!(output, "unlinked {}", row["local_name"].as_str().unwrap_or_default())?;
     Ok(0)
 }
 
