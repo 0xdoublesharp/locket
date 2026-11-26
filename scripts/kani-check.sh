@@ -38,9 +38,28 @@ fi
 # Kani cannot verify the inline assembly used for CPU feature detection or
 # all of the accelerated crypto intrinsics. Check the portable Rust backends.
 export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--cfg=chacha20_backend=\"soft\" --cfg=poly1305_backend=\"soft\""
-# Run each crate sequentially by default so CBMC stays within GitHub runner RAM
-# and reports per-crate verification summaries as it progresses.
-cargo kani -Z stubbing -p locket-crypto --lib --target-dir "$work" \
-    --output-format terse -j "${KANI_JOBS:-1}"
-cargo kani -Z stubbing -p locket-core --lib --target-dir "$work" \
-    --output-format terse -j "${KANI_JOBS:-1}"
+# Run each harness individually with a bounded per-harness timeout so CI logs
+# always record per-harness timing and never silently lose logs to runner kills.
+harness_timeout="${KANI_HARNESS_TIMEOUT:-300}"
+run_harness() {
+    local pkg="$1"
+    local harness="$2"
+    printf '==> Kani %s::%s (timeout %ss)\n' "$pkg" "$harness" "$harness_timeout"
+    if command -v timeout >/dev/null 2>&1; then
+        timeout --foreground "${harness_timeout}s" \
+            cargo kani -Z stubbing -p "$pkg" --lib --target-dir "$work" \
+                --harness "$harness" --exact --output-format terse -j 1
+    else
+        cargo kani -Z stubbing -p "$pkg" --lib --target-dir "$work" \
+            --harness "$harness" --exact --output-format terse -j 1
+    fi
+}
+
+run_harness locket-crypto kani_proofs::embedded_nonce_and_ciphertext_require_exact_lengths
+run_harness locket-crypto kani_proofs::canonical_field_preserves_utf8_boundaries
+run_harness locket-crypto kani_proofs::fixed_wrap_round_trips_and_rejects_a_flipped_tag_bit
+
+run_harness locket-core kani_proofs::a_single_acl_mismatch_denies_an_explicitly_selected_secret
+run_harness locket-core kani_proofs::bounded_secret_names_match_the_ascii_grammar
+run_harness locket-core kani_proofs::bounded_reference_suffixes_parse_without_panics
+run_harness locket-core kani_proofs::bounded_acl_matching_is_panic_free

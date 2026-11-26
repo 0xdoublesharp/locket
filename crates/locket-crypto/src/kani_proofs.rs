@@ -57,7 +57,7 @@ fn embedded_nonce_and_ciphertext_require_exact_lengths() {
 
 #[kani::proof]
 #[kani::stub(zeroize::optimization_barrier, kani_optimization_barrier)]
-#[kani::unwind(80)]
+#[kani::unwind(40)]
 fn fixed_wrap_round_trips_and_rejects_a_flipped_tag_bit() {
     let key = [7; KEY_LEN];
     let nonce = [11; NONCE_LEN];
@@ -68,14 +68,22 @@ fn fixed_wrap_round_trips_and_rejects_a_flipped_tag_bit() {
     };
     assert_eq!(envelope.len(), NONCE_LEN + KEY_LEN + TAG_LEN);
     assert_eq!(&envelope[..NONCE_LEN], &nonce);
-    let Ok(opened) = unwrap_dek_v1(&key, &envelope, aad) else {
-        unreachable!("the original envelope authenticates");
-    };
-    assert_eq!(*opened, material);
 
+    let flip: bool = kani::any();
     let index: usize = kani::any();
     let bit: u8 = kani::any();
     kani::assume(index < TAG_LEN && bit < 8);
-    envelope[NONCE_LEN + KEY_LEN + index] ^= 1 << bit;
-    assert_eq!(unwrap_dek_v1(&key, &envelope, aad).err(), Some(CryptoError::DecryptionFailed));
+    if flip {
+        envelope[NONCE_LEN + KEY_LEN + index] ^= 1 << bit;
+    }
+    match unwrap_dek_v1(&key, &envelope, aad) {
+        Ok(opened) => {
+            assert!(!flip);
+            assert_eq!(*opened, material);
+        }
+        Err(error) => {
+            assert!(flip);
+            assert_eq!(error, CryptoError::DecryptionFailed);
+        }
+    }
 }
