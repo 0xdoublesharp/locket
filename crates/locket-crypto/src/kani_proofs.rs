@@ -63,26 +63,26 @@ fn fixed_wrap_round_trips_and_rejects_a_flipped_tag_bit() {
     let nonce = [11; NONCE_LEN];
     let material = [19; KEY_LEN];
     let aad = b"locket proof fixture";
-    let Ok(mut envelope) = wrap_dek_with_nonce_v1(&key, &material, aad, &nonce) else {
+    let Ok(envelope) = wrap_dek_with_nonce_v1(&key, &material, aad, &nonce) else {
         unreachable!("fixture fits the cipher bounds");
     };
     assert_eq!(envelope.len(), NONCE_LEN + KEY_LEN + TAG_LEN);
     assert_eq!(&envelope[..NONCE_LEN], &nonce);
 
-    let flip: bool = kani::any();
-    let index: usize = kani::any();
-    let bit: u8 = kani::any();
-    kani::assume(index < TAG_LEN && bit < 8);
-    if flip {
-        envelope[NONCE_LEN + KEY_LEN + index] ^= 1 << bit;
-    }
-    match unwrap_dek_v1(&key, &envelope, aad) {
+    // Mutate a fixed tag offset by an arbitrary byte mask so CBMC keeps the
+    // nonce and ciphertext concrete while proving all 255 non-zero corruptions
+    // fail authentication and mask == 0 recovers the original key material.
+    let mut candidate = [0_u8; NONCE_LEN + KEY_LEN + TAG_LEN];
+    candidate.copy_from_slice(&envelope);
+    let mask: u8 = kani::any();
+    candidate[NONCE_LEN + KEY_LEN] ^= mask;
+    match unwrap_dek_v1(&key, &candidate, aad) {
         Ok(opened) => {
-            assert!(!flip);
+            assert_eq!(mask, 0);
             assert_eq!(*opened, material);
         }
         Err(error) => {
-            assert!(flip);
+            assert_ne!(mask, 0);
             assert_eq!(error, CryptoError::DecryptionFailed);
         }
     }

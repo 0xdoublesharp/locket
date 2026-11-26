@@ -38,16 +38,16 @@ fi
 # Kani cannot verify the inline assembly used for CPU feature detection or
 # all of the accelerated crypto intrinsics. Check the portable Rust backends.
 export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--cfg=chacha20_backend=\"soft\" --cfg=poly1305_backend=\"soft\""
-# Run each harness individually with a bounded per-harness timeout so CI logs
-# always record per-harness timing and never silently lose logs to runner kills.
-harness_timeout="${KANI_HARNESS_TIMEOUT:-300}"
+# Run each harness individually with a bounded per-harness timeout (killing the
+# full process group including CBMC) so CI logs always record per-harness timing.
+harness_timeout="${KANI_HARNESS_TIMEOUT:-180}"
 failures=0
 run_harness() {
     local pkg="$1"
     local harness="$2"
     printf '==> Kani %s::%s (timeout %ss)\n' "$pkg" "$harness" "$harness_timeout"
     if command -v timeout >/dev/null 2>&1; then
-        timeout --foreground "${harness_timeout}s" \
+        timeout --kill-after=10s "${harness_timeout}s" \
             cargo kani -Z stubbing -p "$pkg" --lib --target-dir "$work" \
                 --harness "$harness" --exact --output-format terse -j 1 || failures=$((failures + 1))
     else
