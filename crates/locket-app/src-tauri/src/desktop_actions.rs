@@ -8,7 +8,8 @@ use command_detection::DetectedCommand;
 use base64 as _;
 use locket_agent::{
     AgentMethod, CopySecretToSharedResponse, CreateProfileResponse, DeleteSecretResponse,
-    GrantAction,
+    GrantAction, ImportDuplicateMatch, LinkSecretResponse, ListDuplicatesResponse,
+    ListSharedUsagesResponse, UnlinkSecretResponse,
 };
 use locket_core::ProjectConfig;
 
@@ -104,6 +105,12 @@ pub(crate) struct DesktopImportEnvRequest {
     literal: bool,
     #[serde(default)]
     confirmation: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
+    #[serde(default)]
+    link_to_shared: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    promote_to_shared: std::collections::BTreeMap<String, String>,
 }
 #[derive(Deserialize)]
 pub(crate) struct DesktopStartAgentRequest {
@@ -122,6 +129,18 @@ pub(crate) struct DesktopScanProjectRequest {
 #[derive(Serialize)]
 pub(crate) struct DesktopImportSummary {
     summary: String,
+    #[serde(default)]
+    imported: u32,
+    #[serde(default)]
+    overwritten: u32,
+    #[serde(default)]
+    skipped: u32,
+    #[serde(default)]
+    linked: u32,
+    #[serde(default)]
+    promoted: u32,
+    #[serde(default)]
+    duplicate_matches: Vec<ImportDuplicateMatch>,
 }
 #[derive(Serialize)]
 pub(crate) struct DesktopRunResponse {
@@ -1077,15 +1096,30 @@ pub(crate) async fn desktop_import_env(
     )
     .await
     .map_err(|error| error.to_string())?;
-    let mut summary = format!(
-        "Imported {}, overwritten {}, skipped {}. Original file preserved.",
-        result.imported, result.overwritten, result.skipped
-    );
+    let mut summary = if result.linked > 0 || result.promoted > 0 {
+        format!(
+            "Imported {}, linked {}, promoted {}, overwritten {}, skipped {}. Original file preserved.",
+            result.imported, result.linked, result.promoted, result.overwritten, result.skipped
+        )
+    } else {
+        format!(
+            "Imported {}, overwritten {}, skipped {}. Original file preserved.",
+            result.imported, result.overwritten, result.skipped
+        )
+    };
     if let Some(warning) = result.maintenance_warning {
         summary.push(' ');
         summary.push_str(&warning);
     }
-    Ok(DesktopImportSummary { summary })
+    Ok(DesktopImportSummary {
+        summary,
+        imported: result.imported,
+        overwritten: result.overwritten,
+        skipped: result.skipped,
+        linked: result.linked,
+        promoted: result.promoted,
+        duplicate_matches: result.duplicate_matches,
+    })
 }
 
 fn import_env_payload(
@@ -1100,6 +1134,8 @@ fn import_env_payload(
         "store_path": store, "project_root": context.root, "project_id": context.project_id,
         "profile_id": context.profile_id, "env_path": request.path,
         "overwrite": request.overwrite, "literal": request.literal, "confirmation": request.confirmation,
+        "dry_run": request.dry_run, "link_to_shared": request.link_to_shared,
+        "promote_to_shared": request.promote_to_shared,
     }))
 }
 
@@ -1118,6 +1154,8 @@ pub(crate) struct DesktopDeleteSecretRequest {
     secret_name: String,
     source: String,
     confirmation: Option<String>,
+    #[serde(default)]
+    unlink_all: bool,
 }
 
 #[derive(Deserialize)]
@@ -1128,8 +1166,48 @@ pub(crate) struct DesktopCopySecretToSharedRequest {
     secret_name: String,
     source: Option<String>,
     #[serde(default)]
+    target_name: Option<String>,
+    #[serde(default)]
+    replace_with_link: bool,
+    #[serde(default)]
+    consolidate_duplicates: bool,
+    #[serde(default)]
     overwrite: bool,
     confirmation: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DesktopLinkSecretRequest {
+    project_id: String,
+    profile_id: String,
+    local_name: String,
+    target_secret_name: String,
+    confirmation: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DesktopUnlinkSecretRequest {
+    project_id: String,
+    profile_id: String,
+    local_name: String,
+    confirmation: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DesktopListSharedUsagesRequest {
+    target_secret_id: String,
+    #[serde(default)]
+    redact_names: bool,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DesktopListDuplicatesRequest {
+    #[serde(default)]
+    redact_names: bool,
 }
 
 #[derive(Deserialize)]
@@ -1212,6 +1290,93 @@ pub(crate) async fn desktop_copy_secret_to_shared(
     })
 }
 
+#[tauri::command]
+pub(crate) async fn desktop_link_secret(
+    request: DesktopLinkSecretRequest,
+) -> Result<LinkSecretResponse, AgentClientError> {
+    let store = super::default_store_path()?;
+    let context = granted_project_context(&store, &request.project_id, Some(&request.profile_id))?;
+    let payload = desktop_crud_payload(
+        &store,
+        &context,
+        serde_json::json!({
+            "local_name": request.local_name,
+            "target_secret_name": request.target_secret_name,
+            "confirmation": request.confirmation,
+        }),
+    );
+    invoke_granted_at(
+        &super::resolve_socket_path(),
+        AgentMethod::LinkSecret,
+        GrantAction::LinkSecret,
+        payload,
+        &store,
+        &context,
+    )
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn desktop_unlink_secret(
+    request: DesktopUnlinkSecretRequest,
+) -> Result<UnlinkSecretResponse, AgentClientError> {
+    let store = super::default_store_path()?;
+    let context = granted_project_context(&store, &request.project_id, Some(&request.profile_id))?;
+    let payload = desktop_crud_payload(
+        &store,
+        &context,
+        serde_json::json!({
+            "local_name": request.local_name,
+            "confirmation": request.confirmation,
+        }),
+    );
+    invoke_granted_at(
+        &super::resolve_socket_path(),
+        AgentMethod::UnlinkSecret,
+        GrantAction::UnlinkSecret,
+        payload,
+        &store,
+        &context,
+    )
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn desktop_list_shared_usages(
+    request: DesktopListSharedUsagesRequest,
+) -> Result<ListSharedUsagesResponse, AgentClientError> {
+    let store = super::default_store_path()?;
+    let payload = serde_json::json!({
+        "store_path": store,
+        "target_secret_id": request.target_secret_id,
+        "redact_names": request.redact_names,
+    });
+    super::agent_client::invoke_method(
+        &super::resolve_socket_path(),
+        AgentMethod::ListSharedUsages,
+        &payload,
+    )
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn desktop_list_duplicates(
+    request: Option<DesktopListDuplicatesRequest>,
+) -> Result<ListDuplicatesResponse, AgentClientError> {
+    let request = request.unwrap_or_default();
+    let store = super::default_store_path()?;
+    let payload = serde_json::json!({
+        "store_path": store,
+        "redact_names": request.redact_names,
+    });
+    super::agent_client::invoke_method(
+        &super::resolve_socket_path(),
+        AgentMethod::ListDuplicates,
+        &payload,
+    )
+    .await
+}
+
 fn delete_secret_payload(
     store: &Path,
     context: &DesktopProjectContext,
@@ -1224,6 +1389,7 @@ fn delete_secret_payload(
             "secret_name": request.secret_name,
             "source": request.source,
             "confirmation": request.confirmation,
+            "unlink_all": request.unlink_all,
         }),
     )
 }
@@ -1239,6 +1405,9 @@ fn copy_to_shared_payload(
         serde_json::json!({
             "secret_name": request.secret_name,
             "source": request.source,
+            "target_name": request.target_name,
+            "replace_with_link": request.replace_with_link,
+            "consolidate_duplicates": request.consolidate_duplicates,
             "overwrite": request.overwrite,
             "confirmation": request.confirmation,
         }),

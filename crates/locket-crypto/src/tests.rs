@@ -609,9 +609,15 @@ fn secret_fingerprint_is_keyed_and_stable() -> Result<(), CryptoError> {
     let first = secret_fingerprint_v1(&PROFILE_SECRET_KEY, "secret-value")?;
     let second = secret_fingerprint_v1(&PROFILE_SECRET_KEY, "secret-value")?;
     let other_key = secret_fingerprint_v1(&MASTER_KEY, "secret-value")?;
+    let dedup = crate::local_dedup_tag_v1(&PROFILE_SECRET_KEY, "secret-value")?;
+    let dedup_repeat = crate::local_dedup_tag_v1(&PROFILE_SECRET_KEY, "secret-value")?;
+    let dedup_other_key = crate::local_dedup_tag_v1(&MASTER_KEY, "secret-value")?;
 
     assert_eq!(first, second);
     assert_ne!(first, other_key);
+    assert_eq!(dedup, dedup_repeat);
+    assert_ne!(dedup, first);
+    assert_ne!(dedup, dedup_other_key);
     Ok(())
 }
 

@@ -294,7 +294,7 @@ async fn handle_value_access(
         );
     };
 
-    let (store, _) = match crate::keys::open_verified_store_for_state(
+    let (store, store_identity) = match crate::keys::open_verified_store_for_state(
         state,
         project_id,
         store_path,
@@ -306,6 +306,24 @@ async fn handle_value_access(
         Err(error) => return crate::server::store_open_error(request, &error),
     };
 
+    let shared_unlock = {
+        let cache = state.unlock_cache.lock().await;
+        store
+            .resolve_active_secret_link(project_id, &profile_id, &secret_name)
+            .ok()
+            .flatten()
+            .and_then(|resolved| {
+                let entry = cache.lookup(&resolved.target_secret.project_id, now_unix_nanos)?;
+                if entry.store_identity.as_ref().is_some_and(|pin| pin != &store_identity) {
+                    return None;
+                }
+                Some((
+                    resolved.target_secret.project_id,
+                    Zeroizing::new(entry.key_bytes().to_vec()),
+                ))
+            })
+    };
+
     match read_secret_value(
         project_id,
         &profile_id,
@@ -313,6 +331,7 @@ async fn handle_value_access(
         access,
         store,
         &master_key,
+        shared_unlock.as_ref().map(|(id, key)| (id.as_str(), key.as_slice())),
         ttl_seconds,
         now_unix_nanos,
     ) {
@@ -403,6 +422,7 @@ fn read_secret_value(
     access: AccessKind,
     mut store: Store,
     master_key: &[u8],
+    shared_unlock: Option<(&str, &[u8])>,
     ttl_seconds: u32,
     timestamp: i128,
 ) -> Result<ResolvedValue, ValueAccessFailure> {
@@ -413,6 +433,7 @@ fn read_secret_value(
         profile_id,
         secret_name,
         &master_key,
+        shared_unlock,
         timestamp,
     ) {
         Ok(details) => {
@@ -452,9 +473,10 @@ fn read_secret_value_inner(
     profile_id: &str,
     secret_name: &str,
     master_key: &locket_crypto::KeyBytes,
+    shared_unlock: Option<(&str, &[u8])>,
     now: i128,
 ) -> Result<ResolvedValueDetails, ValueAccessFailure> {
-    let secret = select_secret(store, project_id, profile_id, secret_name)?;
+    let (secret, linked_target) = select_secret(store, project_id, profile_id, secret_name)?;
     if super::secrets::secret_has_expired(store, &secret.id, now).map_err(|_| corrupt_db())? {
         return Err(ValueAccessFailure::new(
             "MetadataInvalid",
@@ -473,9 +495,46 @@ fn read_secret_value_inner(
             )
         })?;
     validate_version(&secret, &version)?;
-    let value = decrypt_secret(store, project_id, profile_id, &secret, version.version, master_key)
-        .map_err(|_| corrupt_db())?;
-    let audit = ValueAccessAuditDetails { source: secret.source, version: version.version };
+    let (decrypt_project, decrypt_profile, decrypt_master, source_label) = if linked_target {
+        let Some((shared_id, shared_key)) = shared_unlock else {
+            return Err(ValueAccessFailure::new(
+                ERROR_UNLOCK_REQUIRED,
+                "unlock the Global Vault before reading a linked secret",
+                LocketError::UnlockRequired,
+            ));
+        };
+        if shared_id != secret.project_id {
+            return Err(ValueAccessFailure::new(
+                ERROR_UNLOCK_REQUIRED,
+                "unlock the Global Vault before reading a linked secret",
+                LocketError::UnlockRequired,
+            ));
+        }
+        let target_master = master_key_array(shared_key).map_err(|_| corrupt_db())?;
+        (
+            secret.project_id.as_str(),
+            secret.profile_id.as_str(),
+            target_master,
+            "shared-link".to_owned(),
+        )
+    } else {
+        (project_id, profile_id, Zeroizing::new(*master_key), secret.source.clone())
+    };
+    let value = decrypt_secret(
+        store,
+        decrypt_project,
+        decrypt_profile,
+        &secret,
+        version.version,
+        &decrypt_master,
+    )
+    .map_err(|_| corrupt_db())?;
+    let audit = ValueAccessAuditDetails {
+        source: source_label,
+        version: version.version,
+        target_project_id: linked_target.then(|| secret.project_id.clone()),
+        target_secret_id: linked_target.then(|| secret.id.clone()),
+    };
     Ok(ResolvedValueDetails { value, audit })
 }
 
@@ -487,6 +546,8 @@ struct ResolvedValueDetails {
 struct ValueAccessAuditDetails {
     source: String,
     version: u32,
+    target_project_id: Option<String>,
+    target_secret_id: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -526,6 +587,12 @@ fn append_value_access_audit(
             metadata.insert("status".to_owned(), json!("SUCCESS"));
             metadata.insert("source".to_owned(), json!(details.source));
             metadata.insert("version".to_owned(), json!(details.version));
+            if let Some(target_project_id) = &details.target_project_id {
+                metadata.insert("target_project_id".to_owned(), json!(target_project_id));
+            }
+            if let Some(target_secret_id) = &details.target_secret_id {
+                metadata.insert("target_secret_id".to_owned(), json!(target_secret_id));
+            }
             "SUCCESS"
         }
         ValueAccessAuditOutcome::Failure(error) => {
@@ -556,29 +623,42 @@ fn select_secret(
     project_id: &str,
     profile_id: &str,
     secret_name: &str,
-) -> Result<SecretRecord, ValueAccessFailure> {
+) -> Result<(SecretRecord, bool), ValueAccessFailure> {
     let secrets = store
         .list_secrets_by_name(project_id, profile_id, secret_name)
         .map_err(|_| corrupt_db())?;
-    let active = secrets
+    let active_local = secrets
         .iter()
         .filter(|secret| secret.state == "active")
         .max_by_key(|secret| source_precedence(&secret.source));
-    if let Some(secret) = active {
-        return Ok(secret.clone());
+    let active_link = store
+        .resolve_active_secret_link(project_id, profile_id, secret_name)
+        .map_err(|_| corrupt_db())?;
+    match (active_local, active_link) {
+        (Some(local), Some(link)) => {
+            if source_precedence("shared-link") > source_precedence(&local.source) {
+                Ok((link.target_secret, true))
+            } else {
+                Ok((local.clone(), false))
+            }
+        }
+        (Some(local), None) => Ok((local.clone(), false)),
+        (None, Some(link)) => Ok((link.target_secret, true)),
+        (None, None) => {
+            if secrets.iter().any(|secret| secret.state == "deleted") {
+                return Err(ValueAccessFailure::new(
+                    ERROR_SECRET_DELETED,
+                    "secret source is deleted",
+                    LocketError::SecretDeleted,
+                ));
+            }
+            Err(ValueAccessFailure::new(
+                ERROR_SECRET_NOT_FOUND,
+                "secret not found",
+                LocketError::SecretNotFound,
+            ))
+        }
     }
-    if secrets.iter().any(|secret| secret.state == "deleted") {
-        return Err(ValueAccessFailure::new(
-            ERROR_SECRET_DELETED,
-            "secret source is deleted",
-            LocketError::SecretDeleted,
-        ));
-    }
-    Err(ValueAccessFailure::new(
-        ERROR_SECRET_NOT_FOUND,
-        "secret not found",
-        LocketError::SecretNotFound,
-    ))
 }
 
 fn validate_version(

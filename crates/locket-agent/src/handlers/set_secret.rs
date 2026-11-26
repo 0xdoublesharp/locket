@@ -229,7 +229,7 @@ pub async fn handle_set_secret(
         );
     };
 
-    let (store, _) = match crate::keys::open_verified_store_for_state(
+    let (mut store, store_identity) = match crate::keys::open_verified_store_for_state(
         state,
         &typed.project_id,
         Path::new(&typed.store_path),
@@ -242,7 +242,7 @@ pub async fn handle_set_secret(
     };
 
     match set_secret(
-        store,
+        &mut store,
         SetSecretOperation {
             project_id: &typed.project_id,
             profile_id: &typed.profile_id,
@@ -259,6 +259,19 @@ pub async fn handle_set_secret(
         &options,
     ) {
         Ok(response) => {
+            if let Ok(ts) = i64::try_from(now_unix_nanos) {
+                let cache = state.unlock_cache.lock().await;
+                crate::shared_links::try_record_local_dedup_tag(
+                    &store,
+                    &cache,
+                    now_unix_nanos,
+                    &store_identity,
+                    &response.secret_id,
+                    response.version,
+                    &value,
+                    ts,
+                );
+            }
             let payload = serde_json::to_value(response).unwrap_or(Value::Null);
             ResponseEnvelope::Success(SuccessEnvelope::new(request.id.clone(), payload))
         }
@@ -312,7 +325,7 @@ pub(super) struct SetSecretOperation<'a> {
 }
 
 fn set_secret(
-    mut store: Store,
+    store: &mut Store,
     operation: SetSecretOperation<'_>,
     options: &WriteOptions<'_>,
 ) -> Result<SetSecretResponse, SetSecretFailure> {

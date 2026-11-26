@@ -1191,6 +1191,9 @@ async fn shared_vault_status_and_import_grants_use_the_selected_profile_and_revo
         overwrite: false,
         literal: false,
         confirmation: None,
+        dry_run: false,
+        link_to_shared: std::collections::BTreeMap::new(),
+        promote_to_shared: std::collections::BTreeMap::new(),
     };
     assert_eq!(
         import_env_payload(&fixture.store, &context, import_request(".env".into()))

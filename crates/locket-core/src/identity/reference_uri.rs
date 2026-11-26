@@ -111,8 +111,9 @@ pub enum SecretSource {
 #[must_use]
 pub const fn source_precedence(source: &str) -> u8 {
     match source.as_bytes() {
-        b"machine-local" => 3,
-        b"user-local" => 2,
+        b"machine-local" => 4,
+        b"user-local" => 3,
+        b"shared-link" => 2,
         b"team-managed" => 1,
         _ => 0,
     }
@@ -290,11 +291,12 @@ mod tests {
     #[test]
     fn runtime_source_precedence_uses_persisted_names() {
         for (source, rank) in [
-            (SecretSource::MachineLocal, 3),
-            (SecretSource::UserLocal, 2),
-            (SecretSource::TeamManaged, 1),
+            (SecretSource::MachineLocal.as_str(), 4),
+            (SecretSource::UserLocal.as_str(), 3),
+            ("shared-link", 2),
+            (SecretSource::TeamManaged.as_str(), 1),
         ] {
-            assert_eq!(super::source_precedence(source.as_str()), rank);
+            assert_eq!(super::source_precedence(source), rank);
         }
         assert_eq!(super::source_precedence("unknown"), 0);
     }

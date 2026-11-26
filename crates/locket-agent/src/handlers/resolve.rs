@@ -191,7 +191,7 @@ pub async fn handle_resolve(
         );
     };
 
-    let (store, _) = match crate::keys::open_verified_store_for_state(
+    let (store, store_identity) = match crate::keys::open_verified_store_for_state(
         state,
         project_id,
         Path::new(store_path),
@@ -203,6 +203,29 @@ pub async fn handle_resolve(
         Err(error) => return crate::server::store_open_error(request, &error),
     };
 
+    let shared_unlock = {
+        let cache = state.unlock_cache.lock().await;
+        LkReferenceUri::parse(&typed.reference)
+            .ok()
+            .filter(|parsed| parsed.source().is_none())
+            .and_then(|parsed| {
+                store
+                    .resolve_active_secret_link(project_id, profile_id, parsed.key().as_str())
+                    .ok()
+                    .flatten()
+            })
+            .and_then(|resolved| {
+                let entry = cache.lookup(&resolved.target_secret.project_id, now_unix_nanos)?;
+                if entry.store_identity.as_ref().is_some_and(|pin| pin != &store_identity) {
+                    return None;
+                }
+                Some((
+                    resolved.target_secret.project_id,
+                    Zeroizing::new(entry.key_bytes().to_vec()),
+                ))
+            })
+    };
+
     match resolve_reference(
         &typed.reference,
         project_id,
@@ -210,6 +233,7 @@ pub async fn handle_resolve(
         policy_name,
         store,
         &master_key,
+        shared_unlock.as_ref().map(|(id, key)| (id.as_str(), key.as_slice())),
         now_unix_nanos,
         typed.binding.as_ref(),
     ) {
@@ -262,6 +286,7 @@ fn resolve_reference(
     policy_name: &str,
     mut store: Store,
     master_key: &[u8],
+    shared_unlock: Option<(&str, &[u8])>,
     now_unix_nanos: i128,
     binding: Option<&GrantBinding>,
 ) -> Result<ResolveResponse, ResolveFailure> {
@@ -280,6 +305,7 @@ fn resolve_reference(
         policy_name,
         &parsed,
         &master_key,
+        shared_unlock,
         now_unix_nanos,
         binding,
     ) {
@@ -320,6 +346,7 @@ fn resolve_reference_inner(
     policy_name: &str,
     parsed: &LkReferenceUri,
     master_key: &locket_crypto::KeyBytes,
+    shared_unlock: Option<(&str, &[u8])>,
     now_unix_nanos: i128,
     binding: Option<&GrantBinding>,
 ) -> Result<ResolvedReference, ResolveFailure> {
@@ -348,7 +375,7 @@ fn resolve_reference_inner(
             LocketError::AccessDenied,
         ));
     }
-    let secret = select_secret(store, project_id, &profile.id, parsed)?;
+    let (secret, linked_target) = select_secret(store, project_id, &profile.id, parsed)?;
     if super::secrets::secret_has_expired(store, &secret.id, now_unix_nanos)
         .map_err(|_| corrupt_db())?
     {
@@ -370,12 +397,43 @@ fn resolve_reference_inner(
         )
     })?;
     validate_version(&secret, &version, parsed.version().is_some(), now_unix_nanos)?;
-    let value =
-        decrypt_secret(store, project_id, &profile.id, &secret, version.version, master_key)
-            .map_err(|_| corrupt_db())?;
+    let (decrypt_project, decrypt_profile, decrypt_master, source_label) = if linked_target {
+        let Some((shared_id, shared_key)) = shared_unlock else {
+            return Err(ResolveFailure::new(
+                ERROR_UNLOCK_REQUIRED,
+                "unlock the Global Vault before resolving a linked secret",
+                LocketError::UnlockRequired,
+            ));
+        };
+        if shared_id != secret.project_id {
+            return Err(ResolveFailure::new(
+                ERROR_UNLOCK_REQUIRED,
+                "unlock the Global Vault before resolving a linked secret",
+                LocketError::UnlockRequired,
+            ));
+        }
+        let target_master = master_key_array(shared_key).map_err(|_| corrupt_db())?;
+        (
+            secret.project_id.as_str(),
+            secret.profile_id.as_str(),
+            target_master,
+            "shared-link".to_owned(),
+        )
+    } else {
+        (project_id, profile.id.as_str(), Zeroizing::new(*master_key), secret.source.clone())
+    };
+    let value = decrypt_secret(
+        store,
+        decrypt_project,
+        decrypt_profile,
+        &secret,
+        version.version,
+        &decrypt_master,
+    )
+    .map_err(|_| corrupt_db())?;
     let audit = ResolveAuditDetails {
         profile_id: profile.id.clone(),
-        source: secret.source,
+        source: source_label,
         version: version.version,
         grace_until: version.grace_until,
     };
@@ -598,7 +656,7 @@ fn select_secret(
     project_id: &str,
     profile_id: &str,
     parsed: &LkReferenceUri,
-) -> Result<SecretRecord, ResolveFailure> {
+) -> Result<(SecretRecord, bool), ResolveFailure> {
     if let Some(source) = parsed.source() {
         let secret = store
             .get_secret_by_source(project_id, profile_id, parsed.key().as_str(), source.as_str())
@@ -617,15 +675,32 @@ fn select_secret(
                 LocketError::SecretDeleted,
             ));
         }
-        return Ok(secret);
+        return Ok((secret, false));
     }
 
     let secrets = store
         .list_secrets_by_name(project_id, profile_id, parsed.key().as_str())
         .map_err(|_| corrupt_db())?;
-    preferred_active_secret(secrets).ok_or_else(|| {
-        ResolveFailure::new(ERROR_SECRET_NOT_FOUND, "secret not found", LocketError::SecretNotFound)
-    })
+    let active_local = preferred_active_secret(secrets);
+    let active_link = store
+        .resolve_active_secret_link(project_id, profile_id, parsed.key().as_str())
+        .map_err(|_| corrupt_db())?;
+    match (active_local, active_link) {
+        (Some(local), Some(link)) => {
+            if source_precedence("shared-link") > source_precedence(&local.source) {
+                Ok((link.target_secret, true))
+            } else {
+                Ok((local, false))
+            }
+        }
+        (Some(local), None) => Ok((local, false)),
+        (None, Some(link)) => Ok((link.target_secret, true)),
+        (None, None) => Err(ResolveFailure::new(
+            ERROR_SECRET_NOT_FOUND,
+            "secret not found",
+            LocketError::SecretNotFound,
+        )),
+    }
 }
 
 pub(super) fn preferred_active_secret(secrets: Vec<SecretRecord>) -> Option<SecretRecord> {

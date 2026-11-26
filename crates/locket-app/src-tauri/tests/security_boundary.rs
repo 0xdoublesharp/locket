@@ -21,6 +21,10 @@ desktop_import_env
 desktop_create_profile
 desktop_delete_secret
 desktop_copy_secret_to_shared
+desktop_link_secret
+desktop_unlink_secret
+desktop_list_shared_usages
+desktop_list_duplicates
 desktop_detect_commands
 desktop_start_agent
 desktop_run_policy

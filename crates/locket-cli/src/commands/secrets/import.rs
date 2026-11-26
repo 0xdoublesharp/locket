@@ -46,13 +46,19 @@ use crate::{
 };
 
 /// Key selection and write policy for a dotenv import.
-#[allow(clippy::redundant_pub_crate, reason = "Crate-level API shared with MCP")]
+#[allow(
+    clippy::redundant_pub_crate,
+    clippy::struct_excessive_bools,
+    reason = "Crate-level API shared with MCP"
+)]
 pub(crate) struct EnvImportOptions {
     pub only: Vec<String>,
     pub exclude: Vec<String>,
     pub overwrite: bool,
     pub literal: bool,
     pub dry_run: bool,
+    pub link_shared: bool,
+    pub promote_duplicates: bool,
     pub confirmed_profile: Option<String>,
     pub source: SecretSourceArg,
 }
@@ -166,6 +172,8 @@ fn import_cli(
         overwrite: args.overwrite,
         literal: args.literal,
         dry_run: selection.dry_run,
+        link_shared: selection.link_shared,
+        promote_duplicates: selection.promote_duplicates,
         confirmed_profile,
         source: args.source.unwrap_or(SecretSourceArg::UserLocal),
     };
@@ -249,6 +257,26 @@ fn write_import_report(
     writeln!(output, "{prefix}{import}: {}", report.imported)?;
     writeln!(output, "{prefix}{overwrite}: {}", report.overwritten)?;
     writeln!(output, "{prefix}{skip}: {}", report.skipped)?;
+    if report.linked > 0 {
+        writeln!(output, "linked: {}", report.linked)?;
+    }
+    if report.promoted > 0 {
+        writeln!(output, "promoted: {}", report.promoted)?;
+    }
+    if !report.duplicate_matches.is_empty() {
+        writeln!(output, "duplicate_matches: {}", report.duplicate_matches.len())?;
+        for matched in &report.duplicate_matches {
+            writeln!(
+                output,
+                "  match {} == {} / {} / {} ({})",
+                matched.local_name,
+                matched.matched_project_name,
+                matched.matched_profile_name,
+                matched.matched_secret_name,
+                matched.match_kind,
+            )?;
+        }
+    }
     if !selection.only.is_empty() || !selection.exclude.is_empty() {
         writeln!(output, "filtered_out: {}", report.filtered_out)?;
         writeln!(output, "filtered_out_names: {}", format_name_set(&report.filtered_out_names))?;
@@ -285,6 +313,12 @@ struct ImportReport {
     imported: usize,
     overwritten: usize,
     skipped: usize,
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    linked: usize,
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    promoted: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    duplicate_matches: Vec<super::links::CliDuplicateMatch>,
     filtered_out: usize,
     invalid: usize,
     env_names: BTreeSet<String>,
@@ -299,6 +333,11 @@ struct ImportReport {
     metadata_only: bool,
     #[serde(skip)]
     profile_name_count: usize,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
 }
 
 fn run_import(
@@ -324,6 +363,9 @@ fn run_import(
         ));
     }
 
+    let shared_fp_key =
+        super::links::try_load_shared_fingerprint_key_non_interactive(context, store);
+    let mut duplicate_matches = Vec::new();
     let mut filtered_out_names = BTreeSet::new();
     let mut env_names = BTreeSet::new();
     let mut values = Vec::new();
@@ -331,6 +373,16 @@ fn run_import(
         if (!only.is_empty() && !only.contains(&name)) || exclude.contains(&name) {
             filtered_out_names.insert(name);
         } else {
+            if let Some(fp_key) = shared_fp_key.as_ref() {
+                duplicate_matches.extend(super::links::find_duplicate_matches_for_value(
+                    store,
+                    fp_key,
+                    &target.project.id,
+                    &target.profile.id,
+                    &name,
+                    &value,
+                ));
+            }
             env_names.insert(name.clone());
             if !options.dry_run {
                 values.push((name, value));
@@ -343,7 +395,7 @@ fn run_import(
     let counts = if options.dry_run {
         plan_import(store, target, source, options.overwrite, &env_names)?
     } else {
-        import_entries(context, store, target, source, options, values)?
+        import_entries(context, store, target, source, options, values, shared_fp_key.as_deref())?
     };
     let profile_names = active_profile_secret_names(store, &target.project.id, &target.profile.id)?;
     let missing_in_profile = env_names.difference(&profile_names).cloned().collect();
@@ -357,6 +409,9 @@ fn run_import(
         imported: counts.imported.len(),
         overwritten: counts.overwritten.len(),
         skipped: counts.skipped.len(),
+        linked: counts.linked.len(),
+        promoted: counts.promoted.len(),
+        duplicate_matches,
         filtered_out: filtered_out_names.len(),
         invalid: 0,
         env_names,
@@ -390,6 +445,8 @@ struct ImportNames {
     imported: BTreeSet<String>,
     overwritten: BTreeSet<String>,
     skipped: BTreeSet<String>,
+    linked: BTreeSet<String>,
+    promoted: BTreeSet<String>,
 }
 
 fn existing_import_secret(
@@ -425,6 +482,7 @@ fn plan_import(
     Ok(planned)
 }
 
+#[allow(clippy::too_many_lines)]
 fn import_entries(
     context: &RuntimeContext,
     store: &mut Store,
@@ -432,9 +490,12 @@ fn import_entries(
     source: &str,
     options: &EnvImportOptions,
     parsed: Vec<(String, Zeroizing<String>)>,
+    shared_fp_key: Option<&locket_crypto::KeyBytes>,
 ) -> Result<ImportNames, CliError> {
     let project_id = &target.project.id;
     let profile_id = &target.profile.id;
+    let is_shared_target =
+        project_id.starts_with(crate::commands::discovery::SHARED_PROJECT_PREFIX);
     let metadata = SecretMetadataFlags::default();
     store.with_atomic_write(|store| {
         if options.overwrite {
@@ -454,6 +515,102 @@ fn import_entries(
         let mut names = ImportNames::default();
         let mut keys = None;
         for (name, value) in parsed {
+            if !is_shared_target
+                && (options.link_shared || options.promote_duplicates)
+                && let Some(fp_key) = shared_fp_key
+            {
+                let matches = super::links::find_duplicate_matches_for_value(
+                    store, fp_key, project_id, profile_id, &name, &value,
+                );
+                if options.link_shared
+                    && let Some(shared_match) = matches.iter().find(|m| m.is_shared)
+                    && let Ok((shared_proj, shared_prof)) = super::links::shared_vault_target(store)
+                    && let Some(target_secret) = store.get_active_secret(
+                        &shared_proj.id,
+                        &shared_prof.id,
+                        &shared_match.matched_secret_name,
+                        "user-local",
+                    )?
+                {
+                    let timestamp = now_unix_nanos()?;
+                    super::links::create_link_record_with_audit(
+                        context,
+                        store,
+                        project_id,
+                        profile_id,
+                        &name,
+                        &shared_proj.id,
+                        &shared_prof.id,
+                        &target_secret,
+                        timestamp,
+                    )?;
+                    drop(value);
+                    names.linked.insert(name);
+                    continue;
+                }
+                if options.promote_duplicates
+                    && !matches.is_empty()
+                    && !matches.iter().any(|m| m.is_shared)
+                    && let Ok((shared_proj, shared_prof)) = super::links::shared_vault_target(store)
+                    && store
+                        .get_secret_by_source(
+                            &shared_proj.id,
+                            &shared_prof.id,
+                            &name,
+                            "user-local",
+                        )?
+                        .is_none()
+                {
+                    let timestamp = now_unix_nanos()?;
+                    let shared_keys =
+                        SecretWriteKeys::load(context, store, &shared_proj.id, &shared_prof.id)?;
+                    create_value(
+                        store,
+                        &shared_keys,
+                        &NewSecret {
+                            project_id: &shared_proj.id,
+                            profile_id: &shared_prof.id,
+                            name: &name,
+                            source: "user-local",
+                            value: &value,
+                            origin: "imported",
+                            timestamp,
+                            metadata: &metadata,
+                            action: "IMPORT",
+                        },
+                    )?;
+                    if let Some(created) = store.get_active_secret(
+                        &shared_proj.id,
+                        &shared_prof.id,
+                        &name,
+                        "user-local",
+                    )? {
+                        if let Ok(tag) = locket_crypto::local_dedup_tag_v1(fp_key, &value) {
+                            let _ = store.upsert_local_value_fingerprint(
+                                &created.id,
+                                created.current_version,
+                                &tag,
+                                timestamp,
+                            );
+                        }
+                        super::links::create_link_record_with_audit(
+                            context,
+                            store,
+                            project_id,
+                            profile_id,
+                            &name,
+                            &shared_proj.id,
+                            &shared_prof.id,
+                            &created,
+                            timestamp,
+                        )?;
+                        drop(value);
+                        names.promoted.insert(name);
+                        continue;
+                    }
+                }
+            }
+
             let existing = existing_import_secret(store, target, source, &name)?;
             if existing.is_some() && !options.overwrite {
                 drop(value);
@@ -466,7 +623,7 @@ fn import_entries(
             };
             let timestamp = now_unix_nanos()?;
             if let Some(secret) = existing {
-                rotate_value(
+                let version = rotate_value(
                     store,
                     keys,
                     &secret,
@@ -479,6 +636,12 @@ fn import_entries(
                         action: "ROTATE",
                     },
                 )?;
+                if let Some(fp_key) = shared_fp_key
+                    && let Ok(tag) = locket_crypto::local_dedup_tag_v1(fp_key, &value)
+                {
+                    let _ =
+                        store.upsert_local_value_fingerprint(&secret.id, version, &tag, timestamp);
+                }
                 drop(value);
                 names.overwritten.insert(name);
             } else {
@@ -497,6 +660,18 @@ fn import_entries(
                         action: "IMPORT",
                     },
                 )?;
+                if let Some(fp_key) = shared_fp_key
+                    && let Ok(Some(created)) =
+                        store.get_active_secret(project_id, profile_id, &name, source)
+                    && let Ok(tag) = locket_crypto::local_dedup_tag_v1(fp_key, &value)
+                {
+                    let _ = store.upsert_local_value_fingerprint(
+                        &created.id,
+                        created.current_version,
+                        &tag,
+                        timestamp,
+                    );
+                }
                 drop(value);
                 names.imported.insert(name);
             }

@@ -133,7 +133,8 @@ impl Store {
         Ok(secrets)
     }
 
-    /// Lists active secret metadata for a profile ordered by logical name and source precedence.
+    /// Lists active secret metadata (including live `@shared` links) for a profile ordered by
+    /// logical name and source precedence.
     ///
     /// # Errors
     ///
@@ -144,17 +145,40 @@ impl Store {
         profile_id: &str,
     ) -> Result<Vec<SecretMetadataRecord>, StoreError> {
         let mut statement = self.connection.prepare_cached(
-            "SELECT id, project_id, profile_id, name, source,
-                    CASE source
-                      WHEN 'machine-local' THEN ?3
-                      WHEN 'user-local' THEN ?4
-                      WHEN 'team-managed' THEN ?5
-                      ELSE ?6
-                    END AS source_precedence,
+            "SELECT id, project_id, profile_id, name, source, source_precedence,
                     origin, current_version, state, required, created_at, updated_at,
-                    last_rotated_at
-             FROM secrets
-             WHERE project_id = ?1 AND profile_id = ?2 AND state = 'active'
+                    last_rotated_at, linked_target_secret_id, linked_target_name, link_count
+             FROM (
+               SELECT s.id, s.project_id, s.profile_id, s.name, s.source,
+                      CASE s.source
+                        WHEN 'machine-local' THEN ?3
+                        WHEN 'user-local' THEN ?4
+                        WHEN 'team-managed' THEN ?6
+                        ELSE ?7
+                      END AS source_precedence,
+                      s.origin, s.current_version, s.state, s.required, s.created_at, s.updated_at,
+                      s.last_rotated_at,
+                      CAST(NULL AS TEXT) AS linked_target_secret_id,
+                      CAST(NULL AS TEXT) AS linked_target_name,
+                      (SELECT COUNT(*) FROM secret_links l WHERE l.target_secret_id = s.id) AS link_count
+               FROM secrets s
+               WHERE s.project_id = ?1 AND s.profile_id = ?2 AND s.state = 'active'
+               UNION ALL
+               SELECT l.id, l.project_id, l.profile_id, l.local_name AS name,
+                      'shared-link' AS source,
+                      ?5 AS source_precedence,
+                      'shared-link' AS origin,
+                      ts.current_version, ts.state, ts.required,
+                      l.created_at,
+                      CASE WHEN ts.updated_at > l.updated_at THEN ts.updated_at ELSE l.updated_at END AS updated_at,
+                      ts.last_rotated_at,
+                      ts.id AS linked_target_secret_id,
+                      ts.name AS linked_target_name,
+                      0 AS link_count
+               FROM secret_links l
+               JOIN secrets ts ON ts.id = l.target_secret_id
+               WHERE l.project_id = ?1 AND l.profile_id = ?2 AND ts.state = 'active'
+             )
              ORDER BY name,
                       source_precedence DESC,
                       source",
@@ -166,6 +190,7 @@ impl Store {
                     profile_id,
                     source_precedence("machine-local"),
                     source_precedence("user-local"),
+                    source_precedence("shared-link"),
                     source_precedence("team-managed"),
                     source_precedence(""),
                 ),

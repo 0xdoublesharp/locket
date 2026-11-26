@@ -189,10 +189,26 @@ pub fn resolve_active_secret(
     let profile = default_profile(&store, &project.config)?;
     let secrets =
         store.list_active_secrets_by_profile(project.config.project_id.as_str(), &profile.id)?;
-    let secret = select_highest_precedence_secret(
+    let active_local = select_highest_precedence_secret(
         secrets.into_iter().filter(|secret| secret.name == name.as_str()),
-    )
-    .ok_or_else(|| secret_not_found_error("secret not found"))?;
+    );
+    let active_link = store.resolve_active_secret_link(
+        project.config.project_id.as_str(),
+        &profile.id,
+        name.as_str(),
+    )?;
+    let secret = match (active_local, active_link) {
+        (Some(local), Some(link)) => {
+            if source_precedence("shared-link") > source_precedence(&local.source) {
+                link.target_secret
+            } else {
+                local
+            }
+        }
+        (Some(local), None) => local,
+        (None, Some(link)) => link.target_secret,
+        (None, None) => return Err(secret_not_found_error("secret not found")),
+    };
     Ok(ResolvedSecret { project, profile, secret })
 }
 
@@ -471,12 +487,27 @@ pub fn policy_secret_selections(
 ) -> Result<Vec<PolicySecretSelection>, CliError> {
     let active_by_name =
         active_secrets_by_name(store, resolved.config.project_id.as_str(), &profile.id)?;
+    let links_by_name: BTreeMap<String, locket_store::ResolvedSecretLink> = store
+        .list_active_secret_links_by_profile(resolved.config.project_id.as_str(), &profile.id)?
+        .into_iter()
+        .map(|link| (link.link.local_name.clone(), link))
+        .collect();
     let mut selections = Vec::new();
     for name in &policy.required_secrets {
-        selections.push(policy_secret_selection(name.as_str(), true, &active_by_name));
+        selections.push(policy_secret_selection_with_links(
+            name.as_str(),
+            true,
+            &active_by_name,
+            &links_by_name,
+        ));
     }
     for name in &policy.optional_secrets {
-        selections.push(policy_secret_selection(name.as_str(), false, &active_by_name));
+        selections.push(policy_secret_selection_with_links(
+            name.as_str(),
+            false,
+            &active_by_name,
+            &links_by_name,
+        ));
     }
     if !policy.shared_secrets.is_empty() {
         let shared_by_name = shared_secrets_by_name(store)?;
@@ -490,6 +521,27 @@ pub fn policy_secret_selections(
         }
     }
     Ok(selections)
+}
+
+fn policy_secret_selection_with_links(
+    name: &str,
+    required: bool,
+    active_by_name: &BTreeMap<String, Vec<SecretRecord>>,
+    links_by_name: &BTreeMap<String, locket_store::ResolvedSecretLink>,
+) -> PolicySecretSelection {
+    let mut selection = policy_secret_selection(name, required, active_by_name);
+    if let Some(link) = links_by_name.get(name) {
+        let mut all_sources = selection.sources.clone();
+        all_sources.push("shared-link".to_owned());
+        selection.sources = sources_by_precedence(all_sources);
+        let local_rank =
+            selection.selected.as_ref().map_or(0, |secret| source_precedence(&secret.source));
+        if source_precedence("shared-link") > local_rank {
+            selection.selected = Some(link.target_secret.clone());
+            selection.shared = true;
+        }
+    }
+    selection
 }
 
 fn shared_secrets_by_name(store: &Store) -> Result<BTreeMap<String, Vec<SecretRecord>>, CliError> {

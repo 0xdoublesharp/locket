@@ -600,6 +600,10 @@ impl Store {
                 "DELETE FROM fingerprints WHERE secret_id = ?1 AND version = ?2",
                 params![secret_id, version],
             )?;
+            transaction.execute(
+                "DELETE FROM local_value_fingerprints WHERE secret_id = ?1 AND version = ?2",
+                params![secret_id, version],
+            )?;
         }
         if !changed_any {
             transaction.commit()?;

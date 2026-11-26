@@ -86,6 +86,10 @@ pub enum GrantAction {
     DeleteSecret,
     /// Promote an active secret to the Global Vault.
     CopySecretToShared,
+    /// Link a project secret name to an active Global Vault secret.
+    LinkSecret,
+    /// Remove a project secret link to the Global Vault.
+    UnlinkSecret,
     /// Import a batch into the selected profile.
     ImportDotenv,
     /// Persist an execution policy edit.
@@ -94,7 +98,14 @@ pub enum GrantAction {
 
 impl GrantAction {
     pub(crate) const fn is_desktop_crud(self) -> bool {
-        matches!(self, Self::CreateProfile | Self::DeleteSecret | Self::CopySecretToShared)
+        matches!(
+            self,
+            Self::CreateProfile
+                | Self::DeleteSecret
+                | Self::CopySecretToShared
+                | Self::LinkSecret
+                | Self::UnlinkSecret
+        )
     }
 }
 

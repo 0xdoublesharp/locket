@@ -68,7 +68,7 @@ fn discovery_returns_ordered_cross_project_metadata_without_values() -> Result<(
             owner: Some("Équipe Infra".into()),
             tags: vec!["OnCall".into(), "quote\"tag".into()],
             source: "machine-local".into(),
-            source_precedence: 3,
+            source_precedence: 4,
             origin: "manual".into(),
             current_version: 3,
             state: "active".into(),
@@ -78,7 +78,7 @@ fn discovery_returns_ordered_cross_project_metadata_without_values() -> Result<(
             last_rotated_at: Some(8),
         }
     );
-    assert_eq!(records[2].source_precedence, 2);
+    assert_eq!(records[2].source_precedence, 3);
     assert_eq!(records[3].source_precedence, 1);
     assert!(records[4].profile_dangerous);
     assert_eq!(records[4].project_roots, records[1].project_roots);

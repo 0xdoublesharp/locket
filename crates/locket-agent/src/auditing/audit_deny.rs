@@ -86,6 +86,8 @@ const fn grant_action_label(action: GrantAction) -> &'static str {
         GrantAction::CreateProfile => "CreateProfile",
         GrantAction::DeleteSecret => "DeleteSecret",
         GrantAction::CopySecretToShared => "CopySecretToShared",
+        GrantAction::LinkSecret => "LinkSecret",
+        GrantAction::UnlinkSecret => "UnlinkSecret",
         GrantAction::ImportDotenv => "ImportDotenv",
         GrantAction::ApplyPolicy => "ApplyPolicy",
         GrantAction::TeamSync => "TeamSync",

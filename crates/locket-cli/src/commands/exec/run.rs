@@ -1440,7 +1440,7 @@ fn policy_locket_env<'a>(
                 secret,
                 secret.current_version,
             )?;
-            locket_env.insert(secret.name.clone(), value);
+            locket_env.insert(selection.name.clone(), value);
         }
     }
     Ok(locket_env)

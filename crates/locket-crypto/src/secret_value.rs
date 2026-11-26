@@ -41,6 +41,25 @@ pub fn secret_fingerprint_v1(
     Ok(mac.finalize().into_bytes().into())
 }
 
+/// Computes a local-only keyed deduplication tag using the Global Vault fingerprint key.
+///
+/// Domain-separated from [`secret_fingerprint_v1`] and never exported or synced.
+///
+/// # Errors
+///
+/// Returns an error if `value` is not valid secret value text.
+pub fn local_dedup_tag_v1(
+    shared_fingerprint_key: &KeyBytes,
+    value: &str,
+) -> CryptoResult<FingerprintBytes> {
+    validate_secret_value(value)?;
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(shared_fingerprint_key)
+        .map_err(|_| CryptoError::KeyDerivationFailed)?;
+    mac.update(b"locket-local-dedup-v1");
+    mac.update(value.as_bytes());
+    Ok(mac.finalize().into_bytes().into())
+}
+
 /// Encrypts a UTF-8 secret value and wraps its generated DEK.
 ///
 /// The returned `encrypted_dek` embeds its own wrap nonce. The returned

@@ -12,6 +12,7 @@ pub mod reveal;
 pub mod scan;
 pub mod secrets;
 pub mod set_secret;
+pub mod shared_links;
 pub mod versions;
 
 pub mod mutations;

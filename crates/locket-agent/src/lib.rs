@@ -14,7 +14,7 @@ mod transport;
 pub(crate) use auditing::{audit, audit_deny, audit_verify, degraded_audit};
 pub(crate) use handlers::{
     auth, backup, clients, config, device_members, discovery, mutations, policies, prepare_exec,
-    profile, resolve, reveal, scan, secrets, set_secret, versions,
+    profile, resolve, reveal, scan, secrets, set_secret, shared_links, versions,
 };
 pub(crate) use protocol::{envelope, error, framing, method};
 pub(crate) use state::{
@@ -91,6 +91,10 @@ pub use session_lock::{
 pub use set_secret::{
     SetSecretRequest, SetSecretResponse, SetSecretWriteRequest, has_secret_fingerprint,
 };
+pub use shared_links::{
+    DuplicateGroupRow, DuplicateMemberRow, ListDuplicatesRequest, ListDuplicatesResponse,
+    ListSharedUsagesRequest, ListSharedUsagesResponse, SharedUsageRow,
+};
 pub use status::{
     LockState, STATUS_HEARTBEAT_INTERVAL_SECS, StatusEvent, StatusEventKind, StatusEventSequence,
     StatusPayload,
@@ -117,7 +121,8 @@ mod tests;
 pub use mutations::{
     ApplyPolicyRequest, ApplyPolicyResponse, CopySecretToSharedResponse, CreateProfileResponse,
     DeleteSecretResponse, ImportDiagnostic, ImportDotenvRequest, ImportDotenvResponse,
-    MutationError, MutationScope, apply_policy_with_master, import_dotenv_with_master,
+    ImportDuplicateMatch, LinkSecretResponse, MutationError, MutationScope, UnlinkSecretResponse,
+    apply_policy_with_master, import_dotenv_with_master,
 };
 
 pub mod team_sync;

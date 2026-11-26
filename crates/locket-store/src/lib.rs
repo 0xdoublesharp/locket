@@ -47,10 +47,12 @@ pub use runtime_session::{
 };
 pub use schema::SCHEMA_VERSION;
 pub use secret::{
-    DiscoveredSecretRecord, SecretBlobRecord, SecretCopyTarget, SecretDiscoveryFilter,
+    DiscoveredSecretRecord, DuplicateSecretMemberRecord, DuplicateValueGroupRecord,
+    ResolvedSecretLink, SecretBlobRecord, SecretCopyTarget, SecretDiscoveryFilter,
     SecretExpirationNotice, SecretExpiryPolicy, SecretExpiryStatus, SecretFingerprintRecord,
-    SecretInitialMetadata, SecretMetadataRecord, SecretMetadataUpdate, SecretMutableMetadata,
-    SecretRecord, SecretVersionRecord, VersionDeprecation,
+    SecretInitialMetadata, SecretLinkRecord, SecretMetadataRecord, SecretMetadataUpdate,
+    SecretMutableMetadata, SecretRecord, SecretVersionRecord, SharedSecretUsageRecord,
+    VersionDeprecation,
 };
 pub use team::{
     PendingTeamInviteRecord, StoredTeamInviteRecord, TeamInviteRecord, TeamMemberListRecord,

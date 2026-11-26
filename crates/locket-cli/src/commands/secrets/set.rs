@@ -303,6 +303,21 @@ pub fn write_value(
             Ok(("set", 1))
         }
     })?;
+    if let Ok(Some(written)) = store.get_active_secret(
+        &target.project.id,
+        &target.profile.id,
+        request.name.as_str(),
+        request.source(),
+    ) {
+        super::links::try_record_cli_dedup_tag(
+            context,
+            store,
+            &written.id,
+            version,
+            value,
+            timestamp,
+        );
+    }
     let mut result = json!({
         "project_id": target.project.id, "project_name": target.project.name,
         "profile": target.profile.name, "name": request.name.as_str(), "source": request.source(),
@@ -335,7 +350,7 @@ pub fn validate_write_metadata(
 pub struct SecretWriteKeys {
     audit: Zeroizing<KeyBytes>,
     secret: Zeroizing<KeyBytes>,
-    fingerprint: Zeroizing<KeyBytes>,
+    pub(super) fingerprint: Zeroizing<KeyBytes>,
 }
 
 impl SecretWriteKeys {

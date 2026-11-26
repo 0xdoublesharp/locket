@@ -1210,6 +1210,8 @@ fn import_overwrite_checks_the_current_profile_policy_before_mutating()
         overwrite: false,
         literal: false,
         dry_run: false,
+        link_shared: false,
+        promote_duplicates: false,
         confirmed_profile: None,
         source: SecretSourceArg::UserLocal,
     };

@@ -639,7 +639,10 @@ fn required_fields_for_action(action: &str) -> &'static [&'static str] {
         }
         "REVEAL" | "COPY" | "GET" => &["secret_name", "profile_id", "source", "access_mode"],
         "RESOLVE_REFERENCE" => &["secret_name", "profile_id", "source"],
-        "SECRET_COPY" => &["secret_name", "from_profile_id", "to_profile_id"],
+        "SECRET_COPY" | "SECRET_PROMOTE" => &["secret_name", "from_profile_id", "to_profile_id"],
+        "SECRET_LINK" | "SECRET_UNLINK" => {
+            &["secret_name", "profile_id", "target_project_id", "target_secret_id"]
+        }
         "RUN" | "RUN_POLICY" | "EXEC" => &["command"],
         "SCAN" | "REDACT" => &["scope", "known_value_coverage", "finding_counts", "pattern_only"],
         "TRUST_ROOT" => &["root_hash", "trust_operation"],
@@ -901,6 +904,10 @@ const KNOWN_AUDIT_METADATA_FIELDS: &[&str] = &[
     "suppressed_count",
     "suppressions",
     "tag_update_count",
+    "target_profile_id",
+    "target_project_id",
+    "target_secret_id",
+    "target_secret_name",
     "target_version",
     "team_id",
     "team_name",
@@ -916,6 +923,9 @@ const KNOWN_AUDIT_METADATA_FIELDS: &[&str] = &[
     "trust_operation",
     "trust_root_recorded",
     "ttl_seconds",
+    "unlinked_count",
+    "consolidated_count",
+    "linked_count",
     "unsupported_reason",
     "updated_field_count",
     "updated_fields",

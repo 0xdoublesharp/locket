@@ -83,6 +83,14 @@ pub enum AgentMethod {
     DeleteSecret,
     /// Promote an active secret to the Global Vault inside the agent.
     CopySecretToShared,
+    /// Link a project secret name to an active Global Vault secret.
+    LinkSecret,
+    /// Remove a project secret link to the Global Vault.
+    UnlinkSecret,
+    /// List projects linked to a Global Vault secret (metadata-only).
+    ListSharedUsages,
+    /// List cross-project duplicate value groups from local dedup tags (metadata-only).
+    ListDuplicates,
     /// Import a selected dotenv file with an agent-owned key.
     ImportDotenv,
     /// Persist a selected project policy edit.
@@ -150,6 +158,10 @@ impl AgentMethod {
             Self::CreateProfile => "CreateProfile",
             Self::DeleteSecret => "DeleteSecret",
             Self::CopySecretToShared => "CopySecretToShared",
+            Self::LinkSecret => "LinkSecret",
+            Self::UnlinkSecret => "UnlinkSecret",
+            Self::ListSharedUsages => "ListSharedUsages",
+            Self::ListDuplicates => "ListDuplicates",
             Self::ImportDotenv => "ImportDotenv",
             Self::ApplyPolicy => "ApplyPolicy",
             Self::SetActiveProfile => "SetActiveProfile",
@@ -208,6 +220,10 @@ impl FromStr for AgentMethod {
             "CreateProfile" => Ok(Self::CreateProfile),
             "DeleteSecret" => Ok(Self::DeleteSecret),
             "CopySecretToShared" => Ok(Self::CopySecretToShared),
+            "LinkSecret" => Ok(Self::LinkSecret),
+            "UnlinkSecret" => Ok(Self::UnlinkSecret),
+            "ListSharedUsages" => Ok(Self::ListSharedUsages),
+            "ListDuplicates" => Ok(Self::ListDuplicates),
             "ImportDotenv" => Ok(Self::ImportDotenv),
             "ApplyPolicy" => Ok(Self::ApplyPolicy),
             "SetActiveProfile" => Ok(Self::SetActiveProfile),

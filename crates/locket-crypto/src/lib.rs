@@ -44,7 +44,8 @@ pub use recovery_envelope::{
     recovery_entry_key_v1, seal_recovery_entry_v1,
 };
 pub use secret_value::{
-    EncryptedSecretValue, decrypt_secret_value_v1, encrypt_secret_value_v1, secret_fingerprint_v1,
+    EncryptedSecretValue, decrypt_secret_value_v1, encrypt_secret_value_v1, local_dedup_tag_v1,
+    secret_fingerprint_v1,
 };
 
 /// Size in bytes of Locket symmetric keys.

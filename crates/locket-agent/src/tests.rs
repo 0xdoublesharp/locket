@@ -499,9 +499,9 @@ async fn list_secrets_returns_metadata_ordered_by_source_precedence()
     assert_eq!(
         ordered,
         vec![
-            ("API_TOKEN", "user-local", 2),
-            ("DATABASE_URL", "machine-local", 3),
-            ("DATABASE_URL", "user-local", 2),
+            ("API_TOKEN", "user-local", 3),
+            ("DATABASE_URL", "machine-local", 4),
+            ("DATABASE_URL", "user-local", 3),
             ("DATABASE_URL", "team-managed", 1),
         ]
     );

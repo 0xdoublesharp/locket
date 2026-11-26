@@ -490,6 +490,7 @@ mod proptest_dotenv;
 mod recovery;
 mod scan_redact;
 mod secrets_crud;
+mod shared_links;
 mod source_precedence;
 
 mod variable_contract;

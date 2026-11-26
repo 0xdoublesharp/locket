@@ -80,9 +80,9 @@ fn active_secret_metadata_uses_source_precedence_ordering() -> Result<(), Box<dy
     assert_eq!(
         ordered,
         vec![
-            ("API_TOKEN", "user-local", 2),
-            ("DATABASE_URL", "machine-local", 3),
-            ("DATABASE_URL", "user-local", 2),
+            ("API_TOKEN", "user-local", 3),
+            ("DATABASE_URL", "machine-local", 4),
+            ("DATABASE_URL", "user-local", 3),
             ("DATABASE_URL", "team-managed", 1),
         ]
     );
@@ -507,7 +507,7 @@ fn version_metadata_lists_profile_rows_by_source_precedence_and_version()
             ("team-managed", 1, "current"),
         ]
     );
-    assert_eq!(rows[0].source_precedence, 3);
+    assert_eq!(rows[0].source_precedence, 4);
     assert_eq!(rows[0].current_version, 3);
     assert_eq!(rows[0].last_rotated_at, Some(400));
     assert_eq!(rows[1].grace_until, Some(800));
@@ -937,5 +937,174 @@ fn secret_queries_propagate_missing_schema_instead_of_reporting_absent_records()
     ] {
         assert!(matches!(result, Err(StoreError::Sqlite(_))));
     }
+    Ok(())
+}
+
+#[test]
+fn secret_links_resolve_list_count_and_unlink_on_shared_delete() -> Result<(), Box<dyn Error>> {
+    let mut fixture = open_initialized_store()?;
+    let store = &mut fixture.store;
+    insert_project_profile(store)?;
+    store.insert_project_if_absent("lk_proj_shared_test", "@shared", 1)?;
+    store.insert_profile_if_absent("lk_prof_shared", "lk_proj_shared_test", "default", false, 1)?;
+    let shared_secret = SecretRecord {
+        id: "lk_sec_shared_rpc".into(),
+        project_id: "lk_proj_shared_test".into(),
+        profile_id: "lk_prof_shared".into(),
+        name: "ALCHEMY_MAINNET_RPC".into(),
+        source: "user-local".into(),
+        origin: "manual".into(),
+        current_version: 1,
+        state: "active".into(),
+        created_at: 10,
+        updated_at: 20,
+        last_rotated_at: None,
+        deleted_at: None,
+    };
+    let shared_version = SecretVersionRecord {
+        secret_id: shared_secret.id.clone(),
+        version: 1,
+        source: "user-local".into(),
+        origin: "manual".into(),
+        state: "current".into(),
+        created_at: 10,
+        deprecated_at: None,
+        grace_until: None,
+        purged_at: None,
+    };
+    let shared_blob = SecretBlobRecord {
+        secret_id: shared_secret.id.clone(),
+        version: 1,
+        encrypted_dek: vec![1; 40],
+        ciphertext: vec![2; 40],
+        value_nonce: [3; 24],
+        aad_schema_version: 1,
+        created_at: 10,
+    };
+    let shared_fp = SecretFingerprintRecord {
+        secret_id: shared_secret.id.clone(),
+        version: 1,
+        fingerprint: vec![4; 32],
+        created_at: 10,
+    };
+    store.create_active_secret(&shared_secret, &shared_version, &shared_blob, &shared_fp)?;
+
+    let link = crate::SecretLinkRecord {
+        id: "lk_link_rpc".into(),
+        project_id: "lk_proj_test".into(),
+        profile_id: "lk_prof_test".into(),
+        local_name: "RPC_URL".into(),
+        target_project_id: "lk_proj_shared_test".into(),
+        target_profile_id: "lk_prof_shared".into(),
+        target_secret_id: shared_secret.id.clone(),
+        created_at: 30,
+        updated_at: 30,
+    };
+    store.upsert_secret_link_with_audit(&link, None)?;
+
+    let resolved = store
+        .resolve_active_secret_link("lk_proj_test", "lk_prof_test", "RPC_URL")?
+        .ok_or("link missing")?;
+    assert_eq!(resolved.target_secret.name, "ALCHEMY_MAINNET_RPC");
+
+    let proj_rows = store.list_active_secret_metadata_by_profile("lk_proj_test", "lk_prof_test")?;
+    assert_eq!(proj_rows.len(), 1);
+    assert_eq!(proj_rows[0].name, "RPC_URL");
+    assert_eq!(proj_rows[0].source, "shared-link");
+    assert_eq!(proj_rows[0].source_precedence, 2);
+    assert_eq!(proj_rows[0].linked_target_name.as_deref(), Some("ALCHEMY_MAINNET_RPC"));
+
+    let shared_rows =
+        store.list_active_secret_metadata_by_profile("lk_proj_shared_test", "lk_prof_shared")?;
+    assert_eq!(shared_rows[0].link_count, 1);
+
+    let usages = store.list_shared_secret_usages(&shared_secret.id)?;
+    assert_eq!(usages.len(), 1);
+    assert_eq!(usages[0].local_name, "RPC_URL");
+
+    let unlinked = store.tombstone_secret_and_unlink_with_audit(&shared_secret, 50, None)?;
+    assert_eq!(unlinked.len(), 1);
+    assert!(store.get_secret_link("lk_proj_test", "lk_prof_test", "RPC_URL")?.is_none());
+    assert_eq!(
+        store.list_active_secret_metadata_by_profile("lk_proj_test", "lk_prof_test")?.len(),
+        0
+    );
+    Ok(())
+}
+
+#[test]
+fn local_value_fingerprints_group_cross_project_duplicates_and_clear_on_purge()
+-> Result<(), Box<dyn Error>> {
+    let mut fixture = open_initialized_store()?;
+    let store = &mut fixture.store;
+    insert_project_profile(store)?;
+    store.insert_project_if_absent("lk_proj_shared_test", "@shared", 1)?;
+    store.insert_profile_if_absent("lk_prof_shared", "lk_proj_shared_test", "default", false, 1)?;
+    store.create_active_secret(
+        &test_secret(),
+        &test_secret_version(),
+        &test_secret_blob(),
+        &test_secret_fingerprint(),
+    )?;
+    let shared_secret = SecretRecord {
+        id: "lk_sec_shared_dup".into(),
+        project_id: "lk_proj_shared_test".into(),
+        profile_id: "lk_prof_shared".into(),
+        name: "GLOBAL_RPC".into(),
+        source: "user-local".into(),
+        origin: "manual".into(),
+        current_version: 1,
+        state: "active".into(),
+        created_at: 10,
+        updated_at: 10,
+        last_rotated_at: None,
+        deleted_at: None,
+    };
+    let shared_version = SecretVersionRecord {
+        secret_id: shared_secret.id.clone(),
+        version: 1,
+        source: "user-local".into(),
+        origin: "manual".into(),
+        state: "current".into(),
+        created_at: 10,
+        deprecated_at: None,
+        grace_until: None,
+        purged_at: None,
+    };
+    let shared_blob = SecretBlobRecord {
+        secret_id: shared_secret.id.clone(),
+        version: 1,
+        encrypted_dek: vec![1; 40],
+        ciphertext: vec![2; 40],
+        value_nonce: [3; 24],
+        aad_schema_version: 1,
+        created_at: 10,
+    };
+    let shared_fp = SecretFingerprintRecord {
+        secret_id: shared_secret.id.clone(),
+        version: 1,
+        fingerprint: vec![4; 32],
+        created_at: 10,
+    };
+    store.create_active_secret(&shared_secret, &shared_version, &shared_blob, &shared_fp)?;
+
+    let tag = [0xAB_u8; 32];
+    store.upsert_local_value_fingerprint(&test_secret().id, 1, &tag, 20)?;
+    store.upsert_local_value_fingerprint(&shared_secret.id, 1, &tag, 20)?;
+
+    let matches = store.find_active_secrets_by_dedup_tag(&tag)?;
+    assert_eq!(matches.len(), 2);
+    assert!(matches[0].is_shared);
+    assert_eq!(matches[0].name, "GLOBAL_RPC");
+    assert_eq!(matches[1].name, test_secret().name);
+
+    let groups = store.list_duplicate_value_groups()?;
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].members.len(), 2);
+
+    store.tombstone_secret(&test_secret().id, 30)?;
+    store.purge_secret_version(&test_secret().id, 1, 40)?;
+    assert_eq!(store.find_active_secrets_by_dedup_tag(&tag)?.len(), 1);
+    assert_eq!(store.list_duplicate_value_groups()?.len(), 0);
     Ok(())
 }

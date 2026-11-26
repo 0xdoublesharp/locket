@@ -5,10 +5,15 @@ use crate::audit::AuditContext;
 mod discovery;
 mod expiry;
 mod lifecycle;
+mod links;
 mod queries;
 
 pub use discovery::{DiscoveredSecretRecord, SecretDiscoveryFilter};
 pub use expiry::{SecretExpirationNotice, SecretExpiryPolicy, SecretExpiryStatus};
+pub use links::{
+    DuplicateSecretMemberRecord, DuplicateValueGroupRecord, ResolvedSecretLink, SecretLinkRecord,
+    SharedSecretUsageRecord,
+};
 
 /// Secret metadata row.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -68,6 +73,12 @@ pub struct SecretMetadataRecord {
     pub updated_at: i64,
     /// Last rotation timestamp in nanoseconds since the Unix epoch.
     pub last_rotated_at: Option<i64>,
+    /// Target Global Vault secret identifier when `source == "shared-link"`.
+    pub linked_target_secret_id: Option<String>,
+    /// Target Global Vault secret name when `source == "shared-link"`.
+    pub linked_target_name: Option<String>,
+    /// Number of project links pointing to this Global Vault secret.
+    pub link_count: u32,
 }
 
 /// Secret version metadata row.
@@ -275,6 +286,9 @@ pub fn secret_metadata_record_from_row(
         created_at: row.get(10)?,
         updated_at: row.get(11)?,
         last_rotated_at: row.get(12)?,
+        linked_target_secret_id: row.get(13)?,
+        linked_target_name: row.get(14)?,
+        link_count: row.get(15)?,
     })
 }
 

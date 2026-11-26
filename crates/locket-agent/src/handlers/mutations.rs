@@ -3,16 +3,20 @@
 #[path = "desktop_crud.rs"]
 mod desktop_crud;
 pub use desktop_crud::handle_desktop_crud;
-pub use desktop_crud::{CopySecretToSharedResponse, CreateProfileResponse, DeleteSecretResponse};
+pub use desktop_crud::{
+    CopySecretToSharedResponse, CreateProfileResponse, DeleteSecretResponse, LinkSecretResponse,
+    UnlinkSecretResponse,
+};
 
+use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use locket_core::{CommandSpec, PolicyDocument, ProjectConfig, SecretName};
-use locket_crypto::KeyBytes;
+use locket_core::{CommandSpec, PolicyDocument, ProjectConfig, SecretId, SecretName};
+use locket_crypto::{KeyBytes, local_dedup_tag_v1};
 use locket_platform::PolicyFileDocument;
-use locket_store::{AuditContext, AuditWrite, Store};
+use locket_store::{AuditContext, AuditWrite, SecretLinkRecord, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -59,6 +63,15 @@ pub struct ImportDotenvRequest {
     pub literal: bool,
     /// Actual profile name typed for dangerous overwrite.
     pub confirmation: Option<String>,
+    /// Inspect keys and detect duplicate values without writing to the store.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Map of `local_env_name -> shared_secret_name` to link instead of duplicating.
+    #[serde(default)]
+    pub link_to_shared: BTreeMap<String, String>,
+    /// Map of `local_env_name -> target_shared_name` to store once in `@shared` and link.
+    #[serde(default)]
+    pub promote_to_shared: BTreeMap<String, String>,
 }
 
 /// Safe parser diagnostic.
@@ -70,6 +83,32 @@ pub struct ImportDiagnostic {
     pub message: String,
 }
 
+/// Metadata-only duplicate match found while inspecting an env file for import.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ImportDuplicateMatch {
+    /// Variable name in the env file being imported.
+    pub local_name: String,
+    /// `"shared"` when the exact value already exists in `@shared`, otherwise `"project"`.
+    pub match_kind: String,
+    /// Matching project identifier.
+    pub matched_project_id: String,
+    /// Matching project display name.
+    pub matched_project_name: String,
+    /// Matching profile name.
+    pub matched_profile_name: String,
+    /// Matching secret identifier.
+    pub matched_secret_id: String,
+    /// Matching secret name in the matched project.
+    pub matched_secret_name: String,
+    /// Whether the matched secret is in the Global Vault (`@shared`).
+    pub is_shared: bool,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
 /// Metadata-only import outcome.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ImportDotenvResponse {
@@ -79,6 +118,15 @@ pub struct ImportDotenvResponse {
     pub overwritten: u32,
     /// Number of existing values retained.
     pub skipped: u32,
+    /// Number of keys linked directly to an existing Global Vault secret.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub linked: u32,
+    /// Number of keys stored once in the Global Vault and linked back to the project.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub promoted: u32,
+    /// Duplicate value matches detected across `@shared` and other local projects.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub duplicate_matches: Vec<ImportDuplicateMatch>,
     /// Fixed parser warnings such as duplicate names.
     pub diagnostics: Vec<ImportDiagnostic>,
     /// The source file is always retained by desktop import.
@@ -261,10 +309,16 @@ pub async fn handle_import_dotenv(
         let pin = cache_guard
             .lookup(&typed.scope.project_id, now)
             .and_then(|entry| entry.store_identity.as_ref());
-        let (store, _) = state
+        let (store, store_identity) = state
             .open_store(&typed.scope.store_path, pin, false)
             .map_err(|_| failure("AccessDenied", "could not verify mutation store"))?;
-        import_dotenv_in_store(store, &typed, &master, i64::try_from(now).map_err(|_| storage())?)
+        import_dotenv_in_store(
+            store,
+            &typed,
+            &master,
+            Some((&cache_guard, &store_identity)),
+            i64::try_from(now).map_err(|_| storage())?,
+        )
     }
     .await;
     response(request, result)
@@ -315,18 +369,24 @@ pub fn import_dotenv_with_master(
 ) -> Result<ImportDotenvResponse, MutationError> {
     let (store, _) = crate::keys::open_verified_store(&request.scope.store_path, None)
         .map_err(locket_store::StoreError::from)?;
-    import_dotenv_in_store(store, request, master, timestamp)
+    import_dotenv_in_store(store, request, master, None, timestamp)
 }
 
+#[allow(clippy::too_many_lines)]
 fn import_dotenv_in_store(
     mut store: Store,
     request: &ImportDotenvRequest,
     master: &KeyBytes,
+    shared_ctx: Option<(&crate::UnlockCache, &crate::keys::StoreFileIdentity)>,
     timestamp: i64,
 ) -> Result<ImportDotenvResponse, MutationError> {
     let _guard = MUTATION_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let verified = context(&store, &request.scope)?;
-    if request.overwrite {
+    if !request.dry_run
+        && (request.overwrite
+            || !request.link_to_shared.is_empty()
+            || !request.promote_to_shared.is_empty())
+    {
         confirm_dangerous_profile(
             &verified.profile,
             request.confirmation.as_deref(),
@@ -344,10 +404,21 @@ fn import_dotenv_in_store(
         ));
     };
     let mut document = read_dotenv(&path, request.literal)?;
+    let shared_fp = shared_ctx.and_then(|(cache, identity)| {
+        crate::shared_links::shared_fingerprint_key_from_cache(
+            &store,
+            cache,
+            i128::from(timestamp),
+            identity,
+        )
+    });
     let mut result = ImportDotenvResponse {
         imported: 0,
         overwritten: 0,
         skipped: 0,
+        linked: 0,
+        promoted: 0,
+        duplicate_matches: Vec::new(),
         diagnostics: document
             .warnings
             .iter()
@@ -356,12 +427,307 @@ fn import_dotenv_in_store(
         original_preserved: true,
         maintenance_warning: None,
     };
+
+    if let Some((_, _, fp_key)) = shared_fp.as_ref() {
+        for entry in &document.entries {
+            if let Ok(tag) = local_dedup_tag_v1(fp_key, &entry.value)
+                && let Ok(matches) = store.find_active_secrets_by_dedup_tag(&tag)
+            {
+                for matched in matches {
+                    if matched.project_id == request.scope.project_id
+                        && matched.profile_id == request.scope.profile_id
+                        && matched.name == entry.key
+                    {
+                        continue;
+                    }
+                    result.duplicate_matches.push(ImportDuplicateMatch {
+                        local_name: entry.key.clone(),
+                        match_kind: if matched.is_shared {
+                            "shared".into()
+                        } else {
+                            "project".into()
+                        },
+                        matched_project_id: matched.project_id,
+                        matched_project_name: matched.project_name,
+                        matched_profile_name: matched.profile_name,
+                        matched_secret_id: matched.secret_id,
+                        matched_secret_name: matched.name,
+                        is_shared: matched.is_shared,
+                    });
+                }
+            }
+        }
+    }
+
+    if request.dry_run {
+        for entry in &document.entries {
+            let existing = store.get_secret_by_source(
+                &request.scope.project_id,
+                &request.scope.profile_id,
+                &entry.key,
+                "user-local",
+            )?;
+            if let Some(existing) = existing {
+                if existing.state == "deleted" {
+                    return Err(failure("SecretDeleted", "an imported name has a deleted source"));
+                }
+                if request.overwrite {
+                    result.overwritten += 1;
+                } else {
+                    result.skipped += 1;
+                }
+            } else {
+                result.imported += 1;
+            }
+        }
+        for entry in &mut document.entries {
+            zeroize::Zeroize::zeroize(&mut entry.value);
+        }
+        return Ok(result);
+    }
+
     let write_result = store.with_atomic_write(|store| {
         if context(store, &request.scope)? != verified {
             return Err(metadata());
         }
         for entry in &document.entries {
             let value = Zeroizing::new(entry.value.clone());
+
+            if !is_shared_project_id(&request.scope.project_id)
+                && let Some(target_shared_name) = request.link_to_shared.get(&entry.key)
+            {
+                let target_project = store
+                    .list_projects()?
+                    .into_iter()
+                    .filter(|project| is_shared_project_id(&project.id))
+                    .min_by_key(|project| project.name != "@shared")
+                    .ok_or_else(|| {
+                        failure("ProjectNotFound", "set up the Global Vault before linking secrets")
+                    })?;
+                let target_profile =
+                    store.get_profile_by_name(&target_project.id, "default")?.ok_or_else(|| {
+                        failure("ProfileNotFound", "the Global Vault default profile is missing")
+                    })?;
+                let target_secret = store
+                    .get_active_secret(
+                        &target_project.id,
+                        &target_profile.id,
+                        target_shared_name,
+                        "user-local",
+                    )?
+                    .ok_or_else(|| {
+                        failure("SecretNotFound", "target Global Vault secret not found")
+                    })?;
+                let link_id = format!(
+                    "lk_link_{}",
+                    SecretId::generate().map_err(|_| storage())?.into_string()
+                );
+                let link = SecretLinkRecord {
+                    id: link_id,
+                    project_id: request.scope.project_id.clone(),
+                    profile_id: request.scope.profile_id.clone(),
+                    local_name: entry.key.clone(),
+                    target_project_id: target_project.id.clone(),
+                    target_profile_id: target_profile.id.clone(),
+                    target_secret_id: target_secret.id.clone(),
+                    created_at: timestamp,
+                    updated_at: timestamp,
+                };
+                let source_key =
+                    unwrap_audit_key_with_master(store, &request.scope.project_id, master)
+                        .map_err(|_| storage())?;
+                let link_metadata = json!({
+                    "schema_version": 1,
+                    "action": "SECRET_LINK",
+                    "status": "SUCCESS",
+                    "secret_name": entry.key,
+                    "profile_id": request.scope.profile_id,
+                    "target_project_id": target_project.id,
+                    "target_profile_id": target_profile.id,
+                    "target_secret_id": target_secret.id,
+                    "target_secret_name": target_secret.name,
+                });
+                let link_audit = AuditWrite {
+                    project_id: &request.scope.project_id,
+                    profile_id: Some(&request.scope.profile_id),
+                    action: "SECRET_LINK",
+                    status: "SUCCESS",
+                    secret_name: Some(&entry.key),
+                    command: None,
+                    metadata_json: &link_metadata,
+                    timestamp,
+                };
+                store.upsert_secret_link_with_audit(
+                    &link,
+                    Some(AuditContext { key: source_key.as_ref(), write: &link_audit }),
+                )?;
+                result.linked += 1;
+                continue;
+            }
+
+            if !is_shared_project_id(&request.scope.project_id)
+                && let Some(target_shared_name) = request.promote_to_shared.get(&entry.key)
+            {
+                let (cache, identity) = shared_ctx.ok_or_else(|| {
+                    failure("UnlockRequired", "unlock the Global Vault before promoting secrets")
+                })?;
+                let target_project = store
+                    .list_projects()?
+                    .into_iter()
+                    .filter(|project| is_shared_project_id(&project.id))
+                    .min_by_key(|project| project.name != "@shared")
+                    .ok_or_else(|| {
+                        failure(
+                            "ProjectNotFound",
+                            "set up the Global Vault before promoting secrets",
+                        )
+                    })?;
+                let target_entry =
+                    cache.lookup(&target_project.id, i128::from(timestamp)).ok_or_else(|| {
+                        failure(
+                            "UnlockRequired",
+                            "unlock the Global Vault before promoting secrets",
+                        )
+                    })?;
+                if target_entry.store_identity.as_ref().is_some_and(|pin| pin != identity) {
+                    return Err(failure(
+                        "AccessDenied",
+                        "the Global Vault does not match the selected store",
+                    ));
+                }
+                let target_master =
+                    master_key_array(target_entry.key_bytes()).map_err(|_| storage())?;
+                let target_profile =
+                    store.get_profile_by_name(&target_project.id, "default")?.ok_or_else(|| {
+                        failure("ProfileNotFound", "the Global Vault default profile is missing")
+                    })?;
+                let target_name = SecretName::new(target_shared_name.clone()).map_err(|_| {
+                    failure("InvalidSecretName", "invalid Global Vault secret name")
+                })?;
+                let existing_shared = store.get_secret_by_source(
+                    &target_project.id,
+                    &target_profile.id,
+                    target_name.as_str(),
+                    "user-local",
+                )?;
+                let (target_secret_id, target_version) = if let Some(existing_shared) =
+                    existing_shared
+                {
+                    if existing_shared.state == "deleted" {
+                        return Err(failure(
+                            "SecretDeleted",
+                            "the Global Vault secret source is deleted",
+                        ));
+                    }
+                    let same_value = crate::reveal::decrypt_secret(
+                        store,
+                        &existing_shared.project_id,
+                        &existing_shared.profile_id,
+                        &existing_shared,
+                        existing_shared.current_version,
+                        &target_master,
+                    )
+                    .is_ok_and(|existing_val| existing_val.as_str() == value.as_str());
+                    if same_value {
+                        (existing_shared.id, existing_shared.current_version)
+                    } else if request.overwrite {
+                        let op = SetSecretOperation {
+                            project_id: &target_project.id,
+                            profile_id: &target_profile.id,
+                            name: target_name.as_str(),
+                            source: "user-local",
+                            source_was_omitted: false,
+                            value: &value,
+                            rotate: true,
+                            grace_until: None,
+                            master_key: target_master.as_slice(),
+                            timestamp: i128::from(timestamp),
+                            imported: true,
+                        };
+                        let written = set_secret_in_store(store, &op, &target_master, timestamp)
+                            .map_err(|error| failure(error.error, error.message))?;
+                        (written.secret_id, written.version)
+                    } else {
+                        return Err(failure(
+                            "SecretAlreadyExists",
+                            "a different value with this name already exists in the Global Vault",
+                        ));
+                    }
+                } else {
+                    let op = SetSecretOperation {
+                        project_id: &target_project.id,
+                        profile_id: &target_profile.id,
+                        name: target_name.as_str(),
+                        source: "user-local",
+                        source_was_omitted: false,
+                        value: &value,
+                        rotate: false,
+                        grace_until: None,
+                        master_key: target_master.as_slice(),
+                        timestamp: i128::from(timestamp),
+                        imported: true,
+                    };
+                    let written = set_secret_in_store(store, &op, &target_master, timestamp)
+                        .map_err(|error| failure(error.error, error.message))?;
+                    (written.secret_id, written.version)
+                };
+                if let Some((_, _, fp_key)) = shared_fp.as_ref()
+                    && let Ok(tag) = local_dedup_tag_v1(fp_key, &value)
+                {
+                    let _ = store.upsert_local_value_fingerprint(
+                        &target_secret_id,
+                        target_version,
+                        &tag,
+                        timestamp,
+                    );
+                }
+                let link_id = format!(
+                    "lk_link_{}",
+                    SecretId::generate().map_err(|_| storage())?.into_string()
+                );
+                let link = SecretLinkRecord {
+                    id: link_id,
+                    project_id: request.scope.project_id.clone(),
+                    profile_id: request.scope.profile_id.clone(),
+                    local_name: entry.key.clone(),
+                    target_project_id: target_project.id.clone(),
+                    target_profile_id: target_profile.id.clone(),
+                    target_secret_id: target_secret_id.clone(),
+                    created_at: timestamp,
+                    updated_at: timestamp,
+                };
+                let source_key =
+                    unwrap_audit_key_with_master(store, &request.scope.project_id, master)
+                        .map_err(|_| storage())?;
+                let link_metadata = json!({
+                    "schema_version": 1,
+                    "action": "SECRET_LINK",
+                    "status": "SUCCESS",
+                    "secret_name": entry.key,
+                    "profile_id": request.scope.profile_id,
+                    "target_project_id": target_project.id,
+                    "target_profile_id": target_profile.id,
+                    "target_secret_id": target_secret_id,
+                    "target_secret_name": target_name.as_str(),
+                });
+                let link_audit = AuditWrite {
+                    project_id: &request.scope.project_id,
+                    profile_id: Some(&request.scope.profile_id),
+                    action: "SECRET_LINK",
+                    status: "SUCCESS",
+                    secret_name: Some(&entry.key),
+                    command: None,
+                    metadata_json: &link_metadata,
+                    timestamp,
+                };
+                store.upsert_secret_link_with_audit(
+                    &link,
+                    Some(AuditContext { key: source_key.as_ref(), write: &link_audit }),
+                )?;
+                result.promoted += 1;
+                continue;
+            }
+
             let existing = store.get_secret_by_source(
                 &request.scope.project_id,
                 &request.scope.profile_id,
@@ -390,8 +756,18 @@ fn import_dotenv_in_store(
                 timestamp: i128::from(timestamp),
                 imported: true,
             };
-            set_secret_in_store(store, &operation, master, timestamp)
+            let written = set_secret_in_store(store, &operation, master, timestamp)
                 .map_err(|error| failure(error.error, error.message))?;
+            if let Some((_, _, fp_key)) = shared_fp.as_ref()
+                && let Ok(tag) = local_dedup_tag_v1(fp_key, &value)
+            {
+                let _ = store.upsert_local_value_fingerprint(
+                    &written.secret_id,
+                    written.version,
+                    &tag,
+                    timestamp,
+                );
+            }
             if existing.is_some() {
                 result.overwritten += 1;
             } else {

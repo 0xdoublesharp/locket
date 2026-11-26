@@ -39,12 +39,13 @@ pub fn lifecycle_target(
     Ok((store, profile))
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn rm_command(
     context: &RuntimeContext,
     output: &mut impl Write,
     args: &SourceKeyArgs,
 ) -> Result<(), CliError> {
-    let (store, profile) = lifecycle_target(context, args.project.as_deref())?;
+    let (mut store, profile) = lifecycle_target(context, args.project.as_deref())?;
     let project_id = &profile.project_id;
     if args.project.is_some() {
         confirm_write(&profile, args.use_dangerous, "pass --use-dangerous to confirm the write")?;
@@ -70,16 +71,50 @@ pub fn rm_command(
             }
         }
     };
+    let usages = store.list_shared_secret_usages(&secret.id)?;
+    if !usages.is_empty() {
+        if !args.unlink_all {
+            let summary = usages
+                .iter()
+                .map(|usage| {
+                    format!(
+                        "{} ({}) -> {}",
+                        usage.project_name, usage.profile_name, usage.local_name
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(crate::runtime::error::typed_cli_error(
+                locket_core::LocketError::AccessDenied,
+                format!(
+                    "{} is linked by {} project(s): {summary}; pass --unlink-all to unlink everywhere and remove",
+                    secret.name,
+                    usages.len()
+                ),
+            ));
+        }
+        if usages.iter().any(|usage| usage.profile_dangerous) && !args.use_dangerous {
+            return Err(crate::runtime::error::typed_cli_error(
+                locket_core::LocketError::ConfirmationFailed,
+                "one or more linked projects use a dangerous profile; pass --use-dangerous with --unlink-all",
+            ));
+        }
+    }
     let source = secret.source.as_str();
     let timestamp = now_unix_nanos()?;
     let audit_key = load_project_key(context, &store, project_id, KeyPurpose::Audit)?;
-    let metadata = secret_audit_metadata(
+    let mut metadata = secret_audit_metadata(
         "DELETE",
         &secret.name,
         &profile.id,
         source,
         Some(secret.current_version),
     );
+    if !usages.is_empty()
+        && let Some(obj) = metadata.as_object_mut()
+    {
+        obj.insert("unlinked_count".into(), json!(usages.len()));
+    }
     let audit = AuditWrite {
         project_id,
         profile_id: Some(&profile.id),
@@ -90,15 +125,32 @@ pub fn rm_command(
         metadata_json: &metadata,
         timestamp,
     };
-    store.tombstone_secret_with_audit(
-        &secret.id,
-        timestamp,
-        Some(AuditContext { key: audit_key.as_ref(), write: &audit }),
-    )?;
+    if usages.is_empty() {
+        store.tombstone_secret_with_audit(
+            &secret.id,
+            timestamp,
+            Some(AuditContext { key: audit_key.as_ref(), write: &audit }),
+        )?;
+    } else {
+        store.tombstone_secret_and_unlink_with_audit(
+            &secret,
+            timestamp,
+            Some(AuditContext { key: audit_key.as_ref(), write: &audit }),
+        )?;
+    }
     if args.project.is_none() {
         refresh_example_for_project_if_enabled(context)?;
     }
-    writeln!(output, "removed {} ({source})", args.key)?;
+    if usages.is_empty() {
+        writeln!(output, "removed {} ({source})", args.key)?;
+    } else {
+        writeln!(
+            output,
+            "removed {} ({source}) and unlinked {} project link(s)",
+            args.key,
+            usages.len()
+        )?;
+    }
     Ok(())
 }
 
@@ -366,15 +418,39 @@ pub fn list_command(
     } else {
         store.list_active_secrets_by_profile(&profile.project_id, &profile.id)?
     };
-    if secrets.is_empty() {
+    let links = store.list_active_secret_links_by_profile(&profile.project_id, &profile.id)?;
+    if secrets.is_empty() && links.is_empty() {
         writeln!(output, "no secrets")?;
         return Ok(());
     }
+    let is_shared =
+        profile.project_id.starts_with(crate::commands::discovery::SHARED_PROJECT_PREFIX);
     for secret in secrets {
+        if is_shared {
+            let link_count = store.list_shared_secret_usages(&secret.id)?.len();
+            if link_count > 0 {
+                writeln!(
+                    output,
+                    "{} source={} version={} state={} linked_by={}",
+                    secret.name, secret.source, secret.current_version, secret.state, link_count
+                )?;
+                continue;
+            }
+        }
         writeln!(
             output,
             "{} source={} version={} state={}",
             secret.name, secret.source, secret.current_version, secret.state
+        )?;
+    }
+    for resolved in links {
+        writeln!(
+            output,
+            "{} source=shared-link target=@shared/{} version={} state={}",
+            resolved.link.local_name,
+            resolved.target_secret.name,
+            resolved.target_secret.current_version,
+            resolved.target_secret.state
         )?;
     }
     Ok(())

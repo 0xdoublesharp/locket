@@ -349,7 +349,36 @@ struct ImportEnvArgs {
     #[serde(default)]
     dry_run: bool,
     #[serde(default)]
+    link_shared: bool,
+    #[serde(default)]
+    promote_duplicates: bool,
+    #[serde(default)]
     confirm_dangerous: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SharedUsagesMcpArgs {
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LinkSecretMcpArgs {
+    project: String,
+    profile: Option<String>,
+    local_name: String,
+    target_secret_name: String,
+    confirm_dangerous_profile: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnlinkSecretMcpArgs {
+    project: String,
+    profile: Option<String>,
+    local_name: String,
+    confirm_dangerous_profile: Option<String>,
 }
 
 fn args_as<T: DeserializeOwned>(args: Value) -> Result<T, CliError> {
@@ -385,6 +414,14 @@ fn call_tool(context: &RuntimeContext, name: &str, mut args: Value) -> Result<Va
         "locket_scan_env_files" => scan_env(context, &args_as::<ScanEnvArgs>(args)?),
         "locket_detect_commands" => detect_commands(context, args_as(args)?),
         "locket_import_env" => import_env(context, args_as::<ImportEnvArgs>(args)?),
+        "locket_find_duplicates" => find_duplicates_mcp(context),
+        "locket_list_shared_usages" => {
+            list_shared_usages_mcp(context, &args_as::<SharedUsagesMcpArgs>(args)?)
+        }
+        "locket_link_secret" => link_secret_mcp(context, &args_as::<LinkSecretMcpArgs>(args)?),
+        "locket_unlink_secret" => {
+            unlink_secret_mcp(context, &args_as::<UnlinkSecretMcpArgs>(args)?)
+        }
         _ => Err(metadata_invalid_error("unknown MCP tool")),
     }
 }
@@ -560,10 +597,193 @@ fn import_env(context: &RuntimeContext, args: ImportEnvArgs) -> Result<Value, Cl
         overwrite: args.overwrite,
         literal: args.literal,
         dry_run: args.dry_run,
+        link_shared: args.link_shared,
+        promote_duplicates: args.promote_duplicates,
         confirmed_profile: args.confirm_dangerous.then(|| target.profile.name.clone()),
         source,
     };
     import_env_to_target(context, &mut store, &target, open_scoped_file(&path)?, &options)
+}
+
+fn find_duplicates_mcp(context: &RuntimeContext) -> Result<Value, CliError> {
+    let store = require_metadata_store(context)?;
+    let groups = store.list_duplicate_value_groups()?;
+    let rows: Vec<Value> = groups
+        .into_iter()
+        .enumerate()
+        .map(|(index, group)| {
+            let members: Vec<Value> = group
+                .members
+                .into_iter()
+                .map(|member| {
+                    json!({
+                        "secret_id": member.secret_id,
+                        "project_id": member.project_id,
+                        "project_name": member.project_name,
+                        "is_shared": member.is_shared,
+                        "profile_name": member.profile_name,
+                        "profile_dangerous": member.profile_dangerous,
+                        "name": member.name,
+                        "source": member.source,
+                        "version": member.current_version,
+                    })
+                })
+                .collect();
+            json!({
+                "group_id": format!("dup-{}", index + 1),
+                "count": members.len(),
+                "members": members,
+            })
+        })
+        .collect();
+    Ok(json!({ "group_count": rows.len(), "groups": rows, "metadata_only": true }))
+}
+
+fn list_shared_usages_mcp(
+    context: &RuntimeContext,
+    args: &SharedUsagesMcpArgs,
+) -> Result<Value, CliError> {
+    let name = SecretName::new(args.name.clone())
+        .map_err(|_| crate::invalid_secret_name_error("invalid secret name"))?;
+    let store = require_metadata_store(context)?;
+    let (shared_project, shared_profile) =
+        crate::commands::secrets::links::shared_vault_target(&store)?;
+    let secret = store
+        .get_active_secret(&shared_project.id, &shared_profile.id, name.as_str(), "user-local")?
+        .ok_or_else(|| secret_not_found_error("secret not found in @shared"))?;
+    let usages = store.list_shared_secret_usages(&secret.id)?;
+    let rows: Vec<Value> = usages
+        .iter()
+        .map(|usage| {
+            json!({
+                "link_id": usage.link_id,
+                "project_id": usage.project_id,
+                "project_name": usage.project_name,
+                "profile_name": usage.profile_name,
+                "profile_dangerous": usage.profile_dangerous,
+                "local_name": usage.local_name,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "secret_id": secret.id,
+        "secret_name": secret.name,
+        "usage_count": rows.len(),
+        "usages": rows,
+        "metadata_only": true,
+    }))
+}
+
+fn link_secret_mcp(context: &RuntimeContext, args: &LinkSecretMcpArgs) -> Result<Value, CliError> {
+    let local_name = SecretName::new(args.local_name.clone())
+        .map_err(|_| crate::invalid_secret_name_error("invalid local secret name"))?;
+    let target_name = SecretName::new(
+        args.target_secret_name
+            .strip_prefix("@shared/")
+            .unwrap_or(&args.target_secret_name)
+            .to_owned(),
+    )
+    .map_err(|_| crate::invalid_secret_name_error("invalid target secret name"))?;
+    let mut store = open_store(context)?;
+    let target = select_mcp_target(context, &store, &args.project, args.profile.as_deref())?;
+    if target.project.id.starts_with("lk_proj_shared_") {
+        return Err(metadata_invalid_error("cannot create a shared link inside @shared"));
+    }
+    confirm_write(
+        &target.profile,
+        args.confirm_dangerous_profile.as_deref() == Some(&target.profile.name),
+        "supply the exact profile name in confirm_dangerous_profile",
+    )?;
+    let (shared_project, shared_profile) =
+        crate::commands::secrets::links::shared_vault_target(&store)?;
+    let target_secret = store
+        .get_active_secret(
+            &shared_project.id,
+            &shared_profile.id,
+            target_name.as_str(),
+            "user-local",
+        )?
+        .ok_or_else(|| secret_not_found_error("secret not found in @shared"))?;
+    let link_id = crate::commands::secrets::links::create_link_record_with_audit(
+        context,
+        &mut store,
+        &target.project.id,
+        &target.profile.id,
+        local_name.as_str(),
+        &shared_project.id,
+        &shared_profile.id,
+        &target_secret,
+        now_unix_nanos()?,
+    )?;
+    Ok(json!({
+        "link_id": link_id,
+        "project_id": target.project.id,
+        "profile": target.profile.name,
+        "local_name": local_name.as_str(),
+        "target_secret_name": target_secret.name,
+        "metadata_only": true,
+    }))
+}
+
+fn unlink_secret_mcp(
+    context: &RuntimeContext,
+    args: &UnlinkSecretMcpArgs,
+) -> Result<Value, CliError> {
+    let local_name = SecretName::new(args.local_name.clone())
+        .map_err(|_| crate::invalid_secret_name_error("invalid local secret name"))?;
+    let mut store = open_store(context)?;
+    let target = select_mcp_target(context, &store, &args.project, args.profile.as_deref())?;
+    confirm_write(
+        &target.profile,
+        args.confirm_dangerous_profile.as_deref() == Some(&target.profile.name),
+        "supply the exact profile name in confirm_dangerous_profile",
+    )?;
+    let Some(existing) =
+        store.get_secret_link(&target.project.id, &target.profile.id, local_name.as_str())?
+    else {
+        return Ok(json!({
+            "project_id": target.project.id,
+            "profile": target.profile.name,
+            "local_name": local_name.as_str(),
+            "unlinked": false,
+            "metadata_only": true,
+        }));
+    };
+    let timestamp = now_unix_nanos()?;
+    let audit_key = load_project_key(context, &store, &target.project.id, KeyPurpose::Audit)?;
+    let metadata = json!({
+        "schema_version": 1,
+        "action": "SECRET_UNLINK",
+        "status": "SUCCESS",
+        "secret_name": local_name.as_str(),
+        "profile_id": target.profile.id,
+        "target_project_id": existing.target_project_id,
+        "target_profile_id": existing.target_profile_id,
+        "target_secret_id": existing.target_secret_id,
+    });
+    let audit = AuditWrite {
+        project_id: &target.project.id,
+        profile_id: Some(&target.profile.id),
+        action: "SECRET_UNLINK",
+        status: "SUCCESS",
+        secret_name: Some(local_name.as_str()),
+        command: None,
+        metadata_json: &metadata,
+        timestamp,
+    };
+    store.delete_secret_link_with_audit(
+        &target.project.id,
+        &target.profile.id,
+        local_name.as_str(),
+        Some(AuditContext { key: audit_key.as_ref(), write: &audit }),
+    )?;
+    Ok(json!({
+        "project_id": target.project.id,
+        "profile": target.profile.name,
+        "local_name": local_name.as_str(),
+        "unlinked": true,
+        "metadata_only": true,
+    }))
 }
 
 #[derive(Clone, Copy)]
@@ -875,6 +1095,7 @@ fn detect_commands_tool() -> Value {
     definition
 }
 
+#[allow(clippy::too_many_lines)]
 fn tools() -> Vec<Value> {
     let string = json!({"type": "string"});
     let boolean = json!({"type": "boolean"});
@@ -928,9 +1149,41 @@ fn tools() -> Vec<Value> {
                 "project": string, "path": string, "profile": string,
                 "source": {"type": "string", "enum": ["team-managed", "user-local", "machine-local"], "default": "user-local"},
                 "only": key_list, "exclude": key_list, "overwrite": optional_flag,
-                "literal": optional_flag, "dry_run": optional_flag, "confirm_dangerous": optional_flag,
+                "literal": optional_flag, "dry_run": optional_flag,
+                "link_shared": optional_flag, "promote_duplicates": optional_flag,
+                "confirm_dangerous": optional_flag,
             }),
             &["project", "path"],
+        ),
+        tool(
+            "locket_find_duplicates",
+            "List cross-project duplicate secret value groups using local keyed dedup tags (metadata only).",
+            &json!({}),
+            &[],
+        ),
+        tool(
+            "locket_list_shared_usages",
+            "List projects and local variable names linked to a Global Vault (@shared) secret.",
+            &json!({"name": string}),
+            &["name"],
+        ),
+        tool(
+            "locket_link_secret",
+            "Link a project variable name to an active Global Vault (@shared) secret.",
+            &json!({
+                "project": string, "profile": string, "local_name": string,
+                "target_secret_name": string, "confirm_dangerous_profile": string,
+            }),
+            &["project", "local_name", "target_secret_name"],
+        ),
+        tool(
+            "locket_unlink_secret",
+            "Remove a project link to a Global Vault (@shared) secret.",
+            &json!({
+                "project": string, "profile": string, "local_name": string,
+                "confirm_dangerous_profile": string,
+            }),
+            &["project", "local_name"],
         ),
         tool(
             "locket_discover_secrets",

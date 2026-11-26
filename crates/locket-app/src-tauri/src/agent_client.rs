@@ -401,6 +401,8 @@ async fn round_trip(
             | AgentMethod::CreateProfile
             | AgentMethod::DeleteSecret
             | AgentMethod::CopySecretToShared
+            | AgentMethod::LinkSecret
+            | AgentMethod::UnlinkSecret
     );
     let timeout = match method {
         AgentMethod::RequestGrant => GRANT_APPROVAL_TIMEOUT,

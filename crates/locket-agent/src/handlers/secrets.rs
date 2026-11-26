@@ -68,6 +68,15 @@ pub struct ListSecretsRow {
     pub updated_at: i64,
     /// Last rotation timestamp in nanoseconds since the Unix epoch.
     pub last_rotated_at: Option<i64>,
+    /// Target Global Vault secret identifier when `source == "shared-link"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_target_secret_id: Option<String>,
+    /// Target Global Vault secret name (or privacy alias) when `source == "shared-link"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_target_name: Option<String>,
+    /// Number of project links pointing to this Global Vault secret.
+    #[serde(default)]
+    pub link_count: u32,
 }
 
 /// Lists active-profile secret metadata. This never reads encrypted values.
@@ -95,6 +104,11 @@ pub fn list_secrets_from_store(
             created_at: row.created_at,
             updated_at: row.updated_at,
             last_rotated_at: row.last_rotated_at,
+            linked_target_secret_id: row.linked_target_secret_id,
+            linked_target_name: row
+                .linked_target_name
+                .map(|target| secret_label(&target, request.redact_names)),
+            link_count: row.link_count,
         })
         .collect();
     Ok(ListSecretsResponse { rows })

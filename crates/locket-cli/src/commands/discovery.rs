@@ -78,6 +78,8 @@ pub enum SharedCommand {
     Rotate(RotateArgs),
     /// Tombstone a Global Vault secret source.
     Rm(SourceKeyArgs),
+    /// List projects linked to a Global Vault secret.
+    Usages(secrets::links::SharedUsagesArgs),
 }
 
 pub fn read_metadata_store(context: &RuntimeContext) -> Result<Option<Store>, CliError> {
@@ -313,6 +315,9 @@ pub fn shared_command(
         SharedCommand::Rm(mut args) => {
             select_global_vault(&mut args.project)?;
             return secrets::lifecycle::rm_command(context, output, &args).map(|()| 0);
+        }
+        SharedCommand::Usages(args) => {
+            return secrets::links::shared_usages_command(context, output, &args);
         }
     };
     let result = shared_init(context, &name);

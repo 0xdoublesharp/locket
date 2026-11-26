@@ -225,6 +225,14 @@ enum Command {
         #[command(subcommand)]
         command: commands::discovery::SharedCommand,
     },
+    /// Promote a project secret to the Global Vault (@shared) and replace it with a live link.
+    Promote(commands::secrets::links::PromoteArgs),
+    /// Link a project variable name to an active Global Vault (@shared) secret.
+    Link(commands::secrets::links::LinkArgs),
+    /// Remove a project link to a Global Vault (@shared) secret.
+    Unlink(commands::secrets::links::UnlinkArgs),
+    /// Find duplicate secret values stored across local projects and @shared.
+    Duplicates(commands::secrets::links::DuplicatesArgs),
     /// Check profile parity and workspace plaintext drift.
     Parity(commands::parity::ParityArgs),
     /// Serve tools over stdio using MCP.
@@ -541,6 +549,12 @@ struct ImportSelectionArgs {
     /// Emit a metadata-only JSON report and keep the input file.
     #[arg(long)]
     json: bool,
+    /// Link imported keys whose exact value already exists in @shared instead of duplicating.
+    #[arg(long)]
+    link_shared: bool,
+    /// Promote imported keys whose exact value matches another project to @shared and link.
+    #[arg(long)]
+    promote_duplicates: bool,
     /// Confirm an overwrite in a dangerous profile by supplying its exact name.
     #[arg(long, value_name = "PROFILE", requires = "overwrite")]
     confirm_dangerous: Option<String>,
@@ -615,6 +629,9 @@ struct SourceKeyArgs {
     /// Confirm a write to a dangerous Global Vault profile.
     #[arg(long)]
     use_dangerous: bool,
+    /// Unlink all projects referencing a Global Vault secret when removing it.
+    #[arg(long)]
+    unlink_all: bool,
     /// Secret key name.
     key: String,
     #[command(flatten)]
@@ -1887,6 +1904,18 @@ fn run_with_context(
         Command::Shared { command } => {
             return commands::discovery::shared_command(context, output, command);
         }
+        Command::Promote(args) => {
+            return secrets::links::promote_command(context, output, &args);
+        }
+        Command::Link(args) => {
+            return secrets::links::link_command(context, output, &args);
+        }
+        Command::Unlink(args) => {
+            return secrets::links::unlink_command(context, output, &args);
+        }
+        Command::Duplicates(args) => {
+            return secrets::links::duplicates_command(context, output, &args);
+        }
         Command::Parity(args) => return commands::parity::parity_command(context, output, &args),
         Command::Mcp(args) => match args.command {
             None => commands::mcp::serve(&mut io::stdin().lock(), output, context)?,
@@ -2151,11 +2180,15 @@ pub(crate) fn active_profile_secret_names(
     project_id: &str,
     profile_id: &str,
 ) -> Result<BTreeSet<String>, CliError> {
-    Ok(store
+    let mut names: BTreeSet<String> = store
         .list_active_secrets_by_profile(project_id, profile_id)?
         .into_iter()
         .map(|secret| secret.name)
-        .collect())
+        .collect();
+    for link in store.list_active_secret_links_by_profile(project_id, profile_id)? {
+        names.insert(link.link.local_name);
+    }
+    Ok(names)
 }
 
 pub(crate) const fn yes_no(value: bool) -> &'static str {
@@ -2381,6 +2414,9 @@ fn rotate_secret_value(
             action: "ROTATE",
         },
     )?;
+    commands::secrets::links::try_record_cli_dedup_tag(
+        context, &store, &secret.id, version, value, timestamp,
+    );
     Ok((secret.source, version))
 }
 

@@ -83,6 +83,9 @@ impl Fixture {
             overwrite,
             literal: false,
             confirmation: None,
+            dry_run: false,
+            link_to_shared: std::collections::BTreeMap::new(),
+            promote_to_shared: std::collections::BTreeMap::new(),
         }
     }
     fn policy(&self) -> ApplyPolicyRequest {
@@ -1197,5 +1200,119 @@ fn dotenv_no_overwrite_keeps_prior_ciphertext_and_only_audits_new_names()
     let names: Vec<_> = rows.iter().filter_map(|row| row.secret_name.as_deref()).collect();
     assert_eq!(names, ["TOKEN", "NEW_TOKEN"]);
     assert!(store.verify_audit_chain_read_only(PROJECT, &AUDIT)?.hmac_ok);
+    Ok(())
+}
+
+#[tokio::test]
+async fn promote_links_under_alias_detects_import_duplicates_and_warns_before_shared_delete()
+-> Result<(), Box<dyn std::error::Error>> {
+    const DEST_PROFILE: &str = "lk_prof_global_default";
+    const DEST_MASTER: KeyBytes = [22; 32];
+    const DEST_AUDIT: KeyBytes = [23; 32];
+    let fixture = Fixture::new()?;
+    let db = fixture.store();
+    db.insert_project_if_absent(SHARED_PROJECT, "@shared", 1)?;
+    db.insert_profile_if_absent(DEST_PROFILE, SHARED_PROJECT, "default", false, 1)?;
+    insert_wrapped_keys(&db, SHARED_PROJECT, DEST_PROFILE, &DEST_MASTER, &DEST_AUDIT)?;
+    let state = fixture.state(GrantAction::ImportDotenv).await;
+    unlock_fixture(&state, SHARED_PROJECT, &DEST_MASTER).await;
+
+    // Import RPC_URL into project with @shared unlocked so local dedup tag is recorded.
+    let rpc_url = "https://eth-mainnet.example.invalid/v2/shared-rpc-canary";
+    let import_req = fixture.import(&format!("RPC_URL={rpc_url}\n"), false);
+    assert!(matches!(
+        handle_import_dotenv(&envelope(crate::AgentMethod::ImportDotenv, &import_req), &state, NOW)
+            .await,
+        ResponseEnvelope::Success(_)
+    ));
+
+    // Promote RPC_URL -> @shared/ALCHEMY_MAINNET_RPC with replace_with_link=true.
+    fixture.grant(&state, GrantAction::CopySecretToShared).await;
+    let promote = crud_request(
+        crate::AgentMethod::CopySecretToShared,
+        &fixture.scope,
+        json!({
+            "secret_name": "RPC_URL",
+            "target_name": "ALCHEMY_MAINNET_RPC",
+            "replace_with_link": true,
+        }),
+    );
+    let promoted = success(call_crud(&state, &promote).await);
+    assert_eq!(promoted["secret_name"], "ALCHEMY_MAINNET_RPC");
+    assert_eq!(promoted["linked"], true);
+
+    // Project local user-local copy is tombstoned and replaced by active shared-link.
+    let store = fixture.store();
+    assert!(store.get_active_secret(PROJECT, PROFILE, "RPC_URL", "user-local")?.is_none());
+    let list_rows = store.list_active_secret_metadata_by_profile(PROJECT, PROFILE)?;
+    assert_eq!(list_rows.len(), 1);
+    assert_eq!(list_rows[0].name, "RPC_URL");
+    assert_eq!(list_rows[0].source, "shared-link");
+    assert_eq!(list_rows[0].linked_target_name.as_deref(), Some("ALCHEMY_MAINNET_RPC"));
+
+    // Reveal through the project follows the live link to @shared.
+    fixture.grant(&state, GrantAction::Reveal).await;
+    let reveal_req = RequestEnvelope::new(
+        "rev-link",
+        crate::AgentMethod::Reveal,
+        json!({
+            "store_path": fixture.scope.store_path,
+            "project_id": PROJECT,
+            "profile_id": PROFILE,
+            "secret_name": "RPC_URL",
+            "grant_id": fixture.scope.grant_id,
+            "binding": fixture.scope.binding,
+        }),
+    );
+    let revealed = success(crate::reveal::handle_reveal(&reveal_req, &state, NOW).await);
+    assert_eq!(revealed["value"], rpc_url);
+
+    // Dry-run import of the same URL under a different variable name flags the @shared match.
+    fixture.grant(&state, GrantAction::ImportDotenv).await;
+    let mut preview = fixture.import(&format!("MAINNET_RPC_URL={rpc_url}\n"), false);
+    preview.dry_run = true;
+    let preview_res = success(
+        handle_import_dotenv(&envelope(crate::AgentMethod::ImportDotenv, &preview), &state, NOW)
+            .await,
+    );
+    let matches = preview_res["duplicate_matches"].as_array().ok_or("no matches")?;
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0]["local_name"], "MAINNET_RPC_URL");
+    assert_eq!(matches[0]["match_kind"], "shared");
+    assert_eq!(matches[0]["matched_secret_name"], "ALCHEMY_MAINNET_RPC");
+
+    // Deleting @shared/ALCHEMY_MAINNET_RPC without unlink_all fails with LinkedSecretInUse.
+    let shared_secret = store
+        .get_active_secret(SHARED_PROJECT, DEST_PROFILE, "ALCHEMY_MAINNET_RPC", "user-local")?
+        .ok_or("shared secret missing")?;
+    assert_eq!(store.list_shared_secret_usages(&shared_secret.id)?.len(), 1);
+    let shared_scope = MutationScope {
+        store_path: fixture.scope.store_path.clone(),
+        project_root: PathBuf::new(),
+        project_id: SHARED_PROJECT.into(),
+        profile_id: DEST_PROFILE.into(),
+        grant_id: fixture.scope.grant_id.clone(),
+        binding: fixture.scope.binding.clone(),
+    };
+    let mut shared_fixture = Fixture { directory: fixture.directory, scope: shared_scope.clone() };
+    shared_fixture.grant(&state, GrantAction::DeleteSecret).await;
+    let blocked_req = crud_request(
+        crate::AgentMethod::DeleteSecret,
+        &shared_scope,
+        json!({ "secret_name": "ALCHEMY_MAINNET_RPC", "source": "user-local" }),
+    );
+    assert_eq!(code(call_crud(&state, &blocked_req).await), "LinkedSecretInUse");
+
+    // Deleting with unlink_all=true atomically tombstones @shared and removes all links.
+    shared_fixture.grant(&state, GrantAction::DeleteSecret).await;
+    let allow_req = crud_request(
+        crate::AgentMethod::DeleteSecret,
+        &shared_scope,
+        json!({ "secret_name": "ALCHEMY_MAINNET_RPC", "source": "user-local", "unlink_all": true }),
+    );
+    let deleted = success(call_crud(&state, &allow_req).await);
+    assert_eq!(deleted["unlinked_count"], 1);
+    assert_eq!(store.list_active_secret_metadata_by_profile(PROJECT, PROFILE)?.len(), 0);
+    let _ = &mut shared_fixture;
     Ok(())
 }

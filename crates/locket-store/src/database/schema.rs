@@ -272,6 +272,40 @@ CREATE TABLE IF NOT EXISTS fingerprints (
     ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS secret_links (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  local_name TEXT NOT NULL,
+  target_project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  target_profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  target_secret_id TEXT NOT NULL REFERENCES secrets(id) ON DELETE CASCADE,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  CHECK (project_id != target_project_id),
+  UNIQUE (project_id, profile_id, local_name)
+);
+
+CREATE INDEX IF NOT EXISTS secret_links_target_idx
+  ON secret_links(target_secret_id);
+
+CREATE INDEX IF NOT EXISTS secret_links_project_profile_idx
+  ON secret_links(project_id, profile_id, local_name);
+
+CREATE TABLE IF NOT EXISTS local_value_fingerprints (
+  secret_id TEXT NOT NULL,
+  version INTEGER NOT NULL CHECK (version >= 1 AND version <= 4294967295),
+  dedup_tag BLOB NOT NULL CHECK (length(dedup_tag) = 32),
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (secret_id, version),
+  FOREIGN KEY (secret_id, version)
+    REFERENCES secret_versions(secret_id, version)
+    ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS local_value_fingerprints_tag_idx
+  ON local_value_fingerprints(dedup_tag);
+
 CREATE TABLE IF NOT EXISTS keys (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,

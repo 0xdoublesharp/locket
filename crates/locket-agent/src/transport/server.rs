@@ -1474,6 +1474,12 @@ pub async fn dispatch_with_peer(
                 .await
         }
         Ok(AgentMethod::ListSecrets) => handle_list_secrets(envelope, state).await,
+        Ok(AgentMethod::ListSharedUsages) => {
+            crate::shared_links::handle_list_shared_usages(envelope, state)
+        }
+        Ok(AgentMethod::ListDuplicates) => {
+            crate::shared_links::handle_list_duplicates(envelope, state)
+        }
         Ok(AgentMethod::ListProjects) => crate::discovery::handle_list_projects(envelope, state),
         Ok(AgentMethod::DiscoverSecrets) => {
             crate::discovery::handle_discover_secrets(envelope, state)
@@ -1488,7 +1494,9 @@ pub async fn dispatch_with_peer(
         Ok(
             method @ (AgentMethod::CreateProfile
             | AgentMethod::DeleteSecret
-            | AgentMethod::CopySecretToShared),
+            | AgentMethod::CopySecretToShared
+            | AgentMethod::LinkSecret
+            | AgentMethod::UnlinkSecret),
         ) => {
             crate::mutations::handle_desktop_crud(method, envelope, state, current_unix_nanos())
                 .await
