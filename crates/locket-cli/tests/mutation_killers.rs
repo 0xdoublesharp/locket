@@ -803,21 +803,45 @@ shared_secrets = ["SHARED_SETTING"]
         assert!(!observed.exists());
         assert!(!root.join(".fixture-status-request").exists());
 
+        let observed_batch = root.join(".fixture-unlock-batch-request");
+        assert!(!observed_batch.exists());
         let output = command(root).env_remove("LOCKET_NO_PROMPT").args(args).output()?;
         assert!(output.status.success(), "{output:?}");
-        let requests = fs::read_to_string(observed)?
-            .lines()
-            .map(serde_json::from_str::<Value>)
-            .collect::<Result<Vec<_>, _>>()?;
-        assert_eq!(requests.len(), 3);
-        for (request, (project, profile)) in requests.iter().zip([
-            (PROJECT, PROFILE),
-            (WEB, "lk_prof_web"),
-            (SHARED_PROJECT, "lk_prof_shared"),
-        ]) {
-            assert_eq!(request["project_id"], project);
-            assert_eq!(request["profile_id"], profile);
-            assert_eq!(request["ttl_seconds"], 3600);
+        assert!(
+            String::from_utf8(output.stderr)?.contains(
+                "locket: waiting for vault unlock for 3 vaults (Touch ID or password)..."
+            )
+        );
+        assert!(!observed.exists());
+        let batch: Value = serde_json::from_slice(&fs::read(observed_batch)?)?;
+        let projects = batch["projects"].as_array().ok_or("batch projects missing")?;
+        let expected =
+            [(PROJECT, PROFILE), (WEB, "lk_prof_web"), (SHARED_PROJECT, "lk_prof_shared")];
+        assert_eq!(projects.len(), expected.len());
+        assert_eq!(batch["verify_user"], false);
+        for (item, (project, profile)) in projects.iter().zip(expected) {
+            assert_eq!(item["project_id"], project);
+            assert_eq!(item["audit"]["profile_id"], profile);
+            assert_eq!(item["ttl_seconds"], 3600);
+        }
+
+        for fault in ["UnsupportedMethod", "ProtocolError"] {
+            fs::write(root.join(".fixture-unlock-batch-fault"), fault)?;
+            let output = command(root).env_remove("LOCKET_NO_PROMPT").args(args).output()?;
+            assert!(output.status.success(), "{output:?}");
+            let stdout = String::from_utf8(output.stdout)?;
+            let requests = fs::read_to_string(&observed)?
+                .lines()
+                .map(serde_json::from_str::<Value>)
+                .collect::<Result<Vec<_>, _>>()?;
+            assert_eq!(requests.len(), expected.len());
+            for (request, (project, profile)) in requests.iter().zip(expected) {
+                assert_eq!(request["project_id"], project);
+                assert_eq!(request["profile_id"], profile);
+                assert_eq!(request["ttl_seconds"], 3600);
+                assert!(stdout.contains(&format!("vault {project}: unlocked")), "{stdout}");
+            }
+            fs::remove_file(&observed)?;
         }
         Ok(())
     }
@@ -1266,6 +1290,30 @@ env_mode = "strict"
                     fs::write(".fixture-unlock-request", [])?;
                 }
                 Ok(Value::Null)
+            }
+            AgentMethod::UnlockBatch => {
+                fs::write(".fixture-unlock-batch-request", serde_json::to_vec(&request.payload)?)?;
+                if let Ok(error) = fs::read_to_string(".fixture-unlock-batch-fault") {
+                    return Ok(ResponseEnvelope::Error(ErrorEnvelope::new(
+                        request.id.clone(),
+                        error,
+                        "unknown agent method",
+                        false,
+                    )));
+                }
+                let projects =
+                    request.payload["projects"].as_array().ok_or("missing batch projects")?;
+                let unlocked = projects
+                    .iter()
+                    .map(|item| {
+                        json!({
+                            "project_id": item["project_id"],
+                            "ttl_seconds": item["ttl_seconds"],
+                            "expires_at": 1_000_000_000_i64,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Ok(json!({ "unlocked": unlocked, "batch_size": projects.len() }))
             }
             AgentMethod::Lock => {
                 let mut observed = fs::OpenOptions::new()

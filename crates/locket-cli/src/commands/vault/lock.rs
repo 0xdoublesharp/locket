@@ -156,8 +156,15 @@ pub fn unlock_command(
     }
     if agent_is_available(context)? {
         let ttl = unlock_ttl(context, args.ttl)?;
+        #[cfg(any(unix, windows))]
+        let unlocked_as_batch =
+            targets.len() > 1 && unlock_agent_batch(context, &targets, ttl, args.verify_user)?;
+        #[cfg(not(any(unix, windows)))]
+        let unlocked_as_batch = false;
         return run_vault_batch(output, &targets, UNLOCK_COMMAND, "unlocked", |output, profile| {
-            unlock_agent(context, profile, ttl, args.verify_user)?;
+            if !unlocked_as_batch {
+                unlock_agent(context, profile, ttl, args.verify_user)?;
+            }
             writeln!(output, "project_id: {}", profile.project_id)?;
             writeln!(output, "active_profile: {} ({})", profile.name, profile.id)?;
             writeln!(output, "agent: unlocked")?;
@@ -348,35 +355,47 @@ fn unlock_ttl(context: &RuntimeContext, explicit: Option<u64>) -> Result<u64, Cl
         .ok_or_else(|| metadata_invalid_error("agent.unlock_ttl must be between 1s and 24h"))
 }
 
+#[derive(serde::Serialize)]
+struct UnlockAudit<'a> {
+    store_path: &'a std::path::Path,
+    profile_id: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct UnlockRequest<'a> {
+    project_id: &'a str,
+    passphrase: Option<&'a str>,
+    verify_user: bool,
+    ttl_seconds: u64,
+    audit: UnlockAudit<'a>,
+}
+
+impl<'a> UnlockRequest<'a> {
+    fn new(
+        context: &'a RuntimeContext,
+        profile: &'a ProfileRecord,
+        ttl_seconds: u64,
+        verify_user: bool,
+        passphrase: Option<&'a str>,
+    ) -> Self {
+        Self {
+            project_id: &profile.project_id,
+            passphrase,
+            verify_user,
+            ttl_seconds,
+            audit: UnlockAudit { store_path: &context.store_path, profile_id: &profile.id },
+        }
+    }
+}
+
 fn unlock_agent(
     context: &RuntimeContext,
     profile: &ProfileRecord,
     ttl: u64,
     verify_user: bool,
 ) -> Result<(), CliError> {
-    #[derive(serde::Serialize)]
-    struct UnlockAudit<'a> {
-        store_path: &'a std::path::Path,
-        profile_id: &'a str,
-    }
-
-    #[derive(serde::Serialize)]
-    struct UnlockRequest<'a> {
-        project_id: &'a str,
-        passphrase: Option<&'a str>,
-        verify_user: bool,
-        ttl_seconds: u64,
-        audit: UnlockAudit<'a>,
-    }
-
     let invoke = |passphrase: Option<&str>| {
-        let payload = UnlockRequest {
-            project_id: &profile.project_id,
-            passphrase,
-            verify_user,
-            ttl_seconds: ttl,
-            audit: UnlockAudit { store_path: &context.store_path, profile_id: &profile.id },
-        };
+        let payload = UnlockRequest::new(context, profile, ttl, verify_user, passphrase);
         let _: serde_json::Value =
             agent_invoke(context, locket_agent::AgentMethod::Unlock, &payload, "unlock vault")?;
         Ok::<_, CliError>(())
@@ -391,6 +410,67 @@ fn unlock_agent(
         }
         result => result,
     }
+}
+
+// False means the existing per-vault path should handle this selection.
+#[cfg(any(unix, windows))]
+fn unlock_agent_batch(
+    context: &RuntimeContext,
+    targets: &[VaultTarget],
+    ttl: u64,
+    verify_user: bool,
+) -> Result<bool, CliError> {
+    use locket_agent::{AgentMethod, RequestEnvelope, ResponseEnvelope};
+
+    let count = targets.len();
+    let projects: Vec<_> = targets
+        .iter()
+        .map(|target| UnlockRequest::new(context, &target.profile, ttl, false, None))
+        .collect();
+    let request = RequestEnvelope::new(
+        "run-unlock vault batch",
+        AgentMethod::UnlockBatch,
+        json!({ "projects": projects, "verify_user": verify_user }),
+    );
+    if !prompts_disabled() {
+        let _ = writeln!(
+            io::stderr(),
+            "locket: waiting for vault unlock for {count} vaults (Touch ID or password)..."
+        );
+    }
+    // Allow the agent to report a typed error after LocalAuthentication's deadline.
+    let response = crate::commands::agent::exchange_agent_request(
+        &crate::agent_socket_path(context),
+        request,
+        Some(std::time::Duration::from_secs(135)),
+    ).map_err(|error| {
+        if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) {
+            typed_cli_error(
+                LocketError::UnlockRequired,
+                "vault unlock timed out waiting for Touch ID or password verification; run `locket unlock` from a desktop terminal or unlock in Locket Desktop",
+            )
+        } else {
+            typed_cli_error(
+                LocketError::AgentUnavailable,
+                format!("AgentUnavailable: could not unlock vault: {error}"),
+            )
+        }
+    })?;
+    let ResponseEnvelope::Error(error) = response else { return Ok(true) };
+    if matches!(error.error.as_str(), "UnsupportedMethod" | "UnknownMethod")
+        || (error.error == "ProtocolError"
+            && (error.message.starts_with("unknown agent method")
+                || error.message.starts_with("unknown method")))
+    {
+        return Ok(false);
+    }
+    if error.error == "UnlockRequired"
+        && error.message == "unlock batch requires an interactive passphrase"
+    {
+        return Ok(false);
+    }
+    let kind = LocketError::from_code_name(&error.error).unwrap_or(LocketError::AgentUnavailable);
+    Err(typed_cli_error(kind, format!("{}: {}", error.error, error.message)))
 }
 
 fn unlock_direct(

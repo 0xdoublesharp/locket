@@ -87,6 +87,7 @@ Required agent RPC methods:
 
 - `Status`: returns lock state, active project/profile metadata, grant summary, and agent version.
 - `Unlock`: performs OS keychain or passphrase-fallback unlock and starts the in-memory key TTL. When local user verification is required, the prompt names the project or its ID.
+- `UnlockBatch` (`unlock_batch` on the wire) accepts one to eight unique project IDs from the same vault database. Each vault has an individual TTL, optional passphrase, and optional audit context. The agent checks the OS session gate, project metadata, store and audit selectors, TTLs, and key availability before requesting verification. When `verify_user` is set or verification is required for any vault, one Touch ID or password prompt names the selected vaults, abbreviating long lists. Cancellation or denial returns `UnlockRequired` and leaves every vault's unlock state unchanged. On success, the agent commits an individual `UNLOCK` audit row with `batch_size` and shared verification metadata for each vault, caches each key with its own deadline, and returns `batch_size` and an `unlocked` list with each `project_id`, `ttl_seconds`, and `expires_at` in Unix nanoseconds.
 - `Lock`: clears unwrapped keys and live TTL grants for the supplied project ID or all projects when no ID is supplied.
 - `RegisterClient`: stores a scoped automation-client public key and writes `CLIENT_ADD`.
 - `RevokeClient`: revokes an automation client and writes `CLIENT_REVOKE`.
@@ -110,9 +111,9 @@ CLI agent commands:
 
 `locket lock` locks the current project in the running agent, or all vaults when no project is resolved and no vault is selected. Both `locket unlock` and `locket lock` accept repeated `--project <PROJECT>` flags for vault IDs or names, including `@shared`. The `--shared` flag appends the Global Vault after the selected projects, or selects it on its own from outside a project.
 
-Before contacting the agent or prompting, the CLI resolves every selector and its profile. It deduplicates vaults by project ID in selection order and rejects batches of more than eight distinct vaults. Each vault receives its own agent RPC and audit handling. An explicit unlock applies the requested `--ttl` to each vault and performs its required user verification separately. `--ttl` accepts 1 to 86400 seconds and defaults to `agent.unlock_ttl` (15 minutes unless configured).
+Before contacting the agent or prompting, the CLI resolves every selector and its profile. It deduplicates vaults by project ID in selection order and rejects batches of more than eight distinct vaults. An explicit unlock applies the requested `--ttl` to each vault. `--ttl` accepts 1 to 86400 seconds and defaults to `agent.unlock_ttl` (15 minutes unless configured).
 
-The CLI stops at the first failure or cancellation, reports which vaults succeeded, failed, or were skipped, and exits with the error. Vaults that already succeeded keep their new state. With `LOCKET_NO_PROMPT=1`, unlock returns `UnlockRequired` with a single interactive command for the selected vaults.
+With a running agent, `locket unlock` uses `Unlock` for one vault and `UnlockBatch` for two to eight vaults. Older daemons and vaults that need an interactive passphrase use the sequential per-vault unlock path. Sequential operations stop at the first failure or cancellation and report which vaults succeeded, failed, or were skipped. Vaults that already succeeded keep their new state. With `LOCKET_NO_PROMPT=1`, unlock returns `UnlockRequired` with a single interactive command for the selected vaults.
 
 Without a running agent, unlock runs in metadata-only direct mode for local vaults. A batch that includes the Global Vault requires a running agent before any vault can be unlocked.
 

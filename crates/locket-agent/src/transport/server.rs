@@ -47,6 +47,7 @@ use crate::session_lock::{
 };
 use crate::status::{LockState, RecentAuditStatus, StatusPayload};
 use crate::status_stream::StatusHub;
+use crate::unlock_cache::{UnlockAuditContext, UnlockEntry, UnlockMethod};
 
 #[cfg(all(test, unix))]
 type PeerCredentialValidator =
@@ -1277,6 +1278,13 @@ struct UnlockPayload {
     audit: Option<UnlockAuditPayload>,
 }
 
+#[derive(serde::Deserialize)]
+struct UnlockBatchPayload {
+    projects: Vec<UnlockPayload>,
+    #[serde(default)]
+    verify_user: bool,
+}
+
 fn deserialize_unlock_passphrase<'de, D>(
     deserializer: D,
 ) -> Result<Option<Zeroizing<String>>, D::Error>
@@ -1345,7 +1353,7 @@ pub async fn dispatch_with_peer(
 ) -> ResponseEnvelope {
     let method = envelope.method();
     // Keep store validation and key insertion ordered with session locks.
-    let unlock_session = if matches!(method, Ok(AgentMethod::Unlock)) {
+    let unlock_session = if matches!(method, Ok(AgentMethod::Unlock | AgentMethod::UnlockBatch)) {
         Some(state.session_gate.lock().await)
     } else {
         None
@@ -1370,7 +1378,16 @@ pub async fn dispatch_with_peer(
         return response;
     }
     if let Some(session) = unlock_session {
-        return handle_unlock(envelope, state, session).await;
+        return if matches!(method, Ok(AgentMethod::UnlockBatch)) {
+            match handle_unlock_batch(envelope, state, session).await {
+                Ok(payload) => {
+                    ResponseEnvelope::Success(SuccessEnvelope::new(envelope.id.clone(), payload))
+                }
+                Err(response) => response,
+            }
+        } else {
+            handle_unlock(envelope, state, session).await
+        };
     }
     drop(unlock_session);
     match method {
@@ -1592,6 +1609,18 @@ async fn ide_env_session_dispatch(
 const AGENT_UNLOCK_CLIENT_KIND: &str = "agent";
 const AGENT_UNLOCK_COMMAND: &str = "unlock";
 const MAX_UNLOCK_TTL_SECONDS: u64 = 86_400;
+const MAX_UNLOCK_BATCH_PROJECTS: usize = 8;
+
+fn validate_unlock_ttl(envelope: &RequestEnvelope, seconds: u64) -> Result<(), ResponseEnvelope> {
+    if !(1..=MAX_UNLOCK_TTL_SECONDS).contains(&seconds) {
+        return Err(error_response(
+            envelope,
+            "MetadataInvalid",
+            "unlock TTL must be between 1 and 86400 seconds",
+        ));
+    }
+    Ok(())
+}
 
 /// Server-side `Unlock` handler. The agent never trusts the client to
 /// supply key bytes; it pulls the master key from the OS keychain or
@@ -1612,12 +1641,8 @@ async fn handle_unlock(
         Err(_) => return error_response(envelope, "ProtocolError", "invalid Unlock payload"),
     };
 
-    if !(1..=MAX_UNLOCK_TTL_SECONDS).contains(&payload.ttl_seconds) {
-        return error_response(
-            envelope,
-            "MetadataInvalid",
-            "unlock TTL must be between 1 and 86400 seconds",
-        );
+    if let Err(response) = validate_unlock_ttl(envelope, payload.ttl_seconds) {
+        return response;
     }
 
     let unlock_store = match open_unlock_store(envelope, state, &payload, now).await {
@@ -1668,7 +1693,7 @@ async fn handle_unlock(
     };
     let now = current_unix_nanos();
 
-    let (master_key_bytes, resolved_method) = match resolve_master_key(
+    let key = match resolve_master_key(
         envelope,
         state,
         payload.passphrase.as_ref().map(|passphrase| passphrase.as_str()),
@@ -1678,39 +1703,273 @@ async fn handle_unlock(
         Err(error) => return error,
     };
 
-    let mut entry = crate::unlock_cache::UnlockEntry::new_zeroizing(
-        Zeroizing::new(master_key_bytes.to_vec()),
-        now,
-        std::time::Duration::from_secs(payload.ttl_seconds),
-        resolved_method,
-    );
-    if let Some(mut opened) = unlock_store {
+    let audit_context = if let Some(mut opened) = unlock_store {
         if let Err(response) = append_unlock_audit_row(
             envelope,
             &mut opened.store,
-            &payload.project_id,
+            &payload,
             opened.context.profile_id.as_deref(),
-            &master_key_bytes,
-            resolved_method,
-            payload.ttl_seconds,
+            &key,
             now,
             &verification,
+            None,
         ) {
             return response;
         }
-        entry.store_identity = Some(opened.identity);
-        entry = entry.with_audit_context(opened.context);
-    }
+        Some((opened.identity, opened.context))
+    } else {
+        None
+    };
+    let entry = key.into_cache_entry(now, payload.ttl_seconds, audit_context);
     state.unlock_cache.lock().await.insert(payload.project_id, entry);
     drop(session);
     state.publish_status_snapshot(now).await;
     ResponseEnvelope::Success(SuccessEnvelope::new(envelope.id.clone(), serde_json::Value::Null))
 }
 
+struct PreparedBatchUnlock {
+    payload: UnlockPayload,
+    context: UnlockAuditContext,
+    key: ResolvedMasterKey,
+}
+
+struct PreparedUnlockBatch {
+    projects: Vec<PreparedBatchUnlock>,
+    store: Store,
+    identity: StoreFileIdentity,
+    verification_reason: Option<String>,
+}
+
+async fn handle_unlock_batch(
+    envelope: &RequestEnvelope,
+    state: &AgentSocketState,
+    session: tokio::sync::MutexGuard<'_, BTreeSet<&'static str>>,
+) -> Result<serde_json::Value, ResponseEnvelope> {
+    if !session.is_empty() {
+        return Err(error_response(
+            envelope,
+            "UnlockRequired",
+            "OS session is locked or suspended",
+        ));
+    }
+    let batch = prepare_unlock_batch(envelope, state).await?;
+    let verification = if let Some(reason) = batch.verification_reason.as_deref() {
+        state.verify_local_user(envelope, "unlock_batch", reason).await.map_err(|_| {
+            error_response(
+                envelope,
+                "UnlockRequired",
+                "fresh local user verification failed or is unavailable",
+            )
+        })?
+    } else {
+        UserVerificationAudit::not_required()
+    };
+    let now = current_unix_nanos();
+    state
+        .expire_unlocks(now)
+        .await
+        .map_err(|_| error_response(envelope, "CorruptDb", "failed to audit expired unlock"))?;
+    let mut cache = state.unlock_cache.lock().await;
+    let unlocked = commit_unlock_batch(envelope, batch, now, &verification, &mut cache)?;
+    drop(cache);
+    drop(session);
+    state.publish_status_snapshot(now).await;
+    Ok(serde_json::json!({ "batch_size": unlocked.len(), "unlocked": unlocked }))
+}
+
+async fn prepare_unlock_batch(
+    envelope: &RequestEnvelope,
+    state: &AgentSocketState,
+) -> Result<PreparedUnlockBatch, ResponseEnvelope> {
+    let request: UnlockBatchPayload = serde::Deserialize::deserialize(&envelope.payload)
+        .map_err(|_| error_response(envelope, "ProtocolError", "invalid UnlockBatch payload"))?;
+    let batch_size = request.projects.len();
+    if !(1..=MAX_UNLOCK_BATCH_PROJECTS).contains(&batch_size) {
+        return Err(error_response(
+            envelope,
+            "MetadataInvalid",
+            "unlock batch requires 1 to 8 vaults",
+        ));
+    }
+    let mut project_ids = BTreeSet::new();
+    for project in &request.projects {
+        if project.project_id.trim().is_empty() || !project_ids.insert(&project.project_id) {
+            return Err(error_response(
+                envelope,
+                "MetadataInvalid",
+                "unlock batch requires nonempty, unique project IDs",
+            ));
+        }
+        validate_unlock_ttl(envelope, project.ttl_seconds)?;
+    }
+
+    let now = current_unix_nanos();
+    let mut verification_required = request.verify_user;
+    let mut labels = Vec::with_capacity(batch_size);
+    let mut prepared = Vec::with_capacity(batch_size);
+    let mut batch_store = None;
+    for mut payload in request.projects {
+        let opened = batch_unlock_store(envelope, state, &payload, now).await?;
+        let (label, required) =
+            batch_unlock_project(envelope, state, &opened, &payload.project_id)?;
+        verification_required |= required || payload.verify_user;
+        labels.push(label);
+        let passphrase = payload.passphrase.take();
+        let key = resolve_master_key(
+            envelope,
+            state,
+            passphrase.as_ref().map(|value| value.as_str()),
+            &payload.project_id,
+        )?;
+        if let Some((_, identity)) = &batch_store {
+            if identity != &opened.identity {
+                return Err(error_response(
+                    envelope,
+                    "AccessDenied",
+                    "unlock batch paths must select the same vault database",
+                ));
+            }
+        } else {
+            batch_store = Some((opened.store, opened.identity));
+        }
+        prepared.push(PreparedBatchUnlock { payload, context: opened.context, key });
+    }
+    let Some((store, identity)) = batch_store else {
+        return Err(error_response(
+            envelope,
+            "MetadataInvalid",
+            "unlock batch requires a vault database",
+        ));
+    };
+
+    Ok(PreparedUnlockBatch {
+        projects: prepared,
+        store,
+        identity,
+        verification_reason: verification_required.then(|| batch_unlock_reason(&labels)),
+    })
+}
+
+async fn batch_unlock_store(
+    envelope: &RequestEnvelope,
+    state: &AgentSocketState,
+    payload: &UnlockPayload,
+    now: i128,
+) -> Result<OpenUnlockStore, ResponseEnvelope> {
+    open_unlock_store(envelope, state, payload, now)
+        .await
+        .map_err(|message| error_response(envelope, "AccessDenied", message))?
+        .ok_or_else(|| {
+            error_response(envelope, "AccessDenied", "unlock batch requires a vault database")
+        })
+}
+
+fn batch_unlock_project(
+    envelope: &RequestEnvelope,
+    state: &AgentSocketState,
+    opened: &OpenUnlockStore,
+    project_id: &str,
+) -> Result<(String, bool), ResponseEnvelope> {
+    let store = &opened.store;
+    let corrupt =
+        || error_response(envelope, "CorruptDb", "could not read unlock batch vault metadata");
+    let project = store.get_project(project_id).map_err(|_| corrupt())?.ok_or_else(|| {
+        error_response(envelope, "ProjectNotFound", "unlock batch vault was not found")
+    })?;
+    if let Some(profile_id) = &opened.context.profile_id
+        && !store
+            .list_profiles(project_id)
+            .map_err(|_| corrupt())?
+            .iter()
+            .any(|profile| &profile.id == profile_id)
+    {
+        return Err(error_response(
+            envelope,
+            "ProfileNotFound",
+            "unlock audit profile does not belong to the vault",
+        ));
+    }
+    let required =
+        state.verification_required(Some(store), project_id, &["unlock"]).map_err(|()| {
+            error_response(envelope, "AccessDenied", "could not read unlock verification policy")
+        })?;
+    Ok((project.name, required))
+}
+
+fn batch_unlock_reason(labels: &[String]) -> String {
+    let mut names = labels
+        .iter()
+        .take(6)
+        .map(|label| {
+            let mut chars = label.chars().filter(|char| !char.is_control());
+            let mut name: String = chars.by_ref().take(32).collect();
+            if chars.next().is_some() {
+                name.push_str("...");
+            }
+            name
+        })
+        .collect::<Vec<_>>();
+    if labels.len() > 6 {
+        names.push("...".to_owned());
+    }
+    let vaults = if labels.len() == 1 { "vault" } else { "vaults" };
+    format!("Unlock {} Locket {vaults} ({})", labels.len(), names.join(", "))
+}
+
+fn commit_unlock_batch(
+    envelope: &RequestEnvelope,
+    batch: PreparedUnlockBatch,
+    now: i128,
+    verification: &UserVerificationAudit,
+    cache: &mut crate::unlock_cache::UnlockCache,
+) -> Result<Vec<serde_json::Value>, ResponseEnvelope> {
+    let PreparedUnlockBatch { mut store, identity, projects, .. } = batch;
+    if projects.iter().any(|vault| !identity.matches(&vault.context.store_path)) {
+        return Err(error_response(
+            envelope,
+            "AccessDenied",
+            "unlock batch store identity changed",
+        ));
+    }
+    let transaction_error =
+        || error_response(envelope, "CorruptDb", "failed to commit UNLOCK audit rows");
+    // The store owns the connection, so dropping it rolls back on any early return.
+    // Each append uses its normal savepoint inside the batch transaction.
+    store.connection().execute_batch("BEGIN IMMEDIATE").map_err(|_| transaction_error())?;
+    let batch_size = projects.len();
+    let mut entries = Vec::with_capacity(batch_size);
+    let mut unlocked = Vec::with_capacity(batch_size);
+    for PreparedBatchUnlock { payload, context, key } in projects {
+        append_unlock_audit_row(
+            envelope,
+            &mut store,
+            &payload,
+            context.profile_id.as_deref(),
+            &key,
+            now,
+            verification,
+            Some(batch_size),
+        )?;
+        let entry =
+            key.into_cache_entry(now, payload.ttl_seconds, Some((identity.clone(), context)));
+        unlocked.push(serde_json::json!({
+            "project_id": payload.project_id,
+            "ttl_seconds": payload.ttl_seconds,
+            "expires_at": entry.expires_at_unix_nanos(),
+        }));
+        entries.push((payload.project_id, entry));
+    }
+    store.connection().execute_batch("COMMIT").map_err(|_| transaction_error())?;
+    for (project_id, entry) in entries {
+        cache.insert(project_id, entry);
+    }
+    Ok(unlocked)
+}
+
 struct OpenUnlockStore {
     store: Store,
     identity: StoreFileIdentity,
-    context: crate::unlock_cache::UnlockAuditContext,
+    context: UnlockAuditContext,
 }
 
 async fn open_unlock_store(
@@ -1721,7 +1980,7 @@ async fn open_unlock_store(
 ) -> Result<Option<OpenUnlockStore>, &'static str> {
     let cache = state.unlock_cache.lock().await;
     let entry = cache.lookup(&payload.project_id, now);
-    let previous_context = entry.and_then(crate::unlock_cache::UnlockEntry::audit_context);
+    let previous_context = entry.and_then(UnlockEntry::audit_context);
     let request_path = envelope.payload.get("store_path").and_then(serde_json::Value::as_str);
     let store_path = payload
         .audit
@@ -1746,12 +2005,38 @@ async fn open_unlock_store(
         .as_ref()
         .and_then(|audit| audit.profile_id.clone())
         .or_else(|| previous_context.and_then(|context| context.profile_id.clone()));
-    let context = crate::unlock_cache::UnlockAuditContext {
+    let context = UnlockAuditContext {
         store_path: state.canonical_store_path.as_deref().unwrap_or(path).to_path_buf(),
         profile_id,
     };
     drop(cache);
     Ok(Some(OpenUnlockStore { store, identity, context }))
+}
+
+struct ResolvedMasterKey {
+    bytes: Zeroizing<KeyBytes>,
+    method: UnlockMethod,
+}
+
+impl ResolvedMasterKey {
+    fn into_cache_entry(
+        self,
+        now: i128,
+        ttl_seconds: u64,
+        audit: Option<(StoreFileIdentity, UnlockAuditContext)>,
+    ) -> UnlockEntry {
+        let mut entry = UnlockEntry::new_zeroizing(
+            Zeroizing::new(self.bytes.to_vec()),
+            now,
+            std::time::Duration::from_secs(ttl_seconds),
+            self.method,
+        );
+        if let Some((identity, context)) = audit {
+            entry.store_identity = Some(identity);
+            entry = entry.with_audit_context(context);
+        }
+        entry
+    }
 }
 
 /// Loads the master key for `project_id` from the OS keychain, falling
@@ -1763,13 +2048,20 @@ fn resolve_master_key(
     state: &AgentSocketState,
     passphrase: Option<&str>,
     project_id: &str,
-) -> Result<(Zeroizing<KeyBytes>, crate::unlock_cache::UnlockMethod), ResponseEnvelope> {
-    use crate::unlock_cache::UnlockMethod;
-
+) -> Result<ResolvedMasterKey, ResponseEnvelope> {
     match state.master_key_store.load_master_key(project_id) {
-        Ok(key) => Ok((key, UnlockMethod::OsKeychain)),
+        Ok(bytes) => Ok(ResolvedMasterKey { bytes, method: UnlockMethod::OsKeychain }),
         Err(PlatformError::MasterKeyNotFound) => {
             let Some(passphrase) = passphrase else {
+                if envelope.kind == AgentMethod::UnlockBatch.as_str()
+                    && state.passphrase_store.contains_project(project_id).unwrap_or(false)
+                {
+                    return Err(error_response(
+                        envelope,
+                        "UnlockRequired",
+                        "unlock batch requires an interactive passphrase",
+                    ));
+                }
                 return Err(error_response(
                     envelope,
                     "UnlockRequired",
@@ -1777,7 +2069,7 @@ fn resolve_master_key(
                 ));
             };
             match state.passphrase_store.load_master_key(project_id, passphrase.as_bytes()) {
-                Ok(key) => Ok((key, UnlockMethod::Passphrase)),
+                Ok(bytes) => Ok(ResolvedMasterKey { bytes, method: UnlockMethod::Passphrase }),
                 Err(PlatformError::MasterKeyNotFound) => Err(error_response(
                     envelope,
                     "UnlockRequired",
@@ -1817,17 +2109,17 @@ const fn classify_platform_error(error: &PlatformError) -> &'static str {
 fn append_unlock_audit_row(
     envelope: &RequestEnvelope,
     store: &mut Store,
-    project_id: &str,
+    payload: &UnlockPayload,
     profile_id: Option<&str>,
-    master_key: &KeyBytes,
-    method: crate::unlock_cache::UnlockMethod,
-    ttl_seconds: u64,
+    key: &ResolvedMasterKey,
     now_unix_nanos: i128,
     verification: &UserVerificationAudit,
+    batch_size: Option<usize>,
 ) -> Result<(), ResponseEnvelope> {
-    let audit_key = match unwrap_audit_key_with_master(store, project_id, master_key) {
+    let project_id = &payload.project_id;
+    let audit_key = match unwrap_audit_key_with_master(store, project_id, &key.bytes) {
         Ok(key) => key,
-        Err(_) if !verification.verified => return Ok(()),
+        Err(_) if batch_size.is_none() && !verification.verified => return Ok(()),
         Err(_) => {
             return Err(error_response(
                 envelope,
@@ -1838,13 +2130,13 @@ fn append_unlock_audit_row(
     };
 
     let timestamp = i64::try_from(now_unix_nanos).unwrap_or(i64::MAX);
-    let unlock_method_str = match method {
-        crate::unlock_cache::UnlockMethod::OsKeychain => "OsKeychain",
-        crate::unlock_cache::UnlockMethod::Passphrase => "Passphrase",
-        crate::unlock_cache::UnlockMethod::RecoveryEnvelope => "RecoveryEnvelope",
+    let unlock_method_str = match key.method {
+        UnlockMethod::OsKeychain => "OsKeychain",
+        UnlockMethod::Passphrase => "Passphrase",
+        UnlockMethod::RecoveryEnvelope => "RecoveryEnvelope",
     };
-    let metadata = serde_json::json!({
-        "schema_version": 1,
+    let mut metadata = serde_json::json!({
+        "schema_version": if batch_size.is_some() { 2 } else { 1 },
         "action": "UNLOCK",
         "status": "SUCCESS",
         "command": AGENT_UNLOCK_COMMAND,
@@ -1854,8 +2146,11 @@ fn append_unlock_audit_row(
         "cached_keys": true,
         "user_verification": verification,
         "grant_actions": [],
-        "ttl_seconds": ttl_seconds,
+        "ttl_seconds": payload.ttl_seconds,
     });
+    if let Some(batch_size) = batch_size {
+        metadata["batch_size"] = serde_json::json!(batch_size);
+    }
     let audit = locket_store::AuditWrite {
         project_id,
         profile_id,

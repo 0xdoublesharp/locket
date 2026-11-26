@@ -450,9 +450,9 @@ async fn unlock_grant_lifecycle() {
     };
     run.record("init", "<<>>").await;
     success(fixture.unlock(A, 30).await);
-    run.record("unlock", r#"<< "ProjA", 1 >>"#).await;
+    run.record("unlock", r#"<< {"ProjA"}, 1 >>"#).await;
     success(fixture.unlock(B, 120).await);
-    run.record("unlock", r#"<< "ProjB", 2 >>"#).await;
+    run.record("unlock", r#"<< {"ProjB"}, 2 >>"#).await;
 
     let rejected = fixture.grant(B, GrantAction::ResolveReference, false).await;
     assert_eq!(denial(rejected), "ConfirmationFailed");
@@ -475,7 +475,7 @@ async fn unlock_grant_lifecycle() {
     run.record("revoke", "<<>>").await;
 
     success(fixture.unlock(A, 30).await);
-    run.record("unlock", r#"<< "ProjA", 1 >>"#).await;
+    run.record("unlock", r#"<< {"ProjA"}, 1 >>"#).await;
     run.grant = Some((fixture.grant_id(A, GrantAction::PrepareExec).await, false));
     run.record("grant", r#"<< "ProjA", "normal", "prepare", 2, FALSE >>"#).await;
     run.resolve(A, &fixture.binding, true).await;
@@ -501,6 +501,42 @@ async fn unlock_grant_lifecycle() {
         .await
         .unwrap();
     run.record("resume", "<<>>").await;
+
+    // Exercise both key sources with the same batch and observe it as one step.
+    let passphrase = "fixture-passphrase-for-project-b";
+    fixture.state.master_key_store.store_master_key(A.id, &A.master()).unwrap();
+    fixture
+        .state
+        .passphrase_store
+        .store_master_key(B.id, &B.master(), passphrase.as_bytes(), now())
+        .unwrap();
+    let batch = fixture
+        .rpc(
+            AgentMethod::UnlockBatch,
+            json!({
+                "projects": [
+                    {"project_id": A.id, "ttl_seconds": 120},
+                    {"project_id": B.id, "ttl_seconds": 120, "passphrase": passphrase},
+                ],
+                "verify_user": false,
+            }),
+        )
+        .await;
+    assert_eq!(success(batch)["batch_size"], 2);
+    run.record("unlock", r#"<< {"ProjA", "ProjB"}, 1 >>"#).await;
+    let scoped_lock = fixture.rpc(AgentMethod::Lock, json!({"project_id": A.id})).await;
+    success(scoped_lock);
+    run.record("lock", r#"<< "ProjA" >>"#).await;
+    assert!(fixture.state.unlock_cache.lock().await.lookup(B.id, i128::from(now())).is_some());
+    let native_lock = fixture
+        .state
+        .lock_for_native_session_event(SessionLockSource::ScreenLock, true, i128::from(run.cutoff))
+        .await
+        .unwrap();
+    assert_eq!(native_lock.cached_keys_cleared, 1);
+    assert!(fixture.state.unlock_cache.lock().await.is_empty());
+    run.record("nativeLock", "<<>>").await;
+
     run.trace.emit("AgentUnlockGrantLifecycle");
 }
 

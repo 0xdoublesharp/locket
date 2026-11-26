@@ -41,11 +41,16 @@ Symmetry ==
        clients \in Permutations(Clients)}
 ToOtherProjects(entries, p) == {e \in entries : e.project # p}
 
-Unlock(p, ttl) ==
+Unlock(S, ttl) ==
     /\ ~sessionBlocked
-    /\ keys' = [keys EXCEPT ![p] = Deadline(ttl)]
+    /\ S # {}
+    /\ keys' = [p \in Projects |-> IF p \in S THEN Deadline(ttl) ELSE keys[p]]
     /\ UNCHANGED <<now, sessionBlocked, grants, ideSessions, challenges,
                    minted, replay, redeemed, badAccess, badGrant, badAuth>>
+
+UnlockBatch(S, ttl) ==
+    /\ Cardinality(S) >= 2
+    /\ Unlock(S, ttl)
 
 LockProject(p) ==
     /\ keys' = [keys EXCEPT ![p] = 0]
@@ -169,10 +174,11 @@ AuthWithChallenge(p, client, nonce, signatureOK) ==
 
 Next ==
     \/ SessionLockOrSleep \/ Resume \/ Tick \/ RevokeGrant
+    \/ \E S \in SUBSET Projects, ttl \in TTLs : UnlockBatch(S, ttl)
     \/ \E p \in Projects :
          \/ LockProject(p)
          \/ \E ttl \in TTLs :
-              \/ Unlock(p, ttl)
+              \/ Unlock({p}, ttl)
               \/ \E profile \in Profiles :
                    \/ \E action \in Actions, confirmed \in BOOLEAN :
                         IssueGrant(p, profile, action, ttl, confirmed)

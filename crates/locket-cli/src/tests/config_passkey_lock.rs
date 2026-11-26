@@ -1122,8 +1122,11 @@ fn direct_unlock_batch_is_metadata_only_and_requires_an_agent_for_shared()
 }
 
 #[cfg(unix)]
+const BATCH_FALLBACK_PASSPHRASE: &str = "test batch fallback passphrase";
+
+#[cfg(unix)]
 #[test]
-fn live_agent_vault_batches_stop_after_verification_or_lock_failure()
+fn live_agent_vault_batches_verify_once_and_cancel_together()
 -> Result<(), Box<dyn std::error::Error>> {
     use std::os::unix::net::UnixListener;
     use std::sync::atomic::AtomicBool;
@@ -1137,12 +1140,16 @@ fn live_agent_vault_batches_stop_after_verification_or_lock_failure()
         init_batch_project(&context, "web")?,
         init_batch_project(&context, "worker")?,
     ];
-    let context = RuntimeContext { agent_data_dir: Some(directory.path().into()), ..context };
+    let context = RuntimeContext {
+        agent_data_dir: Some(directory.path().into()),
+        passphrase_reader: Arc::new(StaticPassphraseReader::new(BATCH_FALLBACK_PASSPHRASE)),
+        ..context
+    };
     let endpoint = crate::agent_socket_path(&context);
     let listener = UnixListener::bind(&endpoint)?;
     listener.set_nonblocking(true)?;
     let (record_prompt, prompts) = std::sync::mpsc::channel();
-    let cancel_web = Arc::new(AtomicBool::new(false));
+    let cancel_batch = Arc::new(AtomicBool::new(false));
     let state = locket_agent::AgentSocketState::with_stores(
         "test",
         locket_agent::current_process_uid(),
@@ -1152,7 +1159,7 @@ fn live_agent_vault_batches_stop_after_verification_or_lock_failure()
     .with_canonical_store_path(context.store_path.clone())
     .with_user_verifier(Arc::new(BatchUserVerifier {
         record_prompt,
-        cancel_web: Arc::clone(&cancel_web),
+        cancel_batch: Arc::clone(&cancel_batch),
     }));
     let (stop, mut shutdown) = tokio::sync::oneshot::channel::<()>();
     let server = std::thread::spawn(move || -> std::io::Result<()> {
@@ -1173,7 +1180,8 @@ fn live_agent_vault_batches_stop_after_verification_or_lock_failure()
             }
         })
     });
-    let result = check_live_vault_batches(&context, &ids, &prompts, &cancel_web);
+    let result = check_live_vault_batches(&context, &ids, &prompts, &cancel_batch)
+        .and_then(|()| check_live_batch_passphrase_fallback(&context, &ids[1]));
     let _ = stop.send(());
     server.join().map_err(|_| "vault batch server panicked")??;
     result
@@ -1182,7 +1190,7 @@ fn live_agent_vault_batches_stop_after_verification_or_lock_failure()
 #[cfg(unix)]
 struct BatchUserVerifier {
     record_prompt: std::sync::mpsc::Sender<String>,
-    cancel_web: Arc<std::sync::atomic::AtomicBool>,
+    cancel_batch: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[cfg(unix)]
@@ -1195,8 +1203,8 @@ impl locket_platform::LocalUserVerifier for BatchUserVerifier {
         self.record_prompt
             .send(request.reason.clone())
             .map_err(|_| PlatformError::LocalUserVerificationUnavailable)?;
-        if request.reason.ends_with("(web)")
-            && self.cancel_web.load(std::sync::atomic::Ordering::SeqCst)
+        if request.action == "unlock_batch"
+            && self.cancel_batch.load(std::sync::atomic::Ordering::SeqCst)
         {
             return MemoryLocalUserVerifier::cancelled().verify_user(request);
         }
@@ -1209,7 +1217,7 @@ fn check_live_vault_batches(
     context: &RuntimeContext,
     [api, web, worker]: &[String; 3],
     prompts: &std::sync::mpsc::Receiver<String>,
-    cancel_web: &std::sync::atomic::AtomicBool,
+    cancel_batch: &std::sync::atomic::AtomicBool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use locket_core::LocketError;
     use std::sync::atomic::Ordering;
@@ -1230,13 +1238,6 @@ fn check_live_vault_batches(
             |row| row.get(0),
         )
     };
-    let verify_two = || {
-        assert_eq!(
-            prompts.try_iter().collect::<Vec<_>>(),
-            ["Unlock the Locket vault (api)", "Unlock the Locket vault (web)",]
-        );
-    };
-
     let (result, text) = run(&[
         "unlock",
         "--project",
@@ -1250,7 +1251,7 @@ fn check_live_vault_batches(
         "3600",
     ])?;
     result?;
-    verify_two();
+    assert_eq!(prompts.try_iter().collect::<Vec<_>>(), ["Unlock 2 Locket vaults (api, web)"]);
     for id in [api, web] {
         assert!(text.contains(&format!("vault {id}: unlocked")), "{text}");
         assert_eq!(status(id)?["lock_state"], "unlocked");
@@ -1262,6 +1263,7 @@ fn check_live_vault_batches(
             .ok_or("missing unlock audit row")?;
         let metadata: serde_json::Value = serde_json::from_str(&row.metadata_json)?;
         assert_eq!(metadata["ttl_seconds"], 3600);
+        assert_eq!(metadata["batch_size"], 2);
         assert_eq!(metadata["user_verification"]["satisfied"], true);
     }
 
@@ -1275,27 +1277,25 @@ fn check_live_vault_batches(
 
     let selectors = ["--project", "api", "--project", "web", "--project", "worker"];
     let unlock = [vec!["unlock", "--verify-user"], selectors.to_vec()].concat();
-    cancel_web.store(true, Ordering::SeqCst);
+    cancel_batch.store(true, Ordering::SeqCst);
     let (result, text) = run(&unlock)?;
     assert!(matches!(
         result,
-        Err(crate::CliError::Typed { kind: LocketError::UserVerificationFailed, .. })
+        Err(crate::CliError::Typed { kind: LocketError::UnlockRequired, .. })
     ));
-    verify_two();
-    for expected in [
-        format!("vault {api}: unlocked"),
-        format!("vault {web}: unlock failed"),
-        format!("vault {worker}: unlock skipped"),
-    ] {
-        assert!(text.contains(&expected), "{text}");
+    assert_eq!(
+        prompts.try_iter().collect::<Vec<_>>(),
+        ["Unlock 3 Locket vaults (api, web, worker)"]
+    );
+    assert!(text.is_empty(), "{text}");
+    for id in [api, web, worker] {
+        assert_eq!(status(id)?["lock_state"], "locked");
     }
-    assert_eq!(status(api)?["lock_state"], "unlocked");
-    assert_eq!(status(web)?["lock_state"], "locked");
-    assert_eq!(status(worker)?["lock_state"], "locked");
+    assert_eq!(audits("UNLOCK", api)?, 1);
     assert_eq!(audits("UNLOCK", web)?, 1);
     assert_eq!(audits("UNLOCK", worker)?, 0);
 
-    cancel_web.store(false, Ordering::SeqCst);
+    cancel_batch.store(false, Ordering::SeqCst);
     run(&unlock)?.0?;
     store.connection().execute_batch(&format!(
         "CREATE TRIGGER reject_web_lock BEFORE INSERT ON audit_log
@@ -1314,6 +1314,38 @@ fn check_live_vault_batches(
     assert_eq!(status(api)?["lock_state"], "locked");
     assert_eq!(status(worker)?["lock_state"], "unlocked");
     assert_eq!(audits("LOCK", worker)?, 0);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn check_live_batch_passphrase_fallback(
+    context: &RuntimeContext,
+    web: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let key = context.key_store.load_master_key(web)?;
+    context.passphrase_store.store_master_key(
+        web,
+        &key,
+        BATCH_FALLBACK_PASSPHRASE.as_bytes(),
+        crate::now_unix_nanos()?,
+    )?;
+    context.key_store.delete_master_key(web)?;
+    let mut output = Vec::new();
+    run_with_context(
+        Cli::try_parse_from(["locket", "unlock", "--project", "api", "--project", "web"])?,
+        context,
+        &mut output,
+    )?;
+    let output = String::from_utf8(output)?;
+    assert!(output.contains(&format!("vault {web}: unlocked")), "{output}");
+    let row = crate::open_store(context)?
+        .list_exportable_audit_rows(web)?
+        .into_iter()
+        .rfind(|row| row.action == "UNLOCK")
+        .ok_or("missing passphrase unlock audit row")?;
+    let metadata: serde_json::Value = serde_json::from_str(&row.metadata_json)?;
+    assert_eq!(metadata["method"], "Passphrase");
+    assert!(metadata.get("batch_size").is_none());
     Ok(())
 }
 

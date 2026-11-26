@@ -50,6 +50,7 @@ fn agent_methods_round_trip_through_wire_names() -> Result<(), UnknownMethod> {
     let methods = [
         AgentMethod::Status,
         AgentMethod::Unlock,
+        AgentMethod::UnlockBatch,
         AgentMethod::Lock,
         AgentMethod::Shutdown,
         AgentMethod::RegisterClient,
@@ -88,6 +89,7 @@ fn agent_methods_round_trip_through_wire_names() -> Result<(), UnknownMethod> {
     for method in methods {
         assert_eq!(method.as_str().parse::<AgentMethod>()?, method);
     }
+    assert_eq!(AgentMethod::UnlockBatch.as_str(), "unlock_batch");
 
     Ok(())
 }
@@ -5721,6 +5723,7 @@ async fn invalid_request_payloads_produce_typed_redacted_errors() {
         (AgentMethod::Lock, json!(canary)),
         (AgentMethod::Shutdown, json!(canary)),
         (AgentMethod::Unlock, json!(canary)),
+        (AgentMethod::UnlockBatch, json!(canary)),
         (AgentMethod::RequestGrant, json!(canary)),
         (AgentMethod::ExpireGrant, json!(canary)),
         (AgentMethod::RevokeGrant, json!(canary)),
@@ -6078,4 +6081,307 @@ async fn regression_project_expiry_keeps_cache_eviction_ordered_with_grant_revoc
     assert!(state.unlock_cache.lock().await.is_empty());
     assert!(state.grants.lock().await.is_empty());
     Ok(())
+}
+
+mod unlock_batch_tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    use locket_crypto::KeyBytes;
+    use locket_platform::{
+        LocalUserVerification, LocalUserVerificationRequest, LocalUserVerifier, MasterKeyStore,
+        MemoryLocalUserVerifier, PassphraseFallbackMasterKeyStore, PlatformError,
+    };
+    use locket_store::Store;
+    use serde_json::Value;
+    use zeroize::Zeroizing;
+
+    use super::{AgentMethod, RequestEnvelope, ResponseEnvelope, insert_wrapped_audit_key, json};
+
+    #[derive(Default)]
+    struct ProjectKeys(Mutex<BTreeMap<String, Zeroizing<KeyBytes>>>);
+
+    impl MasterKeyStore for ProjectKeys {
+        fn store_master_key(&self, id: &str, key: &KeyBytes) -> Result<(), PlatformError> {
+            self.0
+                .lock()
+                .map_err(|_| PlatformError::MemoryPoisoned)?
+                .insert(id.to_owned(), Zeroizing::new(*key));
+            Ok(())
+        }
+
+        fn load_master_key(&self, id: &str) -> Result<Zeroizing<KeyBytes>, PlatformError> {
+            self.0
+                .lock()
+                .map_err(|_| PlatformError::MemoryPoisoned)?
+                .get(id)
+                .cloned()
+                .ok_or(PlatformError::MasterKeyNotFound)
+        }
+
+        fn delete_master_key(&self, id: &str) -> Result<(), PlatformError> {
+            self.0.lock().map_err(|_| PlatformError::MemoryPoisoned)?.remove(id);
+            Ok(())
+        }
+    }
+
+    struct RecordingVerifier {
+        verifier: MemoryLocalUserVerifier,
+        requests: Mutex<Vec<LocalUserVerificationRequest>>,
+    }
+
+    impl LocalUserVerifier for RecordingVerifier {
+        fn verify_user(
+            &self,
+            request: &LocalUserVerificationRequest,
+        ) -> Result<LocalUserVerification, PlatformError> {
+            self.requests.lock().unwrap().push(request.clone());
+            self.verifier.verify_user(request)
+        }
+    }
+
+    struct Fixture {
+        state: crate::AgentSocketState,
+        path: PathBuf,
+        store: Store,
+        verifier: Arc<RecordingVerifier>,
+        _directory: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        fn new(verifier: MemoryLocalUserVerifier) -> Result<Self, Box<dyn std::error::Error>> {
+            let directory = tempfile::tempdir()?;
+            let path = directory.path().join("store.db");
+            let mut store = Store::open(&path)?;
+            store.initialize_schema()?;
+            let keys = Arc::new(ProjectKeys::default());
+            for (id, name, byte) in [("one", "Alpha", 7), ("two", "Beta", 8), ("three", "Gamma", 9)]
+            {
+                store.insert_project_if_absent(id, name, 1)?;
+                store.insert_profile_if_absent(
+                    &format!("{id}-profile"),
+                    id,
+                    "default",
+                    false,
+                    1,
+                )?;
+                keys.store_master_key(id, &[byte; 32])?;
+                insert_wrapped_audit_key(&store, id, &[byte; 32], &[byte + 10; 32])?;
+            }
+            store.insert_project_if_absent("missing", "Missing key", 1)?;
+            let verifier = Arc::new(RecordingVerifier { verifier, requests: Mutex::default() });
+            let state = crate::AgentSocketState::with_stores(
+                "batch test",
+                crate::current_process_uid(),
+                keys,
+                Arc::new(PassphraseFallbackMasterKeyStore::new(directory.path().join("fallback"))),
+            )
+            .with_canonical_store_path(path.clone())
+            .with_user_verifier(verifier.clone());
+            Ok(Self { _directory: directory, state, path, store, verifier })
+        }
+
+        fn item(&self, project_id: &str, seconds: u64) -> Value {
+            json!({
+                "project_id": project_id, "ttl_seconds": seconds,
+                "audit": {"store_path": self.path, "profile_id": format!("{project_id}-profile")}
+            })
+        }
+
+        fn unlock(
+            &self,
+            projects: Vec<Value>,
+            verify_user: bool,
+        ) -> impl Future<Output = ResponseEnvelope> + Send + '_ {
+            let state = &self.state;
+            async move {
+                crate::dispatch(
+                    &RequestEnvelope::new(
+                        "unlock",
+                        AgentMethod::UnlockBatch,
+                        json!({
+                            "projects": projects, "verify_user": verify_user,
+                        }),
+                    ),
+                    state,
+                )
+                .await
+            }
+        }
+
+        fn audit_count(&self) -> u32 {
+            self.store
+                .connection()
+                .query_row("SELECT COUNT(*) FROM audit_log WHERE action = 'UNLOCK'", [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        }
+    }
+
+    fn assert_error(response: ResponseEnvelope, code: &str) {
+        let ResponseEnvelope::Error(error) = response else {
+            panic!("expected {code}, received {response:?}");
+        };
+        assert_eq!(error.error, code, "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn verifies_three_vaults_once_and_audits_independent_deadlines()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::server::current_unix_nanos;
+
+        let mut fixture = Fixture::new(MemoryLocalUserVerifier::allowing())?;
+        fixture.state = fixture.state.with_daemon_user_verification(true);
+        let targets = [("one", 30), ("two", 120), ("three", 480)];
+        let response =
+            fixture.unlock(targets.map(|(id, ttl)| fixture.item(id, ttl)).to_vec(), false).await;
+        let ResponseEnvelope::Success(success) = response else {
+            return Err(format!("batch unlock failed: {response:?}").into());
+        };
+        assert_eq!(
+            *fixture.verifier.requests.lock().unwrap(),
+            [LocalUserVerificationRequest::new(
+                "unlock_batch",
+                "Unlock 3 Locket vaults (Alpha, Beta, Gamma)"
+            )],
+        );
+        assert_eq!(success.payload["batch_size"], 3);
+        assert_eq!(success.payload["unlocked"].as_array().unwrap().len(), 3);
+        assert_eq!(fixture.audit_count(), 3);
+        let cache = fixture.state.unlock_cache.lock().await;
+        let mut deadlines = Vec::new();
+        let mut verification_times = Vec::new();
+        for (index, (id, ttl)) in targets.into_iter().enumerate() {
+            let entry = cache.lookup(id, current_unix_nanos()).unwrap();
+            let expiry = entry.expires_at_unix_nanos();
+            deadlines.push(expiry);
+            assert_eq!(
+                success.payload["unlocked"][index],
+                json!({
+                    "project_id": id, "ttl_seconds": ttl, "expires_at": expiry,
+                })
+            );
+            let row = fixture.store.list_exportable_audit_rows(id)?.pop().unwrap();
+            let metadata: Value = serde_json::from_str(&row.metadata_json)?;
+            assert_eq!(row.action, "UNLOCK");
+            assert_eq!(metadata["batch_size"], 3);
+            assert_eq!(metadata["ttl_seconds"], ttl);
+            assert_eq!(metadata["user_verification"]["satisfied"], true);
+            verification_times
+                .push(metadata["user_verification"]["verified_at_unix_nanos"].as_i64().unwrap());
+        }
+        assert_eq!(deadlines[1] - deadlines[0], 90_000_000_000);
+        assert_eq!(deadlines[2] - deadlines[1], 360_000_000_000);
+        assert!(verification_times.windows(2).all(|pair| pair[0] == pair[1]));
+        drop(cache);
+
+        let request =
+            RequestEnvelope::new("lock-one", AgentMethod::Lock, json!({"project_id": "one"}));
+        assert!(matches!(
+            crate::dispatch(&request, &fixture.state).await,
+            ResponseEnvelope::Success(_)
+        ));
+        let cache = fixture.state.unlock_cache.lock().await;
+        assert!(cache.lookup("one", current_unix_nanos()).is_none());
+        assert!(cache.lookup("two", current_unix_nanos()).is_some());
+        assert!(cache.lookup("three", current_unix_nanos()).is_some());
+        drop(cache);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verification_denial_or_cancellation_leaves_no_keys_or_audits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for verifier in [MemoryLocalUserVerifier::denying(), MemoryLocalUserVerifier::cancelled()] {
+            let fixture = Fixture::new(verifier)?;
+            let projects = vec![fixture.item("one", 30), fixture.item("two", 120)];
+            assert_error(fixture.unlock(projects, true).await, "UnlockRequired");
+            assert_eq!(fixture.verifier.requests.lock().unwrap().len(), 1);
+            assert!(fixture.state.unlock_cache.lock().await.is_empty());
+            assert_eq!(fixture.audit_count(), 0);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_batches_and_locked_sessions_before_verifying()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(MemoryLocalUserVerifier::allowing())?;
+        let item = fixture.item("one", 30);
+        let mut foreign_profile = fixture.item("two", 30);
+        foreign_profile["audit"]["profile_id"] = json!("one-profile");
+        let mut foreign_store = fixture.item("two", 30);
+        foreign_store["audit"]["store_path"] = json!(fixture.path.with_extension("other"));
+        let oversized = (0..9)
+            .map(|index| json!({"project_id": index.to_string(), "ttl_seconds": 30}))
+            .collect();
+        for (projects, code) in [
+            (vec![], "MetadataInvalid"),
+            (oversized, "MetadataInvalid"),
+            (vec![item.clone(), item.clone()], "MetadataInvalid"),
+            (vec![item.clone(), fixture.item("two", 0)], "MetadataInvalid"),
+            (vec![item.clone(), fixture.item("two", 86_401)], "MetadataInvalid"),
+            (vec![item.clone(), foreign_profile], "ProfileNotFound"),
+            (vec![item.clone(), foreign_store], "AccessDenied"),
+            (vec![item.clone(), fixture.item("nonexistent", 30)], "ProjectNotFound"),
+            (
+                vec![item.clone(), json!({"project_id": "missing", "ttl_seconds": 30})],
+                "UnlockRequired",
+            ),
+        ] {
+            assert_error(fixture.unlock(projects, true).await, code);
+        }
+        fixture
+            .state
+            .lock_for_native_session_event(
+                crate::SessionLockSource::ScreenLock,
+                true,
+                crate::server::current_unix_nanos(),
+            )
+            .await?;
+        assert_error(fixture.unlock(vec![item], true).await, "UnlockRequired");
+        assert!(fixture.verifier.requests.lock().unwrap().is_empty());
+        assert!(fixture.state.unlock_cache.lock().await.is_empty());
+        assert_eq!(fixture.audit_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn audit_failure_rolls_back_the_batch() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(MemoryLocalUserVerifier::allowing())?;
+        fixture.store.connection().execute_batch(
+            "CREATE TRIGGER reject_second_unlock BEFORE INSERT ON audit_log
+             WHEN NEW.action = 'UNLOCK' AND NEW.project_id = 'two'
+             BEGIN SELECT RAISE(ABORT, 'fixture unlock audit failure'); END;",
+        )?;
+        let projects = vec![fixture.item("one", 30), fixture.item("two", 120)];
+        assert_error(fixture.unlock(projects, true).await, "CorruptDb");
+        assert_eq!(fixture.verifier.requests.lock().unwrap().len(), 1);
+        assert_eq!(fixture.audit_count(), 0);
+        assert!(fixture.state.unlock_cache.lock().await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn single_item_batch_uses_its_vault_policy() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(MemoryLocalUserVerifier::allowing())?;
+        let projects = vec![json!({"project_id": "one", "ttl_seconds": 30})];
+        assert!(matches!(
+            fixture.unlock(projects.clone(), false).await,
+            ResponseEnvelope::Success(_)
+        ));
+        assert!(fixture.verifier.requests.lock().unwrap().is_empty());
+        fixture.store.connection().execute(
+            "UPDATE projects SET user_verification_policy_json = ?1 WHERE id = 'one'",
+            [r#"{"unlock":true}"#],
+        )?;
+        assert!(matches!(fixture.unlock(projects, false).await, ResponseEnvelope::Success(_)));
+        assert_eq!(
+            *fixture.verifier.requests.lock().unwrap(),
+            [LocalUserVerificationRequest::new("unlock_batch", "Unlock 1 Locket vault (Alpha)")],
+        );
+        Ok(())
+    }
 }

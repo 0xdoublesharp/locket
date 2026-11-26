@@ -23,6 +23,8 @@ pub enum AgentMethod {
     Status,
     /// Unlock local key material.
     Unlock,
+    /// Unlock several local vaults with a single user-verification ceremony.
+    UnlockBatch,
     /// Clear local key material and live grants.
     Lock,
     /// Gracefully stop the local daemon after clearing key material.
@@ -128,6 +130,7 @@ impl AgentMethod {
             Self::TeamSyncReconcile => "TeamSyncReconcile",
             Self::Status => "Status",
             Self::Unlock => "Unlock",
+            Self::UnlockBatch => "unlock_batch",
             Self::Lock => "Lock",
             Self::Shutdown => "Shutdown",
             Self::RegisterClient => "RegisterClient",
@@ -190,6 +193,7 @@ impl FromStr for AgentMethod {
             "TeamSyncReconcile" => Ok(Self::TeamSyncReconcile),
             "Status" => Ok(Self::Status),
             "Unlock" => Ok(Self::Unlock),
+            "unlock_batch" => Ok(Self::UnlockBatch),
             "Lock" => Ok(Self::Lock),
             "Shutdown" => Ok(Self::Shutdown),
             "RegisterClient" => Ok(Self::RegisterClient),
