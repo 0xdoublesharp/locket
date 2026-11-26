@@ -284,8 +284,8 @@ mod compensation_tests {
 }
 
 /// Patterns protecting local plaintext environment and vault helper files.
-pub const SECRET_FILE_IGNORE_PATTERNS: [&str; 4] =
-    [".env", ".env.*", ".locket.local", ".locketignore"];
+pub const SECRET_FILE_IGNORE_PATTERNS: [&str; 5] =
+    [".env", ".env.*", "!.env.example", ".locket.local", ".locketignore"];
 
 /// Add missing secret-file patterns without removing existing project ignore rules.
 ///
@@ -302,7 +302,17 @@ pub fn ensure_secret_file_ignores(root: &Path) -> std::io::Result<()> {
     let previous = if metadata.is_some() { fs::read_to_string(&path)? } else { String::new() };
     let mut next = previous.clone();
     for pattern in SECRET_FILE_IGNORE_PATTERNS {
-        if !previous.lines().any(|line| line.trim() == pattern) {
+        let present = if pattern == "!.env.example" {
+            // The last matching Git rule wins, including a wildcard we just appended.
+            next.lines()
+                .rev()
+                .map(str::trim)
+                .find(|line| matches!(*line, ".env.*" | "!.env.example"))
+                == Some(pattern)
+        } else {
+            previous.lines().any(|line| line.trim() == pattern)
+        };
+        if !present {
             if !next.is_empty() && !next.ends_with('\n') {
                 next.push('\n');
             }

@@ -922,6 +922,214 @@ fn run_env_json(
 }
 
 #[test]
+fn import_archive_preserves_bytes_and_creates_distinct_private_backups()
+-> Result<(), Box<dyn std::error::Error>> {
+    let project = tempdir()?;
+    let context = test_context(&project);
+    let outside = tempdir()?;
+    let archive = outside.path().join("backups");
+    let archive_arg = archive.to_str().ok_or("archive path must be UTF-8")?;
+    let source = project.path().join(".env");
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--no-device", "--no-passkey"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+
+    for value in ["first-archive-fixture", "second-archive-fixture"] {
+        let contents = format!("# preserve comments and line endings\r\nTOKEN='{value}'\r\n");
+        fs::write(&source, &contents)?;
+        let (code, report) = run_env_json(
+            &context,
+            &["import", ".env", "--archive", archive_arg, "--overwrite", "--json"],
+            &[value],
+        )?;
+        assert_eq!(code, 0);
+        assert_eq!(report["delete_env"], "archived");
+        let archived = Path::new(report["archived_to"].as_str().ok_or("missing archive path")?);
+        assert_eq!(archived.parent(), Some(archive.canonicalize()?.as_path()));
+        assert_eq!(fs::read(archived)?, contents.as_bytes());
+        assert!(!source.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(fs::metadata(archived)?.permissions().mode() & 0o777, 0o600);
+            assert_eq!(fs::metadata(&archive)?.permissions().mode() & 0o777, 0o700);
+        }
+    }
+    let backups = fs::read_dir(&archive)?
+        .map(|entry| fs::read_to_string(entry?.path()))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(backups.len(), 2);
+    assert!(backups.iter().any(|contents| contents.contains("first-archive-fixture")));
+    Ok(())
+}
+
+#[test]
+fn import_archive_dry_run_leaves_source_and_destination_untouched()
+-> Result<(), Box<dyn std::error::Error>> {
+    let project = tempdir()?;
+    let context = test_context(&project);
+    let source = project.path().join(".env");
+    let contents = "TOKEN=dry-run-archive-fixture\n";
+    fs::write(&source, contents)?;
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--no-device", "--no-passkey"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    let args = ["import", ".env", "--archive", "new/backups", "--dry-run"];
+    let mut output = Vec::new();
+    assert_eq!(
+        run_with_context(
+            Cli::try_parse_from(std::iter::once("locket").chain(args))?,
+            &context,
+            &mut output
+        )?,
+        0
+    );
+    let output = String::from_utf8(output)?;
+    assert!(output.contains("delete_env: would-archive"));
+    assert!(!output.contains("dry-run-archive-fixture"));
+
+    let mut json_args = args.to_vec();
+    json_args.push("--json");
+    let (code, report) = run_env_json(&context, &json_args, &["dry-run-archive-fixture"])?;
+    assert_eq!(code, 0);
+    assert_eq!(report["delete_env"], "would-archive");
+    assert!(report.get("archived_to").is_none());
+    assert_eq!(fs::read_to_string(source)?, contents);
+    assert!(!project.path().join("new").exists());
+    assert!(
+        Cli::try_parse_from(["locket", "import", ".env", "--archive", "backups", "--keep"])
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn import_archive_keeps_source_when_keys_are_skipped_or_filtered()
+-> Result<(), Box<dyn std::error::Error>> {
+    let project = tempdir()?;
+    let context = test_context(&project);
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--no-device", "--no-passkey"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    crate::set_secret_value(&context, &test_secret_write_args("TOKEN"), "old", "manual", 1000)?;
+    let source = project.path().join(".env");
+    let contents = "TOKEN=skipped-archive-fixture\nNEW=imported-archive-fixture\n";
+    fs::write(&source, contents)?;
+
+    for (options, count) in
+        [(&[][..], "skipped"), (&["--exclude", "TOKEN", "--overwrite"][..], "filtered_out")]
+    {
+        let mut args = vec!["import", ".env", "--archive", "backups", "--json"];
+        args.extend_from_slice(options);
+        let (code, report) = run_env_json(
+            &context,
+            &args,
+            &["skipped-archive-fixture", "imported-archive-fixture"],
+        )?;
+        assert_eq!(code, 0);
+        assert_eq!(report[count], 1);
+        assert_eq!(report["delete_env"], "kept");
+        assert!(report.get("archived_to").is_none());
+        assert_eq!(fs::read_to_string(&source)?, contents);
+        assert!(!project.path().join("backups").exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn import_archive_requires_git_ignore_inside_project() -> Result<(), Box<dyn std::error::Error>> {
+    let project = tempdir()?;
+    run_git(project.path(), &["init", "-q"])?;
+    let context = test_context(&project);
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--no-device", "--no-passkey"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    let directory = project.path().join("backups");
+    let source = project.path().join(".env");
+    let contents = "TOKEN=ignored-archive-fixture\n";
+    fs::write(&source, contents)?;
+    let (code, report) = run_env_json(
+        &context,
+        &["import", ".env", "--archive", "backups", "--json"],
+        &["ignored-archive-fixture"],
+    )?;
+    assert_ne!(code, 0);
+    assert!(
+        report["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("must be ignored by Git"))
+    );
+    assert_eq!(fs::read_to_string(&source)?, contents);
+    assert_eq!(fs::read_dir(&directory)?.count(), 0);
+
+    let mut gitignore =
+        fs::OpenOptions::new().append(true).open(project.path().join(".gitignore"))?;
+    writeln!(gitignore, "/backups/")?;
+    let mut output = Vec::new();
+    assert_eq!(
+        run_with_context(
+            Cli::try_parse_from([
+                "locket",
+                "import",
+                ".env",
+                "--archive",
+                "backups",
+                "--overwrite"
+            ])?,
+            &context,
+            &mut output,
+        )?,
+        0
+    );
+    let output = String::from_utf8(output)?;
+    assert!(output.contains("delete_env: archived"));
+    assert!(output.contains("archived_to: "));
+    assert!(!output.contains("ignored-archive-fixture"));
+    assert!(!source.exists());
+    assert_eq!(fs::read_dir(directory)?.count(), 1);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn import_archive_rejects_symlink_destination_and_preserves_source()
+-> Result<(), Box<dyn std::error::Error>> {
+    let project = tempdir()?;
+    let outside = tempdir()?;
+    let context = test_context(&project);
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--no-device", "--no-passkey"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    let source = project.path().join(".env");
+    let contents = "TOKEN=symlink-archive-fixture\n";
+    fs::write(&source, contents)?;
+    std::os::unix::fs::symlink(outside.path(), project.path().join("backups"))?;
+    let mut output = Vec::new();
+    let code = run_with_context(
+        Cli::try_parse_from(["locket", "import", ".env", "--archive", "backups/", "--json"])?,
+        &context,
+        &mut output,
+    )?;
+    assert_ne!(code, 0);
+    let output = String::from_utf8(output)?;
+    assert!(output.contains("archive destination must be a directory"));
+    assert!(!output.contains("symlink-archive-fixture"));
+    assert_eq!(fs::read_to_string(source)?, contents);
+    assert_eq!(fs::read_dir(outside.path())?.count(), 0);
+    Ok(())
+}
+
+#[test]
 fn env_import_selects_shared_keys_outside_a_project() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempdir()?;
     let context = test_context_with_confirmation(&directory, "delete .env");

@@ -1,7 +1,7 @@
 //! Agent command implementation (start/status/stop/logs).
 
 use std::fs;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::Path;
 use std::time::{Duration as StdDuration, Instant};
 
@@ -12,6 +12,8 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::commands::team::{device, members};
 use crate::runtime::error::typed_cli_error;
+#[cfg(target_os = "windows")]
+use crate::set_user_only_file_permissions;
 use crate::support::handoff::{heredoc_command, shell_words_command};
 use crate::{
     AGENT_LOG_FOLLOW_SLEEP_MS, AgentCommand, AgentInviteCommand, AgentInviteCreateArgs,
@@ -19,8 +21,7 @@ use crate::{
     RuntimeContext, TeamAcceptArgs, TeamCommand, TeamInviteArgs, agent_log_path,
     agent_log_paths_oldest_first, agent_pid_path, agent_socket_path, append_agent_log,
     metadata_invalid_error, now_unix_nanos, prepare_agent_log_dir, require_project,
-    resolve_project, sanitize_agent_log_line, set_user_only_file_permissions,
-    unix_nanos_to_rfc3339, write_agent_paths,
+    resolve_project, sanitize_agent_log_line, unix_nanos_to_rfc3339, write_agent_paths,
 };
 
 pub fn agent_command(
@@ -1357,7 +1358,7 @@ fn agent_logs_command(
         return Err(metadata_invalid_error("agent logs --lines is capped at 10000"));
     }
     let since = args.since.as_deref().map(parse_agent_log_since).transpose()?;
-    let lines = read_agent_log_lines(context, since)?;
+    let (lines, mut follower) = read_agent_log_lines(context, since, args.follow)?;
     if lines.is_empty() {
         if !args.follow {
             writeln!(output, "no agent logs")?;
@@ -1368,7 +1369,12 @@ fn agent_logs_command(
         }
     }
     if args.follow {
-        follow_agent_logs(context, output, since)?;
+        let path = agent_log_path(context);
+        output.flush()?;
+        loop {
+            follower.poll(&path, output, since)?;
+            std::thread::sleep(StdDuration::from_millis(AGENT_LOG_FOLLOW_SLEEP_MS));
+        }
     }
     Ok(())
 }
@@ -1394,19 +1400,26 @@ const fn normalize_log_since(value: i64) -> i64 {
 fn read_agent_log_lines(
     context: &RuntimeContext,
     since: Option<i64>,
-) -> Result<Vec<String>, CliError> {
+    follow: bool,
+) -> Result<(Vec<String>, AgentLogFollower), CliError> {
     let mut lines = Vec::new();
+    let mut follower = AgentLogFollower::default();
+    let active_path = agent_log_path(context);
     for path in agent_log_paths_oldest_first(context) {
-        let log_text = match fs::read_to_string(&path) {
-            Ok(log_text) => log_text,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error.into()),
-        };
+        let Some(mut file) = open_agent_log(&path)? else { continue };
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        if follow && path == active_path {
+            let complete = bytes.iter().rposition(|&byte| byte == b'\n').map_or(0, |last| last + 1);
+            follower.pending = bytes.split_off(complete);
+            follower.file = Some(file);
+        }
+        let log_text = String::from_utf8(bytes).map_err(io::Error::other)?;
         lines.extend(
             log_text.lines().filter(|line| agent_log_line_is_since(line, since)).map(str::to_owned),
         );
     }
-    Ok(lines)
+    Ok((lines, follower))
 }
 
 fn agent_log_line_is_since(line: &str, since: Option<i64>) -> bool {
@@ -1427,32 +1440,79 @@ fn agent_log_timestamp_nanos(value: &Value) -> Option<i64> {
     timestamp.unix_timestamp_nanos().try_into().ok()
 }
 
-fn follow_agent_logs(
-    context: &RuntimeContext,
+fn open_agent_log(path: &Path) -> io::Result<Option<fs::File>> {
+    match fs::File::open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[derive(Default)]
+struct AgentLogFollower {
+    file: Option<fs::File>,
+    pending: Vec<u8>,
+}
+
+impl AgentLogFollower {
+    fn poll(&mut self, path: &Path, output: &mut impl Write, since: Option<i64>) -> io::Result<()> {
+        let open_metadata = if let Some(file) = &mut self.file {
+            let metadata = file.metadata()?;
+            if metadata.len() < file.stream_position()? {
+                file.rewind()?;
+                self.pending.clear();
+            }
+            // Drain the open file even if the writer has already renamed it.
+            write_followed_log_lines(file, &mut self.pending, output, since)?;
+            Some(metadata)
+        } else {
+            None
+        };
+
+        let current = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if open_metadata.is_some_and(|open| same_agent_log_file(&open, &current)) {
+            return Ok(());
+        }
+        if let Some(mut file) = open_agent_log(path)? {
+            self.pending.clear();
+            write_followed_log_lines(&mut file, &mut self.pending, output, since)?;
+            self.file = Some(file);
+        }
+        Ok(())
+    }
+}
+
+fn same_agent_log_file(open: &fs::Metadata, current: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        (open.dev(), open.ino()) == (current.dev(), current.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        open.created().ok() == current.created().ok()
+    }
+}
+
+fn write_followed_log_lines(
+    file: &mut fs::File,
+    pending: &mut Vec<u8>,
     output: &mut impl Write,
     since: Option<i64>,
-) -> Result<(), CliError> {
-    prepare_agent_log_dir(context)?;
-    let log_path = agent_log_path(context);
-    let mut file = fs::OpenOptions::new().read(true).create(true).append(true).open(&log_path)?;
-    set_user_only_file_permissions(&log_path)?;
-    file.seek(SeekFrom::End(0))?;
-    let mut pending = String::new();
-    loop {
-        let mut chunk = String::new();
-        file.read_to_string(&mut chunk)?;
-        if !chunk.is_empty() {
-            pending.push_str(&chunk);
-            while let Some(newline) = pending.find('\n') {
-                let line = pending[..newline].to_owned();
-                pending.drain(..=newline);
-                if agent_log_line_is_since(&line, since) {
-                    writeln!(output, "{}", sanitize_agent_log_line(&line))?;
-                }
-            }
+) -> io::Result<()> {
+    file.read_to_end(pending)?;
+    let Some(end) = pending.iter().rposition(|&byte| byte == b'\n') else { return Ok(()) };
+    for line in String::from_utf8_lossy(&pending[..=end]).lines() {
+        if agent_log_line_is_since(line, since) {
+            writeln!(output, "{}", sanitize_agent_log_line(line))?;
         }
-        std::thread::sleep(StdDuration::from_millis(AGENT_LOG_FOLLOW_SLEEP_MS));
     }
+    pending.drain(..=end);
+    output.flush()
 }
 
 #[cfg(all(test, unix))]
@@ -1494,6 +1554,35 @@ mod tests {
         EnvOrPromptPassphraseReader, StdinConfirmationReader, StdinOrPromptSecretValueReader,
         TtyRecoveryCodeReader,
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_log_follower_drains_rotated_file_and_reads_replacement_from_start() -> io::Result<()> {
+        let directory = tempdir()?;
+        let path = directory.path().join("agent.log");
+        let mut follower = AgentLogFollower::default();
+        let mut output = Vec::new();
+        follower.poll(&path, &mut output, None)?;
+
+        fs::write(&path, b"first\n")?;
+        follower.poll(&path, &mut output, None)?;
+        let mut writer = fs::OpenOptions::new().append(true).open(&path)?;
+        writer.write_all(b"last on old file\nabandoned fragment")?;
+        fs::rename(&path, directory.path().join("agent.log.1"))?;
+        follower.poll(&path, &mut output, None)?;
+        assert_eq!(output, b"first\nlast on old file\n");
+
+        fs::write(&path, b"first on replacement file, longer than the old offset\npartial ")?;
+        follower.poll(&path, &mut output, None)?;
+        let mut writer = fs::OpenOptions::new().append(true).open(&path)?;
+        writer.write_all(b"line\n")?;
+        follower.poll(&path, &mut output, None)?;
+        fs::write(&path, b"truncated\n")?;
+        follower.poll(&path, &mut output, None)?;
+        follower.poll(&path, &mut output, None)?;
+        assert_eq!(output, b"first\nlast on old file\nfirst on replacement file, longer than the old offset\npartial line\ntruncated\n");
+        Ok(())
+    }
 
     #[cfg(any(unix, target_os = "windows"))]
     #[tokio::test]

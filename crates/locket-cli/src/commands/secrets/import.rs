@@ -6,8 +6,9 @@ mod env_files;
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs;
-use std::io::Write;
+use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use locket_core::{LocketError, ProfileName, SecretName};
 use locket_crypto::{KeyBytes, KeyPurpose, local_dedup_tag_v1};
@@ -46,10 +47,11 @@ use crate::runtime::error::{
 use crate::runtime::prompts::ConfirmationReader;
 use crate::support::project_files::{ensure_gitignore, refresh_example_for_project_if_enabled};
 use crate::{
-    EnvFileCommand, ImportArgs, ImportSelectionArgs, ResolvedProject, SecretMetadataFlags,
-    SecretSourceArg, absolutize, active_profile_secret_names, ensure_trusted_project_root,
-    load_project_key, now_unix_nanos, open_store, project_not_found_error, require_project,
-    secret_audit_metadata, secret_deleted_error, source_arg_to_str,
+    EnvFileCommand, ImportArgs, ImportSelectionArgs, NANOS_PER_SECOND, ResolvedProject,
+    SecretMetadataFlags, SecretSourceArg, absolutize, active_profile_secret_names,
+    ensure_trusted_project_root, load_project_key, now_unix_nanos, open_store,
+    project_not_found_error, require_project, resolve_project, secret_audit_metadata,
+    secret_deleted_error, source_arg_to_str,
 };
 
 /// Key selection and write policy for a dotenv import.
@@ -187,15 +189,36 @@ fn import_cli(
         source: args.source.unwrap_or(SecretSourceArg::UserLocal),
     };
     let file = open_env_file(&path)?;
-    if selection.json {
-        let report = import_env_to_target(context, &mut store, &target, file, &options)?;
-        refresh_import_project_files(context, root)?;
-        return Ok(report);
+    let archive_source = selection
+        .archive
+        .as_ref()
+        .filter(|_| !selection.dry_run)
+        .map(|dir| Ok::<_, io::Error>((dir, file.try_clone()?, file.metadata()?)))
+        .transpose()?;
+    let mut report =
+        run_import(context, &mut store, &target, file, &options, |warnings, errors| {
+            if selection.json { Ok(()) } else { write_import_diagnostics(output, warnings, errors) }
+        })?;
+    refresh_import_project_files(context, root.as_deref())?;
+    if selection.dry_run && selection.archive.is_some() {
+        report.delete_env = "would-archive";
+    } else if let Some((dir, file, original)) = archive_source
+        && report.completed_cleanly()
+    {
+        let destination = absolutize(&context.cwd, dir);
+        let archived =
+            archive_env_source(&path, file, &original, &destination, &report.project_name)
+                .map_err(|error| {
+                    metadata_invalid_error(format!(
+                        "Import succeeded. Could not archive the dotenv source ({error})."
+                    ))
+                })?;
+        report.delete_env = "archived";
+        report.archived_to = Some(archived.display().to_string());
     }
-    let report = run_import(context, &mut store, &target, file, &options, |warnings, errors| {
-        write_import_diagnostics(output, warnings, errors)
-    })?;
-    refresh_import_project_files(context, root)?;
+    if selection.json {
+        return Ok(serde_json::to_value(report)?);
+    }
     write_import_report(context, output, selection, &path, &report)?;
     Ok(Value::Null)
 }
@@ -225,10 +248,10 @@ fn import_project_root(
 
 fn refresh_import_project_files(
     context: &RuntimeContext,
-    root: Option<PathBuf>,
+    root: Option<&Path>,
 ) -> Result<(), CliError> {
     if let Some(root) = root {
-        let root_context = RuntimeContext { cwd: root, ..context.clone() };
+        let root_context = RuntimeContext { cwd: root.to_owned(), ..context.clone() };
         refresh_example_for_project_if_enabled(&root_context);
         ensure_gitignore(&root_context.cwd)?;
     }
@@ -300,15 +323,17 @@ fn write_import_report(
     writeln!(output, "skipped_names: {}", format_name_set(&report.skipped_names))?;
     writeln!(output, "missing_in_profile: {}", format_name_set(&report.missing_in_profile))?;
     writeln!(output, "extra_in_profile: {}", format_name_set(&report.extra_in_profile))?;
-    if !selection.keep
+    if selection.archive.is_none()
+        && !selection.keep
         && !selection.dry_run
-        && report.filtered_out == 0
-        && report.skipped == 0
-        && report.imported + report.overwritten > 0
+        && report.completed_cleanly()
     {
         write_env_delete_prompt(output, path, context.confirmation_reader.as_ref())?;
     } else {
-        writeln!(output, "delete_env: kept")?;
+        writeln!(output, "delete_env: {}", report.delete_env)?;
+        if let Some(archived_to) = &report.archived_to {
+            writeln!(output, "archived_to: {archived_to}")?;
+        }
     }
     writeln!(output, "metadata_only: yes")?;
     Ok(())
@@ -345,9 +370,19 @@ struct ImportReport {
     extra_in_profile: BTreeSet<String>,
     warnings: Vec<Diagnostic>,
     delete_env: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    archived_to: Option<String>,
     metadata_only: bool,
     #[serde(skip)]
     profile_name_count: usize,
+}
+
+impl ImportReport {
+    const fn completed_cleanly(&self) -> bool {
+        self.filtered_out == 0
+            && self.skipped == 0
+            && self.imported + self.overwritten + self.linked + self.promoted > 0
+    }
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -448,6 +483,7 @@ fn run_import(
         extra_in_profile,
         warnings,
         delete_env: "kept",
+        archived_to: None,
         metadata_only: true,
         profile_name_count: profile_names.len(),
     })
@@ -903,6 +939,114 @@ fn format_name_set(names: &BTreeSet<String>) -> String {
     } else {
         names.iter().cloned().collect::<Vec<_>>().join(",")
     }
+}
+
+fn archive_env_source(
+    path: &Path,
+    mut source: fs::File,
+    original: &fs::Metadata,
+    directory: &Path,
+    project_name: &str,
+) -> Result<PathBuf, CliError> {
+    let directory = prepare_archive_directory(directory)?;
+    let (_, source_name) = input_parent(path)?;
+    let project = archive_name_fragment(project_name);
+    let source_name = archive_name_fragment(&source_name.to_string_lossy());
+    let seconds = now_unix_nanos()?.div_euclid(NANOS_PER_SECOND);
+    let prefix = format!("{project}-{seconds}-");
+    let suffix = format!("-{source_name}");
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(&prefix).suffix(&suffix).rand_bytes(12);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        builder.permissions(fs::Permissions::from_mode(0o600));
+    }
+    let mut backup = builder.tempfile_in(&directory)?;
+    if let Some(project) = resolve_project(&directory)? {
+        let relative = backup.path().strip_prefix(&project.root).map_err(io::Error::other)?;
+        let ignored = Command::new("git")
+            .current_dir(project.root)
+            .args(["check-ignore", "--quiet", "--"])
+            .arg(Path::new(".").join(relative))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !ignored {
+            return Err(metadata_invalid_error(
+                "archive destination inside the project must be ignored by Git",
+            ));
+        }
+    }
+
+    source.rewind()?;
+    let copied =
+        io::copy(&mut source.take(original.len().saturating_add(1)), backup.as_file_mut())?;
+    if copied != original.len() || !same_archive_source(original, &fs::symlink_metadata(path)?)? {
+        return Err(metadata_invalid_error("dotenv source changed during import"));
+    }
+    backup.as_file().sync_all()?;
+    let (_, archived) = backup.keep().map_err(|error| error.error)?;
+    #[cfg(unix)]
+    fs::File::open(&directory)?.sync_all()?;
+    if !same_archive_source(original, &fs::symlink_metadata(path)?)? {
+        return Err(metadata_invalid_error("dotenv source changed during import"));
+    }
+    fs::remove_file(path)?;
+    Ok(archived)
+}
+
+fn prepare_archive_directory(path: &Path) -> Result<PathBuf, CliError> {
+    // Strip trailing separators and `.` before checking whether the final component is a link.
+    let path: PathBuf = path.components().collect();
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt as _;
+                builder.mode(0o700);
+            }
+            builder.create(&path)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    if !fs::symlink_metadata(&path)?.is_dir() {
+        return Err(metadata_invalid_error(
+            "archive destination must be a directory without a symbolic link",
+        ));
+    }
+    Ok(path.canonicalize()?)
+}
+
+fn same_archive_source(original: &fs::Metadata, current: &fs::Metadata) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if (original.dev(), original.ino(), original.ctime(), original.ctime_nsec())
+            != (current.dev(), current.ino(), current.ctime(), current.ctime_nsec())
+        {
+            return Ok(false);
+        }
+    }
+    Ok(current.is_file()
+        && original.len() == current.len()
+        && original.modified()? == current.modified()?)
+}
+
+fn archive_name_fragment(name: &str) -> String {
+    name.chars()
+        .take(64)
+        .map(
+            |ch| {
+                if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') { ch } else { '_' }
+            },
+        )
+        .collect()
 }
 
 fn write_env_delete_prompt(

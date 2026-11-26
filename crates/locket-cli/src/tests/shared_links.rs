@@ -750,6 +750,30 @@ fn import_shared_requires_an_available_vault_and_overwrite_for_collisions()
 }
 
 #[test]
+fn import_with_only_shared_links_can_delete_the_source() -> Result<(), Box<dyn std::error::Error>> {
+    let workspace = tempfile::tempdir()?;
+    let input = "shared-link-delete-fixture";
+    let context = RuntimeContext {
+        key_store: Arc::new(ProjectKeys::default()),
+        secret_value_reader: Arc::new(StaticSecretValueReader::new(input)),
+        ..test_context_with_confirmation(&workspace, "delete .env\n")
+    };
+    run_cli_args(&context, &["init", "--no-device", "--no-passkey"])?;
+    run_cli_args(&context, &["shared", "init"])?;
+    run_cli_args(&context, &["shared", "set", "TOKEN"])?;
+    let source = workspace.path().join(".env");
+    fs::write(&source, format!("LINKED_TOKEN={input}\n"))?;
+
+    let output = run_cli_args(&context, &["import", ".env", "--link-shared"])?;
+    assert!(output.contains("imported: 0"));
+    assert!(output.contains("linked: 1"));
+    assert!(output.contains("delete_env: deleted"));
+    assert!(!output.contains(input));
+    assert!(!source.exists());
+    Ok(())
+}
+
+#[test]
 fn import_promotes_with_matching_preview_and_audits_both_vaults()
 -> Result<(), Box<dyn std::error::Error>> {
     let workspace = tempfile::tempdir()?;

@@ -2,6 +2,27 @@
 use super::*;
 
 #[test]
+fn init_keeps_env_example_visible_to_git() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let root = directory.path();
+    run_git(root, &["init", "-q"])?;
+    fs::write(root.join(".gitignore"), ".env.*\n")?;
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--no-device", "--no-passkey"])?,
+        &test_context(&directory),
+        &mut Vec::new(),
+    )?;
+
+    let output = TestCommand::new("git")
+        .current_dir(root)
+        .args(["check-ignore", "--", ".env", ".env.local", ".env.example"])
+        .output()?;
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stdout)?, ".env\n.env.local\n");
+    Ok(())
+}
+
+#[test]
 fn new_from_builtin_template_initializes_metadata_only_project()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempdir()?;

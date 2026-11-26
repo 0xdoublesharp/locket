@@ -4,7 +4,7 @@ use super::*;
 fn ignore_rules_append_missing_patterns_and_preserve_existing_lines() -> std::io::Result<()> {
     let root = tempfile::tempdir()?;
     let path = root.path().join(".gitignore");
-    fs::write(&path, "# local rules\n/target\n.env")?;
+    fs::write(&path, "# local rules\n/target\n.env\n.env.*")?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -12,7 +12,8 @@ fn ignore_rules_append_missing_patterns_and_preserve_existing_lines() -> std::io
     }
 
     ensure_secret_file_ignores(root.path())?;
-    let expected = "# local rules\n/target\n.env\n.env.*\n.locket.local\n.locketignore\n";
+    let expected =
+        "# local rules\n/target\n.env\n.env.*\n!.env.example\n.locket.local\n.locketignore\n";
     assert_eq!(fs::read_to_string(&path)?, expected);
     #[cfg(unix)]
     {
@@ -31,11 +32,24 @@ fn ignore_rules_create_file_and_reject_nonregular_destination() -> std::io::Resu
     let root = tempfile::tempdir()?;
     let path = root.path().join(".gitignore");
     ensure_secret_file_ignores(root.path())?;
-    assert_eq!(fs::read_to_string(&path)?, ".env\n.env.*\n.locket.local\n.locketignore\n");
+    assert_eq!(
+        fs::read_to_string(&path)?,
+        ".env\n.env.*\n!.env.example\n.locket.local\n.locketignore\n"
+    );
     fs::remove_file(&path)?;
     fs::create_dir(&path)?;
     assert!(ensure_secret_file_ignores(root.path()).is_err());
     assert!(path.is_dir());
+    Ok(())
+}
+
+#[test]
+fn ignore_rules_restore_an_exception_shadowed_by_the_wildcard() -> std::io::Result<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join(".gitignore");
+    fs::write(&path, "!.env.example\n.env.*\n.env\n.locket.local\n.locketignore\n")?;
+    ensure_secret_file_ignores(root.path())?;
+    assert!(fs::read_to_string(&path)?.ends_with(".locketignore\n!.env.example\n"));
     Ok(())
 }
 

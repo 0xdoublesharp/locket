@@ -21,7 +21,7 @@ pub const EXAMPLE_FILE: &str = ".env.example";
 pub const GITIGNORE_FILE: &str = ".gitignore";
 pub const EXAMPLE_BEGIN: &str = "# --- BEGIN LOCKET MANAGED ---";
 pub const EXAMPLE_END: &str = "# --- END LOCKET MANAGED ---";
-pub const GITIGNORE_ENTRIES: [&str; 4] = locket_platform::SECRET_FILE_IGNORE_PATTERNS;
+pub const GITIGNORE_ENTRIES: [&str; 5] = locket_platform::SECRET_FILE_IGNORE_PATTERNS;
 
 #[derive(Debug)]
 pub struct ExampleWriteResult {

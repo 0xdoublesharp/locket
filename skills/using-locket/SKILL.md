@@ -30,7 +30,7 @@ locket env scan
 
 ## Importing `.env` files and linking `@shared` secrets
 
-Always preview imports before writing, keep the source `.env` file until the user chooses to delete it, and reuse `@shared` for repeated credentials such as RPC URLs or provider keys:
+Always preview imports before writing, keep the source `.env` file until the user chooses to archive or delete it, and reuse `@shared` for repeated credentials such as RPC URLs or provider keys:
 
 ```sh
 locket env keys .env
@@ -41,6 +41,7 @@ locket parity
 
 - Pass `--link-shared` to link exact matches already stored in `@shared`, or `--promote-duplicates` to promote repeated values across projects into `@shared` and link them back. Both flags fail closed if `@shared` is unavailable or locked.
 - `--dry-run` uses the same classification planner as real execution and reports `would_link`, `would_promote`, `linked_names`, `promoted_names`, and `duplicate_matches`.
+- When the user chooses to archive the source, use `locket import .env --archive <DIR>` in place of `--keep`. Locket writes a private plaintext backup and removes the source after a complete import with no skipped or filtered keys. Use a directory outside the project or one ignored by Git. Add `--dry-run` to preview without creating a backup.
 - To promote, link, or unlink individual secrets after import:
 
 ```sh

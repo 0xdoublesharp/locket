@@ -547,10 +547,13 @@ struct ImportSelectionArgs {
     /// Keep the plaintext input file without prompting.
     #[arg(long)]
     keep: bool,
+    /// Archive the plaintext input file after a complete import.
+    #[arg(long, value_name = "DIR", conflicts_with = "keep")]
+    archive: Option<PathBuf>,
     /// Plan the import without writing. Shared deduplication needs the Global Vault fingerprint key.
     #[arg(long)]
     dry_run: bool,
-    /// Emit a metadata-only JSON report and keep the input file.
+    /// Emit a metadata-only JSON report without an interactive deletion prompt.
     #[arg(long)]
     json: bool,
     /// Link imported keys whose exact value already exists in @shared instead of duplicating.
