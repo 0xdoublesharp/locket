@@ -20,7 +20,7 @@ class Locket < Formula
   # from offline signing ceremony.
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "MIT"
-  version "0.2.0"
+  version "0.3.0"
 
   depends_on "rust" => :build
 
