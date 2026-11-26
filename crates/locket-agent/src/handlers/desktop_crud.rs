@@ -17,7 +17,7 @@ use serde_json::json;
 
 use super::{
     MutationError, MutationScope, confirm_dangerous_profile, context, failure,
-    is_shared_project_id, metadata, response, storage,
+    is_shared_project_id, metadata, require_unexpired_secret, response, storage,
 };
 use crate::keys::{
     StoreFileIdentity, master_key_array, unwrap_audit_key_with_master,
@@ -177,8 +177,8 @@ pub async fn handle_desktop_crud(
         };
         let scope: MutationScope =
             MutationScope::deserialize(&request.payload).map_err(|_| metadata())?;
-        consume_grant(state, &scope, action, now).await?;
         let cache = state.unlock_cache.lock().await;
+        consume_grant(state, &scope, action, now).await?;
         let locked = if action == GrantAction::CopySecretToShared {
             SOURCE_LOCKED
         } else {
@@ -699,9 +699,7 @@ fn select_copy_source(
             .max_by_key(|secret| source_precedence(&secret.source))
     }
     .ok_or_else(secret_not_found)?;
-    if super::super::secrets::secret_has_expired(store, &secret.id, i128::from(timestamp))? {
-        return Err(failure("MetadataInvalid", super::super::secrets::SECRET_EXPIRED_MESSAGE));
-    }
+    require_unexpired_secret(store, &secret.id, timestamp)?;
     if store
         .get_secret_version(&secret.id, secret.current_version)?
         .is_none_or(|version| version.state != "current")
@@ -791,6 +789,9 @@ fn copy_to_shared(
     )
     .map_err(|_| storage())?;
     let reuse_existing = if let Some(existing_secret) = existing.as_ref() {
+        if request.replace_with_link || request.consolidate_duplicates {
+            require_unexpired_secret(store, &existing_secret.id, timestamp)?;
+        }
         let same_value = crate::reveal::decrypt_secret(
             store,
             &existing_secret.project_id,
@@ -1058,6 +1059,12 @@ fn promote_secret(
                 continue;
             };
             if other_record.state != "active" {
+                continue;
+            }
+            // Replacing a local value with a link would drop its lifecycle policy.
+            if store.get_secret_expiry_policy(&other_record.id)?.is_some_and(|policy| {
+                policy.expires_at.is_some() || policy.rotate_after_days.is_some()
+            }) {
                 continue;
             }
             let link = SecretLinkRecord {

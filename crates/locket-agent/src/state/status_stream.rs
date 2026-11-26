@@ -40,11 +40,10 @@ impl StatusHub {
 
     /// Replaces the current snapshot and broadcasts it.
     pub async fn publish(&self, payload: StatusPayload) {
-        {
-            let mut current = self.inner.current.lock().await;
-            *current = payload.clone();
-        }
+        let mut current = self.inner.current.lock().await;
+        *current = payload.clone();
         let _ = self.inner.sender.send(payload);
+        drop(current);
     }
 
     /// Subscribes a new client. The first
@@ -52,8 +51,11 @@ impl StatusHub {
     /// current status; subsequent calls yield broadcasted updates or
     /// heartbeats per the configured interval.
     pub async fn subscribe(&self) -> StatusSubscriber {
+        // Snapshot and subscription must see the same position in the stream.
+        let current = self.inner.current.lock().await;
+        let snapshot = current.clone();
         let receiver = self.inner.sender.subscribe();
-        let snapshot = self.inner.current.lock().await.clone();
+        drop(current);
         let heartbeat_interval = Duration::from_secs(STATUS_HEARTBEAT_INTERVAL_SECS);
         StatusSubscriber {
             sequence: StatusEventSequence::new(),
@@ -119,6 +121,42 @@ mod tests {
     use super::{StatusHub, StatusPayload};
     use crate::status::LockState;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn subscription_does_not_replay_updates_older_than_its_initial_snapshot()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let locked = StatusPayload::locked("v");
+        let hub = StatusHub::new(locked.clone());
+        let mut subscriber = {
+            let current = hub.inner.current.lock().await;
+            let mut unlocked = locked.clone();
+            unlocked.lock_state = LockState::Unlocked;
+            let mut publish_unlock = std::pin::pin!(hub.publish(unlocked));
+            let mut publish_lock = std::pin::pin!(hub.publish(locked.clone()));
+            let mut subscribe = std::pin::pin!(hub.subscribe());
+            tokio::select! {
+                biased;
+                () = &mut publish_unlock => return Err("unlock skipped the snapshot lock".into()),
+                () = &mut publish_lock => return Err("lock skipped the snapshot lock".into()),
+                _ = &mut subscribe => return Err("subscription skipped the snapshot lock".into()),
+                () = async {} => {}
+            }
+            drop(current);
+            publish_unlock.await;
+            publish_lock.await;
+            subscribe.await
+        };
+        let first = subscriber.next_event().await.ok_or("initial snapshot missing")?;
+        assert_eq!(first.status, locked);
+        tokio::select! {
+            biased;
+            update = subscriber.next_event() => return Err(format!("unexpected queued update: {update:?}").into()),
+            () = async {} => {}
+        }
+        drop(hub);
+        assert!(subscriber.next_event().await.is_none());
+        Ok(())
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn subscriber_receives_initial_status_then_heartbeat() {

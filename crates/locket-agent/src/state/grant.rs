@@ -304,6 +304,16 @@ impl GrantTable {
         self.grants.values().filter(|grant| grant.record.project_id == project_id).count()
     }
 
+    pub(crate) fn live_count(&self, project_id: Option<&str>, now: i128) -> usize {
+        self.grants
+            .values()
+            .filter(|grant| {
+                grant.record.expires_at_unix_nanos > now
+                    && project_id.is_none_or(|id| grant.record.project_id == id)
+            })
+            .count()
+    }
+
     /// Return whether the grant table is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {

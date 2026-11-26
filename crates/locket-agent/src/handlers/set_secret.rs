@@ -196,10 +196,12 @@ pub async fn handle_set_secret(
         return typed_error(request, error.error, error.message, error.kind);
     }
 
+    let Some(grant_id) = typed.grant_id.as_deref() else {
+        return grant_required(request);
+    };
+    // Keep the authorization, store pin, and write ordered with vault locking.
+    let cache = state.unlock_cache.lock().await;
     let grant_validation = {
-        let Some(grant_id) = typed.grant_id.as_deref() else {
-            return grant_required(request);
-        };
         let grants = state.grants.lock().await;
         grants.validate(
             grant_id,
@@ -214,13 +216,7 @@ pub async fn handle_set_secret(
         return grant_required(request);
     }
 
-    let master_key = {
-        let cache = state.unlock_cache.lock().await;
-        cache
-            .lookup(&typed.project_id, now_unix_nanos)
-            .map(|entry| Zeroizing::new(entry.key_bytes().to_vec()))
-    };
-    let Some(master_key) = master_key else {
+    let Some(entry) = cache.lookup(&typed.project_id, now_unix_nanos) else {
         return typed_error(
             request,
             ERROR_UNLOCK_REQUIRED,
@@ -229,14 +225,11 @@ pub async fn handle_set_secret(
         );
     };
 
-    let (mut store, store_identity) = match crate::keys::open_verified_store_for_state(
-        state,
-        &typed.project_id,
+    let (mut store, store_identity) = match state.open_store(
         Path::new(&typed.store_path),
-        now_unix_nanos,
-    )
-    .await
-    {
+        entry.store_identity.as_ref(),
+        false,
+    ) {
         Ok(opened) => opened,
         Err(error) => return crate::server::store_open_error(request, &error),
     };
@@ -252,7 +245,7 @@ pub async fn handle_set_secret(
             value: &value,
             rotate: typed.rotate,
             grace_until: typed.grace_until,
-            master_key: &master_key,
+            master_key: entry.key_bytes(),
             timestamp: now_unix_nanos,
             imported: false,
         },
@@ -260,7 +253,6 @@ pub async fn handle_set_secret(
     ) {
         Ok(response) => {
             if let Ok(ts) = i64::try_from(now_unix_nanos) {
-                let cache = state.unlock_cache.lock().await;
                 crate::shared_links::try_record_local_dedup_tag(
                     &store,
                     &cache,
@@ -272,6 +264,7 @@ pub async fn handle_set_secret(
                     ts,
                 );
             }
+            drop(cache);
             let payload = serde_json::to_value(response).unwrap_or(Value::Null);
             ResponseEnvelope::Success(SuccessEnvelope::new(request.id.clone(), payload))
         }

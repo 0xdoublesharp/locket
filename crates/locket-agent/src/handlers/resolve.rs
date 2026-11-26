@@ -93,14 +93,14 @@ pub async fn handle_resolve(
     let Ok(typed) = serde_json::from_value::<ResolveRequest>(request.payload.clone()) else {
         return protocol_error(request, "invalid ResolveReference payload");
     };
-    if LkReferenceUri::parse(&typed.reference).is_err() {
+    let Ok(parsed) = LkReferenceUri::parse(&typed.reference) else {
         return typed_error(
             request,
             ERROR_INVALID_REFERENCE,
             "invalid lk:// reference",
             LocketError::InvalidReference,
         );
-    }
+    };
     let Some(project_id) = typed.project_id.as_deref() else {
         return protocol_error(request, "ResolveReference requires project_id");
     };
@@ -114,29 +114,9 @@ pub async fn handle_resolve(
         return protocol_error(request, "ResolveReference requires store_path");
     };
 
-    let cached_master_key_for_denial = || async {
-        let cache = state.unlock_cache.lock().await;
-        cache
-            .lookup(project_id, now_unix_nanos)
-            .map(|entry| Zeroizing::new(entry.key_bytes().to_vec()))
-    };
-    let grant_validation = {
-        let Some(grant_id) = typed.grant_id.as_deref() else {
-            let key = cached_master_key_for_denial().await;
-            crate::audit_deny::try_append_grant_denial(
-                state,
-                project_id,
-                profile_id,
-                Some(Path::new(store_path)),
-                key.as_ref().map(|key| key.as_slice()),
-                GrantAction::ResolveReference,
-                0,
-                now_unix_nanos,
-                "agent",
-            )
-            .await;
-            return grant_required(request);
-        };
+    let cache = state.unlock_cache.lock().await;
+    let entry = cache.lookup(project_id, now_unix_nanos);
+    let grant_validation = if let Some(grant_id) = typed.grant_id.as_deref() {
         let grants = state.grants.lock().await;
         // Accept a live `PrepareExec` grant in addition to the narrower
         // `ResolveReference` grant: `PrepareExec` is the umbrella the
@@ -151,9 +131,12 @@ pub async fn handle_resolve(
             now_unix_nanos,
             typed.binding.as_ref(),
         )
+    } else {
+        GrantValidation::Unknown
     };
     if !matches!(grant_validation, GrantValidation::Valid) {
-        let key = cached_master_key_for_denial().await;
+        let key = entry.map(|entry| Zeroizing::new(entry.key_bytes().to_vec()));
+        drop(cache);
         crate::audit_deny::try_append_grant_denial(
             state,
             project_id,
@@ -169,13 +152,8 @@ pub async fn handle_resolve(
         return grant_required(request);
     }
 
-    let master_key = {
-        let cache = state.unlock_cache.lock().await;
-        cache
-            .lookup(project_id, now_unix_nanos)
-            .map(|entry| Zeroizing::new(entry.key_bytes().to_vec()))
-    };
-    let Some(master_key) = master_key else {
+    let Some(entry) = entry else {
+        drop(cache);
         crate::degraded_audit::record_locked_refusal(
             "RESOLVE_REFERENCE",
             Some(project_id),
@@ -191,52 +169,41 @@ pub async fn handle_resolve(
         );
     };
 
-    let (store, store_identity) = match crate::keys::open_verified_store_for_state(
-        state,
-        project_id,
-        Path::new(store_path),
-        now_unix_nanos,
-    )
-    .await
-    {
-        Ok(opened) => opened,
-        Err(error) => return crate::server::store_open_error(request, &error),
-    };
+    let (store, store_identity) =
+        match state.open_store(Path::new(store_path), entry.store_identity.as_ref(), false) {
+            Ok(opened) => opened,
+            Err(error) => return crate::server::store_open_error(request, &error),
+        };
 
-    let shared_unlock = {
-        let cache = state.unlock_cache.lock().await;
-        LkReferenceUri::parse(&typed.reference)
-            .ok()
-            .filter(|parsed| parsed.source().is_none())
-            .and_then(|parsed| {
-                store
-                    .resolve_active_secret_link(project_id, profile_id, parsed.key().as_str())
-                    .ok()
-                    .flatten()
-            })
-            .and_then(|resolved| {
-                let entry = cache.lookup(&resolved.target_secret.project_id, now_unix_nanos)?;
-                if entry.store_identity.as_ref().is_some_and(|pin| pin != &store_identity) {
-                    return None;
-                }
-                Some((
-                    resolved.target_secret.project_id,
-                    Zeroizing::new(entry.key_bytes().to_vec()),
-                ))
-            })
-    };
+    let shared_unlock = (parsed.source().is_none())
+        .then_some(&parsed)
+        .and_then(|parsed| {
+            store
+                .resolve_active_secret_link(project_id, profile_id, parsed.key().as_str())
+                .ok()
+                .flatten()
+        })
+        .and_then(|resolved| {
+            let entry = cache.lookup(&resolved.target_secret.project_id, now_unix_nanos)?;
+            if entry.store_identity.as_ref().is_some_and(|pin| pin != &store_identity) {
+                return None;
+            }
+            Some((resolved.target_secret.project_id, entry.key_bytes()))
+        });
 
-    match resolve_reference(
-        &typed.reference,
+    let result = resolve_reference(
+        &parsed,
         project_id,
         profile_id,
         policy_name,
         store,
-        &master_key,
-        shared_unlock.as_ref().map(|(id, key)| (id.as_str(), key.as_slice())),
+        entry.key_bytes(),
+        shared_unlock.as_ref().map(|(id, key)| (id.as_str(), *key)),
         now_unix_nanos,
         typed.binding.as_ref(),
-    ) {
+    );
+    drop(cache);
+    match result {
         Ok(response) => {
             let payload = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
             ResponseEnvelope::Success(crate::envelope::SuccessEnvelope::new(
@@ -280,7 +247,7 @@ impl ResolveFailure {
 
 #[allow(clippy::too_many_arguments)]
 fn resolve_reference(
-    reference: &str,
+    parsed: &LkReferenceUri,
     project_id: &str,
     authorized_profile_id: &str,
     policy_name: &str,
@@ -290,20 +257,13 @@ fn resolve_reference(
     now_unix_nanos: i128,
     binding: Option<&GrantBinding>,
 ) -> Result<ResolveResponse, ResolveFailure> {
-    let parsed = LkReferenceUri::parse(reference).map_err(|_| {
-        ResolveFailure::new(
-            ERROR_INVALID_REFERENCE,
-            "invalid lk:// reference",
-            LocketError::InvalidReference,
-        )
-    })?;
     let master_key = master_key_array(master_key).map_err(|_| corrupt_db())?;
     match resolve_reference_inner(
         &store,
         project_id,
         authorized_profile_id,
         policy_name,
-        &parsed,
+        parsed,
         &master_key,
         shared_unlock,
         now_unix_nanos,
@@ -315,7 +275,7 @@ fn resolve_reference(
                 project_id,
                 authorized_profile_id,
                 policy_name,
-                &parsed,
+                parsed,
                 &master_key,
                 now_unix_nanos,
                 ResolveAuditOutcome::Success(&resolved.audit),
@@ -328,7 +288,7 @@ fn resolve_reference(
                 project_id,
                 authorized_profile_id,
                 policy_name,
-                &parsed,
+                parsed,
                 &master_key,
                 now_unix_nanos,
                 ResolveAuditOutcome::Failure(&error),
@@ -1895,6 +1855,25 @@ mod tests {
 
         let response = handle_resolve(&envelope, &state, 1).await;
         assert_eq!(error_code(response)?, "ProtocolError");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolve_requires_explicit_project_profile_policy_and_store_selectors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = build_fixture()?;
+        let state = unlocked_state(&fixture).await;
+        let valid = serde_json::to_value(resolve_request(&fixture))?;
+        for field in ["project_id", "profile_id", "policy_name", "store_path"] {
+            let mut payload = valid.clone();
+            payload.as_object_mut().ok_or("expected request object")?.remove(field);
+            let request =
+                RequestEnvelope::new("missing-selector", AgentMethod::ResolveReference, payload);
+            let response = handle_resolve(&request, &state, 1).await;
+            assert!(matches!(response, ResponseEnvelope::Error(error)
+                if error.error == "ProtocolError" && error.message.contains(field)));
+        }
+        assert_eq!(resolve_audit_metadata(&fixture)?, Vec::<serde_json::Value>::new());
         Ok(())
     }
 

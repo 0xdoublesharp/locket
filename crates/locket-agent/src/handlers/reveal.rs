@@ -229,6 +229,8 @@ async fn handle_value_access(
         return protocol_error(request, "value access requires store_path");
     };
 
+    let cache = state.unlock_cache.lock().await;
+    let entry = cache.lookup(project_id, now_unix_nanos);
     let (grant_validation, ttl_seconds) = {
         let grants = state.grants.lock().await;
         let ttl_seconds = grants
@@ -248,12 +250,8 @@ async fn handle_value_access(
         )
     };
     if !matches!(grant_validation, GrantValidation::Valid) {
-        let key = {
-            let cache = state.unlock_cache.lock().await;
-            cache
-                .lookup(project_id, now_unix_nanos)
-                .map(|entry| Zeroizing::new(entry.key_bytes().to_vec()))
-        };
+        let key = entry.map(|entry| Zeroizing::new(entry.key_bytes().to_vec()));
+        drop(cache);
         crate::audit_deny::try_append_grant_denial(
             state,
             project_id,
@@ -269,13 +267,8 @@ async fn handle_value_access(
         return grant_required(request);
     }
 
-    let master_key = {
-        let cache = state.unlock_cache.lock().await;
-        cache
-            .lookup(project_id, now_unix_nanos)
-            .map(|entry| Zeroizing::new(entry.key_bytes().to_vec()))
-    };
-    let Some(master_key) = master_key else {
+    let Some(entry) = entry else {
+        drop(cache);
         crate::degraded_audit::record_locked_refusal(
             access.action(),
             Some(project_id),
@@ -294,47 +287,37 @@ async fn handle_value_access(
         );
     };
 
-    let (store, store_identity) = match crate::keys::open_verified_store_for_state(
-        state,
-        project_id,
-        store_path,
-        now_unix_nanos,
-    )
-    .await
-    {
-        Ok(opened) => opened,
-        Err(error) => return crate::server::store_open_error(request, &error),
-    };
+    let (store, store_identity) =
+        match state.open_store(store_path, entry.store_identity.as_ref(), false) {
+            Ok(opened) => opened,
+            Err(error) => return crate::server::store_open_error(request, &error),
+        };
 
-    let shared_unlock = {
-        let cache = state.unlock_cache.lock().await;
-        store
-            .resolve_active_secret_link(project_id, &profile_id, &secret_name)
-            .ok()
-            .flatten()
-            .and_then(|resolved| {
-                let entry = cache.lookup(&resolved.target_secret.project_id, now_unix_nanos)?;
-                if entry.store_identity.as_ref().is_some_and(|pin| pin != &store_identity) {
-                    return None;
-                }
-                Some((
-                    resolved.target_secret.project_id,
-                    Zeroizing::new(entry.key_bytes().to_vec()),
-                ))
-            })
-    };
+    let shared_unlock = store
+        .resolve_active_secret_link(project_id, &profile_id, &secret_name)
+        .ok()
+        .flatten()
+        .and_then(|resolved| {
+            let entry = cache.lookup(&resolved.target_secret.project_id, now_unix_nanos)?;
+            if entry.store_identity.as_ref().is_some_and(|pin| pin != &store_identity) {
+                return None;
+            }
+            Some((resolved.target_secret.project_id, entry.key_bytes()))
+        });
 
-    match read_secret_value(
+    let result = read_secret_value(
         project_id,
         &profile_id,
         &secret_name,
         access,
         store,
-        &master_key,
-        shared_unlock.as_ref().map(|(id, key)| (id.as_str(), key.as_slice())),
+        entry.key_bytes(),
+        shared_unlock.as_ref().map(|(id, key)| (id.as_str(), *key)),
         ttl_seconds,
         now_unix_nanos,
-    ) {
+    );
+    drop(cache);
+    match result {
         Ok(value) => {
             let payload = match access {
                 AccessKind::Reveal => {

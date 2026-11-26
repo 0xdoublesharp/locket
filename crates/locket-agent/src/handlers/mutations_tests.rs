@@ -1798,3 +1798,371 @@ async fn dotenv_explicit_link_preview_matches_application() -> Result<(), Box<dy
     assert!(fixture.store().get_secret_link(PROJECT, PROFILE, "TOKEN")?.is_some());
     Ok(())
 }
+
+#[tokio::test]
+async fn dotenv_link_overwrite_is_atomic_with_all_shadow_tombstones()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = Fixture::new()?;
+    let state = fixture.state(GrantAction::SetSecret).await;
+    let shared = seed_shared_vault(&fixture, &state).await?;
+    let global =
+        set_link_fixture_value(&state, &shared, "GLOBAL_TOKEN", "user-local", CANARY).await;
+    let shadows = ["machine-local", "user-local", "team-managed"];
+    for source in shadows {
+        set_link_fixture_value(&state, &fixture.scope, "TOKEN", source, CANARY).await;
+    }
+    fixture.grant(&state, GrantAction::ImportDotenv).await;
+    let mut request = fixture.import("TOKEN=unused\n", false);
+    request.link_to_shared.insert("TOKEN".into(), "GLOBAL_TOKEN".into());
+    let import = |request: &ImportDotenvRequest| {
+        let rpc = envelope(AgentMethod::ImportDotenv, request);
+        let state = &state;
+        async move { handle_import_dotenv(&rpc, state, NOW).await }
+    };
+    assert_eq!(success(import(&request).await)["skipped"], 1);
+    let store = fixture.store();
+    assert!(store.get_secret_link(PROJECT, PROFILE, "TOKEN")?.is_none());
+    store.connection().execute_batch(
+        "CREATE TRIGGER reject_shadow_delete BEFORE INSERT ON audit_log
+         WHEN NEW.action = 'DELETE' BEGIN SELECT RAISE(ABORT, 'fixture'); END;",
+    )?;
+    request.overwrite = true;
+    assert_eq!(code(import(&request).await), "CorruptDb");
+    assert!(store.get_secret_link(PROJECT, PROFILE, "TOKEN")?.is_none());
+    for source in shadows {
+        assert!(store.get_active_secret(PROJECT, PROFILE, "TOKEN", source)?.is_some());
+    }
+    assert_eq!(store.list_exportable_audit_rows(PROJECT)?.len(), 3);
+
+    store.connection().execute_batch("DROP TRIGGER reject_shadow_delete;")?;
+    assert_eq!(success(import(&request).await)["linked"], 1);
+    let link = store.get_secret_link(PROJECT, PROFILE, "TOKEN")?.ok_or("missing link")?;
+    assert_eq!(link.target_secret_id, global["secret_id"].as_str().ok_or("missing target")?);
+    for source in shadows {
+        let row = store
+            .get_secret_by_source(PROJECT, PROFILE, "TOKEN", source)?
+            .ok_or("missing secret")?;
+        assert_eq!(row.state, if source == "team-managed" { "active" } else { "deleted" });
+    }
+    let audit = store.verify_audit_chain_read_only(PROJECT, &AUDIT)?;
+    assert!(audit.hmac_ok);
+    assert_eq!(audit.rows_verified, 6);
+    Ok(())
+}
+
+#[tokio::test]
+async fn regression_promotion_preserves_local_values_when_global_target_has_expired()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = Fixture::new()?;
+    let state = fixture.state(GrantAction::SetSecret).await;
+    let mut shared = seed_shared_vault(&fixture, &state).await?;
+    let target =
+        set_link_fixture_value(&state, &shared, "GLOBAL_TOKEN", "user-local", CANARY).await;
+    let target_id = target["secret_id"].as_str().ok_or("missing target ID")?;
+    let local = set_link_fixture_value(&state, &fixture.scope, "TOKEN", "user-local", CANARY).await;
+    let local_id = local["secret_id"].as_str().ok_or("missing source ID")?;
+    let store = fixture.store();
+    let timestamp = i64::try_from(NOW)?;
+    store.set_secret_expiry_policy(
+        target_id,
+        locket_store::SecretExpiryPolicy { expires_at: Some(timestamp), rotate_after_days: None },
+        timestamp,
+    )?;
+    let source_audit = store.list_exportable_audit_rows(PROJECT)?.len();
+    let target_audit = store.list_exportable_audit_rows(SHARED_PROJECT)?.len();
+
+    fixture.grant(&state, GrantAction::CopySecretToShared).await;
+    let copy = crud_request(
+        AgentMethod::CopySecretToShared,
+        &fixture.scope,
+        json!({"secret_name":"TOKEN", "target_name":"GLOBAL_TOKEN", "replace_with_link":true}),
+    );
+    assert_eq!(code(call_crud(&state, &copy).await), "MetadataInvalid");
+
+    shared.grant_id = Some("lk_grant_expired_promotion_target".into());
+    unlock_pinned(&state, &fixture.scope, &MASTER).await?;
+    unlock_pinned(&state, &shared, &MASTER).await?;
+    let mut import = fixture.import(&format!("ORDINARY=new\nTOKEN={CANARY}\n"), true);
+    import.promote_to_shared.insert("TOKEN".into(), "GLOBAL_TOKEN".into());
+    import.target_grant_id.clone_from(&shared.grant_id);
+    fixture.grant(&state, GrantAction::ImportDotenv).await;
+    grant_scope(&state, &shared, GrantAction::CopySecretToShared).await;
+    assert_eq!(
+        code(
+            handle_import_dotenv(&envelope(AgentMethod::ImportDotenv, &import), &state, NOW).await
+        ),
+        "MetadataInvalid",
+    );
+    import.dry_run = true;
+    import.promote_to_shared.clear();
+    import.link_to_shared.insert("TOKEN".into(), "GLOBAL_TOKEN".into());
+    assert_eq!(
+        code(
+            handle_import_dotenv(&envelope(AgentMethod::ImportDotenv, &import), &state, NOW).await
+        ),
+        "MetadataInvalid",
+    );
+    import.dry_run = false;
+    assert_eq!(
+        code(
+            handle_import_dotenv(&envelope(AgentMethod::ImportDotenv, &import), &state, NOW).await
+        ),
+        "MetadataInvalid",
+    );
+
+    assert_eq!(store.get_secret_by_id(local_id)?.ok_or("missing local secret")?.state, "active");
+    assert_eq!(
+        store.get_secret_by_id(target_id)?.ok_or("missing target secret")?.current_version,
+        1,
+    );
+    assert!(store.get_secret_link(PROJECT, PROFILE, "TOKEN")?.is_none());
+    assert!(store.get_active_secret(PROJECT, PROFILE, "ORDINARY", "user-local")?.is_none());
+    assert_eq!(store.list_exportable_audit_rows(PROJECT)?.len(), source_audit);
+    assert_eq!(store.list_exportable_audit_rows(SHARED_PROJECT)?.len(), target_audit);
+    Ok(())
+}
+
+#[tokio::test]
+async fn regression_consolidation_replaces_live_unlocked_duplicates_and_preserves_expired_copies()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = Fixture::new()?;
+    let state = fixture.state(GrantAction::SetSecret).await;
+    let shared = seed_shared_vault(&fixture, &state).await?;
+    let store = fixture.store();
+    let duplicates = [
+        ("lk_proj_consolidate_live", "lk_prof_consolidate_live", false, "live"),
+        ("lk_proj_consolidate_expired", "lk_prof_consolidate_expired", false, "expired"),
+        ("lk_proj_consolidate_rotation", "lk_prof_consolidate_rotation", false, "rotation-policy"),
+        ("lk_proj_consolidate_locked", "lk_prof_consolidate_locked", false, "locked"),
+        ("lk_proj_consolidate_danger", "lk_prof_consolidate_danger", true, "dangerous"),
+        ("lk_proj_consolidate_foreign", "lk_prof_consolidate_foreign", false, "foreign"),
+        ("lk_proj_consolidate_bad_key", "lk_prof_consolidate_bad_key", false, "bad-key"),
+        ("lk_proj_consolidate_wrong_key", "lk_prof_consolidate_wrong_key", false, "wrong-key"),
+    ];
+    let foreign = fixture.directory.path().join("foreign-consolidation.db");
+    let _foreign_store = Store::open(&foreign)?;
+    let mut ids = Vec::new();
+    let timestamp = i64::try_from(NOW)?;
+    for (project_id, profile_id, dangerous, status) in duplicates {
+        store.insert_project_if_absent(project_id, status, 1)?;
+        store.insert_profile_if_absent(profile_id, project_id, "dev", dangerous, 1)?;
+        insert_wrapped_keys(&store, project_id, profile_id, &MASTER, &AUDIT)?;
+        let scope = MutationScope {
+            project_id: project_id.into(),
+            profile_id: profile_id.into(),
+            ..fixture.scope.clone()
+        };
+        unlock_pinned(&state, &scope, &MASTER).await?;
+        let duplicate =
+            set_link_fixture_value(&state, &scope, "DUPLICATE", "user-local", CANARY).await;
+        let id = duplicate["secret_id"].as_str().ok_or("missing duplicate ID")?.to_owned();
+        match status {
+            "expired" => {
+                store.set_secret_expiry_policy(
+                    &id,
+                    locket_store::SecretExpiryPolicy {
+                        expires_at: Some(timestamp),
+                        rotate_after_days: None,
+                    },
+                    timestamp,
+                )?;
+            }
+            "rotation-policy" => {
+                store.set_secret_expiry_policy(
+                    &id,
+                    locket_store::SecretExpiryPolicy {
+                        expires_at: None,
+                        rotate_after_days: Some(7),
+                    },
+                    timestamp,
+                )?;
+            }
+            "locked" => {
+                state.unlock_cache.lock().await.evict(project_id);
+            }
+            "foreign" => {
+                let mut foreign_scope = scope;
+                foreign_scope.store_path.clone_from(&foreign);
+                unlock_pinned(&state, &foreign_scope, &MASTER).await?;
+            }
+            "bad-key" => state.unlock_cache.lock().await.insert(
+                project_id.into(),
+                UnlockEntry::new(vec![1], 0, Duration::from_secs(60), UnlockMethod::Passphrase),
+            ),
+            "wrong-key" => unlock_fixture(&state, project_id, &[0; 32]).await,
+            _ => {}
+        }
+        ids.push(id);
+    }
+    set_link_fixture_value(&state, &fixture.scope, "TOKEN", "user-local", CANARY).await;
+    set_link_fixture_value(&state, &fixture.scope, "MACHINE", "machine-local", CANARY).await;
+    fixture.grant(&state, GrantAction::CopySecretToShared).await;
+    let request = crud_request(
+        AgentMethod::CopySecretToShared,
+        &fixture.scope,
+        json!({"secret_name":"TOKEN", "consolidate_duplicates":true}),
+    );
+    let result = success(call_crud(&state, &request).await);
+    assert_eq!(result["consolidated_count"], 1);
+    assert_eq!(result["skipped_locked_count"], 5);
+    let target = store
+        .get_active_secret(SHARED_PROJECT, &shared.profile_id, "TOKEN", "user-local")?
+        .ok_or("missing promoted secret")?;
+    for ((project, profile, _, status), id) in duplicates.into_iter().zip(ids) {
+        let active = store.get_active_secret(project, profile, "DUPLICATE", "user-local")?;
+        let link = store.get_secret_link(project, profile, "DUPLICATE")?;
+        let audit = store.verify_audit_chain_read_only(project, &AUDIT)?;
+        assert!(audit.hmac_ok);
+        if status == "live" {
+            assert!(active.is_none());
+            assert_eq!(link.ok_or("missing consolidated link")?.target_secret_id, target.id);
+            assert_eq!(store.get_secret_by_id(&id)?.ok_or("missing tombstone")?.state, "deleted");
+            assert_eq!(audit.rows_verified, 3);
+        } else {
+            assert_eq!(active.ok_or("missing skipped duplicate")?.id, id);
+            assert!(link.is_none());
+            assert_eq!(audit.rows_verified, 1);
+        }
+    }
+    assert!(store.get_secret_link(PROJECT, PROFILE, "MACHINE")?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn regression_writes_reject_grants_revoked_while_waiting_for_the_vault()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = Fixture::new()?;
+    let state = fixture.state(GrantAction::SetSecret).await;
+    let requests = [
+        (
+            GrantAction::SetSecret,
+            crud_request(
+                AgentMethod::SetSecret,
+                &fixture.scope,
+                json!({"secret_name":"SET_TOKEN", "value":CANARY}),
+            ),
+        ),
+        (
+            GrantAction::ImportDotenv,
+            envelope(AgentMethod::ImportDotenv, &fixture.import("IMPORT_TOKEN=fixture\n", false)),
+        ),
+        (
+            GrantAction::CreateProfile,
+            crud_request(AgentMethod::CreateProfile, &fixture.scope, json!({"profile_name":"new"})),
+        ),
+    ];
+    for (action, request) in requests {
+        fixture.grant(&state, action).await;
+        let cache = state.unlock_cache.lock().await;
+        let write = async {
+            match action {
+                GrantAction::SetSecret => {
+                    crate::set_secret::handle_set_secret(&request, &state, NOW).await
+                }
+                GrantAction::ImportDotenv => handle_import_dotenv(&request, &state, NOW).await,
+                _ => call_crud(&state, &request).await,
+            }
+        };
+        let mut write = std::pin::pin!(write);
+        // Poll the write against the held vault cache before revoking its grant.
+        tokio::select! {
+            biased;
+            result = &mut write => panic!("write completed while the vault was held: {result:?}"),
+            () = async {} => {}
+        }
+        state.grants.lock().await.revoke(fixture.scope.grant_id.as_deref().unwrap());
+        drop(cache);
+        assert_eq!(code(write.await), "GrantRequired");
+    }
+    let store = fixture.store();
+    assert_eq!(store.list_active_secrets_by_profile(PROJECT, PROFILE)?, []);
+    assert!(store.get_profile_by_name(PROJECT, "new")?.is_none());
+    assert_eq!(store.list_exportable_audit_rows(PROJECT)?, []);
+    Ok(())
+}
+
+#[tokio::test]
+async fn shared_metadata_rpcs_return_redacted_errors_for_invalid_or_unreadable_requests()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = Fixture::new()?;
+    let state = crate::AgentSocketState::locked("test")
+        .with_canonical_store_path(fixture.scope.store_path.clone());
+    let foreign = fixture.directory.path().join(CANARY);
+    let mut other = Store::open(&foreign)?;
+    other.initialize_schema()?;
+    let store = fixture.store();
+    store
+        .connection()
+        .execute_batch("DROP TABLE secret_links; DROP TABLE local_value_fingerprints;")?;
+
+    for method in [AgentMethod::ListDuplicates, AgentMethod::ListSharedUsages] {
+        for (payload, expected) in [
+            (json!(CANARY), "MetadataInvalid"),
+            (json!({"store_path":foreign, "target_secret_id":"fixture"}), "AccessDenied"),
+            (
+                json!({"store_path":fixture.scope.store_path, "target_secret_id":"fixture"}),
+                "CorruptDb",
+            ),
+        ] {
+            let request = RequestEnvelope::new("shared-metadata", method, payload);
+            let response = crate::dispatch(&request, &state).await;
+            assert!(!serde_json::to_string(&response)?.contains(CANARY));
+            assert_eq!(code(response), expected);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn reads_reject_grants_revoked_while_waiting_for_the_vault()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = Fixture::new()?;
+    let state = fixture.state(GrantAction::SetSecret).await;
+    set_link_fixture_value(&state, &fixture.scope, "TOKEN", "user-local", CANARY).await;
+    apply_policy_with_master(&fixture.policy(), &MASTER, 1)?;
+    for (method, action, fields) in [
+        (AgentMethod::Reveal, GrantAction::Reveal, json!({"secret_name":"TOKEN"})),
+        (AgentMethod::Copy, GrantAction::Copy, json!({"secret_name":"TOKEN"})),
+        (
+            AgentMethod::ResolveReference,
+            GrantAction::ResolveReference,
+            json!({"reference":"lk://dev/TOKEN", "policy_name":"dev"}),
+        ),
+        (
+            AgentMethod::ScanKnownValues,
+            GrantAction::ScanKnownValues,
+            json!({"inputs":[{"path":"fixture.txt","text":CANARY}],"require_known":true}),
+        ),
+    ] {
+        fixture.grant(&state, action).await;
+        let request = crud_request(method, &fixture.scope, fields);
+        let cache = state.unlock_cache.lock().await;
+        let read = async {
+            match method {
+                AgentMethod::Reveal => crate::reveal::handle_reveal(&request, &state, NOW).await,
+                AgentMethod::Copy => crate::reveal::handle_copy(&request, &state, NOW).await,
+                AgentMethod::ResolveReference => {
+                    crate::resolve::handle_resolve(&request, &state, NOW).await
+                }
+                _ => crate::scan::handle_scan(&request, &state, NOW).await,
+            }
+        };
+        let mut read = std::pin::pin!(read);
+        tokio::select! {
+            biased;
+            _ = &mut read => panic!("request completed while waiting for the vault: {method:?}"),
+            () = async {} => {}
+        }
+        state.grants.lock().await.revoke(fixture.scope.grant_id.as_deref().unwrap());
+        drop(cache);
+        let response = read.await;
+        assert!(!serde_json::to_string(&response)?.contains(CANARY), "{method:?}");
+        assert_eq!(code(response), "GrantRequired", "{method:?}");
+    }
+    let store = fixture.store();
+    let rows = store.list_exportable_audit_rows(PROJECT)?;
+    assert_eq!(rows.iter().filter(|row| row.status == "DENIED").count(), 4);
+    assert!(rows.iter().all(|row| !row.metadata_json.contains(CANARY)));
+    assert!(store.verify_audit_chain_read_only(PROJECT, &AUDIT)?.hmac_ok);
+    Ok(())
+}

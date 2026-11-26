@@ -159,29 +159,9 @@ pub async fn handle_scan(
         return protocol_error(request, "ScanKnownValues requires store_path");
     };
 
-    let cached_master_key_for_denial = || async {
-        let cache = state.unlock_cache.lock().await;
-        cache
-            .lookup(project_id, now_unix_nanos)
-            .map(|entry| Zeroizing::new(entry.key_bytes().to_vec()))
-    };
-    let Some(grant_id) = typed.grant_id.as_deref() else {
-        let key = cached_master_key_for_denial().await;
-        crate::audit_deny::try_append_grant_denial(
-            state,
-            project_id,
-            profile_id,
-            Some(store_path),
-            key.as_ref().map(|key| key.as_slice()),
-            GrantAction::ScanKnownValues,
-            0,
-            now_unix_nanos,
-            "agent",
-        )
-        .await;
-        return grant_required(request);
-    };
-    let grant_validation = {
+    let cache = state.unlock_cache.lock().await;
+    let entry = cache.lookup(project_id, now_unix_nanos);
+    let grant_validation = if let Some(grant_id) = typed.grant_id.as_deref() {
         let grants = state.grants.lock().await;
         grants.validate(
             grant_id,
@@ -191,9 +171,12 @@ pub async fn handle_scan(
             now_unix_nanos,
             typed.binding.as_ref(),
         )
+    } else {
+        GrantValidation::Unknown
     };
     if !matches!(grant_validation, GrantValidation::Valid) {
-        let key = cached_master_key_for_denial().await;
+        let key = entry.map(|entry| Zeroizing::new(entry.key_bytes().to_vec()));
+        drop(cache);
         crate::audit_deny::try_append_grant_denial(
             state,
             project_id,
@@ -209,13 +192,8 @@ pub async fn handle_scan(
         return grant_required(request);
     }
 
-    let master_key = {
-        let cache = state.unlock_cache.lock().await;
-        cache
-            .lookup(project_id, now_unix_nanos)
-            .map(|entry| Zeroizing::new(entry.key_bytes().to_vec()))
-    };
-    let Some(master_key) = master_key else {
+    let Some(entry) = entry else {
+        drop(cache);
         return if typed.require_known {
             crate::degraded_audit::record_locked_refusal(
                 "SCAN",
@@ -230,27 +208,22 @@ pub async fn handle_scan(
         };
     };
 
-    let (store, _) = match crate::keys::open_verified_store_for_state(
-        state,
-        project_id,
-        store_path,
-        now_unix_nanos,
-    )
-    .await
-    {
+    let (store, _) = match state.open_store(store_path, entry.store_identity.as_ref(), false) {
         Ok(opened) => opened,
         Err(error) => return crate::server::store_open_error(request, &error),
     };
 
-    match scan_known_values(
+    let result = scan_known_values(
         &typed,
         project_id,
         profile_id,
         store,
-        &master_key,
+        entry.key_bytes(),
         now_unix_nanos,
         policy_name,
-    ) {
+    );
+    drop(cache);
+    match result {
         Ok(response) => {
             let count = u32::try_from(response.findings.len()).unwrap_or(u32::MAX);
             state.record_scan_warning_count(count).await;

@@ -483,3 +483,27 @@ fn review_keeps_existing_version_metadata_until_explicitly_accepted() -> TestRes
     assert_eq!(read_version(&store)?.created_at, 200);
     Ok(())
 }
+
+#[tokio::test]
+async fn regression_verify_bundle_rejects_files_over_the_container_limit_before_decoding()
+-> TestResult {
+    let vault = BackupVault::new()?;
+    let path = vault.dir.path().join("oversized.locket-bundle");
+    fs::File::create(&path)?.set_len(
+        locket_core::BUNDLE_MAX_PAYLOAD_LEN
+            + u64::try_from(locket_core::BUNDLE_MAX_MANIFEST_LEN)?
+            + 8
+            + 2
+            + 4
+            + 8
+            + 1,
+    )?;
+    let response = vault.rpc(AgentMethod::VerifyBundle, json!({"bundle_path":path})).await;
+    assert!(
+        matches!(&response, ResponseEnvelope::Error(error)
+            if error.error == "BundleVerificationFailed"
+                && error.message == "bundle file exceeds the maximum container size"),
+        "{response:?}",
+    );
+    Ok(())
+}

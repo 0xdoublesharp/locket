@@ -689,6 +689,17 @@ fn constructors_emit_spec_envelope_shapes() {
 }
 
 #[test]
+fn response_debug_hides_secret_values_without_changing_the_wire_format() -> Result<(), ProtocolError>
+{
+    let value = "response-debug-secret-canary";
+    let response = ResponseEnvelope::Success(SuccessEnvelope::new("read", json!({"value": value})));
+    assert!(!format!("{response:?}").contains(value));
+    let frame = encode_frame(&response, DEFAULT_MAX_MESSAGE_SIZE)?;
+    assert_eq!(decode_response_frame(&frame, DEFAULT_MAX_MESSAGE_SIZE)?.0, response);
+    Ok(())
+}
+
+#[test]
 fn response_envelope_deserializes_by_success_marker_shape() -> Result<(), serde_json::Error> {
     let success_value = json!({
         "v": PROTOCOL_VERSION,
@@ -5990,6 +6001,80 @@ async fn daemon_unlock_fails_closed_on_invalid_verification_policy_and_honors_tr
     std::fs::write(root.join("locket.toml"), "[user_verification_required_for]\nunlock = true\n")?;
     assert!(matches!(crate::dispatch(&unlock, &state).await, ResponseEnvelope::Error(error)
         if error.error == "UserVerificationFailed"));
+    assert!(state.unlock_cache.lock().await.is_empty());
+    assert!(state.grants.lock().await.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn regression_status_counts_only_grants_that_have_not_expired() {
+    let state = crate::AgentSocketState::locked("test");
+    let now = 1_000;
+    let mut grants = state.grants.lock().await;
+    grants.insert(test_grant_record("expired", now - 1));
+    grants.insert(test_grant_record("at-deadline", now));
+    grants.insert(test_grant_record("live", now + 1));
+    let mut other = test_grant_record("other-project", now + 1);
+    other.project_id = "p-2".into();
+    grants.insert(other);
+    drop(grants);
+
+    assert_eq!(state.status_snapshot(now).await.live_grant_count, 2);
+    assert_eq!(state.status_snapshot_for_project("p-1", now).await.live_grant_count, 1);
+    assert_eq!(state.status_snapshot_for_project("p-2", now).await.live_grant_count, 1);
+    assert_eq!(state.status_snapshot(now + 1).await.live_grant_count, 0);
+}
+
+#[test]
+fn regression_rejects_response_envelopes_whose_body_disagrees_with_the_status()
+-> Result<(), ProtocolError> {
+    for response in [
+        json!({"v":PROTOCOL_VERSION, "id":"bad-success", "ok":false, "payload":null}),
+        json!({"v":PROTOCOL_VERSION, "id":"bad-error", "ok":true, "error":"AccessDenied",
+               "message":"access denied", "retryable":false}),
+    ] {
+        let frame = encode_frame(&response, DEFAULT_MAX_MESSAGE_SIZE)?;
+        assert!(matches!(
+            decode_response_frame(&frame, DEFAULT_MAX_MESSAGE_SIZE),
+            Err(ProtocolError::Json(_)),
+        ));
+    }
+    let mut error = ErrorEnvelope::new("bad-version", "AccessDenied", "access denied", false);
+    error.v = 99;
+    let frame = encode_frame(&error, DEFAULT_MAX_MESSAGE_SIZE)?;
+    assert!(matches!(
+        decode_response_frame(&frame, DEFAULT_MAX_MESSAGE_SIZE),
+        Err(ProtocolError::UnsupportedVersion { version: 99 }),
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn regression_project_expiry_keeps_cache_eviction_ordered_with_grant_revocation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let state = crate::AgentSocketState::locked("test");
+    let now = 1_000_000_000;
+    state.unlock_cache.lock().await.insert(
+        "p-1".into(),
+        crate::UnlockEntry::new(
+            vec![7; 32],
+            0,
+            std::time::Duration::from_secs(1),
+            crate::UnlockMethod::Passphrase,
+        ),
+    );
+    let mut grants = state.grants.lock().await;
+    grants.insert(test_grant_record("expiring-vault", now * 2));
+    let expiry = state.expire_unlocks(now);
+    let mut expiry = std::pin::pin!(expiry);
+    tokio::select! {
+        biased;
+        result = &mut expiry => panic!("expiry completed before revoking grants: {result:?}"),
+        () = async {} => {}
+    }
+    assert!(state.unlock_cache.try_lock().is_err());
+    drop(grants);
+    assert_eq!(expiry.await?, 1);
     assert!(state.unlock_cache.lock().await.is_empty());
     assert!(state.grants.lock().await.is_empty());
     Ok(())

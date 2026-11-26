@@ -735,4 +735,39 @@ mod tests {
         let (error, _) = expect_error(response);
         assert_eq!(error, "ProtocolError");
     }
+
+    #[tokio::test]
+    async fn invalid_names_and_selectors_do_not_create_sessions() {
+        let state = locked_state();
+        let base = json!({
+            "session_id":"session-1",
+            "project_id":"proj-1",
+            "store_path":"unused.db",
+            "env_names":["TOKEN"],
+        });
+        for (field, value) in [
+            ("project_id", json!("")),
+            ("env_names", json!([""])),
+            ("env_names", json!(vec!["TOKEN"; super::MAX_IDE_ENV_SESSION_NAMES + 1])),
+            ("ttl_seconds", json!(0)),
+        ] {
+            let mut payload = base.clone();
+            payload[field] = value;
+            let request =
+                RequestEnvelope::new("invalid", AgentMethod::RegisterIdeEnvSession, payload);
+            let (code, message) =
+                expect_error(handle_register_ide_env_session(&request, &state, 1).await);
+            assert_eq!(code, "ProtocolError");
+            assert!(message.contains(field), "{message}");
+        }
+        for field in ["project_id", "session_id"] {
+            let mut selector = json!({"project_id":"proj-1","session_id":"session-1"});
+            selector[field] = json!("");
+            let request = RequestEnvelope::new("invalid", AgentMethod::IdeEnvSession, selector);
+            let (code, message) = expect_error(handle_ide_env_session(&request, &state, 1).await);
+            assert_eq!(code, "ProtocolError");
+            assert!(message.contains(field), "{message}");
+        }
+        assert!(state.ide_env_sessions.lock().await.is_empty());
+    }
 }

@@ -133,13 +133,65 @@ mod tests {
         assert!(!appended, "no store path means no row is appended");
     }
 
+    #[tokio::test]
+    async fn grant_denial_skips_invalid_keys_and_unverifiable_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("store.db");
+        let mut store = locket_store::Store::open(&path)?;
+        store.initialize_schema()?;
+        store.insert_project_if_absent("lk_proj_x", "audit fixture", 1)?;
+        let state = crate::AgentSocketState::locked("test").with_canonical_store_path(path.clone());
+        let missing = dir.path().join("missing.db");
+
+        for (store_path, key, timestamp) in [
+            (path.as_path(), &[0_u8; 31][..], 1),
+            (path.as_path(), &[0_u8; 32][..], i128::MAX),
+            (missing.as_path(), &[0_u8; 32][..], 1),
+            (path.as_path(), &[0_u8; 32][..], 1),
+        ] {
+            assert!(
+                !try_append_grant_denial(
+                    &state,
+                    "lk_proj_x",
+                    "lk_profile_x",
+                    Some(store_path),
+                    Some(key),
+                    GrantAction::Reveal,
+                    0,
+                    timestamp,
+                    "agent",
+                )
+                .await
+            );
+        }
+        assert!(!missing.exists());
+        assert_eq!(store.list_exportable_audit_rows("lk_proj_x")?, []);
+        Ok(())
+    }
+
     #[test]
     fn grant_action_labels_are_stable() {
-        assert_eq!(grant_action_label(GrantAction::Reveal), "Reveal");
-        assert_eq!(grant_action_label(GrantAction::Copy), "Copy");
-        assert_eq!(grant_action_label(GrantAction::ScanKnownValues), "ScanKnownValues");
-        assert_eq!(grant_action_label(GrantAction::ResolveReference), "ResolveReference");
-        assert_eq!(grant_action_label(GrantAction::RunPolicy), "RunPolicy");
-        assert_eq!(grant_action_label(GrantAction::SetSecret), "SetSecret");
+        for (action, label) in [
+            (GrantAction::Reveal, "Reveal"),
+            (GrantAction::Copy, "Copy"),
+            (GrantAction::ScanKnownValues, "ScanKnownValues"),
+            (GrantAction::ResolveReference, "ResolveReference"),
+            (GrantAction::RunPolicy, "RunPolicy"),
+            (GrantAction::SetSecret, "SetSecret"),
+            (GrantAction::PrepareExec, "PrepareExec"),
+            (GrantAction::Redact, "Redact"),
+            (GrantAction::Export, "Export"),
+            (GrantAction::CreateProfile, "CreateProfile"),
+            (GrantAction::DeleteSecret, "DeleteSecret"),
+            (GrantAction::CopySecretToShared, "CopySecretToShared"),
+            (GrantAction::LinkSecret, "LinkSecret"),
+            (GrantAction::UnlinkSecret, "UnlinkSecret"),
+            (GrantAction::ImportDotenv, "ImportDotenv"),
+            (GrantAction::ApplyPolicy, "ApplyPolicy"),
+            (GrantAction::TeamSync, "TeamSync"),
+        ] {
+            assert_eq!(grant_action_label(action), label);
+        }
     }
 }

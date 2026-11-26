@@ -10,7 +10,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use data_encoding::BASE64URL_NOPAD;
@@ -42,6 +42,14 @@ use crate::server::{AgentSocketState, current_unix_nanos};
 
 /// Grant scope for backup operations that can access multiple profiles.
 pub const BUNDLE_PROJECT_GRANT_SCOPE: &str = "*";
+
+// Magic, schema version, manifest length, and payload length precede the contents.
+const BUNDLE_MAX_FILE_LEN: u64 = locket_core::BUNDLE_MAX_PAYLOAD_LEN
+    + locket_core::BUNDLE_MAX_MANIFEST_LEN as u64
+    + locket_core::BUNDLE_MAGIC.len() as u64
+    + 2
+    + 4
+    + 8;
 
 /// Bundle export profile scope.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -693,8 +701,20 @@ fn export_bundle(
 }
 
 fn read_verified_bundle(path: &Path) -> BackupResult<BundleContainer> {
-    let bytes = fs::read(path)
-        .map_err(|error| ("BundleVerificationFailed", format!("could not read bundle: {error}")))?;
+    let read_error =
+        |error| ("BundleVerificationFailed", format!("could not read bundle: {error}"));
+    let oversized = || {
+        ("BundleVerificationFailed", "bundle file exceeds the maximum container size".to_owned())
+    };
+    let file = locket_platform::open_regular_file(path).map_err(read_error)?;
+    if file.metadata().map_err(read_error)?.len() > BUNDLE_MAX_FILE_LEN {
+        return Err(oversized());
+    }
+    let mut bytes = Vec::new();
+    file.take(BUNDLE_MAX_FILE_LEN + 1).read_to_end(&mut bytes).map_err(read_error)?;
+    if bytes.len() as u64 > BUNDLE_MAX_FILE_LEN {
+        return Err(oversized());
+    }
     let bundle = BundleContainer::deserialize(&bytes).map_err(|error| {
         ("BundleVerificationFailed", format!("bundle verification failed: {error}"))
     })?;

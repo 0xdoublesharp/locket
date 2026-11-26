@@ -715,7 +715,7 @@ impl AgentSocketState {
         let summary = collect_live_summary(&self.unlock_cache, now_unix_nanos).await;
         let grant_count = {
             let grants = self.grants.lock().await;
-            grants.len()
+            grants.live_count(None, now_unix_nanos)
         };
         let running_session_count = {
             let sessions = self.runtime_sessions.lock().await;
@@ -757,7 +757,7 @@ impl AgentSocketState {
             if remaining.is_some() { LockState::Unlocked } else { LockState::Locked };
         snapshot.unlock_ttl_seconds = remaining;
         snapshot.live_grant_count =
-            u32::try_from(self.grants.lock().await.count_for_project(project_id))
+            u32::try_from(self.grants.lock().await.live_count(Some(project_id), now))
                 .unwrap_or(u32::MAX);
         snapshot.running_session_count = u32::try_from(
             self.runtime_sessions
@@ -913,8 +913,12 @@ impl AgentSocketState {
     pub async fn expire_unlocks(&self, now: i128) -> Result<usize, StoreError> {
         #[cfg(test)]
         self.expiry_checks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let entries = self.unlock_cache.lock().await.drain_expired(now);
+        let mut cache = self.unlock_cache.lock().await;
+        let entries = cache.drain_expired(now);
         let count = entries.len();
+        if count == 0 {
+            return Ok(0);
+        }
         let material = lock_audit_material(&entries);
         let mut revoked = 0;
         {
@@ -930,6 +934,8 @@ impl AgentSocketState {
             SessionLockOutcome { cached_keys_cleared: count, live_grants_revoked: revoked },
             &material,
         )?;
+        // A new unlock must follow both revocation and its audit event.
+        drop(cache);
         Ok(count)
     }
 
@@ -2896,15 +2902,18 @@ mod connection_failure_tests {
 
     #[tokio::test]
     async fn disconnect_during_partial_frame_does_not_dispatch() -> TestResult {
-        let (mut client, server) = UnixStream::pair()?;
-        client.write_all(&[24, 0, 0, 0, b'{']).await?;
-        client.shutdown().await?;
-        assert_eq!(
-            handle_connection(server, AgentSocketState::locked("framing test")).await,
-            ConnectionOutcome::PeerClosed
-        );
-        let mut response = Vec::new();
-        assert_eq!(client.read_to_end(&mut response).await?, 0);
+        let partial = [24, 0, 0, 0, b'{'];
+        for end in [1, 4, partial.len()] {
+            let (mut client, server) = UnixStream::pair()?;
+            client.write_all(&partial[..end]).await?;
+            client.shutdown().await?;
+            assert_eq!(
+                handle_connection(server, AgentSocketState::locked("framing test")).await,
+                ConnectionOutcome::PeerClosed
+            );
+            let mut response = Vec::new();
+            assert_eq!(client.read_to_end(&mut response).await?, 0);
+        }
         Ok(())
     }
 

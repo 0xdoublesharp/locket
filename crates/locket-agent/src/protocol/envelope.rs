@@ -1,6 +1,6 @@
 //! Request and response envelope types exchanged over the v1 protocol.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use zeroize::Zeroize as _;
 
@@ -79,17 +79,40 @@ pub enum ResponseEnvelope {
     Error(ErrorEnvelope),
 }
 
+fn deserialize_ok<'de, const EXPECTED: bool, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<bool, D::Error> {
+    let ok = bool::deserialize(deserializer)?;
+    if ok != EXPECTED {
+        return Err(serde::de::Error::custom("response status does not match its body"));
+    }
+    Ok(ok)
+}
+
 /// Successful response envelope.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SuccessEnvelope {
     /// Protocol version.
     pub v: u16,
     /// Request id being answered.
     pub id: String,
     /// Success marker.
+    #[serde(deserialize_with = "deserialize_ok::<true, _>")]
     pub ok: bool,
     /// Response payload.
     pub payload: Value,
+}
+
+impl std::fmt::Debug for SuccessEnvelope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SuccessEnvelope")
+            .field("v", &self.v)
+            .field("id", &self.id)
+            .field("ok", &self.ok)
+            .field("payload", &"[redacted]")
+            .finish()
+    }
 }
 
 impl SuccessEnvelope {
@@ -114,6 +137,7 @@ pub struct ErrorEnvelope {
     /// Request id being answered.
     pub id: String,
     /// Success marker. Always false for this variant.
+    #[serde(deserialize_with = "deserialize_ok::<false, _>")]
     pub ok: bool,
     /// Typed Locket error name.
     pub error: String,

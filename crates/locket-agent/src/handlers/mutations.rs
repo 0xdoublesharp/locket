@@ -259,6 +259,17 @@ fn confirm_dangerous_profile(
     Ok(())
 }
 
+fn require_unexpired_secret(
+    store: &Store,
+    secret_id: &str,
+    timestamp: i64,
+) -> Result<(), MutationError> {
+    if super::secrets::secret_has_expired(store, secret_id, i128::from(timestamp))? {
+        return Err(failure("MetadataInvalid", super::secrets::SECRET_EXPIRED_MESSAGE));
+    }
+    Ok(())
+}
+
 async fn authorize(
     scope: &MutationScope,
     action: GrantAction,
@@ -270,6 +281,8 @@ async fn authorize(
         .grant_id
         .as_deref()
         .ok_or_else(|| failure("GrantRequired", "a live grant is required"))?;
+    // Serialize grant validation and the mutation with vault locking.
+    let cache = state.unlock_cache.clone().lock_owned().await;
     if state.grants.lock().await.validate(
         grant,
         &scope.project_id,
@@ -281,7 +294,6 @@ async fn authorize(
     {
         return Err(failure("GrantRequired", "a matching live grant is required"));
     }
-    let cache = state.unlock_cache.clone().lock_owned().await;
     let entry = cache
         .lookup(&scope.project_id, now)
         .ok_or_else(|| failure("UnlockRequired", "unlock the selected project before retrying"))?;
@@ -556,7 +568,7 @@ fn import_dotenv_in_store(
     if request.dry_run {
         let planned = (|| {
             for entry in &document.entries {
-                match plan_import_entry(&store, request, &entry.key)? {
+                match plan_import_entry(&store, request, &entry.key, timestamp)? {
                     ImportEntryAction::Link { .. } => result.linked += 1,
                     ImportEntryAction::Promote(_) => result.promoted += 1,
                     ImportEntryAction::Skip => result.skipped += 1,
@@ -591,7 +603,7 @@ fn import_dotenv_in_store(
             )?;
         }
         for entry in &document.entries {
-            let action = plan_import_entry(store, request, &entry.key)?;
+            let action = plan_import_entry(store, request, &entry.key, timestamp)?;
             let value = Zeroizing::new(entry.value.clone());
 
             if let ImportEntryAction::Link { target_secret } = action {
@@ -857,6 +869,7 @@ fn plan_import_entry<'a>(
     store: &Store,
     request: &'a ImportDotenvRequest,
     name: &str,
+    timestamp: i64,
 ) -> Result<ImportEntryAction<'a>, MutationError> {
     let project_id = &request.scope.project_id;
     let profile_id = &request.scope.profile_id;
@@ -881,6 +894,9 @@ fn plan_import_entry<'a>(
                 }) || !import_shadows(store, request, name)?.is_empty())
             {
                 return Ok(ImportEntryAction::Skip);
+            }
+            if let Some(target) = target.as_ref() {
+                require_unexpired_secret(store, &target.id, timestamp)?;
             }
             if target_name.is_some() {
                 let target = target.ok_or_else(|| {
