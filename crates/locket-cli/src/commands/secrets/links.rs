@@ -206,10 +206,8 @@ pub fn create_link_record_with_audit(
     target_secret: &SecretRecord,
     timestamp: i64,
 ) -> Result<String, CliError> {
-    let link_id =
-        format!("lk_link_{}", SecretId::generate().map_err(|_| CliError::Time)?.into_string());
     let link = SecretLinkRecord {
-        id: link_id.clone(),
+        id: format!("lk_link_{}", SecretId::generate().map_err(|_| CliError::Time)?.into_string()),
         project_id: project_id.to_owned(),
         profile_id: profile_id.to_owned(),
         local_name: local_name.to_owned(),

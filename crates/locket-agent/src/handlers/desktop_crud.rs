@@ -580,9 +580,8 @@ fn link_secret(
             USER_LOCAL,
         )?
         .ok_or_else(secret_not_found)?;
-    let link_id = generate_link_id()?;
     let link = SecretLinkRecord {
-        id: link_id.clone(),
+        id: generate_link_id()?,
         project_id: scope.project_id.clone(),
         profile_id: profile.id.clone(),
         local_name: local_name.as_str().to_owned(),
