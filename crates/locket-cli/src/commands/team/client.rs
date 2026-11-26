@@ -239,45 +239,57 @@ fn client_revoke_command(
     else {
         return Err(policy_not_found_error(format!("automation client not found: {client_ref}")));
     };
-    if client.revoked_at.is_some() {
-        writeln!(output, "client: {}", client.name)?;
-        writeln!(output, "client_id: {}", client.id)?;
-        writeln!(output, "status: already revoked")?;
-        return Ok(());
-    }
-    let timestamp = now_unix_nanos()?;
-    let private_key_ref = store.get_automation_client_private_key_ref(&client.id)?;
-    store.revoke_automation_client(resolved.config.project_id.as_str(), &client.id, timestamp)?;
-    if let Some(reference) = &private_key_ref {
-        delete_client_private_key(context, reference)?;
+    let revoked_at = if client.revoked_at.is_some() {
+        None
+    } else {
+        let timestamp = now_unix_nanos()?;
+        let project_id = resolved.config.project_id.as_str();
+        let audit_key = load_project_key(context, &store, project_id, KeyPurpose::Audit)?;
+        let metadata = json!({
+            "schema_version": 1,
+            "action": "CLIENT_REVOKE",
+            "status": "SUCCESS",
+            "command": "client",
+            "project_id": project_id,
+            "client_id": &client.id,
+            "client_name": &client.name,
+            "public_key_fingerprint": &client.fingerprint,
+            "storage": &client.storage,
+            "allowed_actions": &client.allowed_actions,
+            "allowed_policies": &client.allowed_policies,
+            "revoked_at": timestamp,
+        });
+        let audit = AuditWrite {
+            project_id,
+            profile_id: None,
+            action: "CLIENT_REVOKE",
+            status: "SUCCESS",
+            secret_name: None,
+            command: Some("client"),
+            metadata_json: &metadata,
+            timestamp,
+        };
+        store.with_atomic_write(|store| -> Result<_, CliError> {
+            let revoked = store.revoke_automation_client(project_id, &client.id, timestamp)?;
+            if revoked {
+                store.append_audit(audit_key.as_ref(), &audit)?;
+            }
+            Ok(revoked.then_some(timestamp))
+        })?
+    };
+    // Preserve the reference across a failed deletion so a later revoke can retry cleanup.
+    if let Some(reference) = store.get_automation_client_private_key_ref(&client.id)? {
+        delete_client_private_key(context, &reference)?;
         store.delete_automation_client_private_key_ref(&client.id)?;
     }
-    let metadata = json!({
-        "schema_version": 1,
-        "action": "CLIENT_REVOKE",
-        "status": "SUCCESS",
-        "command": "client",
-        "project_id": resolved.config.project_id.as_str(),
-        "client_id": &client.id,
-        "client_name": &client.name,
-        "public_key_fingerprint": &client.fingerprint,
-        "storage": &client.storage,
-        "allowed_actions": &client.allowed_actions,
-        "allowed_policies": &client.allowed_policies,
-        "revoked_at": timestamp,
-    });
-    write_client_audit_if_available(
-        context,
-        &mut store,
-        &resolved,
-        "CLIENT_REVOKE",
-        &metadata,
-        timestamp,
-    )?;
     writeln!(output, "client: {}", client.name)?;
     writeln!(output, "client_id: {}", client.id)?;
-    writeln!(output, "revoked_at: {}", format_unix_nanos(timestamp))?;
-    writeln!(output, "private_key_material: never displayed")?;
+    if let Some(timestamp) = revoked_at {
+        writeln!(output, "revoked_at: {}", format_unix_nanos(timestamp))?;
+        writeln!(output, "private_key_material: never displayed")?;
+    } else {
+        writeln!(output, "status: already revoked")?;
+    }
     Ok(())
 }
 

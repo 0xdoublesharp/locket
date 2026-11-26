@@ -195,30 +195,28 @@ fn join_package_candidates(
     if let Some(packages) = remote_packages {
         return Ok(Box::new(packages.map(|candidate| candidate.map(|(_, bytes)| bytes))));
     }
-    let candidates = if let Some(package) = &args.package {
-        vec![package.clone()]
-    } else {
-        let folder = args.folder.as_ref().ok_or_else(|| {
-            metadata_invalid_error("provide an encrypted .lkpkg, --folder, or a remote backend")
-        })?;
-        if std::fs::symlink_metadata(folder)?.file_type().is_symlink() {
-            return Err(metadata_invalid_error("shared folder must be a regular directory"));
+    if let Some(package) = &args.package {
+        return Ok(Box::new(std::iter::once(team_sync::read_package_file(package))));
+    }
+    let folder = args.folder.as_ref().ok_or_else(|| {
+        metadata_invalid_error("provide an encrypted .lkpkg, --folder, or a remote backend")
+    })?;
+    if std::fs::symlink_metadata(folder)?.file_type().is_symlink() {
+        return Err(metadata_invalid_error("shared folder must be a regular directory"));
+    }
+    let mut candidates = Vec::new();
+    for (count, entry) in std::fs::read_dir(folder)?.enumerate() {
+        if count >= 100_000 {
+            return Err(metadata_invalid_error(
+                "shared folder has too many entries; choose your .lkpkg explicitly",
+            ));
         }
-        let mut candidates = Vec::new();
-        for (count, entry) in std::fs::read_dir(folder)?.enumerate() {
-            if count >= 100_000 {
-                return Err(metadata_invalid_error(
-                    "shared folder has too many entries; choose your .lkpkg explicitly",
-                ));
-            }
-            let entry = entry?;
-            if entry.path().extension().is_some_and(|ext| ext == "lkpkg") {
-                candidates.push(entry.path());
-            }
+        let entry = entry?;
+        if entry.path().extension().is_some_and(|ext| ext == "lkpkg") {
+            candidates.push(entry.path());
         }
-        candidates.sort();
-        candidates
-    };
+    }
+    candidates.sort();
     Ok(Box::new(
         candidates.into_iter().filter_map(|path| team_sync::read_package_file(&path).ok().map(Ok)),
     ))

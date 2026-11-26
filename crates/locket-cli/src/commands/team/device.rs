@@ -84,6 +84,17 @@ pub(crate) fn device_init_command(
     };
     let GeneratedLocalDevice { record: device, signing_private_key, sealing_private_key } =
         generate_local_device_record(project_id, timestamp)?;
+    let recovery_update = if existing_replacement.is_some() {
+        prepare_recovery_envelope_for_replacement_device(
+            context,
+            &resolved,
+            &device,
+            &signing_private_key,
+            &sealing_private_key,
+        )?
+    } else {
+        None
+    };
     let storage = build_device_private_key_storage(context, project_id)?;
     storage.store(&device.id, &sealing_private_key)?;
     storage.for_signing().store(&device.fingerprint, &signing_private_key)?;
@@ -97,14 +108,11 @@ pub(crate) fn device_init_command(
             verification,
             timestamp,
         )?;
-        // Both new private envelopes were staged before changing the active device row.
-        update_recovery_envelope_for_replacement_device(
-            context,
-            &resolved,
-            &device,
-            &signing_private_key,
-            &sealing_private_key,
-        )?;
+        if let Some((directory, envelope)) = recovery_update {
+            save_recovery_envelope(&directory, &envelope).map_err(|error| {
+                metadata_invalid_error(format!("save recovery envelope: {error}"))
+            })?;
+        }
         // Retain the old sealing envelope for deliberate recovery of old bundles.
     } else {
         store.insert_device(&device)?;
@@ -338,23 +346,19 @@ fn device_remove_command(
         writeln!(output, "metadata_only: yes")?;
         return Ok(());
     }
-    store.revoke_device(project_id, &device.id, now_unix_nanos()?)?;
-    write_device_audit_if_available(
-        context,
-        &mut store,
-        project_id,
-        "DEVICE_REVOKE",
-        "device remove",
-        &device,
-        UserVerificationAudit::not_required(),
-    )?;
-    // Local-device revocation also drops the wrapped private-key envelope.
-    // We only ever held a private key for the local device; remote teammate
-    // device records never have an envelope to clean up.
-    if device.local {
-        let storage = build_device_private_key_storage(context, project_id)?;
-        let _ = storage.delete(&device.id);
-    }
+    store.with_atomic_write(|store| {
+        store.revoke_device(project_id, &device.id, now_unix_nanos()?)?;
+        write_device_audit_if_available(
+            context,
+            store,
+            project_id,
+            "DEVICE_REVOKE",
+            "device remove",
+            &device,
+            UserVerificationAudit::not_required(),
+        )
+    })?;
+    cleanup_local_device_envelope_if_local(context, project_id, &device)?;
     writeln!(output, "device: revoked")?;
     writeln!(output, "device_id: {}", device.id)?;
     writeln!(output, "fingerprint: {}", device.fingerprint)?;
@@ -362,7 +366,7 @@ fn device_remove_command(
     Ok(())
 }
 
-/// Best-effort delete of a wrapped-local-file device private-key envelope when
+/// Best-effort deletion of wrapped local device private-key envelopes when
 /// the revoked device row was the active local device.
 ///
 /// Sibling commands (e.g. `team revoke-device`) use this to keep the local
@@ -381,6 +385,7 @@ pub(super) fn cleanup_local_device_envelope_if_local(
     }
     let storage = build_device_private_key_storage(context, project_id)?;
     let _ = storage.delete(&device.id);
+    let _ = storage.for_signing().delete(&device.fingerprint);
     Ok(())
 }
 
@@ -945,16 +950,16 @@ fn recovery_entries_for_device(
     ])
 }
 
-fn update_recovery_envelope_for_replacement_device(
+fn prepare_recovery_envelope_for_replacement_device(
     context: &RuntimeContext,
     resolved: &ResolvedProject,
     device: &DeviceRecord,
     signing_private_key: &locket_crypto::KeyBytes,
     sealing_private_key: &locket_crypto::KeyBytes,
-) -> Result<(), CliError> {
+) -> Result<Option<(PathBuf, RecoveryEnvelope)>, CliError> {
     let recovery_dir = resolved.root.join(".locket").join("recovery");
     if !recovery_dir.join("envelope.bin").exists() {
-        return Ok(());
+        return Ok(None);
     }
     let kdf = load_recovery_kdf_toml(&recovery_dir)
         .map_err(|error| metadata_invalid_error(format!("recovery/envelope.bin: {error}")))?;
@@ -1011,9 +1016,7 @@ fn update_recovery_envelope_for_replacement_device(
         created_at_unix_nanos: old_envelope.created_at_unix_nanos,
         entries,
     };
-    save_recovery_envelope(&recovery_dir, &new_envelope)
-        .map_err(|error| metadata_invalid_error(format!("save recovery envelope: {error}")))?;
-    Ok(())
+    Ok(Some((recovery_dir, new_envelope)))
 }
 
 fn display_bootstrap_recovery_code(

@@ -299,10 +299,12 @@ impl RemoteSetup {
         config: TransportConfig,
         access_key_id: Option<String>,
     ) -> Result<Self, CliError> {
-        let secret = if matches!(
-            config,
-            TransportConfig::S3 { credential_mode: CredentialMode::Vault, .. }
-        ) {
+        let uses_vault =
+            matches!(config, TransportConfig::S3 { credential_mode: CredentialMode::Vault, .. });
+        if !uses_vault && access_key_id.is_some() {
+            return Err(metadata_invalid_error("--access-key-id requires vault credentials"));
+        }
+        let secret = if uses_vault {
             let locket_id = env_value(&["LOCKET_S3_ACCESS_KEY_ID"])?;
             let locket_key = env_value(&["LOCKET_S3_SECRET_ACCESS_KEY"])?;
             let locket_token = env_value(&["LOCKET_S3_SESSION_TOKEN"])?;

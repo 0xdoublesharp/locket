@@ -28,11 +28,11 @@ use crate::{
     CliError, LOCKET_TOML, ResolvedProject, RuntimeContext, TeamAcceptArgs, TeamCommand,
     TeamInitArgs, TeamInviteArgs, TeamRemoveArgs, TeamRevokeDeviceArgs, TeamRevokeInviteArgs,
     TeamRoleArg, command_type, confirmation_failed_error, ensure_project_exists,
-    external_env_source_label, invalid_reference_error, load_project_key, metadata_invalid_error,
-    now_unix_nanos, open_store, privacy_alias, privacy_redact_names_enabled,
-    profile_not_found_error, read_policy_document, require_project, secret_already_exists_error,
-    secret_not_found_error, set_user_only_file_options, set_user_only_file_permissions,
-    team_role_denied_error, unix_nanos_to_rfc3339,
+    ensure_trusted_project_root, external_env_source_label, invalid_reference_error,
+    load_project_key, metadata_invalid_error, now_unix_nanos, open_store, privacy_alias,
+    privacy_redact_names_enabled, profile_not_found_error, read_policy_document, require_project,
+    secret_already_exists_error, secret_not_found_error, set_user_only_file_options,
+    set_user_only_file_permissions, team_role_denied_error, unix_nanos_to_rfc3339,
 };
 
 const DEFAULT_INVITE_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
@@ -122,6 +122,7 @@ fn team_init_command(
     let mut store = open_store(context)?;
     let project_id = resolved.config.project_id.as_str();
     ensure_project_exists(&store, project_id)?;
+    ensure_trusted_project_root(&store, &resolved)?;
 
     if let Some(existing) = store.get_team_by_project(project_id)? {
         return Err(secret_already_exists_error(format!(
@@ -139,19 +140,6 @@ fn team_init_command(
         created_at: timestamp,
         updated_at: timestamp,
     };
-    store.insert_team(&record)?;
-    if let Some(local_device) = store.get_active_local_device(project_id)? {
-        let member_id = MemberId::generate().map_err(|_| CliError::Time)?.into_string();
-        store.insert_team_member(
-            &member_id,
-            &record.id,
-            Some(&local_device.id),
-            &local_device.name,
-            "owner",
-            timestamp,
-        )?;
-    }
-
     let audit_key = load_project_key(context, &store, project_id, KeyPurpose::Audit)?;
     let metadata = json!({
         "schema_version": 1,
@@ -172,7 +160,21 @@ fn team_init_command(
         metadata_json: &metadata,
         timestamp,
     };
-    store.append_audit(audit_key.as_ref(), &audit)?;
+    store.with_atomic_write(|store| {
+        store.insert_team(&record)?;
+        if let Some(local_device) = store.get_active_local_device(project_id)? {
+            let member_id = MemberId::generate().map_err(|_| CliError::Time)?.into_string();
+            store.insert_team_member(
+                &member_id,
+                &record.id,
+                Some(&local_device.id),
+                &local_device.name,
+                "owner",
+                timestamp,
+            )?;
+        }
+        store.append_audit(audit_key.as_ref(), &audit).map_err(CliError::from)
+    })?;
 
     writeln!(output, "team initialized: {} ({})", record.name, record.id)?;
     writeln!(output, "metadata_only: yes")?;
@@ -1065,8 +1067,6 @@ fn team_remove_command(
         return Ok(());
     }
     let timestamp = now_unix_nanos()?;
-    store.remove_team_member(&member.id, timestamp)?;
-
     let audit_key = load_project_key(context, &store, project_id, KeyPurpose::Audit)?;
     let metadata = json!({
         "schema_version": 1,
@@ -1088,7 +1088,10 @@ fn team_remove_command(
         metadata_json: &metadata,
         timestamp,
     };
-    store.append_audit(audit_key.as_ref(), &audit)?;
+    store.with_atomic_write(|store| {
+        store.remove_team_member(&member.id, timestamp)?;
+        store.append_audit(audit_key.as_ref(), &audit)
+    })?;
 
     writeln!(output, "team_remove: success")?;
     writeln!(output, "metadata_only: yes")?;
@@ -1134,8 +1137,6 @@ fn team_revoke_device_command(
         return Ok(());
     }
     let timestamp = now_unix_nanos()?;
-    store.revoke_device(project_id, &device.id, timestamp)?;
-
     let audit_key = load_project_key(context, &store, project_id, KeyPurpose::Audit)?;
     let metadata = json!({
         "schema_version": 1,
@@ -1157,11 +1158,14 @@ fn team_revoke_device_command(
         metadata_json: &metadata,
         timestamp,
     };
-    store.append_audit(audit_key.as_ref(), &audit)?;
+    store.with_atomic_write(|store| {
+        if store.revoke_device(project_id, &device.id, timestamp)? {
+            store.append_audit(audit_key.as_ref(), &audit)?;
+        }
+        Ok::<_, locket_store::StoreError>(())
+    })?;
 
-    // Drop the wrapped private-key envelope if the revoked device is the
-    // active local device. Remote teammate device records never had an
-    // envelope on this host, so the helper is a no-op for them.
+    // Drop the wrapped private-key envelopes for a revoked local device.
     device::cleanup_local_device_envelope_if_local(context, project_id, &device)?;
 
     writeln!(output, "device: revoked")?;

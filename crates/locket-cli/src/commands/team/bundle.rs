@@ -931,15 +931,20 @@ fn apply_bundle_payload(
                 conflicts.applied = conflicts.applied.saturating_add(1);
             }
             Some(local) => {
-                let identical = local.profile_id == secret.profile_id
-                    && local.name == secret.name
+                // Blob authentication binds the secret ID to its original profile.
+                if local.profile_id != secret.profile_id {
+                    return Err(metadata_invalid_error(
+                        "bundle secret belongs to a different profile",
+                    ));
+                }
+                // The rotation timestamp is receiver-local after an import.
+                let identical = local.name == secret.name
                     && local.source == secret.source
                     && local.origin == secret.origin
                     && local.current_version == secret.current_version
                     && local.state == secret.state
                     && local.created_at == secret.created_at
                     && local.updated_at == secret.updated_at
-                    && local.last_rotated_at == secret.last_rotated_at
                     && local.deleted_at == secret.deleted_at;
                 if identical {
                     conflicts.identical = conflicts.identical.saturating_add(1);
@@ -1276,7 +1281,6 @@ struct LocalSecretRow {
     state: String,
     created_at: i64,
     updated_at: i64,
-    last_rotated_at: Option<i64>,
     deleted_at: Option<i64>,
 }
 
@@ -1288,7 +1292,7 @@ fn read_local_secret(
     transaction
         .query_row(
             "SELECT profile_id, name, source, origin, current_version, state,
-                    created_at, updated_at, last_rotated_at, deleted_at
+                    created_at, updated_at, deleted_at
              FROM secrets
              WHERE id = ?1",
             params![secret_id],
@@ -1302,8 +1306,7 @@ fn read_local_secret(
                     state: row.get(5)?,
                     created_at: row.get(6)?,
                     updated_at: row.get(7)?,
-                    last_rotated_at: row.get(8)?,
-                    deleted_at: row.get(9)?,
+                    deleted_at: row.get(8)?,
                 })
             },
         )
@@ -2483,17 +2486,27 @@ mod tests {
         payload: &SealedBundlePayloadV1,
         resolution: ConflictResolution,
     ) -> Result<ApplyOutcome, Box<dyn std::error::Error>> {
-        let manifest = BundleManifest {
+        Ok(apply_bundle_payload(
+            store,
+            project,
+            payload,
+            resolution,
+            false,
+            &import_manifest(project),
+            &[42; 32],
+            300,
+        )?)
+    }
+
+    fn import_manifest(project: &str) -> BundleManifest {
+        BundleManifest {
             recipient_fingerprints: Vec::new(),
             project_id: project.to_owned(),
             schema_version: BUNDLE_SCHEMA_V1,
             created_at: 100,
             profile_count: 1,
             payload_digest: "11".repeat(32),
-        };
-        Ok(apply_bundle_payload(
-            store, project, payload, resolution, false, &manifest, &[42; 32], 300,
-        )?)
+        }
     }
 
     #[test]
@@ -2655,6 +2668,35 @@ mod tests {
     }
 
     #[test]
+    fn import_rejects_a_secret_id_reused_in_a_different_profile()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Store::open(directory.path().join("store.db"))?;
+        store.initialize_schema()?;
+        store.insert_project_if_absent("project", "project", 100)?;
+        import_apply(
+            &mut store,
+            "project",
+            &import_fixture("original", "secret", 1)?,
+            ConflictResolution::AcceptIncoming,
+        )?;
+
+        let mut incoming = import_fixture("different", "secret", 2)?;
+        incoming.profiles[0].name = "different".to_owned();
+        let error =
+            import_apply(&mut store, "project", &incoming, ConflictResolution::AcceptIncoming)
+                .err()
+                .ok_or("secret ID in a different profile must be rejected")?;
+        assert!(error.to_string().contains("secret belongs to a different profile"), "{error}");
+        let secret = store.get_secret_by_id("secret")?.ok_or("original secret missing")?;
+        assert_eq!(secret.profile_id, "original");
+        assert_eq!(secret.current_version, 1);
+        assert!(store.get_profile_by_name("project", "different")?.is_none());
+        assert!(store.get_blob("secret", 2)?.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn import_rotation_does_not_restore_exporter_grace() -> Result<(), Box<dyn std::error::Error>> {
         for reverse in [false, true] {
             let directory = tempfile::tempdir()?;
@@ -2679,7 +2721,18 @@ mod tests {
             refresh_fixture_counts(&mut incoming);
             import_apply(&mut store, "project", &incoming, ConflictResolution::AcceptIncoming)?;
             // Replaying an accepted bundle must not revive the prior version.
-            import_apply(&mut store, "project", &incoming, ConflictResolution::AcceptIncoming)?;
+            apply_bundle_payload(
+                &mut store,
+                "project",
+                &incoming,
+                ConflictResolution::AcceptIncoming,
+                false,
+                &import_manifest("project"),
+                &[42; 32],
+                301,
+            )?;
+            let secret = store.get_secret_by_id("secret")?.ok_or("missing imported secret")?;
+            assert_eq!(secret.last_rotated_at, Some(300));
             let old = store.get_secret_version("secret", 1)?.ok_or("missing old version")?;
             assert_eq!(old.state, "deprecated");
             assert_eq!(old.deprecated_at, Some(300));
@@ -2964,6 +3017,32 @@ mod tests {
         let payload = encrypt_audit_chain(&rows, BUNDLE_SCHEMA_V1).unwrap();
         let result = decrypt_audit_chain(&payload, BUNDLE_SCHEMA_V1.wrapping_add(1));
         assert!(result.is_err(), "bundle schema mismatch must fail tag verification");
+    }
+
+    #[test]
+    fn audit_chain_rejects_malformed_fields_and_inconsistent_counts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let rows = sample_rows();
+        let encoded = serde_json::to_value(encrypt_audit_chain(&rows, BUNDLE_SCHEMA_V1)?)?;
+        for (field, value, expected) in [
+            ("encryption_key_b64", serde_json::json!("!"), "key is not valid base64url"),
+            ("nonce_b64", serde_json::json!("!"), "nonce is not valid base64url"),
+            ("encrypted_rows_b64", serde_json::json!("!"), "ciphertext is not valid base64url"),
+            ("checkpoint_hmac_b64", serde_json::json!("!"), "hmac is not valid base64url"),
+            ("encryption_key_b64", serde_json::json!("AA"), "key must be 32 bytes"),
+            ("nonce_b64", serde_json::json!("AA"), "nonce must be 24 bytes"),
+            ("checkpoint_hmac_b64", serde_json::json!("AA"), "hmac must be 32 bytes"),
+            ("row_count", serde_json::json!(0), "row count mismatch"),
+        ] {
+            let mut invalid = encoded.clone();
+            invalid[field] = value;
+            let payload = serde_json::from_value(invalid)?;
+            let error = decrypt_audit_chain(&payload, BUNDLE_SCHEMA_V1)
+                .err()
+                .ok_or("malformed audit chain must fail")?;
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+        Ok(())
     }
 
     #[test]

@@ -374,9 +374,17 @@ fn signed_sync_reconciles_collisions_and_revokes_the_recipient()
         .downcast::<crate::CliError>()?;
     assert_eq!(wrong_owner.exit_code(), locket_core::LocketError::MetadataInvalid.exit_code());
     assert!(locket_agent::team_sync::status(&recipient, project)?.owner_fingerprint.is_none());
-    let first = run(&recipient_context, &join(&owner_device.fingerprint.to_ascii_uppercase()))?;
+    let join_folder = |pin| ["locket", "team", "join", "--folder", folder, "--owner", pin];
+    let error = run(&recipient_context, &join_folder(&wrong_pin))
+        .err()
+        .ok_or("folder scan accepted packages for the wrong owner")?;
+    assert!(error.to_string().contains("no valid package for this device"));
+    let first =
+        run(&recipient_context, &join_folder(&owner_device.fingerprint.to_ascii_uppercase()))?;
     assert!(first.contains("Owner fingerprint was supplied independently"));
-    run(&recipient_context, &["locket", "team", "folder", folder])?;
+    assert!(first.contains("Automatic signed updates enabled"));
+    let duplicate = run(&recipient_context, &join(&owner_device.fingerprint))?;
+    assert!(duplicate.contains(r#""duplicate":true"#));
     for args in [
         vec!["locket", "device", "init", "--force"],
         vec!["locket", "device", "remove", &join_device.id, "--force"],
@@ -457,6 +465,44 @@ fn signed_sync_reconciles_collisions_and_revokes_the_recipient()
         .get_secret_by_source(project, &dev.id, "COLLIDING_TOKEN", "team-managed")?
         .ok_or("team value missing after retry")?;
     assert_ne!(team_value.id, local_secret.id);
+    let shared_value = recipient
+        .get_secret_by_source(project, &incoming.id, "TEAM_TOKEN", "team-managed")?
+        .ok_or("shared value missing after applying pending profiles")?;
+    for context in [&recipient_context, &owner_context] {
+        run(
+            context,
+            &[
+                "locket",
+                "set",
+                "TEAM_TOKEN",
+                "--profile",
+                "staging",
+                "--source",
+                "team-managed",
+                "--upsert",
+            ],
+        )?;
+    }
+    assert!(run(&owner_context, &["locket", "team", "publish"])?.contains("delivered 1"));
+    run(&recipient_context, &["locket", "team", "sync", "now"])?;
+    assert_eq!(
+        locket_agent::team_sync::status(&recipient, project)?.conflict_ids.as_slice(),
+        std::slice::from_ref(&shared_value.id),
+    );
+    let result = run(
+        &recipient_context,
+        &["locket", "team", "sync", "resolve", &shared_value.id, "keep-local"],
+    )?;
+    assert!(result.contains("Conflict resolved"));
+    assert_eq!(
+        locket_agent::team_sync::status(&recipient, project)?.conflict_ids,
+        Vec::<String>::new(),
+    );
+    assert!(
+        recipient
+            .get_secret_by_source(project, &incoming.id, "TEAM_TOKEN", "user-local")?
+            .is_some()
+    );
     let status = run(&recipient_context, &["locket", "team", "sync", "status"])?;
     let status: serde_json::Value = serde_json::from_str(&status)?;
     assert_eq!(status["state"], "verified");
@@ -554,5 +600,352 @@ fn signed_sync_reconciles_collisions_and_revokes_the_recipient()
     assert_eq!(disabled["folder"], serde_json::Value::Null);
     assert_eq!(disabled["epoch"], status["epoch"]);
     assert_eq!(disabled["owner_fingerprint"], owner_device.fingerprint);
+    Ok(())
+}
+
+#[test]
+fn team_init_is_retryable_after_unlock_or_audit_failure() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--no-passkey", "--name", "app"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    let init = |context: &RuntimeContext| -> Result<u8, Box<dyn std::error::Error>> {
+        Ok(run_with_context(
+            Cli::try_parse_from(["locket", "team", "init", "New team"])?,
+            context,
+            &mut Vec::new(),
+        )?)
+    };
+    let project = crate::require_project(&context)?.config.project_id;
+    let store = crate::open_store(&context)?;
+    let locked = test_context_with_key_store(&directory, Arc::new(UnavailableMasterKeyStore));
+    assert!(init(&locked).is_err());
+    assert!(store.get_team_by_project(project.as_str())?.is_none());
+
+    let copied = tempdir()?;
+    fs::copy(directory.path().join("locket.toml"), copied.path().join("locket.toml"))?;
+    let mut untrusted = context.clone();
+    untrusted.cwd = copied.path().to_path_buf();
+    let error = init(&untrusted).err().ok_or("untrusted project root was accepted")?;
+    assert_eq!(
+        error.downcast::<crate::CliError>()?.exit_code(),
+        locket_core::LocketError::ProjectRootUntrusted.exit_code()
+    );
+    assert!(store.get_team_by_project(project.as_str())?.is_none());
+
+    store.connection().execute_batch(
+        "CREATE TRIGGER fail_team_init_audit BEFORE INSERT ON audit_log
+         WHEN new.action = 'TEAM_INIT' BEGIN SELECT RAISE(ABORT, 'test audit failure'); END",
+    )?;
+    assert!(init(&context).is_err());
+    assert!(store.get_team_by_project(project.as_str())?.is_none());
+    store.connection().execute_batch("DROP TRIGGER fail_team_init_audit")?;
+
+    init(&context)?;
+    let team = store.get_team_by_project(project.as_str())?.ok_or("team missing after retry")?;
+    let members = store.list_team_members(&team.id)?;
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].role, "owner");
+    assert_eq!(store.list_recent_audit_actions(project.as_str(), 1)?, ["TEAM_INIT"]);
+    Ok(())
+}
+
+#[test]
+fn team_join_preserves_an_explicit_package_read_error() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--no-passkey", "--name", "app"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    let pin = "a".repeat(64);
+    let package = directory.path().join("missing.lkpkg");
+    let error = run_with_context(
+        Cli::try_parse_from([
+            "locket",
+            "team",
+            "join",
+            "--owner",
+            &pin,
+            package.to_str().ok_or("fixture path is not UTF-8")?,
+        ])?,
+        &context,
+        &mut Vec::new(),
+    )
+    .err()
+    .ok_or("missing explicit package must fail")?;
+    assert!(error.to_string().contains("team folder operation failed"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn removing_a_local_device_drops_both_private_key_envelopes()
+-> Result<(), Box<dyn std::error::Error>> {
+    use locket_platform::LocalDevicePrivateKeyStorage as _;
+
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--no-passkey", "--name", "app"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    let project = crate::require_project(&context)?.config.project_id;
+    let store = crate::open_store(&context)?;
+    let device = store.get_active_local_device(project.as_str())?.ok_or("local device missing")?;
+    let run_remove =
+        |context: &RuntimeContext, force: bool| -> Result<u8, Box<dyn std::error::Error>> {
+            let argv = ["locket", "device", "remove", device.id.as_str()]
+                .into_iter()
+                .chain(force.then_some("--force"));
+            Ok(run_with_context(Cli::try_parse_from(argv)?, context, &mut Vec::new())?)
+        };
+    let envelope = || {
+        crate::commands::team::device::build_device_private_key_storage(&context, project.as_str())
+    };
+
+    assert!(run_remove(&context, false).is_err());
+    let locked = test_context_with_key_store(&directory, Arc::new(UnavailableMasterKeyStore));
+    assert!(run_remove(&locked, true).is_err());
+    assert!(store.get_active_local_device(project.as_str())?.is_some());
+    assert!(envelope()?.load(&device.id).is_ok());
+    assert!(envelope()?.for_signing().load(&device.fingerprint).is_ok());
+    run_remove(&context, true)?;
+    assert!(matches!(envelope()?.load(&device.id), Err(PlatformError::DevicePrivateKeyNotFound)));
+    assert!(matches!(
+        envelope()?.for_signing().load(&device.fingerprint),
+        Err(PlatformError::DevicePrivateKeyNotFound)
+    ));
+    run_remove(&context, true)?;
+    Ok(())
+}
+
+fn command_output(
+    context: &RuntimeContext,
+    args: &[&str],
+) -> Result<String, Box<dyn std::error::Error>> {
+    let cli = Cli::try_parse_from(std::iter::once("locket").chain(args.iter().copied()))?;
+    let mut output = Vec::new();
+    assert_eq!(run_with_context(cli, context, &mut output)?, 0);
+    Ok(String::from_utf8(output)?)
+}
+
+#[test]
+fn bundle_verification_distinguishes_missing_recipient_keys_and_invalid_schema()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    command_output(&context, &["init", "--no-passkey", "--name", "app"])?;
+    let project = crate::require_project(&context)?.config.project_id;
+    let store = crate::open_store(&context)?;
+    let device = store.get_active_local_device(project.as_str())?.ok_or("missing local device")?;
+    let descriptor = crate::encode_device_descriptor(&device)?;
+    let bundle = directory.path().join("empty.locket-bundle");
+    let path = bundle.to_str().ok_or("fixture path is not UTF-8")?;
+    let verify = ["bundle", "verify", path];
+    assert!(
+        command_output(&context, &["export", "--recipient", &descriptor])
+            .err()
+            .ok_or("unsealed export must fail")?
+            .to_string()
+            .contains("requires --sealed")
+    );
+    let export =
+        ["export", "--sealed", "--recipient", &descriptor, "--all-profiles", "--output", path];
+    let output = command_output(&context, &export)?;
+    assert!(output.contains("No team-managed values selected"));
+    let original = fs::read(&bundle)?;
+    assert!(
+        command_output(&context, &export)
+            .err()
+            .ok_or("existing output must fail")?
+            .to_string()
+            .contains("bundle output already exists")
+    );
+    assert_eq!(fs::read(&bundle)?, original);
+    assert!(command_output(&context, &verify)?.contains("decryptable_by_this_device: yes"));
+
+    let unrelated_directory = tempdir()?;
+    let unrelated = test_context(&unrelated_directory);
+    assert!(command_output(&unrelated, &verify)?.contains("decryptable_by_this_device: no"));
+    command_output(&unrelated, &["init", "--no-passkey", "--name", "other"])?;
+    assert!(command_output(&unrelated, &verify)?.contains("decryptable_by_this_device: no"));
+
+    fs::remove_file(directory.path().join("devices").join(format!("{}.priv", device.id)))?;
+    assert!(command_output(&context, &verify)?.contains("decryptable_by_this_device: no"));
+
+    let mut invalid = original;
+    invalid[8..10].copy_from_slice(&u16::MAX.to_le_bytes());
+    fs::write(&bundle, invalid)?;
+    let error = command_output(&context, &verify).err().ok_or("unknown schema must fail")?;
+    assert!(error.to_string().contains("unsupported bundle schema version"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn invite_validation_preserves_preexisting_output_and_pending_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    command_output(&context, &["init", "--no-passkey", "--name", "app"])?;
+    command_output(&context, &["team", "init", "New team"])?;
+    let recipient: serde_json::Value = serde_json::from_str(&command_output(
+        &context,
+        &["ci", "init-device", "--print-private-identity"],
+    )?)?;
+    let descriptor = recipient["descriptor"].as_str().ok_or("missing recipient descriptor")?;
+    let file = directory.path().join("existing.invite");
+    let path = file.to_str().ok_or("fixture path is not UTF-8")?;
+    fs::write(&file, "keep this file")?;
+
+    for (profile, expected) in
+        [("unknown", "profile not found: unknown"), ("dev", "invite output already exists")]
+    {
+        let error = command_output(
+            &context,
+            &[
+                "team",
+                "invite",
+                "Recipient",
+                "--device",
+                descriptor,
+                "--role",
+                "read-only",
+                "--profile",
+                profile,
+                "--output",
+                path,
+            ],
+        )
+        .err()
+        .ok_or("invite must fail")?;
+        assert!(error.to_string().contains(expected), "{error}");
+        assert_eq!(fs::read_to_string(&file)?, "keep this file");
+        assert!(command_output(&context, &["team", "members"])?.contains("pending_invites: none"));
+    }
+    Ok(())
+}
+
+#[test]
+fn client_revoke_retries_failed_private_key_cleanup() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    let setup = command_output(
+        &context,
+        &["init", "--no-device", "--no-passkey", "--name", "app", "--recovery-code"],
+    )?;
+    let code = recovery_code_from_output(&setup)?;
+    let context = context_with_recovery_code(&context, code);
+    command_output(&context, &["policy", "add", "ci", "--", "cargo", "test"])?;
+    command_output(
+        &context,
+        &[
+            "client",
+            "create",
+            "ci",
+            "--storage",
+            "wrapped-local-file",
+            "--action",
+            "redact",
+            "--policy",
+            "ci",
+        ],
+    )?;
+    let project = crate::require_project(&context)?.config.project_id;
+    let store = crate::open_store(&context)?;
+    let client = store.get_automation_client(project.as_str(), "ci")?.ok_or("client missing")?;
+    let key = directory.path().join("automation-clients").join(format!("{}.key", client.id));
+    let saved = key.with_extension("saved");
+    fs::rename(&key, &saved)?;
+    fs::create_dir(&key)?;
+
+    let revoke = ["client", "revoke", "ci"];
+    assert!(command_output(&context, &revoke).is_err());
+    assert!(store.get_automation_client_private_key_ref(&client.id)?.is_some());
+    assert!(command_output(&context, &["client", "list"])?.contains("clients: none"));
+    let audited = store.list_recent_audit_actions(project.as_str(), 10)?;
+
+    fs::remove_dir(&key)?;
+    fs::rename(saved, &key)?;
+    assert!(command_output(&context, &revoke)?.contains("status: already revoked"));
+    assert!(!key.exists());
+    assert!(store.get_automation_client_private_key_ref(&client.id)?.is_none());
+    assert_eq!(audited.iter().filter(|action| *action == "CLIENT_REVOKE").count(), 1);
+    assert_eq!(store.list_recent_audit_actions(project.as_str(), 10)?, audited);
+    Ok(())
+}
+
+#[test]
+fn device_replacement_keeps_the_active_identity_when_recovery_code_is_rejected()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    let initialized =
+        command_output(&context, &["init", "--no-passkey", "--recovery-code", "--name", "app"])?;
+    let code = recovery_code_from_output(&initialized)?;
+    let project = crate::require_project(&context)?.config.project_id;
+    let store = crate::open_store(&context)?;
+    let active = || store.get_active_local_device(project.as_str());
+    let original = active()?.ok_or("missing initial device")?;
+    assert!(command_output(&context, &["device", "init"])?.contains("already initialized"));
+    let recovery = directory.path().join(".locket/recovery/envelope.bin");
+    let initial_envelope = fs::read(&recovery)?;
+    let denied = context_with_recovery_code(&context, "wrong-recovery-code");
+    assert!(command_output(&denied, &["device", "init", "--force"]).is_err());
+    assert_eq!(active()?.ok_or("active device disappeared")?.id, original.id);
+    assert_eq!(fs::read(&recovery)?, initial_envelope);
+
+    let accepted = context_with_recovery_code(&context, code);
+    command_output(&accepted, &["device", "init", "--force"])?;
+    assert_ne!(active()?.ok_or("missing replacement device")?.id, original.id);
+    assert_ne!(fs::read(recovery)?, initial_envelope);
+    Ok(())
+}
+
+#[test]
+fn locked_vault_keeps_legacy_membership_and_device_revocations_retryable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    command_output(&context, &["init", "--no-passkey", "--name", "app"])?;
+    let context = context_with_confirmation(&context, "Receiver");
+    command_output(&context, &["team", "init", "New team"])?;
+    let project = crate::require_project(&context)?.config.project_id;
+    let store = crate::open_store(&context)?;
+    let team = store.get_team_by_project(project.as_str())?.ok_or("team missing")?;
+    let device = store.get_active_local_device(project.as_str())?.ok_or("device missing")?;
+    let member_id = "lk_member_receiver";
+    store.insert_team_member(member_id, &team.id, None, "Receiver", "developer", 1)?;
+    let locked_context = test_context_with_key_store_and_confirmation(
+        &directory,
+        Arc::new(UnavailableMasterKeyStore),
+        "Receiver",
+    );
+
+    let remove = ["team", "remove", member_id];
+    assert!(command_output(&locked_context, &remove).is_err());
+    let member = store.get_team_member(&team.id, member_id)?.ok_or("member missing")?;
+    assert!(member.removed_at.is_none());
+    let revoke = ["team", "revoke-device", &device.id];
+    assert!(command_output(&locked_context, &revoke).is_err());
+    assert_eq!(
+        store.get_active_local_device(project.as_str())?.ok_or("device revoked while locked")?.id,
+        device.id
+    );
+
+    command_output(&context, &remove)?;
+    command_output(&context, &revoke)?;
+    let member = store.get_team_member(&team.id, member_id)?.ok_or("member missing")?;
+    assert!(member.removed_at.is_some());
+    assert!(store.get_active_local_device(project.as_str())?.is_none());
+    assert_eq!(
+        store.list_recent_audit_actions(project.as_str(), 2)?,
+        ["TEAM_REMOVE", "DEVICE_REVOKE"]
+    );
     Ok(())
 }

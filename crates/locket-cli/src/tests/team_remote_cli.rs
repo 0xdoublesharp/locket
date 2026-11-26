@@ -22,7 +22,7 @@ fn s3_remote_cli_round_trip() -> TestResult {
     if let Ok(mode) = std::env::var(CHILD_MODE) {
         return round_trip(&mode);
     }
-    for mode in ["env", "vault"] {
+    for mode in ["env", "vault", "vault-aws"] {
         let mut child = TestCommand::new(std::env::current_exe()?);
         child
             .args(["--exact", "tests::team_remote_cli::s3_remote_cli_round_trip", "--nocapture"])
@@ -33,7 +33,7 @@ fn s3_remote_cli_round_trip() -> TestResult {
             .env_remove("AWS_ACCESS_KEY_ID")
             .env_remove("AWS_SECRET_ACCESS_KEY")
             .env_remove("AWS_SESSION_TOKEN");
-        if mode == "env" {
+        if matches!(mode, "env" | "vault-aws") {
             child
                 .env("AWS_ACCESS_KEY_ID", ACCESS_ID)
                 .env("AWS_SECRET_ACCESS_KEY", ACCESS_SECRET)
@@ -67,7 +67,8 @@ fn s3_remote_cli_round_trip() -> TestResult {
 
 #[allow(clippy::too_many_lines)]
 fn round_trip(mode: &str) -> TestResult {
-    let remote = MockRemote::start(MockBackend::S3 { with_session: mode == "env" })?;
+    let credential_mode = if mode == "env" { "env" } else { "vault" };
+    let remote = MockRemote::start(MockBackend::S3 { with_session: mode != "vault" })?;
     let endpoint = format!("http://{}", remote.addr);
     let owner = tempdir()?;
     let receiver = tempdir()?;
@@ -88,7 +89,7 @@ fn round_trip(mode: &str) -> TestResult {
         "--endpoint",
         &endpoint,
         "--credentials",
-        mode,
+        credential_mode,
     ];
     if mode == "vault" {
         set.extend(["--access-key-id", ACCESS_ID]);
@@ -97,7 +98,7 @@ fn round_trip(mode: &str) -> TestResult {
     assert_connection(&owner_context, 0)?;
     let initial = remote_status(&owner_context)?;
     assert_eq!(initial["transport_kind"], "s3");
-    assert_eq!(initial["credential_mode"], mode);
+    assert_eq!(initial["credential_mode"], credential_mode);
     assert_eq!(initial["remote_target"], "s3://bucket/exchange/");
     assert_eq!(initial["remote_region"], "us-east-1");
     let owner_status = sync_status(&owner_context)?;
@@ -109,7 +110,7 @@ fn round_trip(mode: &str) -> TestResult {
     let project = resolved.config.project_id.as_str();
     let issuer = crate::open_store(&owner_context)?;
     let recipient = crate::open_store(&receiver_context)?;
-    assert_eq!(credential_rows(&issuer)?, i64::from(mode == "vault"));
+    assert_eq!(credential_rows(&issuer)?, i64::from(credential_mode == "vault"));
     let device = recipient.get_active_local_device(project)?.ok_or("recipient device missing")?;
     let descriptor = crate::encode_device_descriptor(&device)?;
     run(
@@ -148,7 +149,7 @@ fn round_trip(mode: &str) -> TestResult {
             "--s3-endpoint",
             &endpoint,
             "--credentials",
-            mode,
+            credential_mode,
         ]
     };
     let wrong_pin = "0".repeat(64);
@@ -157,11 +158,11 @@ fn round_trip(mode: &str) -> TestResult {
     assert!(run(&receiver_context, &join(owner_device))?.contains("team package verified"));
     let joined = remote_status(&receiver_context)?;
     assert_eq!(joined["transport_kind"], "s3");
-    assert_eq!(joined["credential_mode"], mode);
+    assert_eq!(joined["credential_mode"], credential_mode);
     let joined_status = sync_status(&receiver_context)?;
     assert_eq!(joined_status["owner_fingerprint"], owner_device);
     assert_eq!(joined_status["epoch"], 2);
-    assert_eq!(credential_rows(&recipient)?, i64::from(mode == "vault"));
+    assert_eq!(credential_rows(&recipient)?, i64::from(credential_mode == "vault"));
     assert!(
         run(&receiver_context, &["team", "join", "--owner", owner_device, "--remote"])?
             .contains("team package verified")
@@ -501,4 +502,75 @@ fn serve(
 fn respond(stream: &mut TcpStream, status: u16, body: &[u8]) -> io::Result<()> {
     write!(stream, "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\n\r\n", body.len())?;
     stream.write_all(body)
+}
+
+#[test]
+fn remote_configuration_rejects_inapplicable_credentials() -> TestResult {
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    run(&context, &["init", "--no-passkey", "--name", "app"])?;
+    run(&context, &["team", "init", "Remote team"])?;
+    for (args, expected) in [
+        (
+            &["s3", "--bucket", "bucket", "--credentials", "env", "--access-key-id", ACCESS_ID][..],
+            "--access-key-id requires vault credentials",
+        ),
+        (
+            &[
+                "webdav",
+                "--url",
+                "https://example.test/team/",
+                "--auth",
+                "basic",
+                "--credentials",
+                "none",
+            ],
+            "Basic and Bearer require vault or env credentials",
+        ),
+        (
+            &[
+                "webdav",
+                "--url",
+                "https://example.test/team/",
+                "--auth",
+                "bearer",
+                "--username",
+                DAV_USER,
+            ],
+            "a WebDAV username requires Basic authentication",
+        ),
+    ] {
+        let command: Vec<_> =
+            ["team", "remote", "set"].into_iter().chain(args.iter().copied()).collect();
+        let cli = Cli::try_parse_from(std::iter::once("locket").chain(command.iter().copied()))?;
+        let debug = format!("{:?}", cli.command);
+        assert!(!debug.contains(ACCESS_ID));
+        assert!(!debug.contains(DAV_USER));
+        if args.contains(&ACCESS_ID) || args.contains(&DAV_USER) {
+            assert!(debug.contains("[redacted]"));
+        }
+        let error =
+            run(&context, &command).err().ok_or("inapplicable credential option was accepted")?;
+        assert!(error.to_string().contains(expected), "{error}");
+        assert!(remote_status(&context)?["transport_kind"].is_null());
+        assert!(sync_status(&context)?["owner_fingerprint"].is_null());
+    }
+    assert_eq!(credential_rows(&crate::open_store(&context)?)?, 0);
+    let pin = "a".repeat(64);
+    let error = run(
+        &context,
+        &["team", "join", "--owner", &pin, "--s3-bucket", "bucket", "--credentials", "none"],
+    )
+    .err()
+    .ok_or("S3 without credentials must fail")?;
+    assert!(error.to_string().contains("S3 credentials must be vault or env"));
+
+    run(&context, &["team", "remote", "set", "webdav", "--url", "https://example.test/team/"])?;
+    assert_eq!(remote_status(&context)?["credential_mode"], "none");
+    let status = sync_status(&context)?;
+    assert!(status["owner_fingerprint"].is_string());
+    run(&context, &["team", "remote", "clear"])?;
+    assert!(remote_status(&context)?["transport_kind"].is_null());
+    assert_eq!(sync_status(&context)?["owner_fingerprint"], status["owner_fingerprint"]);
+    Ok(())
 }

@@ -108,6 +108,101 @@ fn ci_init_device_secure_file_and_output() -> TestResult {
 }
 
 #[test]
+fn ci_rejects_malformed_enrollment_inputs_without_writing_files() -> TestResult {
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    let too_long = "x".repeat(81);
+    for label in ["   ", "runner\nname", &too_long] {
+        let args = ["ci", "init-device", "--label", label, "--print-private-identity"];
+        let error = owner_command(&context, &args).err().ok_or("label must be rejected")?;
+        assert!(error.to_string().contains("invalid CI device label"));
+    }
+    let args = [
+        "locket",
+        "ci",
+        "verify",
+        "--owner",
+        &"A".repeat(64),
+        "--profile",
+        "dev",
+        "--folder",
+        "packages",
+        "--identity-env",
+        "NO=SUCH",
+    ];
+    let error = Cli::try_parse_from(args).err().ok_or("invalid env name must be rejected")?;
+    assert!(error.to_string().contains("invalid CI identity environment variable name"));
+    let cli = Cli::try_parse_from([
+        "locket",
+        "ci",
+        "init-device",
+        "--label",
+        "private-label-canary",
+        "--print-private-identity",
+    ])?;
+    let debug = format!("{:?}", cli.command);
+    assert!(debug.contains("InitDeviceArgs"));
+    assert!(!debug.contains("private-label-canary"));
+    assert_eq!(fs::read_dir(directory.path())?.count(), 0);
+    Ok(())
+}
+
+#[test]
+fn ci_rejects_malformed_identity_tokens_without_echoing_them() -> TestResult {
+    use data_encoding::BASE64URL_NOPAD;
+
+    let directory = tempdir()?;
+    let pin = "a".repeat(64);
+    let args = [
+        "verify",
+        "--owner",
+        &pin,
+        "--project",
+        "lk_proj_test",
+        "--profile",
+        "dev",
+        "--folder",
+        "packages",
+    ];
+    assert_denied(
+        &invoke_ci_as(directory.path(), CUSTOM_IDENTITY, None, &args)?,
+        "CI identity environment variable is missing or invalid",
+    );
+    let device = locket_core::DeviceId::generate()?;
+    let encode = |v: u8, id: &str, key: &str| {
+        format!(
+            "lkci1_{}",
+            BASE64URL_NOPAD.encode(
+                json!({
+                    "v": v,
+                    "id": id,
+                    "label": "fixture",
+                    "signing_seed_b64": key,
+                    "sealing_key_b64": key,
+                })
+                .to_string()
+                .as_bytes()
+            )
+        )
+    };
+    let key = BASE64URL_NOPAD.encode(&[1; 32]);
+    for token in [
+        "unexpected-prefix-canary".to_owned(),
+        "lkci1_A".to_owned(),
+        "lkci1_!!!!".to_owned(),
+        format!("lkci1_{}", BASE64URL_NOPAD.encode(b"plain text canary")),
+        format!("lkci1_{}", BASE64URL_NOPAD.encode(&[0; 1025])),
+        encode(2, device.as_str(), &key),
+        encode(1, "", &key),
+        encode(1, device.as_str(), "AA"),
+        encode(1, device.as_str(), &"!".repeat(key.len())),
+    ] {
+        assert_denied(&invoke_ci(directory.path(), &token, &args)?, "invalid CI identity token");
+    }
+    Ok(())
+}
+
+#[test]
 fn ci_delivery_round_trip() -> TestResult {
     if std::env::var_os(DELIVERY_FIXTURE).is_some() {
         for delivery in [Delivery::Folder, Delivery::S3, Delivery::WebDav] {
@@ -380,6 +475,10 @@ fn test_signed_heads(
     let package = fs::read(fs::read_dir(published)?.next().ok_or("no package")??.path())?;
     let signed = SignedStatement::open(&package, sealing)?;
     let mut statement: TeamStatement = serde_json::from_slice(&signed.statement)?;
+    let missing_folder = path.join("missing");
+    let mut unavailable = args;
+    unavailable[8] = missing_folder.to_str().ok_or("fixture path is not UTF-8")?;
+    assert_denied(&invoke_ci(runner, token, &unavailable)?, "team folder operation failed");
     let store = crate::open_store(context)?;
     let owner = store.get_active_local_device(project)?.ok_or("owner missing")?;
     let owner_key = crate::commands::team::device::load_device_signing_key(context, &owner)?;
@@ -394,12 +493,27 @@ fn test_signed_heads(
     fs::write(path.join("02.lkpkg"), &package)?;
     fs::write(path.join("05.lkpkg"), signed.seal(&statement.publisher.sealing_key)?)?;
     assert_eq!(checked_json(&invoke_ci(runner, token, &args)?)?["epoch"], 1);
+    let mut exec = args.to_vec();
+    exec[0] = "exec";
+    exec.extend(["--secret", "CI_FIRST", "--", test_true()]);
+    assert_denied(
+        &invoke_ci_as(runner, "CI_FIRST", Some(token), &exec)?,
+        "CI secret name conflicts with the identity environment variable",
+    );
     statement.nonce[0] ^= 1;
     write_package("03.lkpkg", &statement)?;
     assert_denied(&invoke_ci(runner, token, &args)?, "conflicting CI packages");
     statement.epoch += 1;
     write_package("04.lkpkg", &statement)?;
     assert_eq!(checked_json(&invoke_ci(runner, token, &args)?)?["epoch"], 2);
+    statement.issued_at -= 60;
+    write_package("04.lkpkg", &statement)?;
+    let mut age_limited = args.to_vec();
+    age_limited.extend(["--max-age-seconds", "30"]);
+    assert_denied(
+        &invoke_ci(runner, token, &age_limited)?,
+        "latest CI package exceeds --max-age-seconds limit",
+    );
 
     statement.profiles[0].secrets[0].blob.as_mut().ok_or("fixture blob missing")?.ciphertext[0] ^=
         1;
@@ -443,21 +557,34 @@ fn json_str<'a>(json: &'a serde_json::Value, field: &str) -> TestResult<&'a str>
 }
 
 fn invoke_ci(cwd: &Path, token: &str, args: &[&str]) -> TestResult<Output> {
-    let mut runner_args = vec!["ci", args[0], "--identity-env", CUSTOM_IDENTITY];
+    invoke_ci_as(cwd, CUSTOM_IDENTITY, Some(token), args)
+}
+
+fn invoke_ci_as(
+    cwd: &Path,
+    identity_env: &str,
+    token: Option<&str>,
+    args: &[&str],
+) -> TestResult<Output> {
+    let mut runner_args = vec!["ci", args[0], "--identity-env", identity_env];
     runner_args.extend_from_slice(&args[1..]);
-    let output = TestCommand::new(std::env::current_exe()?)
+    let mut command = TestCommand::new(std::env::current_exe()?);
+    command
         .args(["--exact", "tests::ci_exec_cli::ci_runner_subprocess", "--nocapture"])
         .env(RUNNER_ARGS, serde_json::to_string(&runner_args)?)
-        .env(CUSTOM_IDENTITY, token)
-        .env("LOCKET_CI_IDENTITY", token)
+        .env_remove(identity_env)
+        .env_remove("LOCKET_CI_IDENTITY")
         .env_remove("CI_FIRST")
         .env_remove("CI_SECOND")
         .env_remove("CI_LOCAL")
-        .current_dir(cwd)
-        .output()?;
+        .current_dir(cwd);
+    if let Some(token) = token {
+        command.env(identity_env, token).env("LOCKET_CI_IDENTITY", token);
+    }
+    let output = command.output()?;
     for stream in [&output.stdout, &output.stderr] {
         let text = String::from_utf8_lossy(stream);
-        for value in [token, FIRST, SECOND, LOCAL, ACCESS_KEY, DAV_TOKEN] {
+        for value in token.into_iter().chain([FIRST, SECOND, LOCAL, ACCESS_KEY, DAV_TOKEN]) {
             assert!(!text.contains(value), "CI command leaked private material");
         }
     }
