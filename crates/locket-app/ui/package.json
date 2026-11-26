@@ -1,7 +1,7 @@
 {
   "name": "locket-ui",
   "private": true,
-  "version": "0.3.2",
+  "version": "0.3.3",
   "type": "module",
   "description": "Vue 3 + Vite frontend for the Locket desktop shell",
   "scripts": {
