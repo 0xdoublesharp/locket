@@ -429,6 +429,10 @@ struct EnvScanReport {
     uninitialized_projects: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     migrated_project_roots: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    staged_project_roots: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    uninitialized_project_roots: Vec<String>,
     metadata_only: bool,
 }
 
@@ -591,6 +595,12 @@ fn build_scan_report(
             }
         }
     }
+    let sorted_root_names = |roots: BTreeSet<&Path>| {
+        let mut names =
+            roots.into_iter().map(|root| root.display().to_string()).collect::<Vec<_>>();
+        names.sort_unstable();
+        names
+    };
     Ok(EnvScanReport {
         root: root.path.display().to_string(),
         total_files: files.len(),
@@ -599,6 +609,8 @@ fn build_scan_report(
         staged_projects,
         uninitialized_projects,
         migrated_project_roots,
+        staged_project_roots: sorted_root_names(staged_roots),
+        uninitialized_project_roots: sorted_root_names(uninitialized_roots),
         files,
         shared_candidates,
         metadata_only: true,
@@ -637,10 +649,16 @@ pub(super) fn write_env_scan(
         "projects: {} migrated, {} staged, {} uninitialized",
         report.migrated_projects, report.staged_projects, report.uninitialized_projects,
     )?;
-    if !report.migrated_project_roots.is_empty() {
-        writeln!(output, "migrated_projects:")?;
-        for root in report.migrated_project_roots {
-            writeln!(output, "  {root:?}")?;
+    for (label, roots) in [
+        ("staged_projects", report.staged_project_roots),
+        ("uninitialized_projects", report.uninitialized_project_roots),
+        ("migrated_projects", report.migrated_project_roots),
+    ] {
+        if !roots.is_empty() {
+            writeln!(output, "{label}:")?;
+            for root in roots {
+                writeln!(output, "  {root:?}")?;
+            }
         }
     }
     for file in report.files {
@@ -677,22 +695,38 @@ mod tests {
     fn scan_reports_migration_progress_by_project() -> Result<(), Box<dyn std::error::Error>> {
         let fixture = tempfile::tempdir()?;
         let root = fixture.path().canonicalize()?;
-        for project in ["migrated", "staged", "uninitialized"] {
+        for project in ["migrated", "staged-z", "staged-a", "uninitialized-z", "uninitialized-a"] {
             fs::create_dir(root.join(project))?;
         }
         fs::write(root.join("migrated/locket.toml"), "")?;
         fs::write(root.join("migrated/.env.example"), "KEY=\n")?;
-        fs::write(root.join("staged/locket.toml"), "")?;
-        fs::write(root.join("staged/.env"), "KEY=fixture\n")?;
-        fs::write(root.join("staged/.env.local"), "KEY=fixture\n")?;
-        fs::write(root.join("uninitialized/.env"), "KEY=fixture\n")?;
+        for project in ["staged-z", "staged-a"] {
+            fs::write(root.join(project).join("locket.toml"), "")?;
+            fs::write(root.join(project).join(".env"), "KEY=fixture\n")?;
+        }
+        fs::write(root.join("staged-a/.env.local"), "KEY=fixture\n")?;
+        for project in ["uninitialized-z", "uninitialized-a"] {
+            fs::create_dir(root.join(project).join(".git"))?;
+            fs::write(root.join(project).join(".env"), "KEY=fixture\n")?;
+        }
 
         let report = scan_open_workspace(&InputDirectory::open(&root)?, 2, false)?;
-        assert_eq!(report["total_files"], 3);
+        assert_eq!(report["total_files"], 5);
         assert_eq!(report["migrated_projects"], 1);
-        assert_eq!(report["staged_projects"], 1);
-        assert_eq!(report["uninitialized_projects"], 1);
+        assert_eq!(report["staged_projects"], 2);
+        assert_eq!(report["uninitialized_projects"], 2);
         assert_eq!(report["migrated_project_roots"], serde_json::json!([root.join("migrated")]));
+        assert_eq!(
+            report["staged_project_roots"],
+            serde_json::json!([root.join("staged-a"), root.join("staged-z")]),
+        );
+        assert_eq!(
+            report["uninitialized_project_roots"],
+            serde_json::json!([root.join("uninitialized-a"), root.join("uninitialized-z")]),
+        );
+        let migrated = scan_workspace_env_files(&root.join("migrated"), 1, false, false)?;
+        assert!(migrated.get("staged_project_roots").is_none());
+        assert!(migrated.get("uninitialized_project_roots").is_none());
         Ok(())
     }
 

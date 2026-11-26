@@ -1745,6 +1745,47 @@ fn import_verify_policy_requires_archive() {
     assert!(Cli::try_parse_from(args.into_iter().chain(["--archive", "backups"])).is_ok());
 }
 
+#[test]
+fn import_verify_timeout_requires_verify_policy() {
+    let args = ["locket", "import", ".env", "--archive", "backups", "--verify-timeout", "1"];
+    assert!(matches!(
+        Cli::try_parse_from(args),
+        Err(error) if error.kind() == clap::error::ErrorKind::MissingRequiredArgument
+            && error.to_string().contains("--verify-policy <POLICY>")
+    ));
+}
+
+#[test]
+fn import_verify_timeout_rejects_out_of_range_values_upfront()
+-> Result<(), Box<dyn std::error::Error>> {
+    let project = tempdir()?;
+    let context = test_context(&project);
+    for seconds in ["0", "601"] {
+        let args = [
+            "import",
+            ".env",
+            "--archive",
+            "backups",
+            "--verify-policy",
+            "check",
+            "--verify-timeout",
+            seconds,
+            "--json",
+        ];
+        for extra_args in [&[][..], &["--dry-run"][..]] {
+            let (code, report) =
+                run_env_json(&context, &[args.as_slice(), extra_args].concat(), &[])?;
+            assert_eq!(code, locket_core::LocketError::MetadataInvalid.exit_code());
+            assert_eq!(report["error"]["code"], "MetadataInvalid");
+            assert!(report["error"]["message"].as_str().is_some_and(|message| {
+                message.contains("--verify-timeout must be between 1 and 600 seconds")
+            }));
+        }
+    }
+    assert!(!context.store_path.exists());
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn import_verify_policy_dry_run_checks_approval_without_running()
@@ -1781,6 +1822,36 @@ fn import_verify_policy_dry_run_checks_approval_without_running()
     assert_eq!(report["verify_policy"], "check");
     assert_eq!(report["verify_policy_status"], "would-run");
 
+    run_env_command(&context, &["import", ".env", "--keep"], &[canary])?;
+    let (code, skipped) = preview("check")?;
+    assert_eq!(code, 0);
+    assert_eq!(skipped["delete_env"], "kept");
+    assert_eq!(skipped["skipped"], 1);
+    assert_eq!(skipped["verify_policy"], "check");
+    assert_eq!(skipped["verify_policy_status"], "would-run");
+    assert!(
+        skipped["archive_blocked_reason"]
+            .as_str()
+            .is_some_and(|reason| { reason.contains("skipped keys exist") })
+    );
+    let (_, text) = run_env_command(
+        &context,
+        &[
+            "import",
+            ".env",
+            "--archive",
+            ".env",
+            "--dry-run",
+            "--verify-policy",
+            "check",
+            "--verify-timeout",
+            "600",
+        ],
+        &[canary],
+    )?;
+    assert!(text.contains("verify_policy: check (would-run)\n"));
+    assert!(text.contains("delete_env: kept\n"));
+
     let (code, missing) = preview("missing")?;
     assert_eq!(code, 0);
     assert_eq!(missing["delete_env"], "kept");
@@ -1789,7 +1860,8 @@ fn import_verify_policy_dry_run_checks_approval_without_running()
             .as_str()
             .is_some_and(|reason| reason.contains("command policy not found: missing"))
     );
-    assert!(missing.get("verify_policy_status").is_none());
+    assert_eq!(missing["verify_policy"], "missing");
+    assert_eq!(missing["verify_policy_status"], "blocked");
 
     let policy_path = project.path().join("locket.toml");
     let config = fs::read_to_string(&policy_path)?;
@@ -1802,7 +1874,14 @@ fn import_verify_policy_dry_run_checks_approval_without_running()
             .as_str()
             .is_some_and(|reason| reason.contains("locket policy refresh check"))
     );
-    assert!(unapproved.get("verify_policy_status").is_none());
+    assert_eq!(unapproved["verify_policy"], "check");
+    assert_eq!(unapproved["verify_policy_status"], "blocked");
+    let (_, text) = run_env_command(
+        &context,
+        &["import", ".env", "--archive", "backups", "--dry-run", "--verify-policy", "check"],
+        &[canary],
+    )?;
+    assert!(text.contains("verify_policy: check (blocked)\n"));
     for path in ["verification-ran", "changed-command-ran", "backups"] {
         assert!(!project.path().join(path).exists());
     }
@@ -1883,6 +1962,70 @@ fn import_verify_policy_keeps_child_output_off_json_stdout()
     assert!(!stdout.contains("verification-child-stdout"));
     assert!(stderr.contains("verification-child-stdout"));
     assert!(!stderr.contains("verify-policy-delivery-fixture"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn import_verify_policy_timeout_keeps_source_and_reports_import()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::time::{Duration, Instant};
+
+    let args = [
+        "import",
+        ".env",
+        "--archive",
+        "backups",
+        "--verify-policy",
+        "check",
+        "--verify-timeout",
+        "1",
+    ];
+    // The subprocess inherits the output pipes. Cover both a waiting shell and one that exits.
+    for (script, extra_args) in [
+        ("touch started; /bin/sleep 10 & wait", &["--json"][..]),
+        ("touch started; /bin/sleep 10 &", &[][..]),
+    ] {
+        let project = tempdir()?;
+        let context = test_context(&project);
+        let source = project.path().join(".env");
+        let canary = "verify-policy-timeout-fixture";
+        let contents = format!("TOKEN={canary}\n");
+        fs::write(&source, &contents)?;
+        run_env_command(&context, &["init", "--no-device", "--no-passkey"], &[])?;
+        run_env_command(&context, &["policy", "add", "check", "--", "/bin/sh", "-c", script], &[])?;
+        let start = Instant::now();
+        let (code, output) =
+            run_env_command(&context, &[args.as_slice(), extra_args].concat(), &[canary])?;
+        assert!(start.elapsed() < Duration::from_secs(6), "verification exceeded its timeout");
+        assert_ne!(code, 0);
+        let message = "verify policy 'check' timed out after 1s; use a finite check policy such as test, typecheck, or build instead of a long-running server";
+        if extra_args.contains(&"--json") {
+            let report: serde_json::Value = serde_json::from_str(&output)?;
+            assert_eq!(report["imported_names"], serde_json::json!(["TOKEN"]));
+            assert_eq!(report["verify_policy"], "check");
+            assert_eq!(report["verify_policy_status"], "timed-out");
+            assert_eq!(report["delete_env"], "kept");
+            assert_eq!(report["archive_error"], message);
+            assert_eq!(report["error"]["code"], "PolicyValidationIncomplete");
+            assert_eq!(report["error"]["message"], message);
+            assert!(report.get("verify_policy_exit_code").is_none());
+        } else {
+            assert!(output.contains("verify_policy: check (timed-out)\n"));
+            assert!(output.contains("delete_env: kept\n"));
+            assert!(output.contains(&format!("archive_error: {message}\n")));
+        }
+        assert!(fs::read(&source)?.as_slice().eq(contents.as_bytes()), "source changed");
+        assert!(!project.path().join("backups").exists());
+        assert!(project.path().join("started").is_file());
+        let store = crate::open_store(&context)?;
+        let ended_at: Option<i64> = store.connection().query_row(
+            "SELECT ended_at FROM runtime_sessions WHERE policy_name = 'check'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(ended_at.is_some());
+    }
     Ok(())
 }
 
@@ -2362,12 +2505,18 @@ fn env_scan_groups_keys_across_repos_and_ignores_templates()
         report["migrated_project_roots"],
         serde_json::json!([root.join("three").canonicalize()?]),
     );
+    let staged = root.join("two").canonicalize()?;
+    let uninitialized = root.join("one").canonicalize()?;
+    assert_eq!(report["staged_project_roots"], serde_json::json!([staged]));
+    assert_eq!(report["uninitialized_project_roots"], serde_json::json!([uninitialized]));
     let (_, remaining) =
         run_env_json(&context, &["env", "scan", "--remaining", "--json"], &canaries)?;
-    assert!(remaining.get("migrated_project_roots").is_none());
-    for field in ["migrated_projects", "staged_projects", "uninitialized_projects", "files"] {
-        assert_eq!(remaining[field], report[field]);
-    }
+    let mut expected_remaining = report.clone();
+    expected_remaining
+        .as_object_mut()
+        .ok_or("missing scan report")?
+        .remove("migrated_project_roots");
+    assert_eq!(remaining, expected_remaining);
     let files = report["files"].as_array().ok_or("missing files")?;
     assert_eq!(files[0]["suggested_profile"], "dev");
     assert_eq!(files[0]["suggested_source"], "user-local");
@@ -2390,13 +2539,17 @@ fn env_scan_groups_keys_across_repos_and_ignores_templates()
     assert!(text.contains(
         "total_files: 3  total_keys: 5\nprojects: 1 migrated, 1 staged, 1 uninitialized\n"
     ));
-    assert!(text.contains("migrated_projects:\n"));
+    let project_lists = format!(
+        "projects: 1 migrated, 1 staged, 1 uninitialized\nstaged_projects:\n  {staged:?}\nuninitialized_projects:\n  {uninitialized:?}\n"
+    );
+    let migrated = root.join("three").canonicalize()?;
+    assert!(text.contains(&format!("{project_lists}migrated_projects:\n  {migrated:?}\n")));
     assert!(text.lines().any(|line| line.contains(".env.local\"") && line.contains("locket=no")));
     assert!(
         text.lines().any(|line| line.contains(".env.staging\"") && line.contains("locket=yes"))
     );
     let (_, text) = run_env_command(&context, &["env", "scan", "--remaining"], &canaries)?;
-    assert!(text.contains("projects: 1 migrated, 1 staged, 1 uninitialized\n"));
+    assert!(text.contains(&project_lists));
     assert!(!text.contains("migrated_projects:\n"));
     let (_, explicit) =
         run_env_json(&context, &["env", "keys", "two/.env.json", "--json"], &canaries)?;

@@ -556,6 +556,14 @@ struct ImportSelectionArgs {
     /// Run an approved saved command policy with vault values before archiving the dotenv source.
     #[arg(long, value_name = "POLICY", requires = "archive")]
     pub verify_policy: Option<String>,
+    /// Maximum seconds to wait for `--verify-policy` before aborting archiving (1 to 600).
+    #[arg(
+        long = "verify-timeout",
+        value_name = "SECONDS",
+        requires = "verify_policy",
+        default_value_t = 60
+    )]
+    pub verify_timeout: u64,
     /// Plan the import without writing. Shared deduplication needs the Global Vault fingerprint key.
     #[arg(long)]
     dry_run: bool,

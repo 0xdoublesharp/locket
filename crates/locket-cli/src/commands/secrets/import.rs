@@ -11,6 +11,7 @@ use std::fs;
 use std::io::{self, Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use locket_core::{LocketError, ProfileName, SecretName};
 use locket_crypto::{KeyBytes, KeyPurpose, local_dedup_tag_v1};
@@ -43,7 +44,9 @@ use crate::commands::agent::request_project_status_snapshot;
 use crate::commands::discovery::{
     error_json, require_metadata_store, trusted_project_configs, write_json_result,
 };
-use crate::commands::exec::run::{require_linked_secret_access, run_verification_policy};
+use crate::commands::exec::run::{
+    VerificationPolicyError, require_linked_secret_access, run_verification_policy,
+};
 use crate::commands::policy::require_approved_policy_source;
 use crate::runtime::RuntimeContext;
 use crate::runtime::error::{
@@ -57,9 +60,9 @@ use crate::support::secret_helpers::{decrypt_secret_version, resolve_active_secr
 use crate::{
     EnvFileCommand, ImportArgs, ImportSelectionArgs, NANOS_PER_SECOND, ResolvedProject,
     SecretMetadataFlags, SecretSourceArg, absolutize, active_profile_secret_names,
-    ensure_trusted_project_root, load_project_key, now_unix_nanos, open_store,
-    project_not_found_error, require_project, resolve_project, secret_audit_metadata,
-    secret_deleted_error, source_arg_to_str,
+    effective_command_policy, effective_policy_profile, ensure_trusted_project_root,
+    load_project_key, now_unix_nanos, open_store, project_not_found_error, require_project,
+    resolve_project, secret_audit_metadata, secret_deleted_error, source_arg_to_str,
 };
 
 /// Key selection and write policy for a dotenv import.
@@ -135,7 +138,13 @@ pub fn import_selected_command(
     args: &ImportArgs,
     selection: &ImportSelectionArgs,
 ) -> Result<u8, CliError> {
-    let (report, archive_error) = match import_cli(context, output, args, selection) {
+    let result =
+        if selection.verify_policy.is_some() && !(1..=600).contains(&selection.verify_timeout) {
+            Err(metadata_invalid_error("--verify-timeout must be between 1 and 600 seconds"))
+        } else {
+            import_cli(context, output, args, selection)
+        };
+    let (report, archive_error) = match result {
         Ok(result) => result,
         Err(error) if selection.json => return write_json_result(output, Err(error)),
         Err(error) => return Err(error),
@@ -252,6 +261,7 @@ fn import_cli(
                     context,
                     store: &store,
                     name,
+                    timeout: Duration::from_secs(selection.verify_timeout),
                 }),
             )
             .err()
@@ -330,16 +340,15 @@ fn finalize_archive_action(
             report.block_archive(&error);
         }
         if let Some(verification) = verification {
-            let approval =
-                ArchiveVerification::project(root, &report.project_id).and_then(|project| {
-                    require_approved_policy_source(verification.store, &project, verification.name)
+            report.verify_policy = Some(verification.name.to_owned());
+            report.verify_policy_status =
+                Some(match verification.preview(root, &report.project_id) {
+                    Ok(()) => "would-run",
+                    Err(error) => {
+                        report.block_archive(&error);
+                        "blocked"
+                    }
                 });
-            if let Err(error) = approval {
-                report.block_archive(&error);
-            } else if report.archive_blocked_reason.is_none() {
-                report.verify_policy = Some(verification.name.to_owned());
-                report.verify_policy_status = Some("would-run");
-            }
         }
         if report.archive_blocked_reason.is_none() {
             report.delete_env = "would-archive";
@@ -367,7 +376,12 @@ fn finalize_archive_action(
                     status.code().and_then(|code| u8::try_from(code).ok());
                 return Err(child_exit_error(status));
             }
-            Err(error) => {
+            Err(VerificationPolicyError::TimedOut(error)) => {
+                report.delete_env = "kept";
+                report.verify_policy_status = Some("timed-out");
+                return Err(error);
+            }
+            Err(VerificationPolicyError::Failed(error)) => {
                 report.verify_policy_status = Some("failed");
                 return Err(error);
             }
@@ -384,16 +398,21 @@ struct ArchiveVerification<'a> {
     context: &'a RuntimeContext,
     store: &'a Store,
     name: &'a str,
+    timeout: Duration,
 }
 
 impl ArchiveVerification<'_> {
-    fn project(root: Option<&Path>, project_id: &str) -> Result<ResolvedProject, CliError> {
+    fn resolve(
+        &self,
+        root: Option<&Path>,
+        project_id: &str,
+    ) -> Result<(ResolvedProject, PathBuf), CliError> {
         let Some(root) = root else {
             return Err(metadata_invalid_error(
                 "--verify-policy requires a trusted locket.toml for the import target",
             ));
         };
-        resolve_project(root)?
+        let project = resolve_project(root)?
             .filter(|project| {
                 project.root == root && project.config.project_id.as_str() == project_id
             })
@@ -401,15 +420,7 @@ impl ArchiveVerification<'_> {
                 metadata_invalid_error(
                     "--verify-policy could not load the import target's locket.toml",
                 )
-            })
-    }
-
-    fn run(
-        self,
-        root: Option<&Path>,
-        project_id: &str,
-    ) -> Result<std::process::ExitStatus, CliError> {
-        let project = Self::project(root, project_id)?;
+            })?;
         let cwd = if resolve_project(&self.context.cwd)
             .is_ok_and(|current| current.is_some_and(|current| current.root == project.root))
         {
@@ -417,8 +428,26 @@ impl ArchiveVerification<'_> {
         } else {
             project.root.clone()
         };
+        Ok((project, cwd))
+    }
+
+    fn preview(&self, root: Option<&Path>, project_id: &str) -> Result<(), CliError> {
+        let (project, cwd) = self.resolve(root, project_id)?;
+        let source = require_approved_policy_source(self.store, &project, self.name)?;
+        let effective = effective_command_policy(&source.document, &project, self.name, &cwd)?;
+        effective_policy_profile(self.store, &project, &effective)?;
+        Ok(())
+    }
+
+    fn run(
+        self,
+        root: Option<&Path>,
+        project_id: &str,
+    ) -> Result<std::process::ExitStatus, VerificationPolicyError> {
+        let (project, cwd) =
+            self.resolve(root, project_id).map_err(VerificationPolicyError::Failed)?;
         let run_context = RuntimeContext { cwd, ..self.context.clone() };
-        run_verification_policy(&run_context, &project, self.name)
+        run_verification_policy(&run_context, &project, self.name, self.timeout)
     }
 }
 

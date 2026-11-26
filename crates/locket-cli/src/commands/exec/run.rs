@@ -5,8 +5,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::Path;
-use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
+use std::process::{Child, Command as ProcessCommand, ExitStatus, Stdio};
 use std::str::FromStr;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use locket_core::{
     CommandPolicy, CommandSpec, ExternalEnvSource, LkReferenceUri, LocketError, OutputRedaction,
@@ -14,7 +16,7 @@ use locket_core::{
 };
 use locket_crypto::KeyPurpose;
 use locket_exec::{
-    EgressEvent, EgressProxyBroker, EgressProxyConfig, EgressSecretBinding,
+    EgressEvent, EgressProxyBroker, EgressProxyConfig, EgressSecretBinding, StreamingRedactor,
     StreamingRedactorConfig, redact_child_output,
 };
 use locket_platform::{LocalUserVerificationRequest, PlatformError};
@@ -101,6 +103,12 @@ pub struct RuntimeExecutionOutcome {
     pub status: ExitStatus,
     /// Metadata-only grant fields when a policy run issued a live grant.
     pub run_policy_grant: Option<RunPolicyGrantMetadata>,
+    timed_out: bool,
+}
+
+pub(in crate::commands) enum VerificationPolicyError {
+    Failed(CliError),
+    TimedOut(CliError),
 }
 
 struct PreparedPolicyExecution {
@@ -365,7 +373,8 @@ pub fn run_command_with_diagnostics(
 ) -> Result<(), CliError> {
     let resolved = require_project(context)?;
     let status =
-        run_policy_status(context, output, diagnostics, &resolved, run_args, io::stdout(), false)?;
+        run_policy_status(context, output, diagnostics, &resolved, run_args, io::stdout(), None)?
+            .status;
     if status.success() {
         return Ok(());
     }
@@ -378,21 +387,33 @@ pub(in crate::commands) fn run_verification_policy(
     context: &RuntimeContext,
     resolved: &ResolvedProject,
     policy_name: &str,
-) -> Result<ExitStatus, CliError> {
+    timeout: Duration,
+) -> Result<ExitStatus, VerificationPolicyError> {
     let args = RunArgs {
         policy: policy_name.to_owned(),
         output_redaction: crate::OutputRedactionArgs { redact_output: true, ..Default::default() },
         ..Default::default()
     };
-    run_policy_status(
+    let outcome = run_policy_status(
         context,
         &mut io::stderr(),
         &mut io::stderr(),
         resolved,
         &args,
         io::stderr(),
-        true,
+        Some(timeout),
     )
+    .map_err(VerificationPolicyError::Failed)?;
+    if outcome.timed_out {
+        return Err(VerificationPolicyError::TimedOut(typed_cli_error(
+            LocketError::PolicyValidationIncomplete,
+            format!(
+                "verify policy '{policy_name}' timed out after {}s; use a finite check policy such as test, typecheck, or build instead of a long-running server",
+                timeout.as_secs(),
+            ),
+        )));
+    }
+    Ok(outcome.status)
 }
 
 fn run_policy_status(
@@ -402,11 +423,11 @@ fn run_policy_status(
     resolved: &ResolvedProject,
     run_args: &RunArgs,
     child_stdout: impl Write + Send,
-    verification: bool,
-) -> Result<ExitStatus, CliError> {
+    timeout: Option<Duration>,
+) -> Result<RuntimeExecutionOutcome, CliError> {
     let mut store = open_store(context)?;
     ensure_trusted_project_root(&store, resolved)?;
-    let approved = if verification {
+    let approved = if timeout.is_some() {
         load_command_policy_or_audit_denial(context, &mut store, resolved, &run_args.policy)?
     } else {
         resolve_run_policy(context, output, &mut store, resolved, run_args)?
@@ -441,7 +462,7 @@ fn run_policy_status(
         approved.source.document.output_redaction,
         !run_args.egress_host.is_empty(),
     )?;
-    let vault_access = if verification {
+    let vault_access = if timeout.is_some() {
         require_verification_vault_unlocked(context, &profile.project_id)
     } else {
         Ok(())
@@ -478,9 +499,10 @@ fn run_policy_status(
         },
         protection,
         child_stdout,
+        timeout,
     )?;
     let status = outcome.status;
-    let audit_status = if status.success() { "SUCCESS" } else { "FAILED" };
+    let audit_status = if status.success() && !outcome.timed_out { "SUCCESS" } else { "FAILED" };
     write_runtime_policy_audit_if_available(
         context,
         &mut store,
@@ -496,7 +518,7 @@ fn run_policy_status(
         outcome.run_policy_grant.as_ref(),
         insecure_argv,
     )?;
-    Ok(status)
+    Ok(outcome)
 }
 
 fn authorize_run_invocation(
@@ -2131,7 +2153,7 @@ pub(super) fn execute_exec_child(
 ) -> Result<ExitStatus, CliError> {
     if !request.secret_names.is_empty() {
         let protection = redactor.map(|redactor| RunProtection { redactor, broker: None });
-        return execute_runtime_child(context, request, protection, io::stdout())
+        return execute_runtime_child(context, request, protection, io::stdout(), None)
             .map(|outcome| outcome.status);
     }
     let mut command = request.prepared.command();
@@ -2154,6 +2176,7 @@ fn execute_runtime_child(
     request: &RuntimeExecutionRequest<'_>,
     protection: Option<RunProtection>,
     child_stdout: impl Write + Send,
+    timeout: Option<Duration>,
 ) -> Result<RuntimeExecutionOutcome, CliError> {
     let started_at = now_unix_nanos()?;
     let session_id = SessionId::generate()
@@ -2167,6 +2190,11 @@ fn execute_runtime_child(
     }
     if protection.is_some() {
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    }
+    #[cfg(unix)]
+    if timeout.is_some() {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
     }
     let run_policy_grant = request
         .run_policy_grant
@@ -2183,6 +2211,7 @@ fn execute_runtime_child(
             return Err(error);
         }
     };
+    let deadline = timeout.map(|timeout| Instant::now() + timeout);
     drop(command);
     let process_id = child.id();
     let session = RuntimeSessionRecord {
@@ -2202,22 +2231,19 @@ fn execute_runtime_child(
 
     if let Err(error) = request.store.insert_runtime_session(&session) {
         revoke_run_policy_grant(context, run_policy_grant.as_ref());
-        let _ignored = child.kill();
+        if deadline.is_some() {
+            terminate_timed_child(&mut child);
+        } else {
+            let _ignored = child.kill();
+        }
         let _ignored = child.wait();
         return Err(error.into());
     }
 
-    let (redaction, broker) = protection.map_or((Ok(()), None), |protection| {
-        (
-            redact_child_output(&mut child, child_stdout, io::stderr(), protection.redactor)
-                .map(|_| ()),
-            protection.broker,
-        )
-    });
-    if redaction.is_err() {
-        let _ignored = child.kill();
-    }
-    let status = child.wait();
+    let (redactor, broker) = protection
+        .map_or((None, None), |protection| (Some(protection.redactor), protection.broker));
+    let (status, redaction, timed_out) =
+        wait_for_runtime_child(&mut child, child_stdout, redactor, deadline);
     let blocked = broker.map_or(0, |broker| {
         broker
             .shutdown()
@@ -2233,7 +2259,9 @@ fn execute_runtime_child(
         status.code(),
         None,
     )?;
-    redaction?;
+    if !timed_out {
+        redaction?;
+    }
     if blocked > 0 {
         let _ignored =
             writeln!(io::stderr(), "warning: Locket blocked {blocked} egress request(s)");
@@ -2241,7 +2269,129 @@ fn execute_runtime_child(
     Ok(RuntimeExecutionOutcome {
         status,
         run_policy_grant: run_policy_grant.map(|grant| grant.metadata),
+        timed_out,
     })
+}
+
+fn wait_for_runtime_child(
+    child: &mut Child,
+    child_stdout: impl Write + Send,
+    redactor: Option<StreamingRedactorConfig>,
+    deadline: Option<Instant>,
+) -> (io::Result<ExitStatus>, io::Result<()>, bool) {
+    if let Some(deadline) = deadline {
+        return if let Some(redactor) = redactor {
+            wait_with_timed_redaction(child, child_stdout, redactor, deadline)
+        } else {
+            let (status, timed_out) = wait_for_timed_child(child, deadline, || true);
+            (status, Ok(()), timed_out)
+        };
+    }
+    let redaction = redactor.map_or(Ok(()), |redactor| {
+        redact_child_output(child, child_stdout, io::stderr(), redactor).map(|_| ())
+    });
+    if redaction.is_err() {
+        let _ignored = child.kill();
+    }
+    (child.wait(), redaction, false)
+}
+
+fn wait_with_timed_redaction(
+    child: &mut Child,
+    child_stdout: impl Write + Send,
+    redactor: StreamingRedactorConfig,
+    deadline: Instant,
+) -> (io::Result<ExitStatus>, io::Result<()>, bool) {
+    thread::scope(|scope| {
+        let mut stdout_worker = None;
+        let mut stderr_worker = None;
+        let start_readers = (|| {
+            let stdout =
+                child.stdout.take().ok_or_else(|| io::Error::other("missing stdout pipe"))?;
+            let stderr =
+                child.stderr.take().ok_or_else(|| io::Error::other("missing stderr pipe"))?;
+            let stdout_config = redactor.clone();
+            stdout_worker = Some(thread::Builder::new().spawn_scoped(scope, move || {
+                redact_verification_stream(stdout, child_stdout, stdout_config)
+            })?);
+            stderr_worker = Some(thread::Builder::new().spawn_scoped(scope, move || {
+                redact_verification_stream(stderr, io::stderr(), redactor)
+            })?);
+            Ok(())
+        })();
+        let (status, timed_out) = if start_readers.is_ok() {
+            wait_for_timed_child(child, deadline, || {
+                stdout_worker.as_ref().is_some_and(thread::ScopedJoinHandle::is_finished)
+                    && stderr_worker.as_ref().is_some_and(thread::ScopedJoinHandle::is_finished)
+            })
+        } else {
+            terminate_timed_child(child);
+            (child.wait(), false)
+        };
+        let mut redaction = start_readers;
+        for worker in [stdout_worker, stderr_worker].into_iter().flatten() {
+            let result = worker.join().map_err(|_| io::Error::other("redaction worker failed"));
+            redaction = redaction.and_then(|()| result.flatten());
+        }
+        (status, redaction, timed_out)
+    })
+}
+
+fn redact_verification_stream(
+    mut pipe: impl Read,
+    output: impl Write,
+    config: StreamingRedactorConfig,
+) -> io::Result<()> {
+    let mut redactor = StreamingRedactor::new(output, config);
+    let mut buffer = Zeroizing::new([0; 8192]);
+    loop {
+        match pipe.read(&mut *buffer) {
+            Ok(0) => return redactor.flush_final(),
+            Ok(count) => redactor.write_all(&buffer[..count])?,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn wait_for_timed_child(
+    child: &mut Child,
+    deadline: Instant,
+    output_finished: impl Fn() -> bool,
+) -> (io::Result<ExitStatus>, bool) {
+    loop {
+        // Keep the process group ID reserved while descendants can hold either pipe open.
+        if output_finished() {
+            match child.try_wait() {
+                Ok(Some(status)) => return (Ok(status), false),
+                Ok(None) => {}
+                Err(error) => {
+                    terminate_timed_child(child);
+                    let _ignored = child.wait();
+                    return (Err(error), false);
+                }
+            }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            terminate_timed_child(child);
+            return (child.wait(), true);
+        }
+        thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+}
+
+fn terminate_timed_child(child: &mut Child) {
+    #[cfg(unix)]
+    if rustix::process::kill_process_group(
+        rustix::process::Pid::from_child(child),
+        rustix::process::Signal::KILL,
+    )
+    .is_ok()
+    {
+        return;
+    }
+    let _ignored = child.kill();
 }
 
 fn recheck_execution_vaults(
