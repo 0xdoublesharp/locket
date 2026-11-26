@@ -1464,7 +1464,7 @@ dependencies = [
 
 [[package]]
 name = "locket-agent"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "data-encoding",
  "ed25519-dalek",
@@ -1492,7 +1492,7 @@ dependencies = [
 
 [[package]]
 name = "locket-core"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "age",
  "bech32 0.12.0",
@@ -1526,7 +1526,7 @@ dependencies = [
 
 [[package]]
 name = "locket-crypto"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "argon2",
  "chacha20poly1305 0.11.0",
@@ -1540,7 +1540,7 @@ dependencies = [
 
 [[package]]
 name = "locket-platform"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "apple-native-keyring-store",
  "block2",
@@ -1573,14 +1573,14 @@ dependencies = [
 
 [[package]]
 name = "locket-scan"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "locket-store"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "hmac 0.13.0",
  "locket-core",
