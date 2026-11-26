@@ -229,7 +229,15 @@ fn import_cli(
                         &absolutize(&context.cwd, dir),
                     )?;
                 }
-                None => report.delete_env = "would-archive",
+                None => {
+                    report.delete_env = "would-archive";
+                    report.archive_scope_note = Some(
+                        "checks vault values only; confirm no Docker/Compose files or other tools still read this file before archiving"
+                            .to_owned(),
+                    );
+                    report.archive_consumer_warnings =
+                        detect_compose_dotenv_consumers(&path, root.as_deref());
+                }
             }
         }
     }
@@ -273,6 +281,48 @@ fn refresh_import_project_files(
         ensure_gitignore(&root_context.cwd)?;
     }
     Ok(())
+}
+
+fn detect_compose_dotenv_consumers(source: &Path, root: Option<&Path>) -> Vec<String> {
+    const COMPOSE_FILES: [&str; 4] =
+        ["compose.yml", "compose.yaml", "docker-compose.yml", "docker-compose.yaml"];
+    const MAX_COMPOSE_BYTES: u64 = 256 * 1024;
+    let Some(source_name) = source.file_name().and_then(|name| name.to_str()) else {
+        return Vec::new();
+    };
+    let mut dirs = Vec::new();
+    if let Some(parent) = source.parent() {
+        dirs.push(parent.to_path_buf());
+    }
+    if let Some(root) = root
+        && !dirs.iter().any(|existing| existing == root)
+    {
+        dirs.push(root.to_path_buf());
+    }
+    let mut seen = BTreeSet::new();
+    let mut warnings = Vec::new();
+    for dir in dirs {
+        for compose_name in COMPOSE_FILES {
+            let candidate = dir.join(compose_name);
+            let Ok(meta) = fs::symlink_metadata(&candidate) else {
+                continue;
+            };
+            if !meta.file_type().is_file() || meta.len() > MAX_COMPOSE_BYTES {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&candidate) else {
+                continue;
+            };
+            let references_source =
+                text.contains(source_name) || (source_name == ".env" && text.contains("env_file:"));
+            if references_source && seen.insert(candidate) {
+                warnings.push(format!(
+                    "{compose_name} may still read {source_name}; confirm Docker/Compose cutover before archiving"
+                ));
+            }
+        }
+    }
+    warnings
 }
 
 fn write_import_diagnostics(
@@ -354,6 +404,12 @@ fn write_import_report(
         write_env_delete_prompt(output, path, context.confirmation_reader.as_ref())?;
     } else {
         writeln!(output, "delete_env: {}", report.delete_env)?;
+        if let Some(note) = &report.archive_scope_note {
+            writeln!(output, "archive_scope: {note}")?;
+        }
+        for warning in &report.archive_consumer_warnings {
+            writeln!(output, "archive_warning: {warning}")?;
+        }
         if let Some(reason) = &report.archive_blocked_reason {
             writeln!(output, "archive_blocked: {reason}")?;
         }
@@ -402,6 +458,10 @@ struct ImportReport {
     extra_in_profile: BTreeSet<String>,
     warnings: Vec<Diagnostic>,
     delete_env: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    archive_scope_note: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    archive_consumer_warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     archive_blocked_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -558,6 +618,8 @@ fn run_import(
         extra_in_profile,
         warnings,
         delete_env: "kept",
+        archive_scope_note: None,
+        archive_consumer_warnings: Vec::new(),
         archive_blocked_reason: None,
         archived_to: None,
         metadata_only: true,

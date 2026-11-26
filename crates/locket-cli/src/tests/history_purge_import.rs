@@ -1155,6 +1155,26 @@ fn import_archive_if_matching_previews_and_archives_an_already_imported_file()
     assert_eq!(report["verified_matching"], 2);
     assert_eq!(report["verified_matching_names"], serde_json::json!(["TOKEN", "ZETA"]));
     assert_eq!(report["delete_env"], "would-archive");
+    assert!(
+        report["archive_scope_note"]
+            .as_str()
+            .is_some_and(|note| note.contains("checks vault values only")),
+        "missing archive_scope_note: {report}"
+    );
+    assert!(report.get("archive_consumer_warnings").is_none());
+    fs::write(
+        dir.path().join("docker-compose.yml"),
+        "services:\n  web:\n    env_file:\n      - .env\n",
+    )?;
+    let (code, compose_report) = run_env_json(&context, &preview, &canaries)?;
+    assert_eq!(code, 0);
+    assert!(
+        compose_report["archive_consumer_warnings"].as_array().is_some_and(|items| items
+            .iter()
+            .any(|item| item.as_str().is_some_and(|s| s.contains("docker-compose.yml")))),
+        "expected docker-compose warning: {compose_report}"
+    );
+    fs::remove_file(dir.path().join("docker-compose.yml"))?;
     assert!(report.get("archive_blocked_reason").is_none());
     assert!(report.get("mismatched_names").is_none());
     assert!(report.get("archived_to").is_none());
