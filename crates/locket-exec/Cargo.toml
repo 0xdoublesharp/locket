@@ -15,8 +15,8 @@ workspace = true
 
 [dependencies]
 data-encoding = { workspace = true }
-locket-core = { version = "0.3.3", path = "../locket-core" }
-locket-scan = { version = "0.3.3", path = "../locket-scan" }
+locket-core = { version = "0.3.4", path = "../locket-core" }
+locket-scan = { version = "0.3.4", path = "../locket-scan" }
 rand = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }
@@ -28,7 +28,7 @@ time = { workspace = true }
 zeroize = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-locket-platform = { version = "0.3.3", path = "../locket-platform" }
+locket-platform = { version = "0.3.4", path = "../locket-platform" }
 
 [dev-dependencies]
 proptest = { workspace = true }
