@@ -1496,7 +1496,7 @@ fn status_uses_live_profile_and_lock_snapshot_and_scans_only_when_requested()
                 return Err("status request must be project-scoped".into());
             }
             let frame = locket_agent::encode_frame(
-                &locket_agent::SuccessEnvelope::new(request.id, snapshot),
+                &locket_agent::SuccessEnvelope::new(request.id.clone(), snapshot),
                 locket_agent::DEFAULT_MAX_MESSAGE_SIZE,
             )
             .map_err(|e| e.to_string())?;

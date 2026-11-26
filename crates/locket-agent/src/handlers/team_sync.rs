@@ -53,11 +53,16 @@ fn response<T: Serialize>(request: &RequestEnvelope, value: T) -> ResponseEnvelo
 fn error(request: &RequestEnvelope, code: &str, message: &str) -> ResponseEnvelope {
     ResponseEnvelope::Error(ErrorEnvelope::new(request.id.clone(), code, message, false))
 }
-async fn granted(request: &TeamSyncRequest, state: &AgentSocketState) -> bool {
+async fn granted(
+    request: &TeamSyncRequest,
+    state: &AgentSocketState,
+    require_dangerous: bool,
+) -> bool {
     let (Some(grant), Some(profile)) = (&request.grant_id, &request.profile_id) else {
         return false;
     };
-    state.grants.lock().await.validate(
+    let table = state.grants.lock().await;
+    table.validate(
         grant,
         &request.project_id,
         profile,
@@ -65,6 +70,7 @@ async fn granted(request: &TeamSyncRequest, state: &AgentSocketState) -> bool {
         crate::server::current_unix_nanos(),
         request.binding.as_ref(),
     ) == GrantValidation::Valid
+        && (!require_dangerous || table.get(grant).is_some_and(|record| record.confirm_dangerous))
 }
 pub async fn handle_team_sync_status(
     request: &RequestEnvelope,
@@ -132,7 +138,7 @@ pub async fn handle_team_sync_configure(
     let Ok(typed) = TeamSyncConfigureRequest::deserialize(&request.payload) else {
         return error(request, "ProtocolError", "invalid sync configuration");
     };
-    if !granted(&typed.scope, state).await {
+    if !granted(&typed.scope, state, typed.allow_dangerous).await {
         return error(request, "GrantRequired", "explicit local grant required for team sync");
     }
     match configure_cached(state, typed).await {
@@ -150,6 +156,7 @@ async fn configure_cached(
     let authorization = granted_commit_authorization(
         state,
         &request.scope,
+        request.allow_dangerous,
         commit_authorization(state, &project, &context.store_path, expiry, &key),
     );
     run_sync_worker(state, project, context.store_path.clone(), pin, move |store| {
@@ -220,7 +227,7 @@ pub async fn handle_team_sync_now(
     let Ok(typed) = serde_json::from_value::<TeamSyncRequest>(request.payload.clone()) else {
         return error(request, "ProtocolError", "invalid sync request");
     };
-    if !granted(&typed, state).await {
+    if !granted(&typed, state, false).await {
         return error(request, "GrantRequired", "explicit local grant required for team sync");
     }
     match run_cached_sync(state, typed.project_id.clone(), Some(typed)).await {
@@ -236,7 +243,7 @@ pub async fn handle_team_sync_test_remote(
     let Ok(typed) = TeamSyncTestRemoteRequest::deserialize(&request.payload) else {
         return error(request, "ProtocolError", "invalid remote test request");
     };
-    if !granted(&typed.scope, state).await {
+    if !granted(&typed.scope, state, false).await {
         return error(request, "GrantRequired", "explicit local grant required for team sync");
     }
     match test_cached_remote(state, typed).await {
@@ -254,6 +261,7 @@ async fn test_cached_remote(
     let authorization = granted_commit_authorization(
         state,
         &request.scope,
+        false,
         commit_authorization(state, &project, &context.store_path, expiry, &key),
     );
     tokio::task::spawn_blocking({
@@ -268,6 +276,11 @@ async fn test_cached_remote(
             drop(authorization()?);
             if let Some(transport) = request.transport {
                 let (config, credentials) = transport.into_parts()?;
+                if config.credential_mode() == team_sync::CredentialMode::Env {
+                    return Err(team_sync::SyncError::Rejected(
+                        "save the transport before testing environment credentials".into(),
+                    ));
+                }
                 team_sync::test_transport(&config, credentials)
             } else {
                 team_sync::test_configured_transport(&store, &project, Some(&key))
@@ -286,7 +299,7 @@ async fn run_cached_sync(
     let (key, context, expiry, pin) = cached_sync_context(state, &project).await?;
     let unlock = commit_authorization(state, &project, &context.store_path, expiry, &key);
     let authorization = match &request {
-        Some(request) => granted_commit_authorization(state, request, unlock),
+        Some(request) => granted_commit_authorization(state, request, false, unlock),
         None => unlock,
     };
     run_sync_worker(state, project.clone(), context.store_path.clone(), pin, move |store| {
@@ -416,7 +429,7 @@ pub async fn handle_team_sync_reconcile(
     else {
         return error(request, "ProtocolError", "invalid team reconciliation request");
     };
-    if !granted(&typed.scope, state).await {
+    if !granted(&typed.scope, state, false).await {
         return error(request, "GrantRequired", "explicit local grant required for team sync");
     }
     match reconcile_cached(state, typed).await {
@@ -434,6 +447,7 @@ async fn reconcile_cached(
     let authorization = granted_commit_authorization(
         state,
         &request.scope,
+        false,
         commit_authorization(state, &project, &context.store_path, expiry, &key),
     );
     run_sync_worker(state, project.clone(), context.store_path.clone(), pin, move |store| {
@@ -533,6 +547,7 @@ fn pending_details(
 fn granted_commit_authorization(
     state: &AgentSocketState,
     scope: &TeamSyncRequest,
+    require_dangerous: bool,
     unlock: team_sync::CommitAuthorization,
 ) -> team_sync::CommitAuthorization {
     let grants = std::sync::Arc::clone(&state.grants);
@@ -550,6 +565,8 @@ fn granted_commit_authorization(
                     crate::server::current_unix_nanos(),
                     scope.binding.as_ref(),
                 ) == GrantValidation::Valid
+                    && (!require_dangerous
+                        || guard.get(grant).is_some_and(|record| record.confirm_dangerous))
             }
             _ => false,
         };
@@ -1151,7 +1168,7 @@ mod tests {
         state.grants.blocking_lock().insert(grant.clone());
         let unlocked: team_sync::CommitAuthorization =
             std::sync::Arc::new(|| Ok(Box::new(()) as Box<dyn Send>));
-        let authorize = granted_commit_authorization(&state, &request, unlocked);
+        let authorize = granted_commit_authorization(&state, &request, false, unlocked);
         drop(authorize()?);
         let _ = state.grants.blocking_lock().revoke("grant");
         assert!(authorize().is_err());
@@ -1235,15 +1252,99 @@ mod tests {
             expires_at_unix_nanos: i128::MAX,
         });
         state.grants.lock().await.insert(record.clone());
-        assert!(!granted(&request, &state).await);
+        assert!(!granted(&request, &state, false).await);
         record.action = GrantAction::TeamSync;
+        state.grants.lock().await.insert(record.clone());
+        assert!(granted(&request, &state, false).await);
+        assert!(!granted(&request, &state, true).await);
+        record.confirm_dangerous = true;
         state.grants.lock().await.insert(record);
-        assert!(granted(&request, &state).await);
+        assert!(granted(&request, &state, true).await);
         request.profile_id = Some("other-profile".into());
-        assert!(!granted(&request, &state).await);
+        assert!(!granted(&request, &state, false).await);
         request.profile_id = Some("profile".into());
         request.binding = Some(GrantBinding::new(42, "reused-pid"));
-        assert!(!granted(&request, &state).await);
+        assert!(!granted(&request, &state, false).await);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn team_sync_configure_dangerous_and_adhoc_env_test_are_rejected()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("store.db");
+        let mut store = locket_store::Store::open(&path)?;
+        store.initialize_schema()?;
+        store.insert_project_if_absent("project", "fixture", 1)?;
+        let state = AgentSocketState::locked("test");
+        let binding = GrantBinding::new(42, "start");
+        let record = GrantRecord::new(GrantRecordFields {
+            grant_id: "grant".into(),
+            project_id: "project".into(),
+            profile_id: "profile".into(),
+            action: GrantAction::TeamSync,
+            binding: binding.clone(),
+            issued_at_unix_nanos: 0,
+            ttl_seconds: 60,
+            expires_at_unix_nanos: i128::MAX,
+        });
+        state.grants.lock().await.insert(record);
+        state.unlock_cache.lock().await.insert(
+            "project".into(),
+            UnlockEntry::new(
+                vec![7; 32],
+                crate::server::current_unix_nanos(),
+                std::time::Duration::from_secs(60),
+                UnlockMethod::Passphrase,
+            )
+            .with_audit_context(crate::unlock_cache::UnlockAuditContext {
+                store_path: path.clone(),
+                profile_id: Some("profile".into()),
+            }),
+        );
+
+        let dangerous_configure = RequestEnvelope::new(
+            "configure-dangerous",
+            crate::AgentMethod::TeamSyncConfigure,
+            serde_json::json!({
+                "project_id": "project",
+                "profile_id": "profile",
+                "store_path": path,
+                "grant_id": "grant",
+                "binding": binding,
+                "folder": directory.path(),
+                "allow_dangerous": true,
+            }),
+        );
+        let configure_resp =
+            serde_json::to_value(handle_team_sync_configure(&dangerous_configure, &state).await)?;
+        assert_eq!(configure_resp["error"], "GrantRequired");
+
+        let adhoc_env_test = RequestEnvelope::new(
+            "test-env-adhoc",
+            crate::AgentMethod::TeamSyncTestRemote,
+            serde_json::json!({
+                "project_id": "project",
+                "profile_id": "profile",
+                "store_path": path,
+                "grant_id": "grant",
+                "binding": binding,
+                "transport": {
+                    "kind": "webdav",
+                    "url": "https://attacker.example/dav",
+                    "credential_mode": "env",
+                    "auth_kind": "bearer",
+                },
+            }),
+        );
+        let test_resp =
+            serde_json::to_value(handle_team_sync_test_remote(&adhoc_env_test, &state).await)?;
+        assert_eq!(test_resp["error"], "TeamSyncRejected");
+        assert!(
+            test_resp["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("environment credentials"))
+        );
         Ok(())
     }
 

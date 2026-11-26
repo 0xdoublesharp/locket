@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use zeroize::Zeroize as _;
 
 use crate::PROTOCOL_VERSION;
 use crate::error::ProtocolError;
@@ -29,6 +30,24 @@ impl std::fmt::Debug for RequestEnvelope {
             .field("kind", &self.kind)
             .field("payload", &"[redacted]")
             .finish()
+    }
+}
+
+impl Drop for RequestEnvelope {
+    fn drop(&mut self) {
+        zeroize_json_value(&mut self.payload);
+    }
+}
+
+fn zeroize_json_value(root: &mut Value) {
+    let mut stack = vec![root];
+    while let Some(value) = stack.pop() {
+        match value {
+            Value::String(secret) => secret.zeroize(),
+            Value::Array(items) => stack.extend(items.iter_mut()),
+            Value::Object(map) => stack.extend(map.values_mut()),
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        }
     }
 }
 

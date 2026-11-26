@@ -1537,6 +1537,7 @@ mod tests {
                 project_id: "project".to_owned(),
                 profile_id: "profile".to_owned(),
                 action: GrantAction::RunPolicy,
+                confirm_dangerous: false,
                 policy_name: None,
                 binding: GrantBinding::new(std::process::id(), "test"),
                 observed_peer_pid: None,

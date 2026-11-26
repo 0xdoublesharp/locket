@@ -18,9 +18,6 @@ use std::path::Path;
 use zeroize::Zeroizing;
 
 const DEFAULT_S3_REGION: &str = "us-east-1";
-const S3_ACCESS_KEY_ID: &[&str] = &["LOCKET_S3_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID"];
-const S3_SECRET_ACCESS_KEY: &[&str] = &["LOCKET_S3_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY"];
-const S3_SESSION_TOKEN: &[&str] = &["LOCKET_S3_SESSION_TOKEN", "AWS_SESSION_TOKEN"];
 const WEBDAV_SECRET: &[&str] = &["LOCKET_WEBDAV_SECRET", "LOCKET_WEBDAV_TOKEN"];
 
 #[derive(Debug, Subcommand)]
@@ -49,7 +46,7 @@ pub enum RemoteSetCommand {
     Folder(TeamFolderArgs),
 }
 
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct S3SetArgs {
     /// Existing bucket for encrypted packages.
     #[arg(long)]
@@ -77,7 +74,23 @@ pub struct S3SetArgs {
     allow_dangerous: bool,
 }
 
-#[derive(Debug, Args)]
+impl std::fmt::Debug for S3SetArgs {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("S3SetArgs")
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("prefix", &self.prefix)
+            .field("endpoint", &self.endpoint)
+            .field("path_style", &self.path_style)
+            .field("credentials", &self.credentials)
+            .field("access_key_id", &self.access_key_id.as_ref().map(|_| "[redacted]"))
+            .field("allow_dangerous", &self.allow_dangerous)
+            .finish()
+    }
+}
+
+#[derive(Args)]
 pub struct WebDavSetArgs {
     /// Existing collection for encrypted packages.
     #[arg(long)]
@@ -94,6 +107,19 @@ pub struct WebDavSetArgs {
     /// Permit automatic delivery of dangerous profile values on this machine.
     #[arg(long)]
     allow_dangerous: bool,
+}
+
+impl std::fmt::Debug for WebDavSetArgs {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WebDavSetArgs")
+            .field("url", &self.url)
+            .field("auth", &self.auth)
+            .field("username", &self.username.as_ref().map(|_| "[redacted]"))
+            .field("credentials", &self.credentials)
+            .field("allow_dangerous", &self.allow_dangerous)
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -253,27 +279,44 @@ impl RemoteSetup {
             config,
             TransportConfig::S3 { credential_mode: CredentialMode::Vault, .. }
         ) {
-            let mut access_key_id = match access_key_id.map(Zeroizing::new) {
-                Some(id) => id,
-                None => match env_value(S3_ACCESS_KEY_ID)? {
-                    Some(id) => id,
-                    None if io::stdin().is_terminal() => {
-                        context.secret_value_reader.read_secret_value("S3 access key ID")?
-                    }
-                    None => {
-                        return Err(metadata_invalid_error(
-                            "provide the S3 access key ID with --access-key-id or Locket/AWS environment variables",
-                        ));
-                    }
-                },
+            let locket_id = env_value(&["LOCKET_S3_ACCESS_KEY_ID"])?;
+            let locket_key = env_value(&["LOCKET_S3_SECRET_ACCESS_KEY"])?;
+            let locket_token = env_value(&["LOCKET_S3_SESSION_TOKEN"])?;
+            let use_locket_family =
+                locket_id.is_some() || locket_key.is_some() || locket_token.is_some();
+            let (env_id, env_secret, env_token) = if use_locket_family {
+                (locket_id, locket_key, locket_token)
+            } else if access_key_id.is_some() {
+                (None, None, None)
+            } else {
+                (
+                    env_value(&["AWS_ACCESS_KEY_ID"])?,
+                    env_value(&["AWS_SECRET_ACCESS_KEY"])?,
+                    env_value(&["AWS_SESSION_TOKEN"])?,
+                )
             };
-            let secret_access_key =
-                read_credential(context, "S3 secret access key", S3_SECRET_ACCESS_KEY)?;
-            let session_token = env_value(S3_SESSION_TOKEN)?;
+            let mut access_key_id = match access_key_id.map(Zeroizing::new).or(env_id) {
+                Some(id) => id,
+                None if io::stdin().is_terminal() => {
+                    context.secret_value_reader.read_secret_value("S3 access key ID")?
+                }
+                None => {
+                    return Err(metadata_invalid_error(
+                        "provide the S3 access key ID with --access-key-id or Locket/AWS environment variables",
+                    ));
+                }
+            };
+            let secret_access_key = if !io::stdin().is_terminal()
+                && let Some(secret) = env_secret
+            {
+                validate_secret_value(secret)?
+            } else {
+                context.secret_value_reader.read_secret_value("S3 secret access key")?
+            };
             Some(TransportSecretInput::S3 {
                 access_key_id: std::mem::take(&mut *access_key_id),
                 secret_access_key,
-                session_token,
+                session_token: env_token,
             })
         } else {
             None

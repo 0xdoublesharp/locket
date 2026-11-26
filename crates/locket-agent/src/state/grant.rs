@@ -112,6 +112,9 @@ pub struct GrantRecord {
     pub profile_id: String,
     /// Authorized action.
     pub action: GrantAction,
+    /// Explicit confirmation to authorize a dangerous profile or project-wide dangerous consent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub confirm_dangerous: bool,
     /// Optional command policy name the grant is bound to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_name: Option<String>,
@@ -161,6 +164,7 @@ impl GrantRecord {
             project_id: fields.project_id,
             profile_id: fields.profile_id,
             action: fields.action,
+            confirm_dangerous: false,
             policy_name: None,
             binding: fields.binding,
             observed_peer_pid: None,
@@ -467,6 +471,7 @@ impl GrantTable {
             ttl_seconds: payload.ttl_seconds,
             expires_at_unix_nanos,
         });
+        record.confirm_dangerous = payload.confirm_dangerous;
         record.policy_name = payload
             .policy_name
             .or_else(|| record.binding.execution.as_ref().map(|scope| scope.policy_name.clone()));

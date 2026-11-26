@@ -153,6 +153,28 @@ mod tests {
             webdav_req.transport.ok_or("webdav transport missing")?.into_parts()?;
         assert_eq!(serde_json::to_value(&webdav_cfg)?["kind"], "webdav");
         assert!(webdav_creds.is_some());
+        let webdav_basic = json!({
+            "project_id": "p",
+            "transport": {
+                "kind": "webdav",
+                "url": "http://127.0.0.1:8080/team",
+                "credential_mode": "vault",
+                "auth_kind": "basic",
+                "username": "webdav-user-to-encrypt",
+                "secret": "webdav-password-to-redact"
+            }
+        });
+        let webdav_basic_req: TeamSyncConfigureRequest = serde_json::from_value(webdav_basic)?;
+        let basic_debug = format!("{webdav_basic_req:?}");
+        assert!(!basic_debug.contains("webdav-user-to-encrypt"));
+        assert!(!basic_debug.contains("webdav-password-to-redact"));
+        let (basic_cfg, basic_creds) =
+            webdav_basic_req.transport.ok_or("webdav basic missing")?.into_parts()?;
+        assert!(matches!(basic_cfg, TransportConfig::WebDav { username: None, .. }));
+        assert!(matches!(
+            basic_creds,
+            Some(crate::team_sync::TransportSecretInput::WebDav { username: Some(_), .. })
+        ));
         Ok(())
     }
 }
@@ -190,8 +212,8 @@ pub enum TeamSyncTransportConfigureInput {
         credential_mode: crate::team_sync::CredentialMode,
         #[serde(default)]
         auth_kind: Option<crate::team_sync::WebDavAuthKind>,
-        #[serde(default)]
-        username: Option<String>,
+        #[serde(default, with = "secret_option")]
+        username: Option<zeroize::Zeroizing<String>>,
         #[serde(default, with = "secret_option")]
         secret: Option<zeroize::Zeroizing<String>>,
     },
@@ -260,9 +282,30 @@ impl TeamSyncTransportConfigureInput {
                     _ if username.is_some() => WebDavAuthKind::Basic,
                     _ => WebDavAuthKind::Bearer,
                 });
-                let credentials =
-                    secret.map(|secret| TransportSecretInput::WebDav { username: None, secret });
-                (TransportConfig::WebDav { url, credential_mode, auth_kind, username }, credentials)
+                let (config_username, credentials) = if credential_mode == CredentialMode::Vault {
+                    (
+                        None,
+                        secret.map(|secret| TransportSecretInput::WebDav {
+                            username: username.map(|mut name| std::mem::take(&mut *name)),
+                            secret,
+                        }),
+                    )
+                } else {
+                    (
+                        username.map(|mut name| std::mem::take(&mut *name)),
+                        secret
+                            .map(|secret| TransportSecretInput::WebDav { username: None, secret }),
+                    )
+                };
+                (
+                    TransportConfig::WebDav {
+                        url,
+                        credential_mode,
+                        auth_kind,
+                        username: config_username,
+                    },
+                    credentials,
+                )
             }
         })
     }

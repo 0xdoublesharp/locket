@@ -26,15 +26,19 @@ fn s3_remote_cli_round_trip() -> TestResult {
         child
             .args(["--exact", "tests::team_remote_cli::s3_remote_cli_round_trip", "--nocapture"])
             .env(CHILD_MODE, mode)
-            .env("LOCKET_S3_ACCESS_KEY_ID", ACCESS_ID)
+            .env_remove("LOCKET_S3_ACCESS_KEY_ID")
             .env_remove("LOCKET_S3_SECRET_ACCESS_KEY")
             .env_remove("LOCKET_S3_SESSION_TOKEN")
+            .env_remove("AWS_ACCESS_KEY_ID")
             .env_remove("AWS_SECRET_ACCESS_KEY")
             .env_remove("AWS_SESSION_TOKEN");
         if mode == "env" {
             child
+                .env("AWS_ACCESS_KEY_ID", ACCESS_ID)
                 .env("AWS_SECRET_ACCESS_KEY", ACCESS_SECRET)
                 .env("AWS_SESSION_TOKEN", SESSION_TOKEN);
+        } else {
+            child.env("LOCKET_S3_ACCESS_KEY_ID", ACCESS_ID);
         }
         let output = child.output()?;
         assert!(
@@ -44,6 +48,19 @@ fn s3_remote_cli_round_trip() -> TestResult {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    let mixed = TestCommand::new(std::env::current_exe()?)
+        .args(["--exact", "tests::team_remote_cli::s3_remote_cli_round_trip", "--nocapture"])
+        .env(CHILD_MODE, "env")
+        .env("LOCKET_S3_ACCESS_KEY_ID", ACCESS_ID)
+        .env_remove("LOCKET_S3_SECRET_ACCESS_KEY")
+        .env_remove("LOCKET_S3_SESSION_TOKEN")
+        .env("AWS_SECRET_ACCESS_KEY", ACCESS_SECRET)
+        .env("AWS_SESSION_TOKEN", SESSION_TOKEN)
+        .output()?;
+    assert!(
+        !mixed.status.success(),
+        "mixed LOCKET_S3_* and AWS_* credential families must fail closed"
+    );
     Ok(())
 }
 

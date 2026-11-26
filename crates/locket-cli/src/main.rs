@@ -1331,7 +1331,7 @@ pub(crate) enum TeamCommand {
     RevokeDevice(TeamRevokeDeviceArgs),
 }
 
-#[derive(Debug, Args)]
+#[derive(Args)]
 #[allow(clippy::struct_excessive_bools)] // Independent CLI switches.
 #[command(
     group(clap::ArgGroup::new("remote_backend").args(["s3_bucket", "webdav_url"])),
@@ -1388,6 +1388,29 @@ pub(crate) struct TeamJoinArgs {
     /// Explicitly permit dangerous profile values on this machine.
     #[arg(long)]
     pub allow_dangerous: bool,
+}
+
+impl std::fmt::Debug for TeamJoinArgs {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TeamJoinArgs")
+            .field("request", &self.request)
+            .field("package", &self.package)
+            .field("owner", &self.owner)
+            .field("folder", &self.folder)
+            .field("remote", &self.remote)
+            .field("s3_bucket", &self.s3_bucket)
+            .field("s3_region", &self.s3_region)
+            .field("s3_prefix", &self.s3_prefix)
+            .field("s3_endpoint", &self.s3_endpoint)
+            .field("s3_path_style", &self.s3_path_style)
+            .field("webdav_url", &self.webdav_url)
+            .field("webdav_auth", &self.webdav_auth)
+            .field("webdav_username", &self.webdav_username.as_ref().map(|_| "[redacted]"))
+            .field("credentials", &self.credentials)
+            .field("allow_dangerous", &self.allow_dangerous)
+            .finish()
+    }
 }
 
 #[derive(Debug, Args)]

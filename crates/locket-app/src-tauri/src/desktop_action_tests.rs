@@ -540,7 +540,7 @@ async fn status_bridge_sends_selected_project_to_fake_agent_and_preserves_real_t
         status.lock_state = locket_agent::LockState::Unlocked;
         status.unlock_ttl_seconds = Some(37);
         let response = locket_agent::ResponseEnvelope::Success(locket_agent::SuccessEnvelope::new(
-            request.id,
+            request.id.clone(),
             serde_json::to_value(status)?,
         ));
         let frame = locket_agent::encode_frame(&response, locket_agent::DEFAULT_MAX_MESSAGE_SIZE)?;
@@ -695,7 +695,7 @@ async fn native_action_grants_use_actual_process_and_are_revoked() -> Result<(),
                 serde_json::json!({"metadata_only":true})
             };
             let response = locket_agent::ResponseEnvelope::Success(
-                locket_agent::SuccessEnvelope::new(request.id, value),
+                locket_agent::SuccessEnvelope::new(request.id.clone(), value),
             );
             stream
                 .write_all(&locket_agent::encode_frame(
@@ -796,7 +796,8 @@ async fn desktop_backup_mints_required_grants_and_forwards_dangerous_confirmatio
                     serde_json::json!({"status": "completed"})
                 };
                 let response = ResponseEnvelope::Success(locket_agent::SuccessEnvelope::new(
-                    request.id, payload,
+                    request.id.clone(),
+                    payload,
                 ));
                 stream
                     .write_all(&locket_agent::encode_frame(
@@ -976,7 +977,7 @@ async fn pending_profile_actions_use_team_sync_grants_and_return_status_metadata
                 serde_json::to_value(locket_agent::team_sync::SyncStatus::default())?
             };
             let response = locket_agent::ResponseEnvelope::Success(
-                locket_agent::SuccessEnvelope::new(request.id, value),
+                locket_agent::SuccessEnvelope::new(request.id.clone(), value),
             );
             stream
                 .write_all(&locket_agent::encode_frame(
@@ -1192,7 +1193,7 @@ async fn shared_vault_status_and_import_grants_use_the_selected_profile_and_revo
                 }
                 "ImportDotenv" => {
                     let import: locket_agent::ImportDotenvRequest =
-                        serde_json::from_value(request.payload)?;
+                        serde_json::from_value(request.payload.clone())?;
                     assert_eq!(import.scope.project_id, shared_id);
                     assert_eq!(import.scope.profile_id, "shared-default");
                     assert_eq!(import.scope.store_path, store_path);
@@ -1208,7 +1209,7 @@ async fn shared_vault_status_and_import_grants_use_the_selected_profile_and_revo
                 }
             };
             let response = locket_agent::ResponseEnvelope::Success(
-                locket_agent::SuccessEnvelope::new(request.id, value),
+                locket_agent::SuccessEnvelope::new(request.id.clone(), value),
             );
             stream
                 .write_all(&locket_agent::encode_frame(
@@ -1446,7 +1447,7 @@ async fn desktop_crud_sends_metadata_and_revokes_native_grants_after_success_and
                 let response = match kind {
                     "CopySecretToShared" => {
                         locket_agent::ResponseEnvelope::Error(locket_agent::ErrorEnvelope::new(
-                            request.id,
+                            request.id.clone(),
                             "UnlockRequired",
                             "unlock the Global Vault before copying the secret",
                             false,
@@ -1454,7 +1455,7 @@ async fn desktop_crud_sends_metadata_and_revokes_native_grants_after_success_and
                     }
                     _ => {
                         locket_agent::ResponseEnvelope::Success(locket_agent::SuccessEnvelope::new(
-                            request.id,
+                            request.id.clone(),
                             if kind == "RequestGrant" {
                                 json!({"grant_id": "native-crud"})
                             } else if kind == method {

@@ -839,6 +839,15 @@ fn remote_urls_redirects_listing_traversal_and_oversized_downloads_are_rejected(
             ("valid.lkpkg".into(), b"opaque".to_vec())
         );
         assert!(packages.next().is_none());
+
+        let mut state = remote.state()?;
+        state.extra_keys.clear();
+        state.extra_keys.extend((0..257).map(|index| format!("cand-{index:04}.lkpkg")));
+        drop(state);
+        assert!(
+            team_sync::list_and_read_join_packages(&config, Some(backend.secret()))
+                .is_err_and(|error| error.to_string().contains("join candidate package limit"))
+        );
     }
     Ok(())
 }

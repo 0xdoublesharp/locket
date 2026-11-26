@@ -962,11 +962,14 @@ fn with_exchanges(socket: &Path, exchanges: Vec<Exchange>, run: impl FnOnce()) {
             }
             let response = match expected.reply {
                 Reply::Success(payload) => {
-                    ResponseEnvelope::Success(SuccessEnvelope::new(request.id, payload))
+                    ResponseEnvelope::Success(SuccessEnvelope::new(request.id.clone(), payload))
                 }
-                Reply::Error(code, message) => {
-                    ResponseEnvelope::Error(ErrorEnvelope::new(request.id, code, message, false))
-                }
+                Reply::Error(code, message) => ResponseEnvelope::Error(ErrorEnvelope::new(
+                    request.id.clone(),
+                    code,
+                    message,
+                    false,
+                )),
             };
             stream
                 .write_all(&encode_frame(&response, DEFAULT_MAX_MESSAGE_SIZE).expect("response"))

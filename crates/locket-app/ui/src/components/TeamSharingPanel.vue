@@ -166,6 +166,14 @@ const canTestSaved = computed(() =>
     !editedBackends.has(backend.value),
   ),
 );
+const requiresSaveForEnvTest = computed(
+  () =>
+    !canTestSaved.value &&
+    ((backend.value === 's3' && s3CredentialMode.value === 'env') ||
+      (backend.value === 'webdav' &&
+        webdavAuth.value !== 'none' &&
+        webdavCredentialMode.value === 'env')),
+);
 
 function transportInput(): TeamSyncTransportInput {
   switch (backend.value) {
@@ -842,11 +850,16 @@ watch(
             ><input v-model="allowDangerous" type="checkbox" /> Allow automatic delivery to
             dangerous profiles on this machine</label
           >
+          <p v-if="requiresSaveForEnvTest" class="sharing__muted">
+            Save the delivery backend first to test environment-variable credentials.
+          </p>
           <div class="sharing__actions sharing__actions--start">
             <button
               type="button"
               class="companion-button"
-              :disabled="busy || !projectId || (!canSave && !canTestSaved)"
+              :disabled="
+                busy || !projectId || (!canSave && !canTestSaved) || requiresSaveForEnvTest
+              "
               @click="perform('test')"
             >
               Test connection

@@ -4,9 +4,14 @@ describe('authenticated team sharing guidance', () => {
   it('requires an independent full pin and safely quotes folder paths', () => {
     expect(joinCommand('', 'a'.repeat(64))).toBeNull();
     expect(joinCommand('/team', 'short')).toBeNull();
-    expect(joinCommand("/team's folder", 'a'.repeat(64))).toBe(
+    expect(joinCommand("/team's folder", 'a'.repeat(64), 'folder', 'posix')).toBe(
       `locket team join --folder '/team'"'"'s folder' --owner '${'a'.repeat(64)}'`,
     );
+    expect(joinCommand('C:\\team & attacker.exe & rem', 'a'.repeat(64), 'folder', 'windows')).toBe(
+      `locket team join --folder "C:\\team & attacker.exe & rem" --owner "${'a'.repeat(64)}"`,
+    );
+    expect(joinCommand('C:\\team\\%COMSPEC%', 'a'.repeat(64), 'folder', 'windows')).toBeNull();
+    expect(joinCommand('C:\\team"bad', 'a'.repeat(64), 'folder', 'windows')).toBeNull();
   });
   it.each(['s3', 'webdav'] as const)('uses the configured %s delivery for remote joins', (kind) => {
     expect(joinCommand('', 'short', kind)).toBeNull();

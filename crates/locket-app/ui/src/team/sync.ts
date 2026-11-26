@@ -67,16 +67,30 @@ export function syncMessage(
     return 'Showing the last verified update. Remote storage cannot prove that this is the owner’s newest state.';
   return 'Showing the last verified update. Folder delivery cannot prove that this is the owner’s newest state.';
 }
-const quote = (value: string) => `'${value.replaceAll("'", `'"'"'`)}'`;
+const quotePosix = (value: string) => `'${value.replaceAll("'", `'"'"'`)}'`;
+const isWindowsHost = () =>
+  typeof navigator !== 'undefined' && /\bwin/i.test(navigator.platform || navigator.userAgent || '');
+
 export function joinCommand(
   folder: string,
   ownerPin: string,
   transport: TeamSyncTransportKind = 'folder',
+  shell: 'posix' | 'windows' = isWindowsHost() ? 'windows' : 'posix',
 ): string | null {
   if (!/^[a-fA-F0-9]{64}$/.test(ownerPin)) return null;
-  if (transport === 'folder' && !folder.trim()) return null;
-  const target = transport === 'folder' ? `--folder ${quote(folder.trim())}` : '--remote';
-  return `locket team join ${target} --owner ${quote(ownerPin.toLowerCase())}`;
+  const trimmedFolder = folder.trim();
+  if (transport === 'folder' && (!trimmedFolder || /[\0\r\n]/.test(trimmedFolder))) return null;
+  const pin = ownerPin.toLowerCase();
+  if (shell === 'windows') {
+    if (transport === 'folder') {
+      // Reject characters that expand or break double-quoted strings in cmd.exe or PowerShell.
+      if (/[%"!$`]/.test(trimmedFolder)) return null;
+      return `locket team join --folder "${trimmedFolder}" --owner "${pin}"`;
+    }
+    return `locket team join --remote --owner "${pin}"`;
+  }
+  const target = transport === 'folder' ? `--folder ${quotePosix(trimmedFolder)}` : '--remote';
+  return `locket team join ${target} --owner ${quotePosix(pin)}`;
 }
 
 export function validDeliveryUrl(value: string, allowLoopbackHttp = false): boolean {

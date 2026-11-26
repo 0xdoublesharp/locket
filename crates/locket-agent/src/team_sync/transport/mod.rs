@@ -25,6 +25,9 @@ use webdav::WebDav;
 const PACKAGE_LIMIT: usize = locket_core::team_package::MAX_PACKAGE_BYTES + 18;
 const LIST_LIMIT: usize = 8 * 1024 * 1024;
 const ENTRY_LIMIT: usize = 100_000;
+const JOIN_CANDIDATE_LIMIT: usize = 256;
+const JOIN_TOTAL_BYTES_LIMIT: usize = 32 * 1024 * 1024;
+const JOIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Source of transport authentication material.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -94,7 +97,9 @@ impl TransportConfig {
         }
     }
 
-    const fn credential_mode(&self) -> CredentialMode {
+    /// Return the configured credential source for this transport.
+    #[must_use]
+    pub const fn credential_mode(&self) -> CredentialMode {
         match self {
             Self::Folder { .. } => CredentialMode::None,
             Self::S3 { credential_mode, .. } | Self::WebDav { credential_mode, .. } => {
@@ -393,16 +398,28 @@ pub fn list_and_read_configured_join_packages(
     JoinPackages::new(open_configured(store, project, master)?.0)
 }
 
-/// Bounded per-object download iterator for encrypted join candidates.
+/// Bounded download iterator for encrypted join candidates.
 pub struct JoinPackages {
     transport: Box<dyn TeamTransport>,
     names: std::vec::IntoIter<String>,
+    remaining_bytes: usize,
+    deadline: std::time::Instant,
+    stopped: bool,
 }
 
 impl JoinPackages {
     fn new(transport: Box<dyn TeamTransport>) -> Result<Self> {
-        let names = transport.list_packages()?.into_iter();
-        Ok(Self { transport, names })
+        let names = transport.list_packages()?;
+        if names.len() > JOIN_CANDIDATE_LIMIT {
+            return Err(reject("remote storage exceeds the join candidate package limit"));
+        }
+        Ok(Self {
+            transport,
+            names: names.into_iter(),
+            remaining_bytes: JOIN_TOTAL_BYTES_LIMIT,
+            deadline: std::time::Instant::now() + JOIN_DEADLINE,
+            stopped: false,
+        })
     }
 }
 
@@ -410,7 +427,24 @@ impl Iterator for JoinPackages {
     type Item = Result<(String, Vec<u8>)>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.stopped {
+            return None;
+        }
         let name = self.names.next()?;
-        Some(self.transport.get_package(&name).map(|bytes| (name, bytes)))
+        if std::time::Instant::now() > self.deadline {
+            self.stopped = true;
+            return Some(Err(reject("remote join timed out while reading candidate packages")));
+        }
+        match self.transport.get_package(&name) {
+            Ok(bytes) => {
+                if bytes.len() > self.remaining_bytes {
+                    self.stopped = true;
+                    return Some(Err(reject("remote join exceeded total download limit")));
+                }
+                self.remaining_bytes -= bytes.len();
+                Some(Ok((name, bytes)))
+            }
+            Err(error) => Some(Err(error)),
+        }
     }
 }

@@ -218,16 +218,27 @@ fn env_value(names: &[&str]) -> Result<Option<String>> {
 fn from_env(config: &TransportConfig) -> Result<TransportSecretInput> {
     match config {
         TransportConfig::S3 { .. } => {
-            let key = env_value(&["LOCKET_S3_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY"])?
+            let locket_id = env_value(&["LOCKET_S3_ACCESS_KEY_ID"])?;
+            let locket_key = env_value(&["LOCKET_S3_SECRET_ACCESS_KEY"])?.map(Zeroizing::new);
+            let locket_token = env_value(&["LOCKET_S3_SESSION_TOKEN"])?.map(Zeroizing::new);
+            if locket_id.is_some() || locket_key.is_some() || locket_token.is_some() {
+                let access_key_id = locket_id
+                    .ok_or_else(|| reject("incomplete LOCKET_S3_* environment credentials"))?;
+                let secret_access_key = locket_key
+                    .ok_or_else(|| reject("incomplete LOCKET_S3_* environment credentials"))?;
+                return Ok(TransportSecretInput::S3 {
+                    access_key_id,
+                    secret_access_key,
+                    session_token: locket_token,
+                });
+            }
+            let access_key_id = env_value(&["AWS_ACCESS_KEY_ID"])?
+                .ok_or_else(|| reject("S3 environment credentials are missing"))?;
+            let secret_access_key = env_value(&["AWS_SECRET_ACCESS_KEY"])?
                 .map(Zeroizing::new)
                 .ok_or_else(|| reject("S3 environment credentials are missing"))?;
-            Ok(TransportSecretInput::S3 {
-                access_key_id: env_value(&["LOCKET_S3_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID"])?
-                    .ok_or_else(|| reject("S3 environment credentials are missing"))?,
-                secret_access_key: key,
-                session_token: env_value(&["LOCKET_S3_SESSION_TOKEN", "AWS_SESSION_TOKEN"])?
-                    .map(Zeroizing::new),
-            })
+            let session_token = env_value(&["AWS_SESSION_TOKEN"])?.map(Zeroizing::new);
+            Ok(TransportSecretInput::S3 { access_key_id, secret_access_key, session_token })
         }
         TransportConfig::WebDav { .. } => {
             let secret = env_value(&["LOCKET_WEBDAV_SECRET", "LOCKET_WEBDAV_TOKEN"])?
