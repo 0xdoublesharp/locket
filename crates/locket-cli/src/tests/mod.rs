@@ -465,6 +465,7 @@ pub(super) fn setup_recovery_envelope(
 
 mod agent_lifecycle;
 mod ai_safe;
+mod ci_exec_cli;
 mod cli_basics;
 mod cli_errors;
 mod config_passkey_lock;

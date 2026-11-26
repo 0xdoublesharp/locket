@@ -2,6 +2,7 @@
 
 pub mod agent;
 pub mod audit;
+pub mod ci;
 pub mod config;
 pub mod debug;
 pub mod diagnostics;

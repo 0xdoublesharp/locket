@@ -172,7 +172,7 @@ AI Agents & Safety
   locket mcp config   Print a client configuration snippet.
 
 Environments, Team & Recovery
-  profile, use, team, device, export, recover, agent, doctor
+  profile, use, team, ci, device, export, recover, agent, doctor
 
 Project files keep policy in locket.toml and values in the encrypted local vault.
 Monorepos can add [paths."relative/path"] env sets; the deepest matching
@@ -354,6 +354,11 @@ enum Command {
         /// Team command.
         #[command(subcommand)]
         command: TeamCommand,
+    },
+    /// Use a standalone CI identity to read signed team secrets.
+    Ci {
+        #[command(subcommand)]
+        command: commands::ci::CiCommand,
     },
     /// Manage automation clients.
     Client {
@@ -1783,6 +1788,16 @@ fn main() -> ProcessExitCode {
                 Err(error) => write_error_and_exit(&error),
             };
         }
+        Some(Command::Ci { command }) => {
+            // CI reads signed delivery packages without creating local vault directories.
+            let result = std::env::current_dir()
+                .map_err(CliError::from)
+                .and_then(|cwd| commands::ci::run(&cwd, &mut output, command));
+            return match result {
+                Ok(code) => ProcessExitCode::from(code),
+                Err(error) => write_error_and_exit(&error),
+            };
+        }
         Some(Command::Mcp(commands::mcp::McpArgs {
             command: Some(commands::mcp::McpCommand::Config { client }),
         })) => {
@@ -1977,6 +1992,7 @@ fn run_with_context(
         Command::Passkey { command } => vault::passkey::passkey_command(context, output, command)?,
         Command::Device { command } => team::device::device_command(context, output, command)?,
         Command::Team { command } => team::members::team_command(context, output, command)?,
+        Command::Ci { command } => return commands::ci::run(&context.cwd, output, command),
         Command::Client { command } => team::client::client_command(context, output, command)?,
         Command::Export(args) => team::bundle::export_bundle_command(context, output, &args)?,
         Command::ImportBundle(args) => team::bundle::import_bundle_command(context, output, &args)?,
