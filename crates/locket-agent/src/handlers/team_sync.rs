@@ -220,6 +220,44 @@ fn check_selected_store(
     Ok(())
 }
 
+pub async fn handle_team_sync_clear(
+    request: &RequestEnvelope,
+    state: &AgentSocketState,
+) -> ResponseEnvelope {
+    let Ok(typed) = serde_json::from_value::<TeamSyncRequest>(request.payload.clone()) else {
+        return error(request, "ProtocolError", "invalid sync clear request");
+    };
+    if !granted(&typed, state, false).await {
+        return error(request, "GrantRequired", "explicit local grant required for team sync");
+    }
+    match clear_cached_transport(state, typed).await {
+        Ok(status) => response(request, status),
+        Err(failure) => error(request, "TeamSyncRejected", &failure.to_string()),
+    }
+}
+
+async fn clear_cached_transport(
+    state: &AgentSocketState,
+    request: TeamSyncRequest,
+) -> team_sync::Result<SyncStatus> {
+    let project = request.project_id.clone();
+    let (key, context, expiry, pin) = cached_sync_context(state, &project).await?;
+    let authorization = granted_commit_authorization(
+        state,
+        &request,
+        false,
+        commit_authorization(state, &project, &context.store_path, expiry, &key),
+    );
+    run_sync_worker(state, project.clone(), context.store_path.clone(), pin, move |store| {
+        check_selected_store(request.store_path.as_deref(), &context.store_path)?;
+        let commit_guard = authorization()?;
+        team_sync::clear_transport(store, &project)?;
+        drop(commit_guard);
+        team_sync::status(store, &project)
+    })
+    .await
+}
+
 pub async fn handle_team_sync_now(
     request: &RequestEnvelope,
     state: &AgentSocketState,
@@ -695,6 +733,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clear_transport_requires_live_grant_and_preserves_trust()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{AgentMethod, tests::dispatch_as_current_process};
+        use serde_json::json;
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("store.db");
+        let store = receiver_store(&path)?;
+        let owner =
+            locket_core::team_package::DeviceIdentity::new("owner".into(), [3; 32], [4; 32]);
+        let owner_json = serde_json::to_string(&owner)?;
+        store.connection().execute(
+            "INSERT INTO team_sync_anchors VALUES ('project','team',?1,1)",
+            [&owner_json],
+        )?;
+        store.connection().execute_batch(
+            "INSERT INTO team_sync_heads VALUES ('project',3,'head','[]','verified',4);
+             INSERT INTO team_sync_seen VALUES ('project','predecessor',2,'verified');
+             INSERT INTO team_sync_join_checkpoints VALUES ('project',2);",
+        )?;
+        let state = cached_projects(&path).await;
+        let scope = json!({
+            "project_id": "project", "store_path": path, "profile_id": "profile",
+            "grant_id": "project", "binding": crate::tests::test_process_binding(),
+        });
+        let mut configuration = scope.clone();
+        configuration["transport"] = json!({
+            "kind": "webdav", "url": "https://fixture.example/team/", "auth_kind": "bearer",
+            "credential_mode": "vault", "secret": "fixture-token",
+        });
+        let configure =
+            RequestEnvelope::new("configure", AgentMethod::TeamSyncConfigure, configuration);
+        assert!(matches!(
+            dispatch_as_current_process(&configure, &state).await,
+            ResponseEnvelope::Success(_)
+        ));
+
+        let clear = RequestEnvelope::new("clear", AgentMethod::TeamSyncClear, scope);
+        assert_eq!(clear.kind, "team_sync.clear");
+        let grant = state.grants.lock().await.revoke("project").ok_or("missing grant")?;
+        assert!(matches!(dispatch_as_current_process(&clear, &state).await,
+            ResponseEnvelope::Error(error) if error.error == "GrantRequired"));
+        let credential_exists = || {
+            store.connection().query_row(
+                "SELECT EXISTS(SELECT 1 FROM team_sync_credentials WHERE project_id='project')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+        };
+        assert!(credential_exists()?);
+        assert_eq!(team_sync::status(&store, "project")?.transport_kind.as_deref(), Some("webdav"));
+
+        state.grants.lock().await.insert(grant);
+        let ResponseEnvelope::Success(result) = dispatch_as_current_process(&clear, &state).await
+        else {
+            return Err("clear rejected a live grant".into());
+        };
+        let status: SyncStatus = serde_json::from_value(result.payload)?;
+        assert!(status.folder.is_none() && status.remote_target.is_none());
+        assert!(status.transport_kind.is_none() && status.credential_mode.is_none());
+        assert!(!credential_exists()?);
+        assert_eq!(status.owner_fingerprint.as_deref(), Some(owner.fingerprint.as_str()));
+        assert_eq!(
+            (status.epoch, status.state.as_str(), status.last_verified_at),
+            (3, "verified", Some(4))
+        );
+        let history = store.connection().query_row(
+            "SELECT owner_json, head.digest, seen.epoch, seen.outcome, checkpoint.epoch
+             FROM team_sync_anchors AS anchor
+             JOIN team_sync_heads AS head USING (project_id)
+             JOIN team_sync_seen AS seen USING (project_id)
+             JOIN team_sync_join_checkpoints AS checkpoint USING (project_id)
+             WHERE anchor.project_id='project' AND seen.digest='predecessor'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )?;
+        assert_eq!(history, (owner_json, "head".into(), 2, "verified".into(), 2));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn sync_rpcs_reject_invalid_scope_and_keep_configured_vault_unchanged()
     -> Result<(), Box<dyn std::error::Error>> {
         use crate::{AgentMethod, dispatch};
@@ -735,6 +862,7 @@ mod tests {
         for method in [
             AgentMethod::TeamSyncStatus,
             AgentMethod::TeamSyncConfigure,
+            AgentMethod::TeamSyncClear,
             AgentMethod::TeamSyncNow,
             AgentMethod::TeamSyncTestRemote,
             AgentMethod::TeamSyncReconcile,
@@ -753,6 +881,7 @@ mod tests {
             ResponseEnvelope::Error(error) if error.error == "AccessDenied"));
         for method in [
             AgentMethod::TeamSyncConfigure,
+            AgentMethod::TeamSyncClear,
             AgentMethod::TeamSyncNow,
             AgentMethod::TeamSyncTestRemote,
             AgentMethod::TeamSyncReconcile,

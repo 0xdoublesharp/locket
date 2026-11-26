@@ -228,7 +228,7 @@ export function createMockRuntime(params: URLSearchParams) {
           },
         ];
   const values = new Map<string, string>();
-  const teamDeliveries = new Map<string, TeamDelivery>();
+  const teamDeliveries = new Map<string, TeamDelivery | null>();
 
   function unlockTtl(): number | null {
     return selected ? (unlockedProjects.get(selected.project_id) ?? null) : null;
@@ -911,11 +911,23 @@ export function createMockRuntime(params: URLSearchParams) {
         teamDeliveries.set(projectId, deliveryMetadata(transport));
         return syncStatus(projectId);
       }
+      case 'desktop_team_sync_clear': {
+        requireDangerousConfirmation(request);
+        const projectId = String(request.project_id);
+        teamDeliveries.set(projectId, null);
+        return syncStatus(projectId);
+      }
       case 'desktop_team_sync_test_remote': {
         requireDangerousConfirmation(request);
         const delivery = request.transport
           ? deliveryMetadata(request.transport as TeamSyncTransportInput)
           : teamDelivery(String(request.project_id));
+        if (!delivery)
+          fail(
+            'TeamSyncRejected',
+            'No delivery backend configured.',
+            'Save a delivery backend and retry.',
+          );
         const target =
           delivery.transport_kind === 'folder' ? delivery.folder : delivery.remote_target;
         const ok = scenario !== 'team-connection-error';
@@ -967,13 +979,11 @@ export function createMockRuntime(params: URLSearchParams) {
     }
   };
 
-  function teamDelivery(projectId: string): TeamDelivery {
-    return (
-      teamDeliveries.get(projectId) ?? {
-        transport_kind: 'folder',
-        folder: `${workspace}/${projectId}/.locket/team`,
-      }
-    );
+  function teamDelivery(projectId: string): TeamDelivery | null {
+    const delivery = teamDeliveries.get(projectId);
+    return delivery === undefined
+      ? { transport_kind: 'folder', folder: `${workspace}/${projectId}/.locket/team` }
+      : delivery;
   }
 
   function deliveryMetadata(transport: TeamSyncTransportInput): TeamDelivery {
@@ -1031,7 +1041,7 @@ export function createMockRuntime(params: URLSearchParams) {
       waiting: 0,
       waiting_known: true,
       last_verified_at: now - minute,
-      published: 1,
+      published: 0,
       applied: 2,
       ...teamDelivery(projectId),
     };

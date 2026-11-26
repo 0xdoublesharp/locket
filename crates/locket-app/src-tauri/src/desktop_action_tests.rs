@@ -939,7 +939,7 @@ fn pending_profile_payload_pins_native_scope_and_rejects_webview_authority_field
 
 #[tokio::test]
 #[cfg(unix)]
-async fn pending_profile_actions_use_team_sync_grants_and_return_status_metadata()
+async fn reconcile_and_clear_use_team_sync_grants_and_return_status_metadata()
 -> Result<(), Box<dyn Error>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let fixture = Fixture::new()?;
@@ -949,7 +949,14 @@ async fn pending_profile_actions_use_team_sync_grants_and_return_status_metadata
     let expected = native_binding()?;
     let id = fixture.id.clone();
     let server = tokio::spawn(async move {
-        for kind in ["RequestGrant", "TeamSyncReconcile", "RevokeGrant"] {
+        for (kind, confirmed) in [
+            ("RequestGrant", false),
+            ("TeamSyncReconcile", false),
+            ("RevokeGrant", false),
+            ("RequestGrant", true),
+            ("team_sync.clear", true),
+            ("RevokeGrant", true),
+        ] {
             let (mut stream, _) = listener.accept().await?;
             let length = stream.read_u32_le().await?;
             let mut bytes = vec![0; length as usize];
@@ -963,9 +970,10 @@ async fn pending_profile_actions_use_team_sync_grants_and_return_status_metadata
             }
             let value = if kind == "RequestGrant" {
                 assert_eq!(request.payload["action"], "TeamSync");
-                serde_json::json!({"grant_id":"pending-grant"})
+                assert_eq!(request.payload["confirm_dangerous"], confirmed);
+                serde_json::json!({"grant_id":"team-grant"})
             } else {
-                assert_eq!(request.payload["grant_id"], "pending-grant");
+                assert_eq!(request.payload["grant_id"], "team-grant");
                 if kind == "TeamSyncReconcile" {
                     assert_eq!(request.payload["incoming_profile_id"], "incoming-profile");
                     assert_eq!(
@@ -974,7 +982,14 @@ async fn pending_profile_actions_use_team_sync_grants_and_return_status_metadata
                     );
                     assert!(request.payload.get("value").is_none());
                 }
-                serde_json::to_value(locket_agent::team_sync::SyncStatus::default())?
+                if kind == "team_sync.clear" {
+                    assert_eq!(request.payload.as_object().map(serde_json::Map::len), Some(5));
+                }
+                serde_json::to_value(locket_agent::team_sync::SyncStatus {
+                    epoch: 3,
+                    owner_fingerprint: Some("fixture-owner".into()),
+                    ..Default::default()
+                })?
             };
             let response = locket_agent::ResponseEnvelope::Success(
                 locket_agent::SuccessEnvelope::new(request.id.clone(), value),
@@ -1005,6 +1020,35 @@ async fn pending_profile_actions_use_team_sync_grants_and_return_status_metadata
     .await?;
     assert_eq!(result.applied, 0);
     assert!(serde_json::to_value(result)?.get("value").is_none());
+
+    assert!(Store::open(&fixture.store)?.set_profile_dangerous(&fixture.id, "dev", true)?);
+    let context = open_project_at(&fixture.store, &fixture.root)?;
+    let mut payload = serde_json::to_value(team_sync_scope(&context, &fixture.store))?;
+    let rejected = invoke_granted_at::<serde_json::Value>(
+        &socket,
+        locket_agent::AgentMethod::TeamSyncClear,
+        locket_agent::GrantAction::TeamSync,
+        payload.clone(),
+        &fixture.store,
+        &context,
+    )
+    .await;
+    assert!(
+        matches!(rejected, Err(AgentClientError::Rejected { code, .. }) if code == "ConfirmationFailed")
+    );
+    payload["confirm_dangerous_profile"] = serde_json::json!("dev");
+    let result: locket_agent::team_sync::SyncStatus = invoke_granted_at(
+        &socket,
+        locket_agent::AgentMethod::TeamSyncClear,
+        locket_agent::GrantAction::TeamSync,
+        payload,
+        &fixture.store,
+        &context,
+    )
+    .await?;
+    assert_eq!(result.epoch, 3);
+    assert_eq!(result.owner_fingerprint.as_deref(), Some("fixture-owner"));
+    assert!(result.remote_target.is_none());
     server.await?.map_err(|error| error.to_string())?;
     Ok(())
 }

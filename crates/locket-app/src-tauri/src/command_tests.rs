@@ -485,6 +485,7 @@ fn malformed_requests(ipc: &Ipc) {
         "desktop_team_sync_status",
         "desktop_team_sync_configure",
         "desktop_team_sync_test_remote",
+        "desktop_team_sync_clear",
         "desktop_team_sync_now",
         "desktop_team_sync_rename_profile",
         "desktop_team_sync_preserve_override",
@@ -1443,6 +1444,28 @@ fn wire_team_sync_delivery(ipc: &Ipc, vault: &Vault, socket: &Path) {
             );
         },
     );
+
+    for dangerous in [false, true] {
+        vault.dangerous(dangerous);
+        let mut request = json!({"project_id":vault.id});
+        if dangerous {
+            request["confirm_dangerous_profile"] = json!("dev");
+        }
+        let response = json!({
+            "state":"verified","epoch":3,"owner_fingerprint":"fixture-owner",
+            "folder":null,"remote_target":null,
+        });
+        let operation = Exchange::success(
+            AgentMethod::TeamSyncClear,
+            json!({"profile_id":PROFILE,"store_path":vault.store}),
+            response.clone(),
+        );
+        with_exchanges(
+            socket,
+            native_grant_exchanges(vault, "TeamSync", PROFILE, dangerous, operation),
+            || assert_eq!(ipc.ok("desktop_team_sync_clear", request), response),
+        );
+    }
 }
 
 fn dangerous_actions_require_typed_name(ipc: &Ipc, vault: &Vault) {
@@ -1463,6 +1486,7 @@ fn dangerous_actions_require_typed_name(ipc: &Ipc, vault: &Vault) {
         ),
         ("desktop_team_sync_now", json!({"project_id":vault.id})),
         ("desktop_team_sync_test_remote", json!({"project_id":vault.id})),
+        ("desktop_team_sync_clear", json!({"project_id":vault.id})),
         (
             "agent_export_bundle",
             json!({

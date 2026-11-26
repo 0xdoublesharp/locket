@@ -1139,6 +1139,7 @@ fn register_commands<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R
         desktop_actions::desktop_team_sync_status,
         desktop_actions::desktop_team_sync_configure,
         desktop_actions::desktop_team_sync_test_remote,
+        desktop_actions::desktop_team_sync_clear,
         desktop_actions::desktop_team_sync_now,
         desktop_actions::desktop_team_sync_rename_profile,
         desktop_actions::desktop_team_sync_preserve_override,

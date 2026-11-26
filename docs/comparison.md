@@ -21,7 +21,7 @@ Scores reflect **shipped behavior** on a 0–2 scale:
 | Local HMAC audit, grace-window rotation & offline recovery | **2** | 1⁵ | 1⁵ | 1⁵ | 1⁵ | 0 | 0 | 0 |
 | Formal verification (TLA+ / Lean 4 / live trace replay) | **2** | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
 | **Local-Dev & Security Subtotal (max 16)** | **16 / 16** | **5 / 16** | **6 / 16** | **7 / 16** | **6 / 16** | **7 / 16** | **5 / 16** | **6 / 16** |
-| Multi-admin team sync & RBAC | 1⁶ | **2** | **2** | **2** | **2** | 1 | 1 | 1 |
+| Multi-admin team sync & RBAC | 1⁶ (S3-compatible, WebDAV, shared folder) | **2** | **2** | **2** | **2** | 1 | 1 | 1 |
 | Cloud CI/CD, SSO/SCIM & dynamic production secrets | 0⁷ | **2** | **2** | 1 | 1 | 1 | 1 | 0 |
 | **Overall Total (max 20)** | **17 / 20** | **9 / 20** | **10 / 20** | **10 / 20** | **9 / 20** | **9 / 20** | **7 / 20** | **7 / 20** |
 
@@ -32,7 +32,7 @@ Scores reflect **shipped behavior** on a 0–2 scale:
 3. **AI-agent & known-value redaction**: Dotenvx documents runtime redaction of loaded values in `dotenvx run` ([Dotenvx official CLI documentation](https://github.com/dotenvx/dotenvx)). Locket pairs known-value scanning (`locket scan --require-known`), output redaction (`locket redact`, `locket ai-safe`), a streaming HTTP egress proxy, projection-first privacy mode, and a zero-knowledge MCP server (`locket mcp` with `locket_inspect_env_keys`, `locket_scan_env_files`, `locket_import_env`, and `locket_detect_commands`).
 4. **Desktop, IDE & shell**: Doppler, Infisical, and Bitwarden SM provide web consoles, while 1Password pairs a native desktop app with `op`. Locket ships a native Tauri v2 desktop companion (Global Vault, 1-click Keychain unlock, Day-2 CRUD, detected commands, MCP/agent setup, and tray), a VS Code extension, and shell hooks.
 5. **Audit, rotation & recovery**: Hosted tools keep audit logs and rotation on their servers. Locket keeps a local tamper-evident HMAC audit chain with external witness receipts, pinned `lk://...@vN` grace windows, and offline recovery envelopes.
-6. **Team sync & RBAC**: Locket ships signed, device-encrypted shared-folder updates with personal overrides, collision holding, and fingerprint-verified onboarding, but currently supports a single pinned owner without owner handover, and live cloud-folder provider qualification remains open. Hosted platforms score 2 for multi-admin hosted RBAC.
+6. **Team sync & RBAC**. Locket ships zero-trust delivery of signed, per-device encrypted packages over AWS S3, Cloudflare R2, Backblaze B2, MinIO, WebDAV, and shared folders. It supports fingerprint-verified onboarding, holds conflicting updates for review, and keeps personal overrides local. The score reflects a single pinned owner. Owner handover is unavailable, and live cloud-provider acceptance remains open. Hosted platforms score 2 for multi-admin hosted RBAC. [Team updates](team-updates.md)
 7. **Cloud CI/CD, SSO/SCIM & dynamic secrets**: Out of scope for Locket. Production and CI pipelines should use platform-native secret stores or hosted platforms like Doppler, Infisical, or HashiCorp Vault.
 
 ## What sets the Rust version apart
@@ -49,11 +49,11 @@ Scores reflect **shipped behavior** on a 0–2 scale:
 | How does an application receive values? | A saved command policy (plus optional monorepo path scope and `shared_secrets`) declares permitted names; Locket injects values into that child process only. |
 | Does routine execution require a hosted service? | No. Local keys, project configuration, and values must be available. |
 | How do AI agents work with secrets safely? | `locket mcp` exposes metadata-only `.env` key inspection, workspace scanning, filtered import, and command detection without ever returning plaintext values. |
-| How are teammates updated? | One owner publishes signed, device-encrypted updates through an existing shared folder. Unlocked agents deliver and apply verified updates. Real provider behavior still needs acceptance testing. |
-| What is shared by default? | Current shared values. Personal/machine overrides and history require opt-in. |
+| How are teammates updated? | One pinned owner publishes opaque, signed `.lkpkg` files encrypted per device to AWS S3, Cloudflare R2, Backblaze B2, MinIO, WebDAV, or a shared folder. Unlocked agents deliver and apply verified updates. Locket requires no dedicated server or SaaS. Live cloud-provider acceptance remains open. |
+| What is shared by default? | Team packages contain current shared values. Personal and machine overrides stay local. Manual exports can include overrides and history by explicit opt-in. |
 | Are imported commands trusted? | Approve command access locally. Signed team updates never install command approvals or project configuration; manual sealed bundles do not authenticate their issuer. |
 | How does a fresh machine join? | Prepare device keys, compare full fingerprints independently with the owner, then join an owner-signed package. Owner handover and trust-fork recovery remain unsupported. |
-| What works in the desktop? | Global Vault (`@shared`) and auto-detecting project setup, 1-click Keychain or passphrase unlock, Secret CRUD + Copy to Global Vault, Environment creation, Detected Commands, 1-click MCP & AI migration prompt copy, readiness checks, terminal launch, and explicit team conflict controls. |
+| What works in the desktop? | Global Vault (`@shared`) and auto-detecting project setup, 1-click Keychain or passphrase unlock, Secret CRUD + Copy to Global Vault, Environment creation, Detected Commands, 1-click MCP & AI migration prompt copy, readiness checks, terminal launch, and team delivery controls for publishing, disconnecting, and resolving conflicts. |
 | Is this a production secret-management service? | No. Use infrastructure designed for your production and CI requirements. |
 
 ## Claims to avoid
@@ -64,7 +64,7 @@ Actual-value redaction is not unique either. Dotenvx documents redaction of load
 
 Locket's scanners and redaction are explicit tools for preparing files or output. They do not intercept arbitrary AI requests or make untrusted code safe. A process receiving a variable can disclose it.
 
-Do not market unfinished SSO, compliance programs, hosted tiers, owner handover, or future pricing as shipped features. Signed folder delivery is implemented; observed team usability and real provider qualification remain open. Vendor prices and plan limits change, so check their primary pricing pages when evaluating a purchase.
+Do not market unfinished SSO, compliance programs, hosted tiers, owner handover, or future pricing as shipped features. S3-compatible, WebDAV, and shared-folder delivery are implemented. Live cloud-provider acceptance and observed team usability remain open. Vendor prices and plan limits change, so check their primary pricing pages when evaluating a purchase.
 
 The remaining adoption test is practical: can an unfamiliar developer import and run their app without coaching, then help a teammate do the same without losing data or sharing extra values? The [team guide](team-updates.md) and [distribution checks](distribution-validation.md) describe the current workflows and acceptance boundaries.
 

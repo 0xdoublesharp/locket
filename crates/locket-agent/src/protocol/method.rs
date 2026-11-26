@@ -11,6 +11,8 @@ pub enum AgentMethod {
     TeamSyncStatus,
     /// Configure an explicitly selected encrypted package transport.
     TeamSyncConfigure,
+    /// Remove the local team delivery configuration and credentials.
+    TeamSyncClear,
     /// Process encrypted team updates with a live local grant.
     TeamSyncNow,
     /// Test listing the configured package transport with a live local grant.
@@ -112,6 +114,7 @@ impl AgentMethod {
         match self {
             Self::TeamSyncStatus => "TeamSyncStatus",
             Self::TeamSyncConfigure => "TeamSyncConfigure",
+            Self::TeamSyncClear => "team_sync.clear",
             Self::TeamSyncNow => "TeamSyncNow",
             Self::TeamSyncTestRemote => "team_sync.test_remote",
             Self::TeamSyncReconcile => "TeamSyncReconcile",
@@ -169,6 +172,7 @@ impl FromStr for AgentMethod {
         match value {
             "TeamSyncStatus" => Ok(Self::TeamSyncStatus),
             "TeamSyncConfigure" => Ok(Self::TeamSyncConfigure),
+            "team_sync.clear" => Ok(Self::TeamSyncClear),
             "TeamSyncNow" => Ok(Self::TeamSyncNow),
             "team_sync.test_remote" => Ok(Self::TeamSyncTestRemote),
             "TeamSyncReconcile" => Ok(Self::TeamSyncReconcile),

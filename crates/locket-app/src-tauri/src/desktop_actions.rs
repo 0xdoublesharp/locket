@@ -2089,6 +2089,13 @@ pub(crate) async fn desktop_team_sync_test_remote(
 }
 
 #[tauri::command]
+pub(crate) async fn desktop_team_sync_clear(
+    request: DesktopTeamSyncRequest,
+) -> Result<serde_json::Value, super::AgentClientError> {
+    team_sync_request(request, locket_agent::AgentMethod::TeamSyncClear).await
+}
+
+#[tauri::command]
 pub(crate) async fn desktop_team_sync_now(
     request: DesktopTeamSyncRequest,
 ) -> Result<serde_json::Value, super::AgentClientError> {

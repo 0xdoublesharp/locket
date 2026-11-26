@@ -98,6 +98,7 @@ function checkCapabilities() {
   assert(!/"agent_copy"/.test(commandsToml), 'desktop-commands.toml must not allow plaintext-returning agent_copy');
   const allowedCommands = /^commands\.allow\s*=\s*\[([^\]]*)\]/m.exec(commandsToml)?.[1] ?? '';
   assert(/^\s*"desktop_team_sync_test_remote",\s*$/m.test(allowedCommands), 'desktop-commands.toml must allow desktop_team_sync_test_remote');
+  assert(/^\s*"desktop_team_sync_clear",\s*$/m.test(allowedCommands), 'desktop-commands.toml must allow desktop_team_sync_clear');
   return identifiers;
 }
 

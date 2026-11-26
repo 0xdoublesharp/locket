@@ -9,6 +9,7 @@ import {
   desktopTeamSyncNow,
   desktopTeamSyncConfigure,
   desktopTeamSyncTestRemote,
+  desktopTeamSyncClear,
   desktopTeamSyncRenameProfile,
   desktopTeamSyncPreserveOverride,
 } from '../agent/client';
@@ -30,6 +31,7 @@ const props = defineProps<{
 const status = ref<TeamSyncStatus | null>(null);
 const busy = ref(false);
 const error = ref('');
+const notice = ref<{ message: string; privateMessage?: string } | null>(null);
 const backends = [
   { kind: 'folder', label: 'Shared folder' },
   { kind: 's3', label: 'S3 / R2 / MinIO' },
@@ -159,6 +161,7 @@ watch(
 const savedTarget = computed(() =>
   activeBackend.value === 'folder' ? status.value?.folder : status.value?.remote_target,
 );
+const hasDelivery = computed(() => Boolean(status.value?.folder || status.value?.remote_target));
 const canTestSaved = computed(() =>
   Boolean(
     savedTarget.value &&
@@ -228,6 +231,7 @@ const message = computed(() =>
   status.value ? syncMessage(status.value) : 'Check this project’s last verified team update.',
 );
 const hasWaiting = computed(() => (status.value?.waiting ?? 0) > 0);
+const isOwner = computed(() => status.value?.state === 'owner');
 const folderSegments = computed(() => status.value?.folder?.split('/') ?? []);
 const verifiedIso = computed(() =>
   status.value?.last_verified_at
@@ -265,12 +269,20 @@ onUnmounted(() => {
   clearCredentials();
   if (timer) clearInterval(timer);
 });
-async function perform(kind: 'status' | 'now' | 'configure' | 'test') {
+const confirmationLabels = {
+  now: 'Sync team updates',
+  configure: 'Configure team sync',
+  test: 'Test team sync connection',
+  clear: 'Disconnect team sync backend',
+};
+
+async function perform(kind: 'status' | keyof typeof confirmationLabels) {
   const project = props.projectId;
   if (!project || busy.value) return;
   const editing = kind === 'configure' || kind === 'test';
   const testSaved = kind === 'test' && canTestSaved.value;
   if (editing && (props.privacyMode || (!testSaved && !canSave.value))) return;
+  if (kind === 'clear' && (props.privacyMode || !hasDelivery.value)) return;
 
   const token = generation;
   const selectedBackend = backend.value;
@@ -279,6 +291,7 @@ async function perform(kind: 'status' | 'now' | 'configure' | 'test') {
   if (kind === 'configure') clearCredentials();
   busy.value = true;
   error.value = '';
+  if (kind !== 'status') notice.value = null;
   if (editing) connection.value = null;
   try {
     const approved =
@@ -286,18 +299,13 @@ async function perform(kind: 'status' | 'now' | 'configure' | 'test') {
         ? false
         : kind === 'configure' && consent
           ? await props.confirmDangerous('Configure team sync', true)
-          : await props.confirmDangerous(
-              kind === 'now'
-                ? 'Sync team updates'
-                : kind === 'test'
-                  ? 'Test team sync connection'
-                  : 'Configure team sync',
-            );
+          : await props.confirmDangerous(confirmationLabels[kind]);
     if (
       approved === undefined ||
       token !== generation ||
       project !== props.projectId ||
       (kind === 'configure' && consent && !approved) ||
+      (kind === 'clear' && props.privacyMode) ||
       (editing && (props.privacyMode || selectedBackend !== backend.value))
     )
       return;
@@ -327,18 +335,34 @@ async function perform(kind: 'status' | 'now' | 'configure' | 'test') {
     const result =
       kind === 'now'
         ? await desktopTeamSyncNow(request)
-        : kind === 'configure' && transport
-          ? await desktopTeamSyncConfigure({
-              ...request,
-              ...(transport.kind === 'folder' ? { folder: transport.path } : { transport }),
-              allow_dangerous: consent,
-            })
-          : await desktopTeamSyncStatus(request);
+        : kind === 'clear'
+          ? await desktopTeamSyncClear(request)
+          : kind === 'configure' && transport
+            ? await desktopTeamSyncConfigure({
+                ...request,
+                ...(transport.kind === 'folder' ? { folder: transport.path } : { transport }),
+                allow_dangerous: consent,
+              })
+            : await desktopTeamSyncStatus(request);
     if (token !== generation || project !== props.projectId) return;
     if (result.ok) {
       if (kind === 'status' && !status.value)
         backend.value = result.value.transport_kind ?? 'folder';
       if (kind === 'configure') editedBackends.delete(selectedBackend);
+      if (kind === 'clear') {
+        clearCredentials();
+        connection.value = null;
+        notice.value = {
+          message: 'Delivery disconnected. Authenticated trust history was preserved.',
+        };
+      }
+      const published = result.value.published;
+      if (kind === 'now' && published > 0) {
+        notice.value = {
+          message: `Published ${published} encrypted ${published === 1 ? 'package' : 'packages'}.`,
+          privateMessage: 'Published team updates.',
+        };
+      }
       const lastError = result.value.last_error;
       status.value = lastError
         ? { ...result.value, last_error: redactCredentials(lastError, transport) }
@@ -392,6 +416,7 @@ watch(
     busy.value = false;
     status.value = null;
     error.value = '';
+    notice.value = null;
     connection.value = null;
     backend.value = 'folder';
     folder.value = '';
@@ -428,7 +453,7 @@ watch(
         <button
           type="button"
           class="companion-button icon-label"
-          :class="{ 'companion-button--primary': !hasWaiting }"
+          :class="{ 'companion-button--primary': !isOwner && !hasWaiting }"
           :disabled="busy || !projectId"
           @click="perform('status')"
         >
@@ -438,18 +463,22 @@ watch(
         <button
           type="button"
           class="companion-button icon-label"
-          :class="{ 'companion-button--primary': hasWaiting }"
+          :class="{ 'companion-button--primary': isOwner || hasWaiting }"
           :disabled="busy || !projectId"
           @click="perform('now')"
         >
           <AppIcon name="check" />
-          Apply verified updates
+          {{ isOwner ? 'Publish updates now' : 'Apply verified updates' }}
         </button>
       </div>
     </header>
     <p :class="['sharing__banner', `sharing__banner--${tone}`]" role="status">
       <AppIcon :name="tone === 'info' ? 'info' : 'alert'" />
       <span>{{ message }}</span>
+    </p>
+    <p v-if="notice" class="sharing__banner sharing__banner--ok" role="status">
+      <AppIcon name="check" />
+      <span>{{ (privacyMode && notice.privateMessage) || notice.message }}</span>
     </p>
     <template v-if="status">
       <dl class="sharing__facts">
@@ -872,6 +901,15 @@ watch(
             >
               Save delivery backend &amp; consent
             </button>
+            <button
+              v-if="hasDelivery"
+              type="button"
+              class="companion-button"
+              :disabled="busy || !projectId"
+              @click="perform('clear')"
+            >
+              Disconnect backend
+            </button>
           </div>
         </fieldset>
         <p
@@ -884,13 +922,12 @@ watch(
             connection.ok ? connection.message : `Connection test failed. ${connection.message}`
           }}</span>
         </p>
-        <p class="sharing__muted">
+        <p v-if="!isOwner" class="sharing__muted">
           After saving, choose “Apply verified updates” to retry held values.
         </p>
         <p class="sharing__muted">
-          Owners can publish immediately with <code>locket team publish</code>. The unlocked owner’s
-          agent also publishes changed shared values automatically. Removing a teammate cannot erase
-          values already received; rotate credentials at their providers.
+          The unlocked owner’s agent publishes changed shared values automatically. Removing a
+          teammate cannot erase values already received; rotate credentials at their providers.
         </p>
       </div>
     </details>

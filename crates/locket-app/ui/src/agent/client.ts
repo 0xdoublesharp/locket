@@ -566,6 +566,12 @@ export async function desktopTeamSyncTestRemote(request: {
 }): Promise<AgentResult<import('./types').TeamSyncTestResult>> {
   return callTyped('desktop_team_sync_test_remote', { request });
 }
+export async function desktopTeamSyncClear(request: {
+  project_id: string;
+  confirm_dangerous_profile?: string;
+}): Promise<AgentResult<import('./types').TeamSyncStatus>> {
+  return callTyped('desktop_team_sync_clear', { request });
+}
 export async function desktopTeamSyncNow(request: {
   project_id: string;
   confirm_dangerous_profile?: string;

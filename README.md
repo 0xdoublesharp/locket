@@ -64,7 +64,7 @@ Start with a personal Global Vault (`@shared`) in one click, or connect any repo
 - 🔄 **Rotation, history, and diffs**: Rotate values safely and compare profiles without revealing plaintext.
 - 🧹 **Scanner, pre-commit, redaction, and AI-safe tools**: Keep secrets out of code, logs, and prompts before sharing context with local AI agents.
 - 🪪 **Recovery and device trust**: Local verification, recovery rotation, and sealed export/import without a hosted service.
-- 👥 **Team updates**: Signed encrypted shared-folder delivery, verified device onboarding, and personal overrides without a hosted service.
+- 👥 **Zero-Trust Teams**: Deliver signed, per-device encrypted updates over AWS S3, Cloudflare R2, Backblaze B2, MinIO, WebDAV, or a shared folder. Personal overrides stay local, and Locket requires no dedicated server or SaaS. [Team setup guide](docs/team-updates.md)
 - 🧾 **Metadata-only audit and diagnostics**: Report what happened without exposing secret values.
 - 🚫 **No telemetry or analytics**: Network access is limited to opt-in update checks or explicit sealed sync, export, and import.
 
@@ -82,7 +82,7 @@ Start with a personal Global Vault (`@shared`) in one click, or connect any repo
 
 The desktop app opens a personal Global Vault (`@shared`) or connects project folders, unlocks the vault, imports env files, edits durable commands, and opens approved commands in a terminal. Imports and policy edits use the unlocked agent cache, including passphrase-only vaults. Native packages bundle a matching CLI, and the editor extension version matches the app and CLI.
 
-Teams can [join a fresh machine and receive signed encrypted updates](docs/team-updates.md) through an existing shared folder. First join requires verifying the owner's full fingerprint over a separate trusted channel. One owner publishes shared values while each developer keeps personal overrides locally. The unlocked agent publishes changed shared values and applies verified updates automatically. Status shows the last verified update; an offline or malicious folder provider can withhold newer files. Once a team owner is pinned, identity replacement is refused; authenticated owner handover and real sync-provider or clean-OS acceptance remain separate qualification work.
+One pinned owner publishes shared values as signed `.lkpkg` files encrypted for each approved device. New devices verify the owner's full fingerprint over a separate trusted channel before joining. The unlocked agent publishes changed shared values and applies verified updates automatically. The delivery backend sees opaque files and can withhold them. Locket reports the last verified update. Owner handover and live cloud-provider acceptance remain open. [Team updates](docs/team-updates.md)
 
 Manual sealed export/import is also available. Sealed bundles encrypt for recipients but do **not** authenticate the issuer. Imported command proposals never grant local execution permission. Exports default to current shared values; personal overrides and history require explicit opt-in. Read [package validation](docs/distribution-validation.md) before preparing installers, because unsigned local artifacts do not establish signing or notarization.
 
@@ -359,7 +359,7 @@ locket team folder /path/to/shared-folder
 locket team publish
 ```
 
-The unlocked agent delivers signed encrypted updates automatically. Held values are shown by `locket team sync pending`; the desktop provides explicit collision resolution. Follow the [team onboarding and recovery guide](docs/team-updates.md) for the complete flow.
+The desktop lets owners choose **Publish updates now** and lets teammates resolve held values explicitly. Use **Disconnect backend** to stop delivery on this device and remove its stored backend credentials while preserving the owner pin and verified history. Use `locket team sync pending` to inspect held values from the CLI. See the team guide for S3-compatible and WebDAV setup. [Team onboarding and recovery guide](docs/team-updates.md)
 
 Manual `export --sealed` / `import-bundle` and the `team invite` / `team accept` commands are also available. Sealed bundles do not authenticate the issuer; use the signed team workflow for ongoing delivery.
 

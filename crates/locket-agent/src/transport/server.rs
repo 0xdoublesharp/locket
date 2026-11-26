@@ -1367,6 +1367,9 @@ pub async fn dispatch_with_peer(
         Ok(AgentMethod::TeamSyncConfigure) => {
             crate::handlers::team_sync::handle_team_sync_configure(envelope, state).await
         }
+        Ok(AgentMethod::TeamSyncClear) => {
+            crate::handlers::team_sync::handle_team_sync_clear(envelope, state).await
+        }
         Ok(AgentMethod::TeamSyncNow) => {
             crate::handlers::team_sync::handle_team_sync_now(envelope, state).await
         }

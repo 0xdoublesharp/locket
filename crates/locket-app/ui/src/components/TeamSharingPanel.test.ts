@@ -283,6 +283,90 @@ it('configures delivery after confirmation and copies the verified owner join co
   });
 });
 
+it.each([1, 3])(
+  'publishes as the owner and redacts the package count in privacy mode (%i)',
+  async (published) => {
+    const owner = { ...checked, state: 'owner', folder: '/fixture/team' };
+    vi.mocked(invoke)
+      .mockResolvedValueOnce(owner)
+      .mockResolvedValueOnce({ ...owner, published });
+    const { root, setProps } = sharing();
+    await settle();
+    const publish = button(root, 'Publish updates now');
+    expect(publish.props.class).toContain('companion-button--primary');
+    expect(nodeText(root)).not.toContain('Apply verified updates');
+    await click(publish);
+    expect(invoke).toHaveBeenLastCalledWith('desktop_team_sync_now', {
+      request: { project_id: 'project-a' },
+    });
+    const notice = `Published ${published} encrypted ${published === 1 ? 'package' : 'packages'}.`;
+    expect(nodeText(root)).toContain(notice);
+    setProps({ privacyMode: true });
+    await settle();
+    expect(nodeText(root)).toContain('Published team updates.');
+    expect(nodeText(root)).not.toContain(notice);
+    expect(nodeText(root)).not.toContain('Disconnect backend');
+  },
+);
+
+it('disconnects a remote backend after confirmation and clears draft credentials and connection feedback', async () => {
+  const trust = { ...checked, owner_fingerprint: 'fixture-owner' };
+  const saved = { ...trust, transport_kind: 's3', remote_target: 's3://fixture-bucket/team' };
+  vi.mocked(invoke)
+    .mockResolvedValueOnce(saved)
+    .mockResolvedValueOnce({ ok: true, package_count: 2 })
+    .mockResolvedValueOnce(trust);
+  const confirmDangerous = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce('dev');
+  const { root } = sharing({ confirmDangerous });
+  await settle();
+  await input(control(root, 'Bucket'), 'fixture-bucket');
+  const accessKey = control(root, 'Access Key ID');
+  const secret = control(root, 'Secret Access Key');
+  const token = control(root, 'Session Token');
+  await input(accessKey, 'fixture-key');
+  await input(secret, 'fixture-secret');
+  await input(token, 'fixture-token');
+  await click(button(root, 'Show secret access key'));
+  await click(button(root, 'Test connection'));
+  expect(nodeText(root)).toContain('Connected · 2 encrypted packages found');
+  await click(button(root, 'Disconnect backend'));
+  expect(confirmDangerous).toHaveBeenLastCalledWith('Disconnect team sync backend');
+  expect(invoke).toHaveBeenLastCalledWith('desktop_team_sync_clear', {
+    request: { project_id: 'project-a', confirm_dangerous_profile: 'dev' },
+  });
+  for (const credential of [accessKey, secret, token]) expect(credential.value).toBe('');
+  expect(secret.props.type).toBe('password');
+  expect(nodeText(root)).toContain(
+    'Delivery disconnected. Authenticated trust history was preserved.',
+  );
+  expect(nodeText(root)).toContain('fixture-owner');
+  expect(nodeText(root)).not.toMatch(/Disconnect backend|Connected ·|s3:\/\/fixture-bucket/);
+});
+
+it('keeps a shared folder connected if confirmation is canceled or privacy mode turns on', async () => {
+  vi.mocked(invoke).mockResolvedValue({ ...checked, folder: '/fixture/team' });
+  const confirmation = deferred<string>();
+  const confirmDangerous = vi
+    .fn()
+    .mockResolvedValueOnce(undefined)
+    .mockReturnValueOnce(confirmation.promise);
+  const { root, setProps } = sharing({ confirmDangerous });
+  await settle();
+  await click(button(root, 'Disconnect backend'));
+  expect(invoke).toHaveBeenCalledTimes(1);
+  expect(nodeText(root)).toContain('Delivery folder');
+  await click(button(root, 'Disconnect backend'));
+  setProps({ privacyMode: true });
+  await settle();
+  confirmation.resolve('dev');
+  await settle();
+  expect(invoke).toHaveBeenCalledTimes(1);
+  expect(nodeText(root)).not.toMatch(/Disconnect backend|Delivery folder/);
+  setProps({ privacyMode: false });
+  await settle();
+  expect(nodeText(root)).toContain('Disconnect backend');
+});
+
 it('reconciles profile and variable collisions with the authenticated IDs', async () => {
   vi.mocked(invoke).mockResolvedValue(blocked);
   const confirmDangerous = vi.fn().mockResolvedValue('dev');
