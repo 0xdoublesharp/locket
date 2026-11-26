@@ -292,7 +292,7 @@ export function createMockRuntime(params: URLSearchParams) {
       project_id: selected?.project_id ?? null,
       profile_name: selected?.profile_name ?? null,
       live_grant_count: ttl === null ? 0 : 1,
-      agent_version: '0.3.0',
+      agent_version: '0.3.1',
       unlock_ttl_seconds: ttl,
       running_session_count: selected
         ? sessions.filter((session) => session.state === 'running').length
