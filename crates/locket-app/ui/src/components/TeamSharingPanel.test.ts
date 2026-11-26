@@ -12,6 +12,7 @@ import {
   input,
   mountComponent,
   nodeText,
+  select,
   settle,
 } from '../test/renderer';
 
@@ -107,6 +108,143 @@ it('keeps delivery identifiers and diagnostics out of privacy mode', async () =>
   expect(nodeText(root)).not.toContain('fixture-sensitive-diagnostic');
 });
 
+it('tests and saves S3 settings, then retests the saved backend without resending credentials', async () => {
+  const saved = {
+    ...checked,
+    transport_kind: 's3',
+    remote_target: 's3://fixture-bucket/team',
+    remote_endpoint: 'https://r2.fixture.test',
+    remote_region: 'auto',
+    credential_mode: 'vault',
+  };
+  const test = {
+    ok: true,
+    transport_kind: 's3',
+    target: saved.remote_target,
+    package_count: 3,
+    writable_checked: false,
+    message: 'Connection succeeded.',
+  };
+  vi.mocked(invoke)
+    .mockResolvedValueOnce(checked)
+    .mockResolvedValueOnce(test)
+    .mockResolvedValueOnce(saved)
+    .mockResolvedValueOnce(test);
+  const confirmDangerous = vi.fn().mockResolvedValue('dev');
+  const { root, setProps } = sharing({ confirmDangerous });
+  await settle();
+  await click(button(root, 'S3 / R2 / MinIO'));
+  await input(control(root, 'Bucket'), 'fixture-bucket');
+  const region = control(root, 'Region');
+  expect(region.value).toBe('us-east-1');
+  await input(region, 'auto');
+  await input(control(root, 'Key prefix'), 'team');
+  await input(control(root, 'Custom endpoint URL'), saved.remote_endpoint);
+  await check(control(root, 'Path-style URLs'));
+  await input(control(root, 'Access Key ID'), 'fixture-key-id');
+  const secret = control(root, 'Secret Access Key');
+  const token = control(root, 'Session Token');
+  await input(secret, 'fixture-secret-key');
+  await input(token, 'fixture-session-token');
+  expect(secret.props.type).toBe('password');
+  expect(token.props.type).toBe('password');
+  await click(button(root, 'Show secret access key'));
+  expect(secret.props.type).toBe('text');
+  await click(button(root, 'Hide secret access key'));
+  expect(secret.props.type).toBe('password');
+  await input(control(root, 'Independently verified owner fingerprint'), 'A'.repeat(64));
+  expect(nodeText(root)).not.toContain('Join verified team');
+  const request = {
+    project_id: 'project-a',
+    confirm_dangerous_profile: 'dev',
+    transport: {
+      kind: 's3',
+      bucket: 'fixture-bucket',
+      region: 'auto',
+      prefix: 'team',
+      endpoint: saved.remote_endpoint,
+      path_style: true,
+      credential_mode: 'vault',
+      access_key_id: 'fixture-key-id',
+      secret_access_key: 'fixture-secret-key',
+      session_token: 'fixture-session-token',
+    },
+  };
+  await click(button(root, 'Test connection'));
+  expect(invoke).toHaveBeenLastCalledWith('desktop_team_sync_test_remote', { request });
+  expect(nodeText(root)).toContain('Connected · 3 encrypted packages found');
+  await check(control(root, 'Allow automatic delivery'));
+  await click(button(root, 'Save delivery backend & consent'));
+  expect(confirmDangerous).toHaveBeenLastCalledWith('Configure team sync', true);
+  expect(invoke).toHaveBeenLastCalledWith('desktop_team_sync_configure', {
+    request: { ...request, allow_dangerous: true },
+  });
+  expect(secret.value).toBe('');
+  expect(token.value).toBe('');
+  expect(nodeText(root)).toContain('Remote storage cannot prove');
+  expect(nodeText(root)).toContain('Delivery backend S3 s3://fixture-bucket/team');
+  expect(nodeText(root)).toContain('Vault encrypted');
+  expect(nodeText(root)).toContain(saved.remote_endpoint);
+  expect(byProp(root, 'aria-label', 'Join verified team').value).toBe(
+    `locket team join --remote --owner '${'a'.repeat(64)}'`,
+  );
+  await click(button(root, 'Test connection'));
+  expect(invoke).toHaveBeenLastCalledWith('desktop_team_sync_test_remote', {
+    request: { project_id: 'project-a', confirm_dangerous_profile: 'dev' },
+  });
+  setProps({ privacyMode: true });
+  await settle();
+  expect(nodeText(root)).toContain('Connection test passed.');
+  expect(nodeText(root)).not.toMatch(
+    /fixture-bucket|r2\.fixture\.test|3 encrypted packages|Vault encrypted/,
+  );
+});
+
+it('redacts WebDAV diagnostics in privacy mode and clears credentials when switching backends or projects', async () => {
+  const test = deferred<unknown>();
+  vi.mocked(invoke).mockResolvedValueOnce(checked).mockReturnValueOnce(test.promise);
+  const { root, setProps } = sharing();
+  await settle();
+  await click(button(root, 'WebDAV'));
+  await input(control(root, 'HTTPS URL'), 'https://dav.fixture.test/team');
+  await select(control(root, 'Auth type', 'select'), 'basic');
+  await input(control(root, 'Username'), 'fixture-user');
+  await input(control(root, 'Password'), 'fixture-password');
+  await click(button(root, 'Shared folder'));
+  await click(button(root, 'WebDAV'));
+  expect(control(root, 'Password').value).toBe('');
+  await select(control(root, 'Auth type', 'select'), 'bearer');
+  await input(control(root, 'Bearer token'), 'fixture-bearer');
+  await click(button(root, 'Test connection'));
+  setProps({ privacyMode: true });
+  await settle();
+  test.resolve({
+    ok: false,
+    transport_kind: 'webdav',
+    target: 'https://dav.fixture.test/team',
+    package_count: 0,
+    writable_checked: false,
+    message: 'Access denied at dav.fixture.test for fixture-bearer',
+  });
+  await settle();
+  expect(nodeText(root)).toContain('Connection test failed.');
+  expect(nodeText(root)).not.toMatch(/dav\.fixture\.test|fixture-bearer|Access denied/);
+  setProps({ privacyMode: false });
+  await settle();
+  expect(nodeText(root)).toContain('Access denied at dav.fixture.test');
+  expect(nodeText(root)).not.toContain('fixture-bearer');
+  expect(control(root, 'Bearer token').value).toBe('');
+  await input(control(root, 'Bearer token'), 'fixture-unsaved');
+  vi.mocked(invoke).mockResolvedValueOnce(checked);
+  setProps({ projectId: 'project-b' });
+  await settle();
+  await click(button(root, 'WebDAV'));
+  await select(control(root, 'Auth type', 'select'), 'bearer');
+  expect(control(root, 'Bearer token').value).toBe('');
+  expect(control(root, 'HTTPS URL').value).toBe('');
+  expect(nodeText(root)).not.toContain('Access denied');
+});
+
 it('configures delivery after confirmation and copies the verified owner join command', async () => {
   vi.mocked(invoke).mockResolvedValue(checked);
   const confirmDangerous = vi
@@ -118,7 +256,7 @@ it('configures delivery after confirmation and copies the verified owner join co
   vi.stubGlobal('navigator', { clipboard: { writeText } });
   const { root } = sharing({ confirmDangerous });
   await settle();
-  expect(button(root, 'Save folder and consent').props.disabled).toBe(true);
+  expect(button(root, 'Save delivery backend & consent').props.disabled).toBe(true);
   await input(control(root, 'Shared folder'), '/fixture/team');
   await input(control(root, 'Independently verified owner fingerprint'), 'A'.repeat(64));
   const join = byProp(root, 'aria-label', 'Join verified team').value;
@@ -126,9 +264,9 @@ it('configures delivery after confirmation and copies the verified owner join co
   await click(button(root, 'Copy Join verified team'));
   expect(writeText).toHaveBeenCalledWith(join);
   await check(control(root, 'Allow automatic delivery'));
-  await click(button(root, 'Save folder and consent'));
+  await click(button(root, 'Save delivery backend & consent'));
   expect(invoke).toHaveBeenCalledTimes(1);
-  await click(button(root, 'Save folder and consent'));
+  await click(button(root, 'Save delivery backend & consent'));
   expect(confirmDangerous).toHaveBeenCalledWith('Configure team sync', true);
   expect(invoke).toHaveBeenLastCalledWith('desktop_team_sync_configure', {
     request: {

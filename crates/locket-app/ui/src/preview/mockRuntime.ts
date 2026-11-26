@@ -21,15 +21,29 @@ import type {
   RuntimeSessionWireRow,
   SecretWireRow,
   SetActiveProfileResponse,
+  TeamSyncStatus,
+  TeamSyncTestResult,
+  TeamSyncTransportInput,
   UnlockRequest,
   VersionWireRow,
   WriteConfigRequest,
 } from '../agent/types';
 import type { SetSecretRequest, SetSecretResponse } from '../agent/client';
+import { validDeliveryUrl } from '../team/sync';
 
 const workspace = '/Users/justin/Workspaces';
 const mcp = { command: 'locket', args: ['mcp'] };
 const noResponse = new Promise<never>(() => {});
+type TeamDelivery =
+  | { transport_kind: 'folder'; folder: string }
+  | {
+      transport_kind: 's3' | 'webdav';
+      folder: null;
+      remote_target: string;
+      remote_endpoint?: string;
+      remote_region?: string;
+      credential_mode: 'none' | 'vault' | 'env';
+    };
 
 export function createMockRuntime(params: URLSearchParams) {
   const scenario = params.get('state');
@@ -214,7 +228,7 @@ export function createMockRuntime(params: URLSearchParams) {
           },
         ];
   const values = new Map<string, string>();
-  let teamFolder = `${workspace}/acme-api/.locket/team`;
+  const teamDeliveries = new Map<string, TeamDelivery>();
 
   function unlockTtl(): number | null {
     return selected ? (unlockedProjects.get(selected.project_id) ?? null) : null;
@@ -395,6 +409,7 @@ export function createMockRuntime(params: URLSearchParams) {
   function requireDangerousConfirmation(
     request: Record<string, unknown>,
     projectWide = false,
+    force = false,
   ): void {
     const project = requireSelectedProject();
     const active = profiles.get(project.profile_id);
@@ -403,7 +418,10 @@ export function createMockRuntime(params: URLSearchParams) {
           (profile) => profile.project === project.project_id && profile.dangerous,
         )
       : active?.dangerous;
-    if (dangerous && (!active?.name || request.confirm_dangerous_profile !== active.name)) {
+    if (
+      (dangerous || force) &&
+      (!active?.name || request.confirm_dangerous_profile !== active.name)
+    ) {
       fail(
         'ConfirmationFailed',
         'Type the exact active profile name to confirm this action.',
@@ -883,17 +901,42 @@ export function createMockRuntime(params: URLSearchParams) {
           })),
         };
       }
-      case 'desktop_team_sync_configure':
+      case 'desktop_team_sync_configure': {
+        requireDangerousConfirmation(request, false, request.allow_dangerous === true);
+        const projectId = String(request.project_id);
+        const transport = (request.transport ?? {
+          kind: 'folder',
+          path: String(request.folder ?? ''),
+        }) as TeamSyncTransportInput;
+        teamDeliveries.set(projectId, deliveryMetadata(transport));
+        return syncStatus(projectId);
+      }
+      case 'desktop_team_sync_test_remote': {
         requireDangerousConfirmation(request);
-        teamFolder = String(request.folder);
-        return syncStatus();
+        const delivery = request.transport
+          ? deliveryMetadata(request.transport as TeamSyncTransportInput)
+          : teamDelivery(String(request.project_id));
+        const target =
+          delivery.transport_kind === 'folder' ? delivery.folder : delivery.remote_target;
+        const ok = scenario !== 'team-connection-error';
+        return {
+          ok,
+          transport_kind: delivery.transport_kind,
+          target,
+          package_count: ok ? 3 : 0,
+          writable_checked: false,
+          message: ok
+            ? 'Connection succeeded.'
+            : 'Could not list encrypted packages at the delivery target.',
+        } satisfies TeamSyncTestResult;
+      }
       case 'desktop_team_sync_now':
       case 'desktop_team_sync_rename_profile':
       case 'desktop_team_sync_preserve_override':
         requireDangerousConfirmation(request);
-        return syncStatus();
+        return syncStatus(String(request.project_id));
       case 'desktop_team_sync_status':
-        return syncStatus();
+        return syncStatus(String(request.project_id));
       case 'agent_export_bundle':
         requireDangerousConfirmation(request, request.scope === 'all-profiles');
         return {
@@ -924,17 +967,73 @@ export function createMockRuntime(params: URLSearchParams) {
     }
   };
 
-  function syncStatus() {
+  function teamDelivery(projectId: string): TeamDelivery {
+    return (
+      teamDeliveries.get(projectId) ?? {
+        transport_kind: 'folder',
+        folder: `${workspace}/${projectId}/.locket/team`,
+      }
+    );
+  }
+
+  function deliveryMetadata(transport: TeamSyncTransportInput): TeamDelivery {
+    const invalid = (message: string): never =>
+      fail('InvalidTransport', message, 'Check the delivery backend settings and retry.');
+    switch (transport.kind) {
+      case 'folder':
+        if (!transport.path?.trim()) invalid('Enter a shared folder path.');
+        return { transport_kind: 'folder', folder: transport.path.trim() };
+      case 's3': {
+        if (!transport.bucket?.trim() || !transport.region?.trim())
+          invalid('Enter an S3 bucket and region.');
+        if (transport.endpoint && !validDeliveryUrl(transport.endpoint, true))
+          invalid('Enter a valid S3 endpoint URL without credentials.');
+        if (
+          transport.credential_mode === 'vault' &&
+          (!transport.access_key_id || !transport.secret_access_key)
+        )
+          invalid('Enter the S3 access key ID and secret access key.');
+        const prefix = transport.prefix?.trim().replace(/^\/+|\/+$/g, '');
+        return {
+          transport_kind: 's3',
+          folder: null,
+          remote_target: `s3://${transport.bucket.trim()}${prefix ? `/${prefix}` : ''}`,
+          remote_endpoint: transport.endpoint,
+          remote_region: transport.region.trim(),
+          credential_mode: transport.credential_mode,
+        };
+      }
+      case 'webdav': {
+        if (!validDeliveryUrl(transport.url))
+          invalid('Enter a valid WebDAV HTTPS URL without credentials.');
+        const auth = transport.auth_kind ?? 'none';
+        if (
+          (auth === 'none') !== (transport.credential_mode === 'none') ||
+          (transport.credential_mode === 'vault' &&
+            (!transport.secret || (auth === 'basic' && !transport.username)))
+        )
+          invalid('Check the WebDAV authentication settings.');
+        return {
+          transport_kind: 'webdav',
+          folder: null,
+          remote_target: transport.url.trim(),
+          credential_mode: transport.credential_mode,
+        };
+      }
+    }
+  }
+
+  function syncStatus(projectId: string): TeamSyncStatus {
     return {
       epoch: 3,
-      state: unlockTtl() === null ? 'locked' : 'verified',
+      state: unlockedProjects.has(projectId) ? 'verified' : 'locked',
       conflicts: 0,
       waiting: 0,
       waiting_known: true,
       last_verified_at: now - minute,
       published: 1,
       applied: 2,
-      folder: teamFolder,
+      ...teamDelivery(projectId),
     };
   }
 }

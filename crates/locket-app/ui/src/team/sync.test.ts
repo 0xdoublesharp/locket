@@ -1,11 +1,29 @@
 import { describe, expect, it } from 'vitest';
-import { joinCommand, syncMessage } from './sync';
+import { joinCommand, syncMessage, validDeliveryUrl } from './sync';
 describe('authenticated team sharing guidance', () => {
   it('requires an independent full pin and safely quotes folder paths', () => {
+    expect(joinCommand('', 'a'.repeat(64))).toBeNull();
     expect(joinCommand('/team', 'short')).toBeNull();
     expect(joinCommand("/team's folder", 'a'.repeat(64))).toBe(
       `locket team join --folder '/team'"'"'s folder' --owner '${'a'.repeat(64)}'`,
     );
+  });
+  it.each(['s3', 'webdav'] as const)('uses the configured %s delivery for remote joins', (kind) => {
+    expect(joinCommand('', 'short', kind)).toBeNull();
+    expect(joinCommand('', 'A'.repeat(64), kind)).toBe(
+      `locket team join --remote --owner '${'a'.repeat(64)}'`,
+    );
+    expect(
+      syncMessage({ state: 'verified', conflicts: 0, waiting: 0, transport_kind: kind }),
+    ).toContain('Remote storage cannot prove');
+  });
+  it('rejects URLs with credentials and limits plain HTTP to local S3 endpoints', () => {
+    expect(validDeliveryUrl('https://dav.example.test/team')).toBe(true);
+    expect(validDeliveryUrl('http://localhost:9000', true)).toBe(true);
+    expect(validDeliveryUrl('http://localhost:9000')).toBe(false);
+    expect(validDeliveryUrl('http://minio.example.test', true)).toBe(false);
+    expect(validDeliveryUrl('https://user:secret@dav.example.test/team')).toBe(false);
+    expect(validDeliveryUrl('https://dav.example.test/team?token=secret')).toBe(false);
   });
   it('counts held profiles separately from conflicting values', () => {
     const message = syncMessage({

@@ -3,6 +3,110 @@ import type { DesktopProjectContext, DetectedCommandRow } from '../agent/types';
 import { createMockRuntime } from './mockRuntime';
 
 describe('desktop preview actions', () => {
+  it('tests and switches delivery backends per project while retaining only transport metadata', async () => {
+    const invoke = createMockRuntime(new URLSearchParams());
+    const request = (command: string, payload: Record<string, unknown> = {}) =>
+      invoke(command, { request: { project_id: 'acme-api', ...payload } });
+
+    const folder = '/fixture/team';
+    await expect(
+      request('desktop_team_sync_configure', { folder, allow_dangerous: false }),
+    ).resolves.toMatchObject({ transport_kind: 'folder', folder });
+    await expect(request('desktop_team_sync_test_remote')).resolves.toMatchObject({
+      ok: true,
+      transport_kind: 'folder',
+      target: folder,
+      package_count: 3,
+    });
+
+    const s3 = {
+      kind: 's3',
+      bucket: 'fixture-bucket',
+      prefix: 'team',
+      region: 'auto',
+      endpoint: 'https://fixture.r2.test',
+      credential_mode: 'vault',
+      access_key_id: 'fixture-s3-access',
+      secret_access_key: 'fixture-s3-secret',
+      session_token: 'fixture-s3-token',
+    };
+    const s3Target = 's3://fixture-bucket/team';
+    const test = await request('desktop_team_sync_test_remote', { transport: s3 });
+    expect(test).toMatchObject({
+      ok: true,
+      transport_kind: 's3',
+      target: s3Target,
+      package_count: 3,
+      writable_checked: false,
+    });
+    expect(JSON.stringify(test)).not.toMatch(/fixture-s3-(?:access|secret|token)/);
+    await expect(request('desktop_team_sync_status')).resolves.toMatchObject({ folder });
+    await expect(
+      request('desktop_team_sync_configure', { transport: s3, allow_dangerous: true }),
+    ).rejects.toMatchObject({ code: 'ConfirmationFailed' });
+    const configured = await request('desktop_team_sync_configure', {
+      transport: s3,
+      allow_dangerous: true,
+      confirm_dangerous_profile: 'dev',
+    });
+    expect(configured).toMatchObject({
+      transport_kind: 's3',
+      remote_target: s3Target,
+      remote_region: 'auto',
+      remote_endpoint: s3.endpoint,
+      credential_mode: 'vault',
+      folder: null,
+    });
+    expect(JSON.stringify(configured)).not.toMatch(/fixture-s3-(?:access|secret|token)/);
+    await expect(request('desktop_team_sync_test_remote')).resolves.toMatchObject({
+      target: s3Target,
+    });
+    await expect(
+      request('desktop_team_sync_status', { project_id: 'web-app' }),
+    ).resolves.toMatchObject({
+      transport_kind: 'folder',
+      folder: expect.stringContaining('/web-app/'),
+    });
+
+    const webdav = {
+      kind: 'webdav',
+      url: 'https://fixture.dav.test/team',
+      auth_kind: 'basic',
+      credential_mode: 'vault',
+      username: 'fixture-dav-user',
+      secret: 'fixture-dav-password',
+    };
+    const davStatus = await request('desktop_team_sync_configure', {
+      transport: webdav,
+      allow_dangerous: false,
+    });
+    expect(davStatus).toMatchObject({
+      transport_kind: 'webdav',
+      remote_target: webdav.url,
+      credential_mode: 'vault',
+      folder: null,
+    });
+    expect(JSON.stringify(davStatus)).not.toMatch(
+      /fixture-dav-(?:user|password)|fixture\.r2\.test/,
+    );
+    await expect(request('desktop_team_sync_test_remote')).resolves.toMatchObject({
+      ok: true,
+      transport_kind: 'webdav',
+      target: webdav.url,
+    });
+    await expect(
+      request('desktop_team_sync_test_remote', {
+        transport: { ...webdav, url: 'https://fixture-url-secret@fixture.dav.test/team' },
+      }),
+    ).rejects.toMatchObject({ code: 'InvalidTransport' });
+    await expect(
+      request('desktop_team_sync_configure', {
+        transport: { kind: 'folder', path: '/fixture/explicit' },
+        allow_dangerous: false,
+      }),
+    ).resolves.toMatchObject({ transport_kind: 'folder', folder: '/fixture/explicit' });
+  });
+
   it('creates an environment, copies the selected source, and deletes the original', async () => {
     const invoke = createMockRuntime(new URLSearchParams({ state: 'locked' }));
     const request = (command: string, payload: Record<string, unknown>) =>

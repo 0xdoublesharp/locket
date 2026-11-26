@@ -552,11 +552,19 @@ export async function desktopTeamSyncStatus(request: {
 }
 export async function desktopTeamSyncConfigure(request: {
   project_id: string;
-  folder: string;
-  allow_dangerous?: boolean;
+  folder?: string;
+  transport?: import('./types').TeamSyncTransportInput;
+  allow_dangerous: boolean;
   confirm_dangerous_profile?: string;
 }): Promise<AgentResult<import('./types').TeamSyncStatus>> {
   return callTyped('desktop_team_sync_configure', { request });
+}
+export async function desktopTeamSyncTestRemote(request: {
+  project_id: string;
+  transport?: import('./types').TeamSyncTransportInput;
+  confirm_dangerous_profile?: string;
+}): Promise<AgentResult<import('./types').TeamSyncTestResult>> {
+  return callTyped('desktop_team_sync_test_remote', { request });
 }
 export async function desktopTeamSyncNow(request: {
   project_id: string;

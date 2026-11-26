@@ -22,6 +22,7 @@ import {
   input,
   mountComponent,
   nodeText,
+  select,
   settle,
   submit,
 } from './test/renderer';
@@ -2041,7 +2042,15 @@ describe('connected desktop journeys through the preview fixture agent', () => {
     await settle();
     expect(nodeText(root)).toContain('Showing the last verified update.');
     await input(control(root, 'Shared folder'), '/fixture/team-delivery');
-    await clickRendered(renderedButton(root, 'Save folder and consent'));
+    await clickRendered(renderedButton(root, 'Test connection'));
+    expect(invoke).toHaveBeenCalledWith('desktop_team_sync_test_remote', {
+      request: {
+        project_id: 'acme-api',
+        transport: { kind: 'folder', path: '/fixture/team-delivery' },
+      },
+    });
+    expect(nodeText(root)).toContain('Connected · 3 encrypted packages found');
+    await clickRendered(renderedButton(root, 'Save delivery backend & consent'));
     expect(invoke).toHaveBeenCalledWith('desktop_team_sync_configure', {
       request: { project_id: 'acme-api', folder: '/fixture/team-delivery', allow_dangerous: false },
     });
@@ -2050,6 +2059,79 @@ describe('connected desktop journeys through the preview fixture agent', () => {
     expect(invoke).toHaveBeenCalledWith('desktop_team_sync_now', {
       request: { project_id: 'acme-api' },
     });
+  });
+
+  it('tests WebDAV, requires the exact profile for consent, and hides delivery details in privacy mode', async () => {
+    const { root, state } = await openFixtureProject();
+    state.selectView('team');
+    await settle();
+    const dialog = byProp(root, 'aria-labelledby', 'dangerous-action-title');
+    const prompt = Object.assign(dialog, {
+      open: false,
+      returnValue: '',
+      showModal() {
+        this.open = true;
+      },
+      close(result = '') {
+        this.open = false;
+        this.returnValue = result;
+        dialog.dispatchEvent(new Event('close'));
+      },
+    });
+    const url = 'https://dav.fixture.test/team';
+    await clickRendered(renderedButton(root, 'WebDAV'));
+    await input(control(root, 'HTTPS URL'), url);
+    await select(control(root, 'Auth type', 'select'), 'basic');
+    await input(control(root, 'Username'), 'fixture-user');
+    const password = control(root, 'Password');
+    await input(password, 'fixture-password');
+    await clickRendered(renderedButton(root, 'Test connection'));
+    const transport = {
+      kind: 'webdav',
+      url,
+      auth_kind: 'basic',
+      credential_mode: 'vault',
+      username: 'fixture-user',
+      secret: 'fixture-password',
+    };
+    expect(invoke).toHaveBeenCalledWith('desktop_team_sync_test_remote', {
+      request: { project_id: 'acme-api', transport },
+    });
+    expect(nodeText(root)).toContain('Connected · 3 encrypted packages found');
+    await check(control(root, 'Allow automatic delivery'));
+    await clickRendered(renderedButton(root, 'Save delivery backend & consent'));
+    expect(password.value).toBe('');
+    expect(prompt.open).toBe(true);
+    expect(nodeText(dialog)).toContain('Configure team sync');
+    expect(calls).not.toContain('desktop_team_sync_configure');
+    const profile = byProp(dialog, 'id', 'dangerous-action-profile');
+    await input(profile, 'Dev');
+    expect(renderedButton(dialog, 'Allow action').props.disabled).toBe(true);
+    await submit(dialog);
+    expect(calls).not.toContain('desktop_team_sync_configure');
+    await input(profile, 'dev');
+    await submit(dialog);
+    expect(invoke).toHaveBeenCalledWith('desktop_team_sync_configure', {
+      request: {
+        project_id: 'acme-api',
+        transport,
+        allow_dangerous: true,
+        confirm_dangerous_profile: 'dev',
+      },
+    });
+    expect(nodeText(root)).toContain(`Delivery backend WebDAV ${url}`);
+    await clickRendered(renderedButton(root, 'Test connection'));
+    expect(invoke).toHaveBeenLastCalledWith('desktop_team_sync_test_remote', {
+      request: { project_id: 'acme-api' },
+    });
+
+    state.selectView('settings');
+    await settle();
+    await check(control(byProp(root, 'aria-labelledby', 'settings-privacy'), 'Redact'));
+    state.selectView('team');
+    await settle();
+    expect(nodeText(root)).toContain('Remote storage cannot prove');
+    expect(nodeText(root)).not.toMatch(/dav\.fixture\.test|fixture-password|Set up this device/);
   });
 });
 

@@ -2,6 +2,12 @@
 // AgentClientError. Kept in sync by the locket-desktop tests/config.rs
 // regression and the agent_client integration tests.
 
+import type {
+  TeamSyncCredentialMode,
+  TeamSyncTransportKind,
+  TeamSyncWebDavAuthKind,
+} from '../team/sync';
+
 export type LockState = 'locked' | 'unlocked' | 'unknown';
 
 export interface AgentStatus {
@@ -713,6 +719,39 @@ export interface VariableReadinessResponse {
   }[];
 }
 export type TeamSyncStatus = import('../team/sync').TeamSyncStatus;
+
+export type TeamSyncTransportInput =
+  | { kind: 'folder'; path: string }
+  | {
+      kind: 's3';
+      bucket: string;
+      region: string;
+      prefix?: string;
+      endpoint?: string;
+      path_style?: boolean;
+      credential_mode: 'vault' | 'env';
+      access_key_id?: string;
+      secret_access_key?: string;
+      session_token?: string;
+    }
+  | {
+      kind: 'webdav';
+      url: string;
+      credential_mode: TeamSyncCredentialMode;
+      auth_kind?: TeamSyncWebDavAuthKind;
+      username?: string;
+      secret?: string;
+    };
+
+export interface TeamSyncTestResult {
+  ok: boolean;
+  transport_kind: TeamSyncTransportKind;
+  target: string;
+  package_count: number;
+  writable_checked: boolean;
+  message: string;
+}
+
 export interface TeamSyncRenameProfileRequest {
   project_id: string;
   incoming_profile_id: string;

@@ -22,17 +22,68 @@ import {
   desktopCopySecretToShared,
   desktopDetectCommands,
   desktopSavePolicy,
+  desktopTeamSyncConfigure,
+  desktopTeamSyncTestRemote,
   desktopTeamSyncRenameProfile,
   desktopTeamSyncPreserveOverride,
   unlockVault,
   actionError,
 } from './client';
+import type { TeamSyncTransportInput } from './types';
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn(), isTauri: vi.fn() }));
 describe('typed desktop operations', () => {
   beforeEach(() => {
     vi.resetAllMocks();
     vi.mocked(isTauri).mockReturnValue(true);
     vi.mocked(invoke).mockResolvedValue(undefined);
+  });
+  it('forwards legacy folder settings and every configured or draft delivery test shape', async () => {
+    const project_id = 'fixture';
+    const allow_dangerous = false;
+    const legacy = { project_id, folder: '/fixture/team', allow_dangerous };
+    vi.mocked(invoke).mockResolvedValue({ transport_kind: 'folder', folder: legacy.folder });
+    await expect(desktopTeamSyncConfigure(legacy)).resolves.toMatchObject({
+      ok: true,
+      value: { folder: legacy.folder },
+    });
+    expect(invoke).toHaveBeenLastCalledWith('desktop_team_sync_configure', { request: legacy });
+
+    const transports: TeamSyncTransportInput[] = [
+      { kind: 'folder', path: legacy.folder },
+      { kind: 's3', bucket: 'fixture', region: 'auto', credential_mode: 'env' },
+      {
+        kind: 'webdav',
+        url: 'https://fixture.test/team',
+        credential_mode: 'none',
+        auth_kind: 'none',
+      },
+    ];
+    for (const transport of transports) {
+      const request = { project_id, transport, allow_dangerous };
+      await desktopTeamSyncConfigure(request);
+      expect(invoke).toHaveBeenLastCalledWith('desktop_team_sync_configure', { request });
+
+      const result = {
+        ok: true,
+        transport_kind: transport.kind,
+        target: 'fixture-target',
+        package_count: 3,
+        writable_checked: false,
+        message: 'Package listing succeeded',
+      };
+      vi.mocked(invoke).mockResolvedValueOnce(result);
+      const test = { project_id, transport, confirm_dangerous_profile: 'dev' };
+      await expect(desktopTeamSyncTestRemote(test)).resolves.toEqual({ ok: true, value: result });
+      expect(invoke).toHaveBeenLastCalledWith('desktop_team_sync_test_remote', { request: test });
+    }
+    vi.mocked(invoke).mockRejectedValueOnce({ kind: 'protocol', reason: 'Connection lost' });
+    await expect(desktopTeamSyncTestRemote({ project_id })).resolves.toEqual({
+      ok: false,
+      error: { kind: 'protocol', reason: 'Connection lost' },
+    });
+    expect(invoke).toHaveBeenLastCalledWith('desktop_team_sync_test_remote', {
+      request: { project_id },
+    });
   });
   it('forwards exact native argument shapes', async () => {
     await desktopListProjects();
