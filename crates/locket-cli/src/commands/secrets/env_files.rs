@@ -29,8 +29,10 @@ const SKIP_DIRECTORIES: &[&str] = &[
     ".cache",
     "vendor",
 ];
-const ENV_TEMPLATES: &[&str] =
-    &[".env.example", ".env.sample", ".env.template", ".env.dist", ".env.defaults"];
+const ENV_EXCLUDED_EXTENSIONS: &[&str] = &[
+    "example", "sample", "template", "dist", "defaults", "json", "yaml", "yml", "toml", "js", "ts",
+    "cjs", "mjs", "sh", "bak",
+];
 const SHARED_PROVIDER_KEYS: &[&str] = &[
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
@@ -282,10 +284,6 @@ impl InputDirectory {
 
     pub fn child_has_file(&self, directory: &str, name: &str) -> bool {
         self.child_directory(OsStr::new(directory)).is_ok_and(|dir| dir.is_regular(name))
-    }
-
-    pub(super) fn has_git_boundary(&self) -> bool {
-        matches!(self.entry_kind(OsStr::new(".git")), Ok(EntryKind::Directory | EntryKind::File))
     }
 
     pub(super) fn names(&self) -> io::Result<Vec<OsString>> {
@@ -560,8 +558,9 @@ fn build_scan_report(
 
 fn is_env_filename(name: &str) -> bool {
     (name == ".env" || name.starts_with(".env."))
-        && !ENV_TEMPLATES.contains(&name)
-        && !Path::new(name).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("bak"))
+        && !Path::new(name).extension().is_some_and(|ext| {
+            ENV_EXCLUDED_EXTENSIONS.iter().any(|excluded| ext.eq_ignore_ascii_case(excluded))
+        })
 }
 
 fn suggested_profile(path: &Path) -> &'static str {
@@ -586,9 +585,10 @@ pub(super) fn write_env_scan(
     for file in report.files {
         writeln!(
             output,
-            "{:?}  project_root={:?}  profile={}  source={}  keys={}  warnings={}  invalid={}",
+            "{:?}  project_root={:?}  locket={}  profile={}  source={}  keys={}  warnings={}  invalid={}",
             file.path.display().to_string(),
             file.project_root.display().to_string(),
+            if file.has_locket_config { "yes" } else { "no" },
             file.suggested_profile,
             file.suggested_source,
             file.key_count,
@@ -607,11 +607,28 @@ pub(super) fn write_env_scan(
     Ok(())
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::fs;
 
+    #[test]
+    fn scan_filename_filter_excludes_final_template_and_non_dotenv_extensions() {
+        for suffix in [
+            "EXAMPLE", "sample", "Template", "dist", "defaults", "JSON", "yaml", "yml", "toml",
+            "js", "ts", "cjs", "mjs", "sh", "BAK",
+        ] {
+            assert!(!is_env_filename(&format!(".env.{suffix}")));
+            assert!(!is_env_filename(&format!(".env.local.{suffix}")));
+        }
+        for name in [".env", ".env.local", ".env.production.local", ".env.example.local"] {
+            assert!(is_env_filename(name));
+        }
+        assert!(!is_env_filename("test.env"));
+    }
+
+    #[cfg(unix)]
     #[test]
     fn scan_and_reads_use_the_open_directory_after_its_path_changes()
     -> Result<(), Box<dyn std::error::Error>> {

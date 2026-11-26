@@ -1006,6 +1006,7 @@ fn import_archive_dry_run_leaves_source_and_destination_untouched()
     let (code, report) = run_env_json(&context, &json_args, &["dry-run-archive-fixture"])?;
     assert_eq!(code, 0);
     assert_eq!(report["delete_env"], "would-archive");
+    assert_eq!(report["archive_directory"], context.cwd.join("new/backups").display().to_string());
     assert!(report.get("archived_to").is_none());
     assert_eq!(fs::read_to_string(source)?, contents);
     assert!(!project.path().join("new").exists());
@@ -1025,7 +1026,8 @@ fn import_archive_warns_about_file_consumers_in_preview_and_execution()
     let archive = workspace.path().join("backups");
     let archive_arg = archive.to_str().ok_or("archive path must be UTF-8")?;
     fs::create_dir_all(&web)?;
-    let context = RuntimeContext { cwd: root.clone(), ..test_context(&workspace) };
+    run_git(&root, &["init", "-q"])?;
+    let context = RuntimeContext { cwd: web.clone(), ..test_context(&workspace) };
     run_env_command(&context, &["init", "--no-device", "--no-passkey"], &[])?;
     let canaries = ["dotenv-value-fixture", "compose-value-fixture", "script-value-fixture"];
     let source = web.join(".env");
@@ -1073,7 +1075,7 @@ fn import_archive_warns_about_file_consumers_in_preview_and_execution()
             }
         }))?,
     )?;
-    let args = ["import", "apps/web/.env", "--archive", archive_arg];
+    let args = ["import", ".env", "--archive", archive_arg];
     let categories = [
         "apps/compose.override.YAML",
         "apps/web/compose.yml",
@@ -1096,6 +1098,12 @@ fn import_archive_warns_about_file_consumers_in_preview_and_execution()
     for category in categories {
         assert!(text_warnings.iter().any(|warning| warning.starts_with(category)));
     }
+    assert!(text_warnings.contains(
+        &"docker-compose.yml references .env in Docker Compose env_file; replace with environment: pass-through or mark required: false"
+    ));
+    assert!(text_warnings.contains(
+        &"apps/web/compose.yml may interpolate .env (${VAR}) through Docker Compose; run via `locket compose run --policy <name> -- ...`"
+    ));
     preview.push("--json");
     let (code, report) = run_env_json(&context, &preview, &canaries)?;
     assert_eq!(code, 0);
@@ -1149,6 +1157,82 @@ fn import_archive_ignores_symlinked_and_oversize_consumers_at_git_boundaries()
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn import_archive_warns_about_make_and_one_hop_script_consumers()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::symlink;
+
+    let workspace = tempdir()?;
+    let root = workspace.path();
+    let app = root.join("apps/web");
+    let scripts = app.join("scripts");
+    fs::create_dir_all(&scripts)?;
+    run_git(root, &["init", "-q"])?;
+    let context = RuntimeContext { cwd: app.clone(), ..test_context(&workspace) };
+    run_env_command(&context, &["init", "--no-device", "--no-passkey"], &[])?;
+    let canaries = ["source-value-fixture", "recipe-value-fixture", "shell-value-fixture"];
+    fs::write(app.join(".env"), format!("TOKEN={}\n", canaries[0]))?;
+    fs::write(
+        root.join("Makefile"),
+        "include apps/web/.env\nstart:\n\tnode --env-file=apps/web/.env app.js # recipe-value-fixture\n",
+    )?;
+    fs::write(app.join("makefile"), "-include .env\nstart:\n\tcp -n .env.example .env\n")?;
+    fs::write(app.join("GNUmakefile"), "sinclude .env\nstart:\n\tdotenv -e .env -- node app.js\n")?;
+    fs::write(
+        app.join("package.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "scripts": {
+                "copy": "cp .env.example .env",
+                "dev": "./scripts/dev.sh",
+                "move": "sh scripts/move.sh",
+                "install-env": "bash ./scripts/install.sh",
+                "indirect": "./scripts/indirect.sh",
+                "skip-link": "sh scripts/link.sh",
+                "skip-link-dir": "sh linked-scripts/dev.sh",
+                "skip-large": "sh scripts/large.sh"
+            }
+        }))?,
+    )?;
+    fs::write(
+        scripts.join("dev.sh"),
+        "#!/bin/sh\nENV_FILE=\".env\"\ncp -n .env.example \"$ENV_FILE\" # shell-value-fixture\n",
+    )?;
+    fs::write(scripts.join("move.sh"), "mv .env.example .env\n")?;
+    fs::write(
+        scripts.join("install.sh"),
+        "ROOT_DIR=$(pwd)\nENV_FILE=\"$ROOT_DIR/.env\"\ninstall .env.example \"$ENV_FILE\"\n",
+    )?;
+    fs::write(scripts.join("indirect.sh"), "sh scripts/dev.sh\n")?;
+    symlink("dev.sh", scripts.join("link.sh"))?;
+    symlink("scripts", app.join("linked-scripts"))?;
+    fs::write(scripts.join("large.sh"), "cp .env.example .env\n")?;
+    fs::OpenOptions::new().write(true).open(scripts.join("large.sh"))?.set_len(64 * 1024 + 1)?;
+    symlink("apps/web", root.join("web-alias"))?;
+    let (code, report) = run_env_json(
+        &context,
+        &["import", "../../web-alias/.env", "--archive", "backups", "--dry-run", "--json"],
+        &canaries,
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        report["archive_consumer_warnings"],
+        serde_json::json!([
+            "Makefile includes .env in Makefile",
+            "Makefile recipe may still read .env",
+            "apps/web/GNUmakefile includes .env in Makefile",
+            "apps/web/GNUmakefile recipe may still read .env",
+            "apps/web/makefile includes .env in Makefile",
+            "apps/web/makefile recipe may recreate .env",
+            "apps/web/package.json script \"copy\" may recreate .env",
+            "apps/web/scripts/dev.sh (invoked by apps/web/package.json script \"dev\") may recreate .env",
+            "apps/web/scripts/install.sh (invoked by apps/web/package.json script \"install-env\") may recreate .env",
+            "apps/web/scripts/move.sh (invoked by apps/web/package.json script \"move\") may recreate .env"
+        ])
+    );
+    Ok(())
+}
+
 #[test]
 fn import_archive_only_checks_the_source_directory_outside_the_project()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -1180,7 +1264,7 @@ fn import_archive_only_checks_the_source_directory_outside_the_project()
     assert_eq!(
         report["archive_consumer_warnings"],
         serde_json::json!([
-            "../other/compose.override.yaml may still read .env through Docker Compose"
+            "../other/compose.override.yaml may interpolate .env (${VAR}) through Docker Compose; run via `locket compose run --policy <name> -- ...`"
         ])
     );
     Ok(())
@@ -1323,9 +1407,9 @@ fn import_archive_if_matching_previews_and_archives_an_already_imported_file()
     assert_eq!(report["verified_matching_names"], serde_json::json!(["TOKEN", "ZETA"]));
     assert_eq!(report["delete_env"], "would-archive");
     assert!(
-        report["archive_scope_note"]
-            .as_str()
-            .is_some_and(|note| note.contains("checks vault values only")),
+        report["archive_scope_note"].as_str().is_some_and(
+            |note| note.contains("dotenv/config") && note.contains("locket run <policy>")
+        ),
         "missing archive_scope_note: {report}"
     );
     assert!(report.get("archive_consumer_warnings").is_none());
@@ -1594,6 +1678,13 @@ fn import_archive_requires_git_ignore_inside_project() -> Result<(), Box<dyn std
         &["ignored-archive-fixture"],
     )?;
     assert_ne!(code, 0);
+    assert_eq!(report["imported"], 1);
+    assert_eq!(report["delete_env"], "kept");
+    assert!(
+        report["archive_error"]
+            .as_str()
+            .is_some_and(|message| message.contains("must be ignored by Git"))
+    );
     assert!(
         report["error"]["message"]
             .as_str()
@@ -1630,6 +1721,111 @@ fn import_archive_requires_git_ignore_inside_project() -> Result<(), Box<dyn std
     Ok(())
 }
 
+#[test]
+fn import_archive_checks_git_destinations_outside_the_monorepo_subpackage()
+-> Result<(), Box<dyn std::error::Error>> {
+    let workspace = tempdir()?;
+    run_git(workspace.path(), &["init", "-q", "main"])?;
+    let main = workspace.path().join("main");
+    run_git(
+        &main,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "initial",
+        ],
+    )?;
+    run_git(&main, &["worktree", "add", "-qb", "monorepo", "../checkout"])?;
+    let root = workspace.path().join("checkout");
+    let app = root.join("apps/web");
+    fs::create_dir_all(&app)?;
+    assert!(root.join(".git").is_file());
+    let context = RuntimeContext { cwd: app.clone(), ..test_context(&workspace) };
+    run_env_command(&context, &["init", "--no-device", "--no-passkey"], &[])?;
+    assert!(!root.join("locket.toml").exists());
+    let source = app.join(".env");
+    let canary = "monorepo-archive-value-fixture";
+    let contents = format!("TOKEN={canary}\n");
+    fs::write(&source, &contents)?;
+
+    let args = ["import", ".env", "--archive", "../backups", "--json"];
+    let preview = [args.as_slice(), &["--dry-run"]].concat();
+    let destination = root.join("apps/backups");
+    let (code, report) = run_env_json(&context, &preview, &[canary])?;
+    assert_eq!(code, 0);
+    assert_eq!(report["delete_env"], "kept");
+    assert_eq!(report["archive_directory"], destination.display().to_string());
+    assert!(
+        report["archive_blocked_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("must be ignored by Git"))
+    );
+    assert!(!destination.exists());
+    let (code, report) = run_env_json(&context, &args, &[canary])?;
+    assert_ne!(code, 0);
+    assert_eq!(report["imported_names"], serde_json::json!(["TOKEN"]));
+    assert_eq!(report["delete_env"], "kept");
+    assert!(report["archive_error"].is_string());
+    assert_eq!(fs::read_to_string(&source)?, contents);
+    assert_eq!(fs::read_dir(&destination)?.count(), 0);
+    fs::remove_dir(&destination)?;
+
+    fs::write(root.join(".gitignore"), "/apps/backups/\n")?;
+    let (code, report) = run_env_json(
+        &context,
+        &[preview.as_slice(), &["--archive-if-matching"]].concat(),
+        &[canary],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(report["delete_env"], "would-archive");
+    assert_eq!(report["verified_matching"], 1);
+    assert_eq!(report["archive_directory"], destination.display().to_string());
+    assert!(!destination.exists());
+    let (code, report) =
+        run_env_json(&context, &[args.as_slice(), &["--archive-if-matching"]].concat(), &[canary])?;
+    assert_eq!(code, 0);
+    assert_eq!(report["delete_env"], "archived");
+    assert!(report.get("archive_error").is_none());
+    assert!(!source.exists());
+    assert_eq!(fs::read_dir(destination)?.count(), 1);
+    Ok(())
+}
+
+#[test]
+fn import_archive_keeps_source_when_git_cannot_check_the_destination()
+-> Result<(), Box<dyn std::error::Error>> {
+    let project = tempdir()?;
+    let context = test_context(&project);
+    run_env_command(&context, &["init", "--no-device", "--no-passkey"], &[])?;
+    let canary = "git-archive-error-value-fixture";
+    let source = project.path().join(".env");
+    fs::write(&source, format!("TOKEN={canary}\n"))?;
+    let other = project.path().join("broken-worktree");
+    fs::create_dir(&other)?;
+    fs::write(other.join(".git"), "gitdir: missing\n")?;
+    fs::write(other.join(".gitignore"), "/backups/\n")?;
+    let args = ["import", ".env", "--archive", "broken-worktree/backups", "--json"];
+    let (code, preview) =
+        run_env_json(&context, &[args.as_slice(), &["--dry-run"]].concat(), &[canary])?;
+    assert_eq!(code, 0);
+    assert_eq!(preview["delete_env"], "kept");
+    assert!(preview["archive_blocked_reason"].is_string());
+    assert!(!other.join("backups").exists());
+    let (code, report) = run_env_json(&context, &args, &[canary])?;
+    assert_ne!(code, 0);
+    assert_eq!(report["imported"], 1);
+    assert_eq!(report["delete_env"], "kept");
+    assert!(report["archive_error"].is_string());
+    assert!(source.exists());
+    assert_eq!(fs::read_dir(other.join("backups"))?.count(), 0);
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn import_archive_rejects_symlink_destination_and_preserves_source()
@@ -1646,6 +1842,22 @@ fn import_archive_rejects_symlink_destination_and_preserves_source()
     let contents = "TOKEN=symlink-archive-fixture\n";
     fs::write(&source, contents)?;
     std::os::unix::fs::symlink(outside.path(), project.path().join("backups"))?;
+    fs::write(project.path().join("file"), "not a directory")?;
+    for destination in ["backups/", "backups/nested/out", "backups/../other", "file/nested"] {
+        let (code, report) = run_env_json(
+            &context,
+            &["import", ".env", "--archive", destination, "--dry-run", "--json"],
+            &["symlink-archive-fixture"],
+        )?;
+        assert_eq!(code, 0);
+        assert_eq!(report["delete_env"], "kept");
+        assert!(
+            report["archive_blocked_reason"]
+                .as_str()
+                .is_some_and(|message| message.contains("archive destination must be a directory"))
+        );
+    }
+    assert!(!project.path().join("other").exists());
     let mut output = Vec::new();
     let code = run_with_context(
         Cli::try_parse_from(["locket", "import", ".env", "--archive", "backups/", "--json"])?,
@@ -1658,6 +1870,15 @@ fn import_archive_rejects_symlink_destination_and_preserves_source()
     assert!(!output.contains("symlink-archive-fixture"));
     assert_eq!(fs::read_to_string(source)?, contents);
     assert_eq!(fs::read_dir(outside.path())?.count(), 0);
+    let (code, output) = run_env_command(
+        &context,
+        &["import", ".env", "--archive", "backups/nested", "--overwrite"],
+        &["symlink-archive-fixture"],
+    )?;
+    assert_ne!(code, 0);
+    assert!(output.contains("overwritten: 1\n"));
+    assert!(output.contains("delete_env: kept\n"));
+    assert!(output.contains("archive_error: "));
     Ok(())
 }
 
@@ -1824,9 +2045,18 @@ fn env_scan_groups_keys_across_repos_and_ignores_templates()
     )?;
     std::fs::write(root.join("one/.env.local"), format!("SAME_ROOT={}\n", canaries[1]))?;
     std::fs::write(root.join("two/.env.staging"), format!("BOTH={}\n", canaries[2]))?;
-    for path in
-        ["one/node_modules/package/.env", "two/.env.example", "two/.env.local.bak", "one/.git/.env"]
-    {
+    for path in [
+        "one/node_modules/package/.env",
+        "one/.git/.env",
+        "two/.env.example",
+        "two/.env.local.example",
+        "two/.env.prod.SAMPLE",
+        "two/.env.json",
+        "two/.env.schema.json",
+        "two/.env.ts",
+        "two/.env.yaml",
+        "two/.env.local.bak",
+    ] {
         std::fs::write(root.join(path), "IGNORED=fixture\n")?;
     }
     #[cfg(unix)]
@@ -1854,6 +2084,15 @@ fn env_scan_groups_keys_across_repos_and_ignores_templates()
     let (_, shallow) =
         run_env_json(&context, &["env", "scan", "--depth", "2", "--json"], &canaries)?;
     assert_eq!(shallow["total_files"], 2);
+    let (code, text) = run_env_command(&context, &["env", "scan"], &canaries)?;
+    assert_eq!(code, 0);
+    assert!(text.lines().any(|line| line.contains(".env.local\"") && line.contains("locket=no")));
+    assert!(
+        text.lines().any(|line| line.contains(".env.staging\"") && line.contains("locket=yes"))
+    );
+    let (_, explicit) =
+        run_env_json(&context, &["env", "keys", "two/.env.json", "--json"], &canaries)?;
+    assert_eq!(explicit["keys"], serde_json::json!(["IGNORED"]));
     assert!(!context.store_path.exists());
     Ok(())
 }
