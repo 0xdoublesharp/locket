@@ -1,7 +1,7 @@
 //! Static, metadata-only hints for files that may still consume a dotenv source.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io::Read as _;
 use std::iter::Peekable;
@@ -10,14 +10,18 @@ use std::str::Chars;
 
 use serde_json::Value;
 
-use super::env_files::InputDirectory;
+use super::env_files::{InputDirectory, SKIP_DIRECTORIES};
 use super::git_worktree_root;
 
 const MAX_CONFIG_BYTES: u64 = 256 * 1024;
 const MAX_SCRIPT_BYTES: u64 = 64 * 1024;
 const MAX_SCRIPTS: usize = 16;
 const MAX_ANCESTORS: usize = 8;
+const MAX_SUBDIR_DEPTH: usize = 2;
+const MAX_SUBDIRS: usize = 64;
+const MAX_SUBDIR_COMPOSE_FILES: usize = 32;
 const MAX_STATIC_WORD_BYTES: usize = 4096;
+const MAX_SUBST_DEPTH: usize = 4;
 
 pub(super) fn detect_archive_consumers(source: &Path, root: Option<&Path>) -> Vec<String> {
     let (Some(parent), Some(name)) = (source.parent(), source.file_name()) else {
@@ -43,6 +47,33 @@ pub(super) fn detect_archive_consumers(source: &Path, root: Option<&Path>) -> Ve
         scan.directory(&directory, dir);
         if dir == boundary {
             break;
+        }
+    }
+    if in_project.is_some() {
+        let mut visited = BTreeSet::new();
+        let mut dirs_budget = MAX_SUBDIRS;
+        let mut files_budget = MAX_SUBDIR_COMPOSE_FILES;
+        if let Ok(directory) = InputDirectory::open(&parent) {
+            scan.compose_subdirectories(
+                &directory,
+                &parent,
+                MAX_SUBDIR_DEPTH,
+                &mut visited,
+                &mut dirs_budget,
+                &mut files_budget,
+            );
+        }
+        if boundary != parent
+            && let Ok(directory) = InputDirectory::open(boundary)
+        {
+            scan.compose_subdirectories(
+                &directory,
+                boundary,
+                1,
+                &mut visited,
+                &mut dirs_budget,
+                &mut files_budget,
+            );
         }
     }
     scan.warnings.sort_unstable();
@@ -103,6 +134,99 @@ impl ConsumerScan<'_> {
             }
         }
         self.package_scripts(directory, dir, &source_name, matches_source);
+        if implicit {
+            self.cargo_dotenv_dependencies(directory, dir, &source_name);
+        }
+    }
+
+    fn compose_subdirectories(
+        &mut self,
+        directory: &InputDirectory,
+        dir: &Path,
+        remaining_depth: usize,
+        visited: &mut BTreeSet<PathBuf>,
+        dirs_budget: &mut usize,
+        files_budget: &mut usize,
+    ) {
+        if remaining_depth == 0 || *dirs_budget == 0 || *files_budget == 0 {
+            return;
+        }
+        let mut names = directory.names().unwrap_or_default();
+        names.sort_unstable();
+        let source = self.source;
+        let source_name =
+            source.file_name().unwrap_or_default().to_string_lossy().escape_debug().to_string();
+        for entry in names {
+            if *dirs_budget == 0 || *files_budget == 0 {
+                break;
+            }
+            let Some(name) = entry.to_str() else { continue };
+            if name.starts_with('.') || SKIP_DIRECTORIES.contains(&name) {
+                continue;
+            }
+            if !directory.is_directory(&entry) {
+                continue;
+            }
+            let child_path = dir.join(name);
+            if !visited.insert(child_path.clone()) {
+                continue;
+            }
+            *dirs_budget -= 1;
+            let Ok(child_dir) = directory.child_directory(&entry) else { continue };
+            let mut child_names = child_dir.names().unwrap_or_default();
+            child_names.sort_unstable();
+            let matches_source =
+                |literal: &str| normalized_path(&child_path.join(literal)) == source;
+            for file in child_names.iter().filter_map(|file| file.to_str()) {
+                if *files_budget == 0 {
+                    break;
+                }
+                if !is_compose_file(file) {
+                    continue;
+                }
+                *files_budget -= 1;
+                let Some(text) = read_config(&child_dir, file, MAX_CONFIG_BYTES) else { continue };
+                if compose_references(&text, matches_source) {
+                    let path = relative_display(self.root, &child_path.join(file));
+                    self.warnings.push(format!(
+                        "{path} references {source_name} in Docker Compose env_file; replace with environment: pass-through or mark required: false"
+                    ));
+                }
+            }
+            self.compose_subdirectories(
+                &child_dir,
+                &child_path,
+                remaining_depth - 1,
+                visited,
+                dirs_budget,
+                files_budget,
+            );
+        }
+    }
+
+    fn cargo_dotenv_dependencies(
+        &mut self,
+        directory: &InputDirectory,
+        dir: &Path,
+        source_name: &str,
+    ) {
+        let Some(text) = read_config(directory, "Cargo.toml", MAX_CONFIG_BYTES) else { return };
+        let Ok(manifest) = toml::from_str::<toml::Value>(&text) else { return };
+        let path = relative_display(self.root, &dir.join("Cargo.toml"));
+        for dep in ["dotenvy", "dotenv"] {
+            let declared =
+                ["dependencies", "dev-dependencies", "build-dependencies"].iter().any(|section| {
+                    manifest
+                        .get(*section)
+                        .and_then(toml::Value::as_table)
+                        .is_some_and(|table| table.contains_key(dep))
+                });
+            if declared {
+                self.warnings.push(format!(
+                    "{path} depends on {dep}; Rust code calling `{dep}::dotenv()` requires `locket run <policy>` or `locket exec` once {source_name} is archived"
+                ));
+            }
+        }
     }
 
     fn package_scripts(
@@ -114,13 +238,31 @@ impl ConsumerScan<'_> {
     ) {
         let Some(text) = read_config(directory, "package.json", MAX_CONFIG_BYTES) else { return };
         let Ok(manifest) = serde_json::from_str::<Value>(&text) else { return };
-        let Some(scripts) = manifest.get("scripts").and_then(Value::as_object) else { return };
         let path = relative_display(self.root, &dir.join("package.json"));
+        if self.source.parent() == Some(dir) && self.source.file_name() == Some(OsStr::new(".env"))
+        {
+            for dep in ["dotenv", "dotenvx", "@dotenvx/dotenvx"] {
+                let declared = ["dependencies", "devDependencies", "optionalDependencies"]
+                    .iter()
+                    .any(|section| {
+                        manifest
+                            .get(*section)
+                            .and_then(Value::as_object)
+                            .is_some_and(|table| table.contains_key(dep))
+                    });
+                if declared {
+                    self.warnings.push(format!(
+                        "{path} depends on {dep}; code loading {source_name} (such as `import 'dotenv/config'`) requires `locket run <policy>` or `locket exec` once archived"
+                    ));
+                }
+            }
+        }
+        let Some(scripts) = manifest.get("scripts").and_then(Value::as_object) else { return };
         for (name, script) in scripts {
             let Some(script) = script.as_str() else { continue };
             let mut reads = false;
             let mut recreates = false;
-            shell_commands(script, None, |words| {
+            shell_commands(script, None, None, |words| {
                 reads |= command_references(words, &matches_source);
                 recreates |= command_recreates(words, &matches_source);
                 if let Some(script) = local_script_argument(words)
@@ -163,10 +305,11 @@ impl ConsumerScan<'_> {
             recreates_in: BTreeMap::new(),
         });
         let text = script.text.as_deref()?;
+        let path_ctx = StaticPathContext { cwd, script_dir: &parent };
         if *script
             .recreates_in
             .entry(cwd.to_owned())
-            .or_insert_with(|| local_script_recreates(text, matches_source))
+            .or_insert_with(|| local_script_recreates(text, path_ctx, matches_source))
         {
             Some(relative_display(root, &path))
         } else {
@@ -198,7 +341,7 @@ fn makefile_references(text: &str, matches_source: impl Fn(&str) -> bool) -> (bo
     for line in text.lines() {
         if let Some(recipe) = line.strip_prefix('\t') {
             let recipe = recipe.trim_start().trim_start_matches(['@', '-', '+']);
-            shell_commands(recipe, None, |words| {
+            shell_commands(recipe, None, None, |words| {
                 reads |= command_references(words, &matches_source);
                 recreates |= command_recreates(words, &matches_source);
                 false
@@ -206,7 +349,7 @@ fn makefile_references(text: &str, matches_source: impl Fn(&str) -> bool) -> (bo
         } else if let Some((directive, files)) = line.trim_start().split_once(char::is_whitespace)
             && matches!(directive, "include" | "-include" | "sinclude")
         {
-            includes |= shell_commands(files, None, |words| {
+            includes |= shell_commands(files, None, None, |words| {
                 words.iter().flatten().any(|name| matches_source(name))
             });
         }
@@ -216,7 +359,9 @@ fn makefile_references(text: &str, matches_source: impl Fn(&str) -> bool) -> (bo
 
 fn is_compose_file(name: &str) -> bool {
     name.rsplit_once('.').is_some_and(|(stem, extension)| {
-        (stem.starts_with("compose") || stem.starts_with("docker-compose"))
+        (stem.starts_with("compose")
+            || stem.starts_with("docker-compose")
+            || stem.ends_with(".compose"))
             && (extension.eq_ignore_ascii_case("yml") || extension.eq_ignore_ascii_case("yaml"))
     })
 }
@@ -404,9 +549,16 @@ fn unquoted_yaml_chars(line: &str) -> impl Iterator<Item = (usize, char)> {
     })
 }
 
+#[derive(Clone, Copy)]
+struct StaticPathContext<'a> {
+    cwd: &'a Path,
+    script_dir: &'a Path,
+}
+
 fn shell_commands(
     script: &str,
     variables: Option<&BTreeMap<String, String>>,
+    path_ctx: Option<StaticPathContext<'_>>,
     mut visit: impl FnMut(&[Option<String>]) -> bool,
 ) -> bool {
     let mut chars = script.chars().peekable();
@@ -433,7 +585,9 @@ fn shell_commands(
             '<' | '>' => return visit(&words),
             '(' | ')' => return false,
             _ => {
-                let Ok(word) = shell_word(&mut chars, variables, false) else { return false };
+                let Ok(word) = shell_word(&mut chars, variables, path_ctx, false, 0) else {
+                    return false;
+                };
                 words.push(word);
             }
         }
@@ -444,8 +598,13 @@ fn shell_commands(
 fn shell_word(
     chars: &mut Peekable<Chars<'_>>,
     variables: Option<&BTreeMap<String, String>>,
-    allow_pwd: bool,
+    path_ctx: Option<StaticPathContext<'_>>,
+    allow_static_subst: bool,
+    depth: usize,
 ) -> Result<Option<String>, ()> {
+    if depth > MAX_SUBST_DEPTH {
+        return Err(());
+    }
     let mut word = String::new();
     let mut quote = None;
     let mut literal = true;
@@ -473,20 +632,36 @@ fn shell_word(
             '\x60' if quote != Some('\'') => return Err(()),
             '$' if quote != Some('\'') => {
                 if chars.peek() == Some(&'(') {
-                    if !allow_pwd || !"(pwd)".chars().all(|ch| chars.next() == Some(ch)) {
+                    if !allow_static_subst {
                         return Err(());
                     }
-                    word.push('.');
+                    let Some(ctx) = path_ctx else { return Err(()) };
+                    let inner = take_balanced_parens(chars)?;
+                    let Some(resolved) =
+                        eval_static_command_subst(&inner, variables, ctx, depth + 1)
+                    else {
+                        return Err(());
+                    };
+                    if word.len() + resolved.len() > MAX_STATIC_WORD_BYTES {
+                        return Err(());
+                    }
+                    word.push_str(&resolved);
                 } else if let Some(variables) = variables {
-                    let name = shell_variable_name(chars)?;
-                    if let Some(value) = variables.get(&name) {
+                    let expanded = expand_shell_variable(
+                        chars,
+                        variables,
+                        path_ctx,
+                        allow_static_subst,
+                        depth,
+                    )?;
+                    if let Some(value) = expanded {
                         if word.len() + value.len() > MAX_STATIC_WORD_BYTES {
                             return Err(());
                         }
                         if quote.is_none() && value.contains(char::is_whitespace) {
                             literal = false;
                         }
-                        word.push_str(value);
+                        word.push_str(&value);
                     } else {
                         literal = false;
                     }
@@ -505,16 +680,210 @@ fn shell_word(
     if quote.is_some() { Err(()) } else { Ok(literal.then_some(word)) }
 }
 
-fn shell_variable_name(chars: &mut Peekable<Chars<'_>>) -> Result<String, ()> {
-    let braced = chars.peek() == Some(&'{');
-    if braced {
+fn take_balanced_parens(chars: &mut Peekable<Chars<'_>>) -> Result<String, ()> {
+    if chars.next() != Some('(') {
+        return Err(());
+    }
+    let mut inner = String::new();
+    let mut paren_depth = 1_usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in chars.by_ref() {
+        if escaped {
+            escaped = false;
+            inner.push(ch);
+            continue;
+        }
+        if quote == Some('"') && ch == '\\' {
+            escaped = true;
+            inner.push(ch);
+            continue;
+        }
+        if quote == Some(ch) {
+            quote = None;
+            inner.push(ch);
+            continue;
+        }
+        if quote.is_none() {
+            match ch {
+                '\'' | '"' => quote = Some(ch),
+                '(' => paren_depth += 1,
+                ')' => {
+                    paren_depth -= 1;
+                    if paren_depth == 0 {
+                        return Ok(inner);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if inner.len() >= MAX_STATIC_WORD_BYTES {
+            return Err(());
+        }
+        inner.push(ch);
+    }
+    Err(())
+}
+
+fn expand_shell_variable(
+    chars: &mut Peekable<Chars<'_>>,
+    variables: &BTreeMap<String, String>,
+    path_ctx: Option<StaticPathContext<'_>>,
+    allow_static_subst: bool,
+    depth: usize,
+) -> Result<Option<String>, ()> {
+    if chars.peek() == Some(&'{') {
         chars.next();
+        let mut expr = String::new();
+        let mut brace_depth = 1_usize;
+        for ch in chars.by_ref() {
+            match ch {
+                '{' => brace_depth += 1,
+                '}' => {
+                    brace_depth -= 1;
+                    if brace_depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            if expr.len() >= MAX_STATIC_WORD_BYTES {
+                return Err(());
+            }
+            expr.push(ch);
+        }
+        if brace_depth != 0 {
+            return Err(());
+        }
+        if matches!(expr.as_str(), "BASH_SOURCE" | "BASH_SOURCE[0]" | "0") {
+            return Ok(
+                path_ctx.map(|ctx| ctx.script_dir.join("_script").to_string_lossy().into_owned())
+            );
+        }
+        if let Some((name, default)) = expr.split_once(":-") {
+            if let Some(value) = variables.get(name).filter(|value| !value.is_empty()) {
+                return Ok(Some(value.clone()));
+            }
+            let mut default_chars = default.chars().peekable();
+            let resolved = shell_word(
+                &mut default_chars,
+                Some(variables),
+                path_ctx,
+                allow_static_subst,
+                depth + 1,
+            )?;
+            return Ok(default_chars.peek().is_none().then_some(resolved).flatten());
+        }
+        return Ok(variables.get(&expr).cloned());
+    }
+    if chars.peek() == Some(&'0') {
+        chars.next();
+        return Ok(
+            path_ctx.map(|ctx| ctx.script_dir.join("_script").to_string_lossy().into_owned())
+        );
     }
     let mut name = String::new();
     while let Some(ch) = chars.next_if(|ch| ch.is_ascii_alphanumeric() || *ch == '_') {
         name.push(ch);
     }
-    if braced && chars.next() != Some('}') { Err(()) } else { Ok(name) }
+    if name == "BASH_SOURCE" {
+        return Ok(
+            path_ctx.map(|ctx| ctx.script_dir.join("_script").to_string_lossy().into_owned())
+        );
+    }
+    Ok(variables.get(&name).cloned())
+}
+
+fn eval_static_command_subst(
+    inner: &str,
+    variables: Option<&BTreeMap<String, String>>,
+    ctx: StaticPathContext<'_>,
+    depth: usize,
+) -> Option<String> {
+    let trimmed = inner.trim();
+    if trimmed == "pwd" {
+        return Some(if ctx.cwd.as_os_str().is_empty() {
+            ".".to_owned()
+        } else {
+            ctx.cwd.to_string_lossy().into_owned()
+        });
+    }
+    if let Some(rest) =
+        trimmed.strip_prefix("dirname").filter(|rest| rest.starts_with(char::is_whitespace))
+    {
+        let arg = eval_single_static_arg(rest.trim(), variables, ctx, depth)?;
+        let path = normalized_path(Path::new(&arg));
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        return Some(parent.to_string_lossy().into_owned());
+    }
+    if let Some((before_and, after_and)) = trimmed.split_once("&&")
+        && after_and.trim() == "pwd"
+        && let Some(cd_rest) = before_and
+            .trim()
+            .strip_prefix("cd")
+            .filter(|rest| rest.starts_with(char::is_whitespace))
+    {
+        let target_expr = strip_trailing_redirections(cd_rest.trim());
+        let arg = eval_single_static_arg(target_expr, variables, ctx, depth)?;
+        let resolved = if Path::new(&arg).is_absolute() || ctx.cwd.as_os_str().is_empty() {
+            normalized_path(Path::new(&arg))
+        } else {
+            normalized_path(&ctx.cwd.join(&arg))
+        };
+        return Some(resolved.to_string_lossy().into_owned());
+    }
+    None
+}
+
+fn eval_single_static_arg(
+    expr: &str,
+    variables: Option<&BTreeMap<String, String>>,
+    ctx: StaticPathContext<'_>,
+    depth: usize,
+) -> Option<String> {
+    let expr = expr.strip_prefix("--").map_or(expr, str::trim_start);
+    let mut chars = expr.chars().peekable();
+    let value = shell_word(&mut chars, variables, Some(ctx), true, depth).ok().flatten()?;
+    (chars.collect::<String>().trim().is_empty() && !value.is_empty()).then_some(value)
+}
+
+fn strip_trailing_redirections(expr: &str) -> &str {
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, ch) in expr.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quote == Some('"') && ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if quote == Some(ch) {
+            quote = None;
+            continue;
+        }
+        if quote.is_none() {
+            if matches!(ch, '\'' | '"') {
+                quote = Some(ch);
+            } else if matches!(ch, '>' | '<') {
+                let prefix = expr[..index].trim_end();
+                return prefix
+                    .strip_suffix('&')
+                    .or_else(|| prefix.strip_suffix('2'))
+                    .or_else(|| prefix.strip_suffix('1'))
+                    .filter(|trimmed| {
+                        trimmed.is_empty()
+                            || trimmed.chars().last().is_some_and(char::is_whitespace)
+                    })
+                    .map_or(prefix, str::trim_end);
+            }
+        }
+    }
+    expr
 }
 
 fn local_script_argument(words: &[Option<String>]) -> Option<&str> {
@@ -533,7 +902,11 @@ fn local_script_argument(words: &[Option<String>]) -> Option<&str> {
         .then_some(program)
 }
 
-fn local_script_recreates(script: &str, matches_source: impl Fn(&str) -> bool) -> bool {
+fn local_script_recreates(
+    script: &str,
+    path_ctx: StaticPathContext<'_>,
+    matches_source: impl Fn(&str) -> bool,
+) -> bool {
     let mut variables = BTreeMap::new();
     for line in script.lines() {
         let line = line.trim_start();
@@ -548,7 +921,8 @@ fn local_script_recreates(script: &str, matches_source: impl Fn(&str) -> bool) -
             && is_shell_variable_name(name)
         {
             let mut chars = value.chars().peekable();
-            let value = shell_word(&mut chars, Some(&variables), true).ok().flatten();
+            let value =
+                shell_word(&mut chars, Some(&variables), Some(path_ctx), true, 0).ok().flatten();
             let trailing = chars.collect::<String>();
             if let Some(value) =
                 value.filter(|value| !value.is_empty() && value.len() <= MAX_STATIC_WORD_BYTES)
@@ -561,7 +935,7 @@ fn local_script_recreates(script: &str, matches_source: impl Fn(&str) -> bool) -
             continue;
         }
         let mut changes_context = false;
-        if shell_commands(line, Some(&variables), |words| {
+        if shell_commands(line, Some(&variables), Some(path_ctx), |words| {
             // The initial working directory is the package directory. Stop at commands
             // that could change it or invalidate the static assignment state.
             let program = words.first().and_then(Option::as_deref);
@@ -653,14 +1027,29 @@ mod tests {
 
     #[test]
     fn templates_resolve_only_literal_or_statically_assigned_destinations() {
-        let matches = |path: &str| normalized_path(Path::new(path)) == Path::new(".env");
+        let cwd = Path::new("/repo");
+        let script_dir = Path::new("/repo/scripts");
+        let ctx = StaticPathContext { cwd, script_dir };
+        let matches = |path: &str| normalized_path(&cwd.join(path)) == Path::new("/repo/.env");
         for script in [
             r#"cp -n ".env.example" "./.env""#,
             "mv -- .env.example .env",
             "ENV_FILE=.env\ncp .env.example \"$ENV_FILE\"",
             "REPO_ROOT=\"$(pwd)\"\nENV_FILE=\"${REPO_ROOT}/.env\"\ninstall .env.example \"$ENV_FILE\"",
+            concat!(
+                "SCRIPT_DIR=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd)\"\n",
+                "PROJECT_ROOT=\"$(dirname \"$SCRIPT_DIR\")\"\n",
+                "ENV_FILE=\"${ENV_FILE:-$PROJECT_ROOT/.env}\"\n",
+                "ensure_env() {\n",
+                "  cp \"$PROJECT_ROOT/.env.example\" \"$ENV_FILE\"\n",
+                "}\n",
+            ),
+            concat!(
+                "ROOT=\"$(cd \"$(dirname \"$0\")/..\" >/dev/null 2>&1 && pwd)\"\n",
+                "cp \"$ROOT/.env.example\" \"$ROOT/.env\"\n",
+            ),
         ] {
-            assert!(local_script_recreates(script, matches), "{script}");
+            assert!(local_script_recreates(script, ctx, matches), "{script}");
         }
         for script in [
             "cp .env .env.example",
@@ -673,8 +1062,79 @@ mod tests {
             "ENV_FILE=\"$ROOT_DIR/.env\"\ncp .env.example \"$ENV_FILE\"",
             "cat <<'EOF'\ncp .env.example .env\nEOF",
         ] {
-            assert!(!local_script_recreates(script, matches), "{script}");
+            assert!(!local_script_recreates(script, ctx, matches), "{script}");
         }
+    }
+
+    #[test]
+    fn consumer_scan_detects_subfolder_compose_manifest_loaders_and_script_dir_idiom()
+    -> io::Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path();
+        fs::create_dir(root.join(".git"))?;
+        fs::create_dir(root.join("deploy"))?;
+        fs::create_dir(root.join("scripts"))?;
+        fs::create_dir(root.join("node_modules"))?;
+        fs::write(root.join("deploy/compose.yaml"), "services:\n  app:\n    env_file: ../.env\n")?;
+        fs::write(
+            root.join("deploy/server.compose.yaml"),
+            "services:\n  app:\n    env_file: ../.env\n",
+        )?;
+        // Skipped directory must never be scanned.
+        fs::write(
+            root.join("node_modules/compose.yaml"),
+            "services:\n  app:\n    env_file: ../.env\n",
+        )?;
+        fs::write(
+            root.join("scripts/dev.sh"),
+            concat!(
+                "#!/usr/bin/env bash\n",
+                "SCRIPT_DIR=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd)\"\n",
+                "PROJECT_ROOT=\"$(dirname \"$SCRIPT_DIR\")\"\n",
+                "ENV_FILE=\"$PROJECT_ROOT/.env\"\n",
+                "ensure_env() {\n",
+                "  cp \"$PROJECT_ROOT/.env.example\" \"$ENV_FILE\"\n",
+                "}\n",
+            ),
+        )?;
+        fs::write(
+            root.join("package.json"),
+            serde_json::json!({
+                "scripts": { "dev:docker": "./scripts/dev.sh start" },
+                "dependencies": { "dotenv": "^17.4.2" }
+            })
+            .to_string(),
+        )?;
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\n[dependencies]\ndotenvy = \"0.15\"\n",
+        )?;
+
+        let warnings = detect_archive_consumers(&root.join(".env"), Some(root));
+        assert!(
+            warnings.iter().any(|w| w.starts_with("deploy/compose.yaml references .env")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.starts_with("deploy/server.compose.yaml references .env")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains(
+                "scripts/dev.sh (invoked by package.json script \"dev:docker\") may recreate .env"
+            )),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.starts_with("package.json depends on dotenv;")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.starts_with("Cargo.toml depends on dotenvy;")),
+            "{warnings:?}"
+        );
+        assert!(!warnings.iter().any(|w| w.contains("node_modules")), "{warnings:?}");
+        Ok(())
     }
 
     #[test]

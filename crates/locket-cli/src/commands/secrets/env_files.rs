@@ -14,7 +14,7 @@ use zeroize::Zeroizing;
 use crate::runtime::error::{CliError, metadata_invalid_error};
 
 const MAX_ENV_BYTES: usize = 1024 * 1024;
-const SKIP_DIRECTORIES: &[&str] = &[
+pub(super) const SKIP_DIRECTORIES: &[&str] = &[
     ".git",
     "node_modules",
     "target",
@@ -191,7 +191,7 @@ impl InputDirectory {
         }
     }
 
-    fn child_directory(&self, name: &OsStr) -> io::Result<Self> {
+    pub(super) fn child_directory(&self, name: &OsStr) -> io::Result<Self> {
         #[cfg(unix)]
         {
             use rustix::fs::{Mode, OFlags, openat};
@@ -280,6 +280,10 @@ impl InputDirectory {
 
     pub fn is_regular(&self, name: &str) -> bool {
         self.entry_kind(OsStr::new(name)).is_ok_and(|kind| kind == EntryKind::File)
+    }
+
+    pub(super) fn is_directory(&self, name: &OsStr) -> bool {
+        self.entry_kind(name).is_ok_and(|kind| kind == EntryKind::Directory)
     }
 
     pub fn child_has_file(&self, directory: &str, name: &str) -> bool {

@@ -1234,6 +1234,82 @@ fn import_archive_warns_about_make_and_one_hop_script_consumers()
 }
 
 #[test]
+fn import_archive_warns_on_subfolder_compose_manifest_loaders_and_bash_dev_script()
+-> Result<(), Box<dyn std::error::Error>> {
+    let workspace = tempdir()?;
+    let root = workspace.path().join("repo");
+    fs::create_dir_all(root.join(".git"))?;
+    fs::create_dir_all(root.join("deploy"))?;
+    fs::create_dir_all(root.join("scripts"))?;
+    let context = RuntimeContext { cwd: root.clone(), ..test_context(&workspace) };
+    run_env_command(&context, &["init", "--name", "repo", "--no-device", "--no-passkey"], &[])?;
+    let canary = "subfolder-consumer-secret-fixture";
+    fs::write(root.join(".env"), format!("API_KEY={canary}\n"))?;
+    fs::write(root.join("deploy/compose.yaml"), "services:\n  api:\n    env_file: ../.env\n")?;
+    fs::write(
+        root.join("scripts/dev.sh"),
+        concat!(
+            "#!/usr/bin/env bash\n",
+            "SCRIPT_DIR=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd)\"\n",
+            "PROJECT_ROOT=\"$(dirname \"$SCRIPT_DIR\")\"\n",
+            "ENV_FILE=\"$PROJECT_ROOT/.env\"\n",
+            "ensure_env() {\n",
+            "  cp \"$PROJECT_ROOT/.env.example\" \"$ENV_FILE\"\n",
+            "}\n",
+        ),
+    )?;
+    fs::write(
+        root.join("package.json"),
+        serde_json::json!({
+            "scripts": { "dev:docker": "./scripts/dev.sh start" },
+            "dependencies": { "dotenv": "^17.4.2" }
+        })
+        .to_string(),
+    )?;
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"repo\"\n[dependencies]\ndotenvy = \"0.15\"\n",
+    )?;
+    let backup = workspace.path().join("backups");
+    let args = [
+        "import",
+        ".env",
+        "--archive",
+        backup.to_str().ok_or("non-utf8 backup")?,
+        "--dry-run",
+        "--json",
+    ];
+    let (code, report) = run_env_json(&context, &args, &[canary])?;
+    assert_eq!(code, 0);
+    assert_eq!(report["delete_env"], "would-archive");
+    let warnings = report["archive_consumer_warnings"]
+        .as_array()
+        .ok_or("missing consumer warnings")?
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>();
+    assert!(
+        warnings.iter().any(|w| w.starts_with("deploy/compose.yaml references .env")),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains(
+            "scripts/dev.sh (invoked by package.json script \"dev:docker\") may recreate .env"
+        )),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings.iter().any(|w| w.starts_with("package.json depends on dotenv;")),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings.iter().any(|w| w.starts_with("Cargo.toml depends on dotenvy;")),
+        "{warnings:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn import_archive_only_checks_the_source_directory_outside_the_project()
 -> Result<(), Box<dyn std::error::Error>> {
     let workspace = tempdir()?;
