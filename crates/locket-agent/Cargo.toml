@@ -31,10 +31,10 @@ unimplemented = "deny"
 unwrap_used = "deny"
 
 [dependencies]
-locket-crypto = { version = "0.3.4", path = "../locket-crypto" }
-locket-core = { version = "0.3.4", path = "../locket-core" }
-locket-platform = { version = "0.3.4", path = "../locket-platform" }
-locket-store = { version = "0.3.4", path = "../locket-store" }
+locket-crypto = { version = "0.3.5", path = "../locket-crypto" }
+locket-core = { version = "0.3.5", path = "../locket-core" }
+locket-platform = { version = "0.3.5", path = "../locket-platform" }
+locket-store = { version = "0.3.5", path = "../locket-store" }
 data-encoding = { workspace = true }
 ed25519-dalek = { workspace = true }
 hmac = { workspace = true }
