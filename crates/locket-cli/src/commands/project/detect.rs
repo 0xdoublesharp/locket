@@ -12,6 +12,13 @@ use crate::runtime::error::{CliError, metadata_invalid_error};
 const PACKAGE_TASKS: &[&str] =
     &["dev", "start", "build", "test", "lint", "typecheck", "migrate", "db:migrate"];
 const MAKE_TARGETS: &[&str] = &["dev", "test", "build", "lint", "run"];
+const PACKAGE_MANAGER_MARKERS: &[(&str, &[&str])] = &[
+    ("pnpm", &["pnpm-lock.yaml", "pnpm-workspace.yaml"]),
+    ("yarn", &["yarn.lock"]),
+    ("bun", &["bun.lock", "bun.lockb"]),
+    ("npm", &["package-lock.json"]),
+];
+const PACKAGE_MANAGER_SEARCH_DEPTH: usize = 8;
 
 struct DetectedCommand {
     name: &'static str,
@@ -89,6 +96,13 @@ fn detect_commands(root: &Path, follow_links: bool) -> Result<Vec<DetectedComman
         };
         commands.push(DetectedCommand { name: "test", argv, source_file: "pyproject.toml" });
     }
+    if manifest_is_file(&root.join("foundry.toml"), follow_links) {
+        commands.extend(["build", "test"].map(|name| DetectedCommand {
+            name,
+            argv: vec!["forge", name],
+            source_file: "foundry.toml",
+        }));
+    }
     Ok(commands)
 }
 
@@ -114,17 +128,7 @@ fn package_commands(
     let Some(scripts) = document.get("scripts").and_then(serde_json::Value::as_object) else {
         return Ok(Vec::new());
     };
-    let runner = if manifest_is_file(&root.join("pnpm-lock.yaml"), follow_links) {
-        "pnpm"
-    } else if manifest_is_file(&root.join("yarn.lock"), follow_links) {
-        "yarn"
-    } else if manifest_is_file(&root.join("bun.lock"), follow_links)
-        || manifest_is_file(&root.join("bun.lockb"), follow_links)
-    {
-        "bun"
-    } else {
-        "npm"
-    };
+    let runner = package_manager(root, &document, follow_links);
     Ok(names
         .iter()
         .copied()
@@ -140,6 +144,35 @@ fn package_commands(
             source_file: "package.json",
         })
         .collect())
+}
+
+fn package_manager(root: &Path, document: &serde_json::Value, follow_links: bool) -> &'static str {
+    if let Some(declared) = document.get("packageManager").and_then(serde_json::Value::as_str) {
+        let name = declared.split_once('@').map_or(declared, |(name, _)| name);
+        if let Some((runner, _)) =
+            PACKAGE_MANAGER_MARKERS.iter().find(|(runner, _)| *runner == name)
+        {
+            return runner;
+        }
+    }
+    let directory_count = root
+        .ancestors()
+        .position(|directory| {
+            manifest_metadata(&directory.join(".git"), follow_links)
+                .is_ok_and(|metadata| metadata.is_dir() || metadata.is_file())
+        })
+        .map_or(1, |depth| (depth + 1).min(PACKAGE_MANAGER_SEARCH_DEPTH));
+    root.ancestors()
+        .take(directory_count)
+        .find_map(|directory| {
+            PACKAGE_MANAGER_MARKERS.iter().find_map(|(runner, markers)| {
+                markers
+                    .iter()
+                    .any(|marker| manifest_is_file(&directory.join(marker), follow_links))
+                    .then_some(*runner)
+            })
+        })
+        .unwrap_or("npm")
 }
 
 fn make_commands(

@@ -25,6 +25,7 @@ fn policy_detect_reports_metadata_across_manifests_without_initializing()
     )?;
     std::fs::write(root.join("pyproject.toml"), "[project]\nname='sample'\n")?;
     std::fs::write(root.join("uv.lock"), "")?;
+    std::fs::write(root.join("foundry.toml"), "")?;
 
     let mut output = Vec::new();
     let cli = Cli::try_parse_from(["locket", "policy", "detect", "--json"])?;
@@ -44,6 +45,8 @@ fn policy_detect_reports_metadata_across_manifests_without_initializing()
         ("dev", vec!["make", "dev"], "Makefile"),
         ("run", vec!["make", "run"], "Makefile"),
         ("test", vec!["uv", "run", "pytest"], "pyproject.toml"),
+        ("build", vec!["forge", "build"], "foundry.toml"),
+        ("test", vec!["forge", "test"], "foundry.toml"),
     ];
     assert_eq!(detected.len(), expected.len());
     for (name, argv, source_file) in expected {
@@ -104,6 +107,104 @@ fn policy_detect_uses_lockfile_runners_and_marks_existing_commands_from_subdirec
     run_with_context(Cli::try_parse_from(["locket", "policy", "detect"])?, &context, &mut output)?;
     assert!(String::from_utf8(output)?.contains("npm run dev"));
     assert_eq!(std::fs::read_to_string(root.join("locket.toml"))?, config);
+    Ok(())
+}
+
+#[test]
+fn policy_detect_resolves_package_managers_within_the_worktree()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let outside = directory.path();
+    let worktree = outside.join("repo");
+    let parent = worktree.join("packages");
+    let package = parent.join("app");
+    std::fs::create_dir_all(&package)?;
+    std::fs::write(outside.join("pnpm-lock.yaml"), "")?;
+    let mut context = test_context(&directory);
+    context.cwd = package.clone();
+
+    let assert_runner = |package_manager, runner| -> Result<(), Box<dyn std::error::Error>> {
+        std::fs::write(
+            package.join("package.json"),
+            json!({"packageManager": package_manager, "scripts": {"dev": "local-dev"}}).to_string(),
+        )?;
+        let mut output = Vec::new();
+        run_with_context(
+            Cli::try_parse_from(["locket", "policy", "detect", "--json"])?,
+            &context,
+            &mut output,
+        )?;
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&output)?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["argv"], json!([runner, "run", "dev"]));
+        Ok(())
+    };
+
+    assert_runner(None, "npm")?;
+    run_git(&worktree, &["init", "-q"])?;
+    assert_runner(None, "npm")?;
+    std::fs::write(worktree.join("pnpm-lock.yaml"), "")?;
+    assert_runner(None, "pnpm")?;
+    std::fs::remove_file(worktree.join("pnpm-lock.yaml"))?;
+    std::fs::write(worktree.join("pnpm-workspace.yaml"), "")?;
+    assert_runner(None, "pnpm")?;
+    assert_runner(Some("yarn@4.0.0"), "yarn")?;
+    assert_runner(Some("bun"), "bun")?;
+    std::fs::write(parent.join("bun.lock"), "")?;
+    assert_runner(Some("unknown@1.0.0"), "bun")?;
+    std::fs::write(package.join("package-lock.json"), "")?;
+    assert_runner(None, "npm")?;
+    std::fs::write(package.join("yarn.lock"), "")?;
+    assert_runner(None, "yarn")?;
+    Ok(())
+}
+
+#[test]
+fn policy_detect_respects_git_file_boundaries_and_the_marker_depth_limit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let root = directory.path();
+    let worktree = root.join("repo");
+    let package = worktree.join("one/two/three/four/five/six/seven/eight");
+    fs::create_dir_all(&package)?;
+    run_git(&worktree, &["init", "-q", "--separate-git-dir", "../git-metadata"])?;
+    assert!(worktree.join(".git").is_file());
+    fs::write(root.join("yarn.lock"), "")?;
+    fs::write(worktree.join("pnpm-lock.yaml"), "")?;
+    for path in [&worktree, &package] {
+        fs::write(path.join("package.json"), r#"{"scripts":{"dev":"local-dev"}}"#)?;
+    }
+    let detect = crate::commands::project::detect::detect_policy_commands;
+    assert_eq!(detect(&package, false)?[0].argv, ["npm", "run", "dev"]);
+    fs::write(worktree.join("one/two/bun.lock"), "")?;
+    assert_eq!(detect(&package, false)?[0].argv, ["bun", "run", "dev"]);
+    fs::remove_file(worktree.join("pnpm-lock.yaml"))?;
+    assert_eq!(detect(&worktree, false)?[0].argv, ["npm", "run", "dev"]);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn policy_detect_respects_manifest_symlink_settings() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let worktree = directory.path();
+    let package = worktree.join("app");
+    fs::create_dir(&package)?;
+    run_git(worktree, &["init", "-q"])?;
+    fs::write(worktree.join("marker"), "")?;
+    fs::write(package.join("package.json"), r#"{"scripts":{"dev":"local-dev"}}"#)?;
+    std::os::unix::fs::symlink("marker", worktree.join("pnpm-workspace.yaml"))?;
+    std::os::unix::fs::symlink("../marker", package.join("foundry.toml"))?;
+
+    let detect = crate::commands::project::detect::detect_policy_commands;
+    let no_follow = detect(&package, false)?;
+    assert_eq!(no_follow.len(), 1);
+    assert_eq!(no_follow[0].argv, ["npm", "run", "dev"]);
+    let follow = detect(&package, true)?;
+    assert_eq!(follow.len(), 3);
+    assert_eq!(follow[0].argv, ["pnpm", "run", "dev"]);
+    assert_eq!(follow[1].argv, ["forge", "build"]);
+    assert_eq!(follow[2].argv, ["forge", "test"]);
     Ok(())
 }
 

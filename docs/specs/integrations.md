@@ -65,14 +65,26 @@ Component checks:
 
 ## Git Integration & Pre-Commit
 
-`locket init`, `locket import`, and `locket team accept` must ensure `.gitignore` contains:
+`locket init`, `locket import`, and `locket team accept` protect local secret files with these ignore rules and keep the environment templates recognized by `locket env scan` visible to Git.
 
 ```text
 .env
 .env.*
 .locket.local
 .locketignore
+!.env.example
+!.env.sample
+!.env.template
+!.env.dist
+!.env.defaults
+!.env.*.example
+!.env.*.sample
+!.env.*.template
 ```
+
+Locket inherits a protection rule only when Git confirms that the winning rule for a representative path is a positive rule from a tracked `.gitignore` inside the worktree. Untracked parent files, global excludes, and `.git/info/exclude` do not count. Locket adds any unverified protection to the project's `.gitignore`, including when Git is unavailable or the project is outside a worktree. It adds template exceptions when Git reports that the template is ignored or when it adds the `.env.*` rule locally. The exceptions follow `.env.*` so Git applies them to templates.
+
+Ignoring `.locketignore` by default keeps scan suppressions per developer. One contributor cannot silently weaken pre-commit scanning for everyone by committing local suppressions through the normal Git workflow.
 
 Locket generates empty placeholders in `.env.example` for the union of active names across project profiles, including active shared-link aliases.
 
