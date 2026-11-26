@@ -94,8 +94,11 @@ fn ci_init_device_secure_file_and_output() -> TestResult {
     assert_eq!(Zeroizing::new(fs::read_to_string(&path)?), token);
     assert_eq!(fs::read_dir(directory.path())?.count(), 1);
 
-    let stdout: serde_json::Value =
-        serde_json::from_str(&owner_command(&context, &["ci", "init-device"])?)?;
+    assert!(Cli::try_parse_from(["locket", "ci", "init-device"]).is_err());
+    let stdout: serde_json::Value = serde_json::from_str(&owner_command(
+        &context,
+        &["ci", "init-device", "--print-private-identity"],
+    )?)?;
     assert!(json_str(&stdout, "ci_identity")?.starts_with("lkci1_"));
     assert!(json_str(&stdout, "descriptor")?.starts_with("lkdev2_"));
     assert_eq!(stdout["label"], "ci-runner");
@@ -264,6 +267,8 @@ fn round_trip(delivery: Delivery) -> TestResult {
         }),
     );
     assert_denied(&call("verify", &"0".repeat(64), &[])?, "owner pin and project");
+    assert_denied(&call("verify", pin, &["--min-epoch", "2"])?, "older than required --min-epoch");
+    assert_eq!(checked_json(&call("verify", pin, &["--min-epoch", "1"])?)?["epoch"], 1);
     if matches!(delivery, Delivery::Folder) {
         test_runner_execution(&call, pin)?;
         test_signed_heads(&context, runner.path(), &token, project, pin, folder.path())?;
@@ -288,14 +293,12 @@ fn round_trip(delivery: Delivery) -> TestResult {
     owner_confirmation.confirmation_reader = Arc::new(StaticConfirmationReader::new("ci-bot\n"));
     owner_command(&owner_confirmation, &["team", "remove", "ci-bot"])?;
     assert!(owner_command(&owner_confirmation, &["team", "publish"])?.contains("delivered 0"));
-    // The existing publisher keeps old delivery objects and emits no tombstone
-    // for the removed recipient. Remove its objects as part of offboarding.
+    // Owner-side prune deletes all remote packages belonging to removed/revoked recipients.
+    let pruned: serde_json::Value =
+        serde_json::from_str(&owner_command(&owner_confirmation, &["team", "remote", "prune"])?)?;
+    assert!(pruned["deleted"].as_u64().is_some_and(|deleted| deleted >= 2));
     if let Some(remote) = &remote {
-        remote.objects.lock().map_err(|_| "mock storage lock poisoned")?.clear();
-    } else {
-        for entry in fs::read_dir(folder.path())? {
-            fs::remove_file(entry?.path())?;
-        }
+        assert_eq!(remote.objects.lock().map_err(|_| "mock storage lock poisoned")?.len(), 0);
     }
     assert_denied(&call("verify", pin, &["--allow-dangerous"])?, "no CI package verified");
 
@@ -316,12 +319,32 @@ fn test_runner_execution(
     );
     let output = call("exec", pin, &["--secret", "CI_FIRST", "--", test_shell(), "-c", &script])?;
     assert_eq!(output.status.code(), Some(47), "{:?}", output.status);
+    #[cfg(unix)]
+    {
+        // On Unix, `ci exec` replaces locket via execve so $PPID is the caller test harness
+        // itself rather than a surviving locket parent holding LOCKET_CI_IDENTITY in its env.
+        let harness_pid = std::process::id();
+        let ppid_script = format!(
+            "test \"$PPID\" = '{harness_pid}' && ! (ps eww -p \"$PPID\" 2>/dev/null | grep -q 'lkci1_')"
+        );
+        let ppid_check =
+            call("exec", pin, &["--secret", "CI_FIRST", "--", test_shell(), "-c", &ppid_script])?;
+        assert!(
+            ppid_check.status.success(),
+            "parent process check failed: {}",
+            String::from_utf8_lossy(&ppid_check.stderr)
+        );
+    }
     let script = format!("test \"$CI_FIRST\" = '{FIRST}' && test \"$CI_SECOND\" = '{SECOND}'");
     let output = call("exec", pin, &["--all-profile-secrets", "--", test_shell(), "-c", &script])?;
     assert!(output.status.success());
     assert_denied(
         &call("exec", pin, &["--secret", "CI_FIRST", "--secret", "CI_LOCAL", "--", test_true()])?,
         "requested CI secret CI_LOCAL is missing",
+    );
+    assert_denied(
+        &call("exec", pin, &["--secret", "NODE_OPTIONS", "--", test_true()])?,
+        "child startup variable",
     );
     Ok(())
 }
@@ -567,13 +590,18 @@ fn serve(stream: &mut TcpStream, objects: &RemoteObjects, delivery: Delivery) ->
     match (method, objects.get(key)) {
         ("HEAD", Some(_)) => respond(stream, 200, &[]),
         ("GET", Some(bytes)) => respond(stream, 200, bytes),
-        ("HEAD" | "GET", None) => respond(stream, 404, &[]),
+        ("HEAD" | "GET" | "DELETE", None) => respond(stream, 404, &[]),
         ("PUT", _) if header("if-none-match") != Some("*") => respond(stream, 400, &[]),
         ("PUT", Some(_)) => respond(stream, 412, &[]),
         ("PUT", None) => {
             objects.insert(key.to_owned(), body);
             drop(objects);
             respond(stream, 201, &[])
+        }
+        ("DELETE", Some(_)) => {
+            objects.remove(key);
+            drop(objects);
+            respond(stream, 204, &[])
         }
         _ => respond(stream, 400, &[]),
     }

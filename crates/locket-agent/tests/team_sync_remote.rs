@@ -792,10 +792,12 @@ fn recipient_join_and_owner_prune(backend: Backend) -> TestResult {
     let before = remote.state()?.objects.clone();
     let dry_run =
         team_sync::prune_remote_packages(&publisher.store, PROJECT, Some(&MASTER), 2, true)?;
-    assert_eq!((dry_run.examined, dry_run.kept, dry_run.deleted), (7, 5, 2));
+    assert_eq!((dry_run.examined, dry_run.kept, dry_run.deleted), (7, 3, 4));
     assert!(dry_run.dry_run);
     assert!(dry_run.deleted_filenames.iter().any(|name| name == legacy));
-    assert!(dry_run.deleted_filenames.contains(&revoked[0]));
+    for revoked_file in &revoked {
+        assert!(dry_run.deleted_filenames.contains(revoked_file));
+    }
     assert_eq!(remote.state()?.objects, before);
     assert_eq!(remote.state()?.deletes, 0);
     assert_eq!(outbox_filenames(&publisher.store, &recipient)?, active);
@@ -806,11 +808,13 @@ fn recipient_join_and_owner_prune(backend: Backend) -> TestResult {
     assert_eq!(result, team_sync::PruneResult { dry_run: false, ..dry_run });
     let mut expected = before;
     expected.remove(legacy);
-    expected.remove(&revoked[0]);
+    for revoked_file in &revoked {
+        expected.remove(revoked_file);
+    }
     assert_eq!(remote.state()?.objects, expected);
-    assert_eq!(remote.state()?.deletes, 2);
+    assert_eq!(remote.state()?.deletes, 4);
     assert_eq!(outbox_filenames(&publisher.store, &recipient)?, &active[1..]);
-    assert_eq!(outbox_filenames(&publisher.store, &removed)?, &revoked[1..]);
+    assert_eq!(outbox_filenames(&publisher.store, &removed)?, Vec::<String>::new());
     assert_eq!(publisher.sync(154)?.published, 0);
     assert_eq!(remote.state()?.objects, expected);
     Ok(())

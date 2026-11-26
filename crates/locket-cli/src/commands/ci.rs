@@ -57,6 +57,11 @@ pub enum CiCommand {
 }
 
 #[derive(Args)]
+#[command(group(
+    ArgGroup::new("private_output")
+        .required(true)
+        .args(["output_key_file", "print_private_identity"])
+))]
 pub struct InitDeviceArgs {
     /// Label in the public device descriptor.
     #[arg(long, default_value = "ci-runner")]
@@ -64,6 +69,9 @@ pub struct InitDeviceArgs {
     /// Save the private identity to a new file instead of printing it.
     #[arg(long, value_name = "PATH")]
     output_key_file: Option<PathBuf>,
+    /// Explicitly print the private CI identity token to stdout.
+    #[arg(long)]
+    print_private_identity: bool,
 }
 
 #[derive(Args)]
@@ -113,6 +121,12 @@ pub struct CiReadArgs {
     /// Allow a profile the owner marked dangerous.
     #[arg(long)]
     allow_dangerous: bool,
+    /// Reject verified snapshots older than this minimum team epoch.
+    #[arg(long, value_name = "EPOCH")]
+    min_epoch: Option<u64>,
+    /// Reject verified snapshots issued more than this many seconds ago.
+    #[arg(long, value_name = "SECONDS")]
+    max_age_seconds: Option<u64>,
 }
 
 #[derive(Args)]
@@ -241,7 +255,7 @@ fn init_device(output: &mut impl Write, args: &InitDeviceArgs) -> Result<(), Cli
     if let Some(path) = &args.output_key_file {
         write_key_file(path, &token)?;
         serde_json::to_writer(&mut *output, &metadata)?;
-    } else {
+    } else if args.print_private_identity {
         // Stream the private field directly from its zeroizing buffer.
         #[derive(Serialize)]
         struct Output<'a> {
@@ -258,6 +272,10 @@ fn init_device(output: &mut impl Write, args: &InitDeviceArgs) -> Result<(), Cli
                 warning: "Store ci_identity in CI Secrets as LOCKET_CI_IDENTITY. Never commit it.",
             },
         )?;
+    } else {
+        return Err(metadata_invalid_error(
+            "pass --output-key-file PATH or explicitly pass --print-private-identity",
+        ));
     }
     writeln!(output)?;
     Ok(())
@@ -407,7 +425,8 @@ fn latest_snapshot(
     })?;
     // The stateful update verifier deliberately permits expired updates.
     // A standalone reader has no saved checkpoint and requires a live head.
-    if now_unix_nanos()? / 1_000_000_000 >= latest.statement.expires_at {
+    let verified_now = now_unix_nanos()? / 1_000_000_000;
+    if verified_now >= latest.statement.expires_at {
         return Err(bundle_verification_error("latest CI package has expired"));
     }
     Ok(latest)
@@ -432,6 +451,23 @@ fn read_profile(cwd: &Path, args: &CiReadArgs) -> Result<VerifiedProfile, CliErr
         latest_snapshot(&args.transport(cwd)?, &sealing, &device, &project_id, &args.owner)?;
     drop(sealing);
     let statement = snapshot.statement;
+    if let Some(min_epoch) = args.min_epoch
+        && statement.epoch < min_epoch
+    {
+        return Err(bundle_verification_error(format!(
+            "CI package epoch {} is older than required --min-epoch {min_epoch}",
+            statement.epoch
+        )));
+    }
+    if let Some(max_age) = args.max_age_seconds {
+        let now_secs = now_unix_nanos()? / 1_000_000_000;
+        let max_age = i64::try_from(max_age).unwrap_or(i64::MAX);
+        if now_secs.saturating_sub(statement.issued_at) > max_age {
+            return Err(bundle_verification_error(
+                "latest CI package exceeds --max-age-seconds limit",
+            ));
+        }
+    }
     let member = statement
         .members
         .iter()
@@ -504,6 +540,11 @@ fn exec(cwd: &Path, args: &CiExecArgs) -> Result<u8, CliError> {
         args.secrets.iter().collect::<Vec<_>>()
     };
     for name in selected {
+        if locket_exec::is_child_runtime_control(name.as_str()) {
+            return Err(crate::runtime::error::invalid_policy_error(format!(
+                "CI secret cannot set a child startup variable: {name}"
+            )));
+        }
         let value = profile.values.get(name).ok_or_else(|| {
             secret_not_found_error(format!("requested CI secret {name} is missing"))
         })?;
@@ -522,8 +563,18 @@ fn exec(cwd: &Path, args: &CiExecArgs) -> Result<u8, CliError> {
         command.env(name.as_str(), value.as_str());
     }
     drop(profile);
-    let child = command.spawn();
-    drop(command);
-    let status = child?.wait()?;
-    Ok(crate::runtime::error::child_exit_error(status).exit_code())
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        // Replace the locket process image in-place so the child cannot inspect
+        // a live parent process's original environment or heap memory.
+        Err(command.exec().into())
+    }
+    #[cfg(not(unix))]
+    {
+        let child = command.spawn();
+        drop(command);
+        let status = child?.wait()?;
+        Ok(crate::runtime::error::child_exit_error(status).exit_code())
+    }
 }

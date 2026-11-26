@@ -403,6 +403,9 @@ pub struct AgentSocketState {
     /// Serializes native session transitions with key/grant creation. Each
     /// block reason remains active until its matching OS resume notification.
     session_gate: Arc<Mutex<BTreeSet<&'static str>>>,
+    /// Per-project serializer covering team sync configure, clear, sync, and reconcile
+    /// so disconnecting a backend waits for any in-flight transport work to finish.
+    pub(crate) team_sync_locks: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
     /// Counts expiry work for deterministic idle-work regression checks.
     #[cfg(test)]
     pub(crate) expiry_checks: Arc<std::sync::atomic::AtomicUsize>,
@@ -478,6 +481,7 @@ impl AgentSocketState {
             status_hub,
             shutdown: Arc::new(Notify::new()),
             session_gate: Arc::new(Mutex::new(BTreeSet::new())),
+            team_sync_locks: Arc::new(Mutex::new(BTreeMap::new())),
             #[cfg(test)]
             expiry_checks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
@@ -525,6 +529,7 @@ impl AgentSocketState {
             status_hub,
             shutdown: Arc::new(Notify::new()),
             session_gate: Arc::new(Mutex::new(BTreeSet::new())),
+            team_sync_locks: Arc::new(Mutex::new(BTreeMap::new())),
             expiry_checks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             test_expiry_clock_offset: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             #[cfg(unix)]

@@ -10,7 +10,7 @@ Generate the identity on a trusted machine.
 locket ci init-device --label deploy-runner --output-key-file ./deploy-runner.key
 ```
 
-Save the contents of the key file as a protected CI secret named `LOCKET_CI_IDENTITY`. Locket creates the file atomically with mode `0600` on Unix. On Windows, use a directory with a private ACL. With no output file, the command prints the private identity alongside public enrollment metadata. Keep the identity out of source control and CI logs.
+Save the contents of the key file as a protected CI secret named `LOCKET_CI_IDENTITY`. Locket creates the file atomically with mode `0600` on Unix. On Windows, use a directory with a private ACL. To print the private identity on stdout instead of writing a file, pass `--print-private-identity` explicitly. Keep the identity out of source control and CI logs.
 
 On the owner's machine, confirm the device fingerprint and enroll the CI device with read-only access to the deployment profile.
 
@@ -66,6 +66,6 @@ For a shared folder, use `--folder PATH`. For WebDAV, use `--webdav-url URL` and
 
 `locket ci verify` takes the same project, owner, profile, and delivery flags. It decrypts the profile to check its integrity and prints JSON with the verified epoch and active secret names. Both commands require `--allow-dangerous` for a signed dangerous profile.
 
-`locket ci exec` injects the named secrets and returns the command's exit code. Repeat `--secret NAME` for each required value, or use `--all-profile-secrets` to opt into the full profile. The child inherits normal environment variables. Locket removes the CI identity and inherited delivery credentials before starting it. The deployment command controls what it writes and logs.
+`locket ci exec` injects the named secrets and replaces the `locket` process image with the child command via `execve` on Unix so the child cannot inspect a live parent environment for `LOCKET_CI_IDENTITY` or delivery credentials. Repeat `--secret NAME` for each required value, or use `--all-profile-secrets` to opt into the full profile. Startup-control variable names such as `PATH`, `LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`, `BASH_ENV`, and `NODE_OPTIONS` are rejected. The deployment command controls what it writes and logs.
 
-The runner accepts the highest authentic, unexpired snapshot available to its device and rejects conflicting snapshots at that epoch. Delivery storage can withhold newer snapshots from a runner with no saved history. When offboarding, remove the device on the owner's machine, publish, rotate credentials at their providers, and delete that device's old packages from delivery storage. The publisher stops issuing packages for a removed device. Copies of its earlier packages can still be decrypted with its private key, and an unexpired copy can still be replayed to a stateless runner.
+The runner accepts the highest authentic, unexpired snapshot available to its device and rejects conflicting snapshots at that epoch. Pass `--min-epoch EPOCH` and/or `--max-age-seconds SECONDS` to tighten freshness bounds on stateless runners. Delivery storage can withhold newer snapshots from a runner with no saved history. When offboarding, remove the device on the owner's machine, publish, run `locket team remote prune` (which deletes all remote packages for removed/revoked devices), and rotate credentials at their providers.

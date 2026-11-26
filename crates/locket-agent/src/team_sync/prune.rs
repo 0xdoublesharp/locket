@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use locket_crypto::KeyBytes;
 use locket_store::Store;
 use rusqlite::{Transaction, TransactionBehavior};
@@ -16,7 +18,19 @@ pub struct PruneResult {
     pub deleted_filenames: Vec<String>,
 }
 
-/// Prune superseded, delivered packages for the pinned local owner.
+fn active_recipients(store: &Store, project: &str) -> Result<BTreeSet<String>> {
+    let mut statement = store.connection().prepare(
+        "SELECT d.fingerprint FROM devices d
+         JOIN team_members m ON m.device_id = d.id
+         JOIN teams t ON t.id = m.team_id
+         WHERE t.project_id = ?1 AND d.revoked_at IS NULL AND m.removed_at IS NULL",
+    )?;
+    let rows = statement.query_map([project], |row| row.get::<_, String>(0))?;
+    rows.collect::<std::result::Result<BTreeSet<_>, _>>().map_err(Into::into)
+}
+
+/// Prune superseded, delivered packages for active recipients and all remote packages
+/// belonging to removed or revoked recipients, restricted to the pinned local owner.
 /// # Errors
 /// Rejects unauthorized devices, zero retention, and storage or transport failures.
 pub fn prune_remote_packages(
@@ -32,6 +46,7 @@ pub fn prune_remote_packages(
     }
     let (transport, configured) = transport::open_configured(store, project, master)?;
     let remote_names = transport.list_packages()?;
+    let active = active_recipients(store, project)?;
     let mut result = PruneResult { dry_run, keep_epochs, ..PruneResult::default() };
     let mut candidates = Vec::new();
     {
@@ -56,8 +71,11 @@ pub fn prune_remote_packages(
                 retained_epochs = 0;
             }
             let delivered: bool = row.get(3)?;
-            if delivered && retained_epochs == keep_epochs {
-                candidates.push((row.get::<_, i64>(0)?, filename));
+            if !active.contains(&recipient) {
+                // Zero retention for removed/revoked recipients, including crash-leftover rows.
+                candidates.push((row.get::<_, i64>(0)?, filename, recipient.clone(), false));
+            } else if delivered && retained_epochs == keep_epochs {
+                candidates.push((row.get::<_, i64>(0)?, filename, recipient.clone(), true));
             } else {
                 result.kept += 1;
                 retained_epochs += usize::from(delivered);
@@ -65,7 +83,7 @@ pub fn prune_remote_packages(
         }
     }
 
-    for (rowid, filename) in candidates {
+    for (rowid, filename, recipient, require_delivered) in candidates {
         if !dry_run {
             let tx =
                 Transaction::new_unchecked(store.connection(), TransactionBehavior::Immediate)?;
@@ -75,13 +93,32 @@ pub fn prune_remote_packages(
             {
                 return Err(reject("team owner or transport changed during prune; retry"));
             }
-            let still_delivered: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM team_sync_outbox
-                 WHERE project_id=?1 AND rowid=?2 AND filename=?3 AND delivered=1)",
-                (project, rowid, &filename),
-                |row| row.get(0),
-            )?;
-            if !still_delivered {
+            let still_eligible: bool = if require_delivered {
+                tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM team_sync_outbox
+                     WHERE project_id=?1 AND rowid=?2 AND filename=?3 AND delivered=1)",
+                    (project, rowid, &filename),
+                    |row| row.get(0),
+                )?
+            } else {
+                let row_exists: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM team_sync_outbox
+                     WHERE project_id=?1 AND rowid=?2 AND filename=?3 AND recipient=?4)",
+                    (project, rowid, &filename, &recipient),
+                    |row| row.get(0),
+                )?;
+                let still_active: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM devices d
+                     JOIN team_members m ON m.device_id = d.id
+                     JOIN teams t ON t.id = m.team_id
+                     WHERE t.project_id=?1 AND d.fingerprint=?2
+                       AND d.revoked_at IS NULL AND m.removed_at IS NULL)",
+                    (project, &recipient),
+                    |row| row.get(0),
+                )?;
+                row_exists && !still_active
+            };
+            if !still_eligible {
                 continue;
             }
             transport.delete_package(&filename)?;

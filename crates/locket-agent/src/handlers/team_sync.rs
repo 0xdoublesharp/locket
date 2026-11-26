@@ -376,6 +376,15 @@ async fn run_sync_worker(
     pin: Option<crate::keys::StoreFileIdentity>,
     operation: impl FnOnce(&mut locket_store::Store) -> team_sync::Result<SyncStatus> + Send + 'static,
 ) -> team_sync::Result<SyncStatus> {
+    let project_lock = {
+        let mut locks = state.team_sync_locks.lock().await;
+        std::sync::Arc::clone(
+            locks
+                .entry(project.clone())
+                .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    };
+    let _operation_guard = project_lock.lock().await;
     let worker_project = project.clone();
     let worker_state = state.clone();
     let worker = tokio::task::spawn_blocking(move || -> team_sync::Result<_> {
