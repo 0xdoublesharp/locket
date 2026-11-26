@@ -69,20 +69,13 @@ fn fixed_wrap_round_trips_and_rejects_a_flipped_tag_bit() {
     assert_eq!(envelope.len(), NONCE_LEN + KEY_LEN + TAG_LEN);
     assert_eq!(&envelope[..NONCE_LEN], &nonce);
 
-    let mut candidate = [0_u8; NONCE_LEN + KEY_LEN + TAG_LEN];
-    candidate.copy_from_slice(&envelope);
-    let flip: bool = kani::any();
-    if flip {
-        candidate[NONCE_LEN + KEY_LEN] ^= 1;
-    }
-    match unwrap_dek_v1(&key, &candidate, aad) {
-        Ok(opened) => {
-            assert!(!flip);
-            assert_eq!(*opened, material);
-        }
-        Err(error) => {
-            assert!(flip);
-            assert_eq!(error, CryptoError::DecryptionFailed);
-        }
-    }
+    let Ok(opened) = unwrap_dek_v1(&key, &envelope, aad) else {
+        unreachable!("valid envelope must unwrap");
+    };
+    assert_eq!(*opened, material);
+
+    let mut tampered = [0_u8; NONCE_LEN + KEY_LEN + TAG_LEN];
+    tampered.copy_from_slice(&envelope);
+    tampered[NONCE_LEN + KEY_LEN] ^= 1;
+    assert_eq!(unwrap_dek_v1(&key, &tampered, aad), Err(CryptoError::DecryptionFailed));
 }

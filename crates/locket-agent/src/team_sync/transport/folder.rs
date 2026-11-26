@@ -40,6 +40,14 @@ fn validate_local_filename(filename: &str) -> Result<()> {
     Ok(())
 }
 
+fn sync_dir(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    fs::File::open(path)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 impl Folder {
     pub(super) fn new(path: PathBuf, summary: TransportSummary) -> Result<Self> {
         verify_directory(&path)?;
@@ -49,8 +57,7 @@ impl Folder {
     fn existing(&self, target: &Path, bytes: &[u8]) -> Result<Option<PutOutcome>> {
         match fs::symlink_metadata(target) {
             Ok(_) if read_package_file(target).is_ok_and(|existing| existing == bytes) => {
-                #[cfg(unix)]
-                fs::File::open(&self.path)?.sync_all()?;
+                sync_dir(&self.path)?;
                 Ok(Some(PutOutcome::AlreadyPresent))
             }
             Ok(_) => Ok(Some(PutOutcome::Conflict)),
@@ -114,8 +121,7 @@ impl TeamTransport for Folder {
         match linked {
             Ok(()) => {
                 cleaned?;
-                #[cfg(unix)]
-                fs::File::open(&self.path)?.sync_all()?;
+                sync_dir(&self.path)?;
                 Ok(PutOutcome::Written)
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {

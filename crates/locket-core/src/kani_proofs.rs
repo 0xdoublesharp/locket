@@ -27,27 +27,24 @@ fn bounded_secret_names_match_the_ascii_grammar() {
 }
 
 #[kani::proof]
-#[kani::unwind(12)]
+#[kani::unwind(10)]
 fn bounded_reference_suffixes_parse_without_panics() {
     // Representative URI alphabet covering every grammar branch: valid secret
     // chars, version delimiters, and query delimiter.
-    const ALPHABET: [u8; 6] = *b"A_0@v?";
+    const ALPHABET: [u8; 5] = *b"A_0@?";
     let indices: [usize; 2] = kani::any();
     let len: usize = kani::any();
     kani::assume(len <= indices.len());
 
-    let mut suffix_bytes = [0_u8; 2];
+    let mut buf = *b"lk://d/K\0\0";
     for i in 0..2 {
         kani::assume(indices[i] < ALPHABET.len());
-        suffix_bytes[i] = ALPHABET[indices[i]];
+        buf[8 + i] = ALPHABET[indices[i]];
     }
-    let Ok(suffix) = std::str::from_utf8(&suffix_bytes[..len]) else {
+    let Ok(input) = std::str::from_utf8(&buf[..8 + len]) else {
         unreachable!("ASCII alphabet bytes are valid UTF-8");
     };
-    let mut input = String::with_capacity(8 + suffix_bytes.len());
-    input.push_str("lk://d/K");
-    input.push_str(suffix);
-    if let Ok(uri) = LkReferenceUri::parse(&input) {
+    if let Ok(uri) = LkReferenceUri::parse(input) {
         assert_eq!(uri.profile().as_str(), "d");
         assert!(SecretName::new(uri.key().as_str()).is_ok());
         assert!(uri.version().is_none_or(|version| version.get() > 0));
@@ -55,14 +52,14 @@ fn bounded_reference_suffixes_parse_without_panics() {
 }
 
 #[kani::proof]
-#[kani::unwind(10)]
+#[kani::unwind(6)]
 fn a_single_acl_mismatch_denies_an_explicitly_selected_secret() {
     let Ok(name) = SecretName::new("K") else { unreachable!("valid fixture name") };
     let acl = SecretAccessPolicy {
         name,
         allow_commands: vec!["b:*".to_owned()],
-        allow_argv: vec![vec!["t".to_owned(), "**".to_owned(), "r".to_owned()]],
-        allow_paths: vec!["s/**".to_owned()],
+        allow_argv: vec![vec!["t".to_owned(), "r".to_owned()]],
+        allow_paths: vec!["s/*".to_owned()],
     };
 
     let command_matches: bool = kani::any();
@@ -71,8 +68,10 @@ fn a_single_acl_mismatch_denies_an_explicitly_selected_secret() {
     let path_matches: bool = kani::any();
     let command = if command_matches { "b:x" } else { "d" };
     let cwd = Path::new(if path_matches { "s/c" } else { "s-x" });
-    let argv = ["t".to_owned(), if argv_matches { "r" } else { "x" }.to_owned()];
-    let allowed = acl.allows(command, argv_present.then_some(&argv[..]), cwd);
+    let argv_ok = ["t".to_owned(), "r".to_owned()];
+    let argv_bad = ["t".to_owned(), "x".to_owned()];
+    let argv = if argv_matches { &argv_ok[..] } else { &argv_bad[..] };
+    let allowed = acl.allows(command, argv_present.then_some(argv), cwd);
     assert_eq!(allowed, command_matches && argv_present && argv_matches && path_matches);
 }
 

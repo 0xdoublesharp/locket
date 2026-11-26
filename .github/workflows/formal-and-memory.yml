@@ -120,7 +120,7 @@ jobs:
           jar="$RUNNER_TEMP/tla2tools.jar"
           curl --fail --silent --show-error --location --retry 3 \
             --output "$jar" https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
-          printf '%s  %s\n' fdffef247f563ef6edbfd44958d2a82db79e7564e07cb673262d896353fa6713 "$jar" | sha256sum --check
+          printf '%s  %s\n' 67f9575c3b9ef7a0787b1bded34812862ffe79d711298e5a75b1a77720b19928 "$jar" | sha256sum --check
           printf 'TLA2TOOLS_JAR=%s\n' "$jar" >> "$GITHUB_ENV"
 
       - name: Install elan and the pinned Lean toolchain
