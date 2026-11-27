@@ -124,6 +124,87 @@ pub const fn platform_name() -> &'static str {
     std::env::consts::OS
 }
 
+#[cfg(target_os = "macos")]
+static MACOS_KEYCHAIN_INTERACTION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Returns whether `LOCKET_NO_PROMPT` requests non-interactive execution.
+#[must_use]
+pub fn keyring_prompts_disabled() -> bool {
+    std::env::var("LOCKET_NO_PROMPT").is_ok_and(|value| {
+        let normalized = value.trim();
+        !normalized.is_empty()
+            && !normalized.eq_ignore_ascii_case("0")
+            && !normalized.eq_ignore_ascii_case("false")
+            && !normalized.eq_ignore_ascii_case("no")
+            && !normalized.eq_ignore_ascii_case("off")
+    })
+}
+
+/// Controls whether OS keychain operations in this process may show modal UI dialogs.
+///
+/// On macOS this invokes `SecKeychainSetUserInteractionAllowed` so non-interactive
+/// invocations fail immediately with `errSecInteractionNotAllowed` instead of blocking
+/// on a hidden Keychain ACL dialog. On other platforms this is a no-op.
+pub fn set_keyring_user_interaction_allowed(allowed: bool) {
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(_guard) = MACOS_KEYCHAIN_INTERACTION_LOCK.lock() {
+            set_macos_keychain_interaction_allowed(allowed);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = allowed;
+    }
+}
+
+/// Runs `operation` with OS keychain UI dialogs disabled for the duration of the call.
+///
+/// On macOS this temporarily calls `SecKeychainSetUserInteractionAllowed(false)` and
+/// restores the prior setting when `operation` returns (unless `LOCKET_NO_PROMPT` is
+/// set, in which case interaction stays disabled).
+pub fn without_keyring_user_interaction<T>(operation: impl FnOnce() -> T) -> T {
+    #[cfg(target_os = "macos")]
+    {
+        let _guard = MACOS_KEYCHAIN_INTERACTION_LOCK.lock();
+        let previous = macos_keychain_interaction_allowed();
+        set_macos_keychain_interaction_allowed(false);
+        let result = operation();
+        if previous && !keyring_prompts_disabled() {
+            set_macos_keychain_interaction_allowed(true);
+        }
+        result
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        operation()
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn macos_keychain_interaction_allowed() -> bool {
+    #[link(name = "Security", kind = "framework")]
+    unsafe extern "C" {
+        fn SecKeychainGetUserInteractionAllowed(state: *mut u8) -> i32;
+    }
+    let mut allowed: u8 = 1;
+    // SAFETY: `allowed` is a valid, aligned, writable `Boolean` (`u8`) out-pointer.
+    let status = unsafe { SecKeychainGetUserInteractionAllowed(&raw mut allowed) };
+    status != 0 || allowed != 0
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn set_macos_keychain_interaction_allowed(allowed: bool) {
+    #[link(name = "Security", kind = "framework")]
+    unsafe extern "C" {
+        fn SecKeychainSetUserInteractionAllowed(state: u8) -> i32;
+    }
+    // SAFETY: `SecKeychainSetUserInteractionAllowed` takes a macOS `Boolean` (`0` or `1`).
+    let _status = unsafe { SecKeychainSetUserInteractionAllowed(u8::from(allowed)) };
+}
+
 /// Installs the OS credential store as `keyring-core`'s default backend.
 ///
 /// `keyring-core` 1.0 split the per-platform credential store out of the
@@ -143,6 +224,10 @@ pub fn init_platform_keyring() -> Result<(), PlatformError> {
     use std::sync::atomic::{AtomicBool, Ordering};
     static INSTALLED: AtomicBool = AtomicBool::new(false);
     static GUARD: Mutex<()> = Mutex::new(());
+
+    if keyring_prompts_disabled() {
+        set_keyring_user_interaction_allowed(false);
+    }
 
     if INSTALLED.load(Ordering::Acquire) {
         return Ok(());

@@ -933,15 +933,22 @@ fn write_doctor_audit_if_available(
     resolved: &ResolvedProject,
     validation: &DoctorValidation,
 ) -> Result<(), CliError> {
-    if validation.reports.is_empty() {
+    if validation.reports.is_empty() || validation.fatal_error.is_some() {
         return Ok(());
     }
     let mut store = open_store(context)?;
     if store.get_project(resolved.config.project_id.as_str())?.is_none() {
         return Ok(());
     }
-    let audit_key =
-        load_project_key(context, &store, resolved.config.project_id.as_str(), KeyPurpose::Audit)?;
+    // `policy doctor` is a metadata-only diagnostic: never block on OS keychain
+    // UI dialogs or fail the command when the local keychain requires interaction.
+    let audit_key = match locket_platform::without_keyring_user_interaction(|| {
+        load_project_key(context, &store, resolved.config.project_id.as_str(), KeyPurpose::Audit)
+    }) {
+        Ok(key) => key,
+        Err(CliError::Platform(_)) => return Ok(()),
+        Err(error) => return Err(error),
+    };
     let timestamp = now_unix_nanos()?;
     let check_names: Vec<String> =
         validation.reports.iter().map(|report| format!("policy.{}", report.name)).collect();

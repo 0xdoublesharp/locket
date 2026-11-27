@@ -357,6 +357,47 @@ fn policy_doctor_no_agent_falls_back_to_legacy_ok_without_lk_references()
 }
 
 #[test]
+fn policy_doctor_degrades_cleanly_when_keychain_audit_key_is_unavailable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let mock_keys = std::sync::Arc::new(locket_platform::MockMasterKeyStore::default());
+    let mut context = test_context(&directory);
+    context.key_store = mock_keys.clone();
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--name", "app", "--profile", "dev"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    run_with_context(
+        Cli::try_parse_from(["locket", "policy", "add", "check", "--", "/usr/bin/true"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    tighten_directory(directory.path())?;
+    let agent = DoctorTestAgent::start(&context)?;
+    seed_command_policies(&agent, &context)?;
+    unlock_via_agent(&context)?;
+    // Simulate a locked/non-interactive keychain refusal when policy doctor
+    // tries to write its optional audit entry after validating policies.
+    mock_keys
+        .set_load_failure(Some(locket_platform::MockMasterKeyStoreFailure::MasterKeyNotFound))?;
+    let mut fresh_context = test_context(&directory);
+    fresh_context.key_store = mock_keys;
+
+    let mut output = Vec::new();
+    let result = run_with_context(
+        Cli::try_parse_from(["locket", "policy", "doctor"])?,
+        &fresh_context,
+        &mut output,
+    );
+    agent.stop()?;
+    result?;
+    let output_text = String::from_utf8(output)?;
+    assert!(output_text.contains("policy_doctor: ok"), "{output_text}");
+    Ok(())
+}
+
+#[test]
 fn policy_doctor_no_agent_with_lk_references_returns_agent_unavailable()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempdir()?;

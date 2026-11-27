@@ -1013,14 +1013,13 @@ fn write_doctor_audit_if_available(
     if store.get_project(project.config.project_id.as_str())?.is_none() {
         return Ok(());
     }
-    let audit_key = match load_project_key(
-        context,
-        &store,
-        project.config.project_id.as_str(),
-        KeyPurpose::Audit,
-    ) {
+    // `locket doctor` is a metadata-only diagnostic: never block on OS keychain
+    // UI dialogs or fail when local keychain access requires user interaction.
+    let audit_key = match locket_platform::without_keyring_user_interaction(|| {
+        load_project_key(context, &store, project.config.project_id.as_str(), KeyPurpose::Audit)
+    }) {
         Ok(key) => key,
-        Err(CliError::Platform(locket_platform::PlatformError::MasterKeyNotFound)) => return Ok(()),
+        Err(CliError::Platform(_)) => return Ok(()),
         Err(error) => return Err(error),
     };
     let metadata = report.audit_metadata();

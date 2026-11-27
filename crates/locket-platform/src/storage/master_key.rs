@@ -52,20 +52,41 @@ impl MasterKeyStore for KeyringMasterKeyStore {
         project_id: &str,
         master_key: &KeyBytes,
     ) -> Result<(), PlatformError> {
-        let entry = master_key_entry(project_id)?;
-        entry.set_password(&encode_key(master_key)).map_err(PlatformError::Keyring)
+        let write = || {
+            let entry = master_key_entry(project_id)?;
+            entry.set_password(&encode_key(master_key)).map_err(PlatformError::Keyring)
+        };
+        if crate::keyring_prompts_disabled() {
+            crate::without_keyring_user_interaction(write)
+        } else {
+            write()
+        }
     }
 
     fn load_master_key(&self, project_id: &str) -> Result<Zeroizing<KeyBytes>, PlatformError> {
-        let entry = master_key_entry(project_id)?;
-        let encoded = Zeroizing::new(entry.get_secret().map_err(map_keyring_get_error)?);
-        drop(entry);
-        decode_key(&encoded)
+        let read = || {
+            let entry = master_key_entry(project_id)?;
+            let encoded = Zeroizing::new(entry.get_secret().map_err(map_keyring_get_error)?);
+            drop(entry);
+            decode_key(&encoded)
+        };
+        if crate::keyring_prompts_disabled() {
+            crate::without_keyring_user_interaction(read)
+        } else {
+            read()
+        }
     }
 
     fn delete_master_key(&self, project_id: &str) -> Result<(), PlatformError> {
-        let entry = master_key_entry(project_id)?;
-        entry.delete_credential().map_err(PlatformError::Keyring)
+        let delete = || {
+            let entry = master_key_entry(project_id)?;
+            entry.delete_credential().map_err(PlatformError::Keyring)
+        };
+        if crate::keyring_prompts_disabled() {
+            crate::without_keyring_user_interaction(delete)
+        } else {
+            delete()
+        }
     }
 }
 
