@@ -249,7 +249,7 @@ fn policy_detect_prints_next_steps_only_for_unconfigured_commands()
     };
     let next =
         "next: grant required secrets explicitly with `locket policy require <name> <KEY>...`";
-    let tip = "tip: use finite check commands (such as test, typecheck, or build) with `locket import --verify-policy <name>`";
+    let tip = "tip: use finite, offline check commands that do not install packages (such as test, typecheck, build, or `pnpm --offline ...`) with `locket import --verify-policy <name>`";
     let output = detect()?;
     assert!(
         output.contains("test: npm run test (source_file=package.json, already_configured=false)")

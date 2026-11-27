@@ -138,7 +138,8 @@ fn detect(
             )?;
             writeln!(
                 output,
-                "tip: use finite check commands (such as test, typecheck, or build) \
+                "tip: use finite, offline check commands that do not install packages \
+                 (such as test, typecheck, build, or `pnpm --offline ...`) \
                  with `locket import --verify-policy <name>`"
             )?;
         }
