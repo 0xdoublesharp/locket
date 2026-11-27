@@ -21,14 +21,14 @@ const PACKAGE_MANAGER_MARKERS: &[(&str, &[&str])] = &[
 const PACKAGE_MANAGER_SEARCH_DEPTH: usize = 8;
 
 struct DetectedCommand {
-    name: &'static str,
+    name: String,
     argv: Vec<&'static str>,
     source_file: &'static str,
 }
 
 #[derive(Serialize)]
 pub struct PolicyDetection {
-    pub name: &'static str,
+    pub name: String,
     pub argv: Vec<&'static str>,
     pub command_preview: String,
     pub suggested_command: String,
@@ -38,7 +38,7 @@ pub struct PolicyDetection {
 
 impl PolicyDetection {
     pub(crate) fn new(
-        name: &'static str,
+        name: String,
         argv: Vec<&'static str>,
         source_file: &'static str,
         already_configured: bool,
@@ -48,6 +48,43 @@ impl PolicyDetection {
         let suggested_command = format!("locket policy add {name} -- {command_preview}");
         Self { name, argv, command_preview, suggested_command, source_file, already_configured }
     }
+}
+
+pub fn finalize_policy_detections(
+    commands: Vec<(String, Vec<&'static str>, &'static str)>,
+    configured: Option<&toml::Table>,
+) -> Vec<PolicyDetection> {
+    let mut used = std::collections::BTreeSet::new();
+    let mut resolved = Vec::with_capacity(commands.len());
+    for (mut name, argv, source_file) in commands {
+        if !used.insert(name.clone()) {
+            let prefixed = match (source_file, name.as_str()) {
+                ("Cargo.toml", bare) => format!("cargo-{bare}"),
+                ("Makefile", bare) => format!("make-{bare}"),
+                ("pyproject.toml", "test") => "pytest".to_owned(),
+                ("pyproject.toml", bare) => format!("python-{bare}"),
+                ("foundry.toml", bare) => format!("forge-{bare}"),
+                (_, bare) => format!("{bare}-{}", resolved.len() + 1),
+            };
+            name = if used.insert(prefixed.clone()) {
+                prefixed
+            } else {
+                let fallback = format!("{prefixed}-{}", resolved.len() + 1);
+                used.insert(fallback.clone());
+                fallback
+            };
+        }
+        let already_configured = configured.is_some_and(|commands| {
+            commands.get(&name).is_some_and(toml::Value::is_table)
+                || commands.values().any(|entry| {
+                    entry.get("argv").and_then(toml::Value::as_array).is_some_and(|saved| {
+                        saved.iter().map(toml::Value::as_str).eq(argv.iter().copied().map(Some))
+                    })
+                })
+        });
+        resolved.push(PolicyDetection::new(name, argv, source_file, already_configured));
+    }
+    resolved
 }
 
 pub fn detect_policy_commands(
@@ -63,20 +100,11 @@ pub fn detect_policy_commands(
         .as_ref()
         .and_then(|document| document.get("commands"))
         .and_then(toml::Value::as_table);
-    Ok(detect_commands(root, follow_manifest_links)?
+    let commands = detect_commands(root, follow_manifest_links)?
         .into_iter()
-        .map(|command| {
-            let already_configured = configured
-                .and_then(|commands| commands.get(command.name))
-                .is_some_and(toml::Value::is_table);
-            PolicyDetection::new(
-                command.name,
-                command.argv,
-                command.source_file,
-                already_configured,
-            )
-        })
-        .collect())
+        .map(|command| (command.name, command.argv, command.source_file))
+        .collect();
+    Ok(finalize_policy_detections(commands, configured))
 }
 
 fn detect_commands(root: &Path, follow_links: bool) -> Result<Vec<DetectedCommand>, CliError> {
@@ -85,7 +113,7 @@ fn detect_commands(root: &Path, follow_links: bool) -> Result<Vec<DetectedComman
         let cargo: toml::Value = toml::from_str(&manifest)
             .map_err(|_| metadata_invalid_error("could not parse Cargo.toml"))?;
         commands.push(DetectedCommand {
-            name: "test",
+            name: "test".to_owned(),
             argv: vec!["cargo", "test"],
             source_file: "Cargo.toml",
         });
@@ -98,7 +126,7 @@ fn detect_commands(root: &Path, follow_links: bool) -> Result<Vec<DetectedComman
                 && manifest_is_file(&root.join("src/main.rs"), follow_links))
         {
             commands.push(DetectedCommand {
-                name: "run",
+                name: "run".to_owned(),
                 argv: vec!["cargo", "run"],
                 source_file: "Cargo.toml",
             });
@@ -111,11 +139,15 @@ fn detect_commands(root: &Path, follow_links: bool) -> Result<Vec<DetectedComman
         } else {
             vec!["pytest"]
         };
-        commands.push(DetectedCommand { name: "test", argv, source_file: "pyproject.toml" });
+        commands.push(DetectedCommand {
+            name: "test".to_owned(),
+            argv,
+            source_file: "pyproject.toml",
+        });
     }
     if manifest_is_file(&root.join("foundry.toml"), follow_links) {
         commands.extend(["build", "test"].map(|name| DetectedCommand {
-            name,
+            name: name.to_owned(),
             argv: vec!["forge", name],
             source_file: "foundry.toml",
         }));
@@ -156,7 +188,7 @@ fn package_commands(
                 .is_some_and(|script| !script.trim().is_empty())
         })
         .map(|name| DetectedCommand {
-            name,
+            name: name.to_owned(),
             argv: vec![runner, "run", name],
             source_file: "package.json",
         })
@@ -212,7 +244,11 @@ fn make_commands(
         .iter()
         .copied()
         .filter(|name| targets.contains(name))
-        .map(|name| DetectedCommand { name, argv: vec!["make", name], source_file: "Makefile" })
+        .map(|name| DetectedCommand {
+            name: name.to_owned(),
+            argv: vec!["make", name],
+            source_file: "Makefile",
+        })
         .collect())
 }
 

@@ -60,7 +60,7 @@ pub(super) fn detect_archive_consumers(
         let mut dirs_budget = MAX_SUBDIRS;
         let mut files_budget = MAX_SUBDIR_COMPOSE_FILES;
         if let Ok(directory) = InputDirectory::open(&parent) {
-            scan.compose_subdirectories(
+            scan.scan_subdirectories(
                 &directory,
                 &parent,
                 MAX_SUBDIR_DEPTH,
@@ -72,7 +72,7 @@ pub(super) fn detect_archive_consumers(
         if boundary != parent
             && let Ok(directory) = InputDirectory::open(boundary)
         {
-            scan.compose_subdirectories(
+            scan.scan_subdirectories(
                 &directory,
                 boundary,
                 1,
@@ -148,7 +148,7 @@ impl ConsumerScan<'_> {
         }
     }
 
-    fn compose_subdirectories(
+    fn scan_subdirectories(
         &mut self,
         directory: &InputDirectory,
         dir: &Path,
@@ -190,19 +190,49 @@ impl ConsumerScan<'_> {
                 if *files_budget == 0 {
                     break;
                 }
-                if !is_compose_file(file) {
-                    continue;
-                }
-                *files_budget -= 1;
-                let Some(text) = read_config(&child_dir, file, MAX_CONFIG_BYTES) else { continue };
-                if compose_references(&text, matches_source) {
+                if is_compose_file(file) {
+                    *files_budget -= 1;
+                    let Some(text) = read_config(&child_dir, file, MAX_CONFIG_BYTES) else {
+                        continue;
+                    };
+                    if compose_references(&text, matches_source) {
+                        let path = relative_display(self.root, &child_path.join(file));
+                        self.warnings.push(format!(
+                            "{path} references {source_name} in Docker Compose env_file; replace with environment: pass-through or mark required: false"
+                        ));
+                    }
+                } else if matches!(file, "Makefile" | "makefile" | "GNUmakefile") {
+                    *files_budget -= 1;
+                    let Some(text) = read_config(&child_dir, file, MAX_CONFIG_BYTES) else {
+                        continue;
+                    };
                     let path = relative_display(self.root, &child_path.join(file));
-                    self.warnings.push(format!(
-                        "{path} references {source_name} in Docker Compose env_file; replace with environment: pass-through or mark required: false"
-                    ));
+                    let (includes, reads, recreates) = makefile_references(&text, matches_source);
+                    if includes {
+                        self.warnings.push(format!("{path} includes {source_name} in Makefile"));
+                    }
+                    if reads {
+                        self.warnings.push(format!("{path} recipe may still read {source_name}"));
+                    }
+                    if recreates {
+                        self.warnings.push(format!("{path} recipe may recreate {source_name}"));
+                    }
                 }
             }
-            self.compose_subdirectories(
+            if *files_budget > 0 && child_dir.is_regular("package.json") {
+                *files_budget -= 1;
+                self.package_scripts(&child_dir, &child_path, &source_name, matches_source);
+            }
+            if *files_budget > 0
+                && self.source.file_name() == Some(OsStr::new(".env"))
+                && self.source.parent().is_some_and(|root| child_path.starts_with(root))
+                && !child_dir.is_regular(".env")
+                && child_dir.is_regular("Cargo.toml")
+            {
+                *files_budget -= 1;
+                self.cargo_dotenv_dependencies(&child_dir, &child_path, &source_name);
+            }
+            self.scan_subdirectories(
                 &child_dir,
                 &child_path,
                 remaining_depth - 1,
@@ -248,8 +278,11 @@ impl ConsumerScan<'_> {
         let Some(text) = read_config(directory, "package.json", MAX_CONFIG_BYTES) else { return };
         let Ok(manifest) = serde_json::from_str::<Value>(&text) else { return };
         let path = relative_display(self.root, &dir.join("package.json"));
-        if self.source.parent() == Some(dir) && self.source.file_name() == Some(OsStr::new(".env"))
-        {
+        let may_load_root_dotenv = self.source.file_name() == Some(OsStr::new(".env"))
+            && (self.source.parent() == Some(dir)
+                || (self.source.parent().is_some_and(|root| dir.starts_with(root))
+                    && !directory.is_regular(".env")));
+        if may_load_root_dotenv {
             for dep in ["dotenv", "dotenvx", "@dotenvx/dotenvx"] {
                 let declared = ["dependencies", "devDependencies", "optionalDependencies"]
                     .iter()
@@ -1068,6 +1101,45 @@ fn command_references(words: &[Option<String>], matches_source: impl Fn(&str) ->
         }
     }
     false
+}
+
+#[cfg(test)]
+mod monorepo_consumer_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn root_env_archive_warns_for_workspace_subdirectory_dotenv_and_scripts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().canonicalize()?;
+        fs::create_dir_all(root.join("apps/bot"))?;
+        fs::create_dir_all(root.join("apps/web"))?;
+        fs::write(root.join(".env"), "BOT_TOKEN=fixture\n")?;
+        fs::write(
+            root.join("apps/bot/package.json"),
+            r#"{"dependencies":{"dotenv":"^16.0.0"},"scripts":{"start":"node --env-file=../../.env dist/index.js"}}"#,
+        )?;
+        // Subdirectory with its own .env should not trigger the root soft-loader advisory.
+        fs::write(root.join("apps/web/.env"), "WEB_KEY=fixture\n")?;
+        fs::write(root.join("apps/web/package.json"), r#"{"dependencies":{"dotenv":"^16.0.0"}}"#)?;
+
+        let names = BTreeSet::from(["BOT_TOKEN".to_owned()]);
+        let warnings = detect_archive_consumers(&root.join(".env"), Some(&root), &names);
+        assert!(
+            warnings.iter().any(|w| w.contains("apps/bot/package.json") && w.contains("dotenv")),
+            "expected apps/bot dotenv warning, got: {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("apps/bot/package.json") && w.contains("start")),
+            "expected apps/bot script warning, got: {warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|w| w.contains("apps/web/package.json")),
+            "unexpected apps/web warning when it has its own .env: {warnings:?}"
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]

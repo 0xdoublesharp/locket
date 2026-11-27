@@ -502,12 +502,11 @@ fn detect_open_workspace(directory: &InputDirectory) -> Result<Vec<PolicyDetecti
         .map(|text| toml::from_str::<toml::Value>(&text))
         .transpose()
         .map_err(|_| metadata_invalid_error("could not parse locket.toml"))?;
-    let configured = config.as_ref().and_then(|value| value.get("commands"));
-    let mut commands = Vec::new();
-    let mut add = |name, argv: Vec<&'static str>, source_file| {
-        let already_configured =
-            configured.and_then(|value| value.get(name)).is_some_and(toml::Value::is_table);
-        commands.push(PolicyDetection::new(name, argv, source_file, already_configured));
+    let configured =
+        config.as_ref().and_then(|value| value.get("commands")).and_then(toml::Value::as_table);
+    let mut commands: Vec<(String, Vec<&'static str>, &'static str)> = Vec::new();
+    let mut add = |name: &str, argv: Vec<&'static str>, source_file: &'static str| {
+        commands.push((name.to_owned(), argv, source_file));
     };
 
     if let Some(manifest) = read_workspace_manifest(directory, "package.json")? {
@@ -564,7 +563,11 @@ fn detect_open_workspace(directory: &InputDirectory) -> Result<Vec<PolicyDetecti
         };
         add("test", argv, "pyproject.toml");
     }
-    Ok(commands)
+    if directory.is_regular("foundry.toml") {
+        add("build", vec!["forge", "build"], "foundry.toml");
+        add("test", vec!["forge", "test"], "foundry.toml");
+    }
+    Ok(crate::commands::project::detect::finalize_policy_detections(commands, configured))
 }
 
 fn import_env(context: &RuntimeContext, args: ImportEnvArgs) -> Result<Value, CliError> {

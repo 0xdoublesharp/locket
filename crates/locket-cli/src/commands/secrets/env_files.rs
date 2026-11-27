@@ -424,6 +424,8 @@ struct EnvScanReport {
     shared_candidates: Vec<SharedCandidate>,
     total_files: usize,
     total_keys: usize,
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    git_tracked_files: usize,
     migrated_projects: usize,
     staged_projects: usize,
     uninitialized_projects: usize,
@@ -436,10 +438,47 @@ struct EnvScanReport {
     metadata_only: bool,
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
 #[derive(Default)]
 struct ScanEntries {
     files: Vec<ScannedEnvFile>,
     configured_projects: BTreeSet<PathBuf>,
+    git_tracked_cache: BTreeMap<PathBuf, BTreeSet<PathBuf>>,
+    git_tracked_files: usize,
+}
+
+fn is_git_tracked_env_file(
+    git_root: &Path,
+    file_path: &Path,
+    cache: &mut BTreeMap<PathBuf, BTreeSet<PathBuf>>,
+) -> bool {
+    let tracked = cache.entry(git_root.to_owned()).or_insert_with(|| {
+        let Ok(output) = std::process::Command::new("git")
+            .arg("-C")
+            .arg(git_root)
+            .args(["ls-files", "-z", "--", ":(glob)**/.env", ":(glob)**/.env.*"])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+        else {
+            return BTreeSet::new();
+        };
+        if !output.status.success() {
+            return BTreeSet::new();
+        }
+        output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+            .filter_map(|entry| std::str::from_utf8(entry).ok())
+            .map(|relative| git_root.join(relative))
+            .collect()
+    });
+    tracked.contains(file_path)
 }
 
 /// Discover dotenv metadata and shared-key candidates without opening a vault.
@@ -483,6 +522,7 @@ fn scan_directory(
     directory: &InputDirectory,
     inherited_root: &Path,
     inherited_config: bool,
+    inherited_git_root: Option<&Path>,
     remaining_depth: usize,
     literal: bool,
     found: &mut ScanEntries,
@@ -496,6 +536,7 @@ fn scan_directory(
     }
     let has_git =
         directory.entry_kind(OsStr::new(".git")).is_ok_and(|kind| kind != EntryKind::Other);
+    let git_root = if has_git { Some(directory.path.as_path()) } else { inherited_git_root };
     let (project_root, has_locket_config) = if has_config || has_git {
         (directory.path.as_path(), has_config)
     } else {
@@ -515,6 +556,7 @@ fn scan_directory(
                         &child,
                         project_root,
                         has_locket_config,
+                        git_root,
                         remaining_depth - 1,
                         literal,
                         found,
@@ -523,6 +565,12 @@ fn scan_directory(
             }
             Ok(EntryKind::File) if name.to_str().is_some_and(is_env_filename) => {
                 let path = directory.path.join(&name);
+                if git_root.is_some_and(|repo| {
+                    is_git_tracked_env_file(repo, &path, &mut found.git_tracked_cache)
+                }) {
+                    found.git_tracked_files += 1;
+                    continue;
+                }
                 let (keys, warnings_count, invalid, error) =
                     match directory.open_file(&name).and_then(|file| read_keys(file, literal)) {
                         Ok(report) => (report.keys, report.warnings.len(), report.invalid, None),
@@ -555,8 +603,9 @@ fn build_scan_report(
 ) -> Result<EnvScanReport, CliError> {
     let mut locations = BTreeMap::<String, KeyLocations>::new();
     let mut found = ScanEntries::default();
-    scan_directory(root, &root.path, false, max_depth, literal, &mut found)?;
-    let ScanEntries { mut files, configured_projects } = found;
+    let initial_git_root = super::git_worktree_root(&root.path).ok().flatten();
+    scan_directory(root, &root.path, false, initial_git_root, max_depth, literal, &mut found)?;
+    let ScanEntries { mut files, configured_projects, git_tracked_files, .. } = found;
     files.sort_by(|left, right| left.path.cmp(&right.path));
     let mut staged_roots = BTreeSet::new();
     let mut uninitialized_roots = BTreeSet::new();
@@ -605,6 +654,7 @@ fn build_scan_report(
         root: root.path.display().to_string(),
         total_files: files.len(),
         total_keys: files.iter().map(|file| file.key_count).sum(),
+        git_tracked_files,
         migrated_projects,
         staged_projects,
         uninitialized_projects,
@@ -644,6 +694,13 @@ pub(super) fn write_env_scan(
     let report = scan_env_files(root, max_depth, literal, remaining)?;
     writeln!(output, "root: {:?}", report.root)?;
     writeln!(output, "total_files: {}  total_keys: {}", report.total_files, report.total_keys)?;
+    if report.git_tracked_files > 0 {
+        writeln!(
+            output,
+            "git_tracked_files: {} (excluded from migration work queue)",
+            report.git_tracked_files,
+        )?;
+    }
     writeln!(
         output,
         "projects: {} migrated, {} staged, {} uninitialized",
@@ -764,6 +821,35 @@ mod tests {
         let scan = scan_open_workspace(&directory, 1, false)?;
         assert_eq!(scan["total_files"], 1);
         assert_eq!(scan["files"][0]["keys"], serde_json::json!(["ORIGINAL"]));
+        Ok(())
+    }
+
+    #[test]
+    fn scan_excludes_git_tracked_dotenv_files_from_migration_queue()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().canonicalize()?;
+        let repo = root.join("repo");
+        fs::create_dir_all(repo.join("tests"))?;
+        let init =
+            std::process::Command::new("git").args(["init", "-q"]).current_dir(&repo).status();
+        let Ok(status) = init else { return Ok(()) };
+        if !status.success() {
+            return Ok(());
+        }
+        fs::write(repo.join("tests/.env.test"), "TEST_MODE=1\n")?;
+        fs::write(repo.join(".env.ci"), "CI=true\n")?;
+        fs::write(repo.join(".env"), "LOCAL_SECRET=fixture\n")?;
+        let add = std::process::Command::new("git")
+            .args(["add", "tests/.env.test", ".env.ci"])
+            .current_dir(&repo)
+            .status()?;
+        assert!(add.success());
+
+        let report = scan_workspace_env_files(&root, 4, false, false)?;
+        assert_eq!(report["total_files"], 1);
+        assert_eq!(report["git_tracked_files"], 2);
+        assert_eq!(report["files"][0]["path"], repo.join(".env").display().to_string());
         Ok(())
     }
 }

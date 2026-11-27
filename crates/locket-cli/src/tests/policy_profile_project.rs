@@ -40,13 +40,13 @@ fn policy_detect_reports_metadata_across_manifests_without_initializing()
         ("typecheck", vec!["pnpm", "run", "typecheck"], "package.json"),
         ("migrate", vec!["pnpm", "run", "migrate"], "package.json"),
         ("db:migrate", vec!["pnpm", "run", "db:migrate"], "package.json"),
-        ("test", vec!["cargo", "test"], "Cargo.toml"),
+        ("cargo-test", vec!["cargo", "test"], "Cargo.toml"),
         ("run", vec!["cargo", "run"], "Cargo.toml"),
-        ("dev", vec!["make", "dev"], "Makefile"),
-        ("run", vec!["make", "run"], "Makefile"),
-        ("test", vec!["uv", "run", "pytest"], "pyproject.toml"),
-        ("build", vec!["forge", "build"], "foundry.toml"),
-        ("test", vec!["forge", "test"], "foundry.toml"),
+        ("make-dev", vec!["make", "dev"], "Makefile"),
+        ("make-run", vec!["make", "run"], "Makefile"),
+        ("pytest", vec!["uv", "run", "pytest"], "pyproject.toml"),
+        ("forge-build", vec!["forge", "build"], "foundry.toml"),
+        ("forge-test", vec!["forge", "test"], "foundry.toml"),
     ];
     assert_eq!(detected.len(), expected.len());
     for (name, argv, source_file) in expected {
