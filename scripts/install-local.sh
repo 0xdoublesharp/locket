@@ -39,12 +39,18 @@ cd "$ROOT"
 
 VERSION="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
 
+SIGN_LABEL=""
 if [[ -z "$SIGN_IDENTITY" ]] && command -v security >/dev/null 2>&1; then
     IDENTITIES="$(security find-identity -v -p codesigning 2>/dev/null || true)"
     if grep -q '"Locket Local Dev"' <<<"$IDENTITIES"; then
-        SIGN_IDENTITY="Locket Local Dev"
+        SIGN_IDENTITY="$(sed -n 's/^[[:space:]]*[0-9]*)[[:space:]]*\([0-9A-Fa-f]\{40\}\)[[:space:]]*"Locket Local Dev".*/\1/p' <<<"$IDENTITIES" | head -n 1)"
+        SIGN_LABEL="Locket Local Dev ($SIGN_IDENTITY)"
     else
-        SIGN_IDENTITY="$(sed -n 's/.*"\(Developer ID Application:[^"]*\)".*/\1/p' <<<"$IDENTITIES" | head -n 1)"
+        DEV_LINE="$(grep '"Developer ID Application:' <<<"$IDENTITIES" | head -n 1 || true)"
+        if [[ -n "$DEV_LINE" ]]; then
+            SIGN_IDENTITY="$(sed -n 's/^[[:space:]]*[0-9]*)[[:space:]]*\([0-9A-Fa-f]\{40\}\)[[:space:]]*".*/\1/p' <<<"$DEV_LINE")"
+            SIGN_LABEL="$(sed -n 's/.*"\(Developer ID Application:[^"]*\)".*/\1/p' <<<"$DEV_LINE") ($SIGN_IDENTITY)"
+        fi
     fi
 fi
 
@@ -52,7 +58,7 @@ if [[ -z "$SIGN_IDENTITY" ]]; then
     SIGN_IDENTITY="-"
     echo "install-local: signing with ad-hoc identity (-). Create a self-signed 'Locket Local Dev' Code Signing cert in Keychain Access to avoid Keychain prompts on rebuilds."
 else
-    echo "install-local: signing with persistent identity: $SIGN_IDENTITY"
+    echo "install-local: signing with persistent identity: ${SIGN_LABEL:-$SIGN_IDENTITY}"
 fi
 
 echo "install-local: building release locket-cli and locket-desktop ($VERSION)..."
