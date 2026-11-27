@@ -2645,17 +2645,58 @@ pub fn finalize_configuration_environment(
         .map_err(|error| invalid_policy_error(error.to_string()))
 }
 
+const MAX_BROWSER_EXPOSURE_NAMES: usize = 8;
+
+pub(super) fn write_browser_exposure_warnings(
+    names: &[String],
+    output: &mut impl Write,
+) -> Result<(), CliError> {
+    match names {
+        [] => Ok(()),
+        [single] => {
+            if let Some(warning) = locket_core::variable_exposure_warning(
+                single,
+                locket_core::VariableClassification::Secret,
+            ) {
+                writeln!(output, "warning: {warning}")?;
+            }
+            Ok(())
+        }
+        many => {
+            let mut sorted: Vec<&str> = many.iter().map(String::as_str).collect();
+            sorted.sort_unstable();
+            sorted.dedup();
+            let shown = if sorted.len() > MAX_BROWSER_EXPOSURE_NAMES {
+                format!(
+                    "{} (+{} more)",
+                    sorted[..MAX_BROWSER_EXPOSURE_NAMES].join(", "),
+                    sorted.len() - MAX_BROWSER_EXPOSURE_NAMES,
+                )
+            } else {
+                sorted.join(", ")
+            };
+            writeln!(
+                output,
+                "warning: {} secret-classified browser-prefix variables ({shown}): these prefixes may expose values in browser bundles; mark genuinely public keys with classification = \"public\" under [variables.<NAME>] in locket.toml or rename secrets",
+                sorted.len()
+            )?;
+            Ok(())
+        }
+    }
+}
+
 pub fn write_configuration_warnings(
     document: &PolicyDocument,
     policy: &CommandPolicy,
     output: &mut impl Write,
 ) -> Result<(), CliError> {
+    let mut browser_names = Vec::new();
     for row in document.variable_readiness(policy, &std::collections::BTreeMap::new(), false) {
-        if let Some(warning) = row.warning {
-            writeln!(output, "warning: {warning}")?;
+        if row.warning.is_some() {
+            browser_names.push(row.name);
         }
     }
-    Ok(())
+    write_browser_exposure_warnings(&browser_names, output)
 }
 
 #[cfg(test)]

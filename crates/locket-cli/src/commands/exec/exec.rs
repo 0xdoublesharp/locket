@@ -286,6 +286,7 @@ fn validate_exec_configuration(
 ) -> Result<(), CliError> {
     // Ad-hoc exec selects existing vault names explicitly. Contracts validate these
     // values but do not authorize additional names or apply saved-command defaults.
+    let mut browser_names = Vec::new();
     for name in secret_names {
         let contract = document.variables.get(name);
         if let (Some(contract), Some(value)) = (contract, env.get(name)) {
@@ -297,11 +298,11 @@ fn validate_exec_configuration(
             .map_or(locket_core::VariableClassification::Secret, |contract| {
                 contract.classification
             });
-        if let Some(warning) = locket_core::variable_exposure_warning(name, classification) {
-            writeln!(output, "warning: {warning}")?;
+        if locket_core::variable_exposure_warning(name, classification).is_some() {
+            browser_names.push(name.clone());
         }
     }
-    Ok(())
+    super::run::write_browser_exposure_warnings(&browser_names, output)
 }
 
 fn confirm_exec_all_scope(

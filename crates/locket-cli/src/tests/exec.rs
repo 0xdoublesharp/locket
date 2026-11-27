@@ -238,6 +238,54 @@ fn exec_injects_secret_into_child_scope() -> Result<(), Box<dyn std::error::Erro
 }
 
 #[test]
+fn exec_consolidates_multiple_browser_prefix_exposure_warnings_into_one_line()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let context = test_context(&directory);
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--name", "web", "--profile", "dev"])?,
+        &context,
+        &mut Vec::new(),
+    )?;
+    for name in ["VITE_API_URL", "VITE_CHAIN_ID", "NEXT_PUBLIC_APP_NAME"] {
+        crate::set_secret_value(&context, &test_secret_write_args(name), "val", "manual", 1_000)?;
+    }
+
+    let mut output = Vec::new();
+    run_with_context(
+        Cli::try_parse_from([
+            "locket",
+            "exec",
+            "--secret",
+            "VITE_API_URL",
+            "--secret",
+            "VITE_CHAIN_ID",
+            "--secret",
+            "NEXT_PUBLIC_APP_NAME",
+            "--",
+            test_shell(),
+            "-c",
+            "true",
+        ])?,
+        &context,
+        &mut output,
+    )?;
+    let text = String::from_utf8(output)?;
+    let warning_lines: Vec<_> = text.lines().filter(|line| line.starts_with("warning:")).collect();
+    assert_eq!(warning_lines.len(), 1, "expected 1 consolidated warning line, got: {text}");
+    assert!(
+        warning_lines[0].contains("3 secret-classified browser-prefix variables"),
+        "{}",
+        warning_lines[0]
+    );
+    assert!(warning_lines[0].contains("NEXT_PUBLIC_APP_NAME"), "{}", warning_lines[0]);
+    assert!(warning_lines[0].contains("VITE_API_URL"), "{}", warning_lines[0]);
+    assert!(warning_lines[0].contains("VITE_CHAIN_ID"), "{}", warning_lines[0]);
+    assert!(warning_lines[0].contains("browser bundles"), "{}", warning_lines[0]);
+    Ok(())
+}
+
+#[test]
 fn exec_secret_requires_unlocked_vault_before_spawn() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempdir()?;
     let context = test_context(&directory);
