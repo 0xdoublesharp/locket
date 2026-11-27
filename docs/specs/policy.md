@@ -69,7 +69,7 @@ Policy source of truth:
 - Project secret ACLs are canonical in `locket.toml` under `[secrets.<SECRET_NAME>]` so per-secret command and path limits are reviewable without exporting secret values.
 - The SQLite `command_policies` table stores a normalized local index/cache used by the agent, UI, tray, VS Code, and policy doctor.
 - Agent reference resolution requires both a durable `source_path` and a matching `source_digest`; legacy allow-list-only indexes fail closed. The source is read and validated on every resolution, including current command, path, profile, and secret ACL rules. After upgrading, review `locket.toml` and use `locket policy refresh <name>` for any legacy policy reported by doctor.
-- `policy add`, `policy allow`, `policy require`, `policy edit`, and `policy delete` update `locket.toml` first, then refresh the SQLite index in the same user-visible operation.
+- `policy add`, `policy allow`, `policy require`, and `policy edit` update `locket.toml` first. In an interactive terminal (`LOCKET_NO_PROMPT` unset and stdin attached to a TTY), they refresh the local SQLite approval index in the same user-visible operation. In non-interactive runs (`LOCKET_NO_PROMPT=1` or non-TTY stdin), they leave the SQLite approval index unchanged and report `approval: pending` so new or edited policies require explicit human approval via `locket policy refresh <name>` or Locket Desktop before execution. `policy delete` always requires typed confirmation of the policy name before updating `locket.toml` and removing the index entry.
 - If `locket.toml` and SQLite disagree, `locket.toml` wins after a successful parse; invalid TOML fails closed and leaves the prior SQLite index read-only for diagnostics only.
 
 ## Variable contracts

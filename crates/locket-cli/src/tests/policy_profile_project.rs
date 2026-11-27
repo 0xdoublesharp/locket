@@ -119,6 +119,115 @@ fn policy_detect_uses_lockfile_runners_and_marks_existing_commands_from_subdirec
 }
 
 #[test]
+fn noninteractive_policy_mutations_require_explicit_refresh_approval()
+-> Result<(), Box<dyn std::error::Error>> {
+    struct NonInteractiveReader;
+    impl crate::ConfirmationReader for NonInteractiveReader {
+        fn read_confirmation(&self, prompt: &str) -> Result<String, crate::CliError> {
+            Err(crate::runtime::error::tty_required_error(format!(
+                "{prompt} requires interactive confirmation"
+            )))
+        }
+
+        fn is_interactive(&self) -> bool {
+            false
+        }
+    }
+
+    let directory = tempdir()?;
+    let mut interactive = test_context(&directory);
+    run_with_context(
+        Cli::try_parse_from(["locket", "init", "--name", "app", "--profile", "dev"])?,
+        &interactive,
+        &mut Vec::new(),
+    )?;
+    let noninteractive = RuntimeContext {
+        confirmation_reader: Arc::new(NonInteractiveReader),
+        ..interactive.clone()
+    };
+
+    // Non-interactive `policy add` and `policy require` must leave the policy unapproved.
+    let mut add_out = Vec::new();
+    run_with_context(
+        Cli::try_parse_from(["locket", "policy", "add", "check", "--", "echo", "ok"])?,
+        &noninteractive,
+        &mut add_out,
+    )?;
+    let add_out = String::from_utf8(add_out)?;
+    assert!(add_out.contains("approval: pending"), "{add_out}");
+    assert!(add_out.contains("locket policy refresh check"), "{add_out}");
+
+    let mut req_out = Vec::new();
+    run_with_context(
+        Cli::try_parse_from(["locket", "policy", "require", "check", "API_KEY"])?,
+        &noninteractive,
+        &mut req_out,
+    )?;
+    let req_out = String::from_utf8(req_out)?;
+    assert!(req_out.contains("approval: pending"), "{req_out}");
+
+    let store = locket_store::Store::open(directory.path().join("store.db"))?;
+    let resolved = crate::require_project(&noninteractive)?;
+    assert!(
+        store.get_command_policy_index(resolved.config.project_id.as_str(), "check")?.is_none(),
+        "non-interactive policy add/require must not create an approval index"
+    );
+
+    // Interactive `policy refresh` approves the policy.
+    interactive.confirmation_reader =
+        test_context_with_confirmation(&directory, "check\n").confirmation_reader;
+    run_with_context(
+        Cli::try_parse_from(["locket", "policy", "refresh", "check"])?,
+        &interactive,
+        &mut Vec::new(),
+    )?;
+    let approved = store
+        .get_command_policy_index(resolved.config.project_id.as_str(), "check")?
+        .ok_or("policy should be indexed after interactive refresh")?;
+    let before_normalized = approved.normalized_json;
+
+    // Subsequent non-interactive `policy allow` changes locket.toml without updating SQLite digest,
+    // invalidating the prior approval until another interactive refresh runs.
+    let mut allow_out = Vec::new();
+    run_with_context(
+        Cli::try_parse_from(["locket", "policy", "allow", "check", "EXTRA_SECRET"])?,
+        &noninteractive,
+        &mut allow_out,
+    )?;
+    let allow_out = String::from_utf8(allow_out)?;
+    assert!(allow_out.contains("approval: pending"), "{allow_out}");
+    let after = store
+        .get_command_policy_index(resolved.config.project_id.as_str(), "check")?
+        .ok_or("prior index remains for stale-approval detection")?;
+    assert_eq!(after.normalized_json, before_normalized);
+
+    // Dry-run import with `--verify-policy check` must now report the policy blocked.
+    std::fs::write(directory.path().join(".env"), "API_KEY=fixture-secret\n")?;
+    let backup = directory.path().join("backups");
+    let mut dry_out = Vec::new();
+    run_with_context(
+        Cli::try_parse_from([
+            "locket",
+            "import",
+            ".env",
+            "--archive",
+            backup.to_str().ok_or("non-utf8 path")?,
+            "--verify-policy",
+            "check",
+            "--dry-run",
+            "--json",
+        ])?,
+        &noninteractive,
+        &mut dry_out,
+    )?;
+    let report: serde_json::Value = serde_json::from_slice(&dry_out)?;
+    assert_eq!(report["verify_policy"], "check");
+    assert_eq!(report["verify_policy_status"], "blocked");
+    assert_eq!(report["delete_env"], "kept");
+    Ok(())
+}
+
+#[test]
 fn policy_detect_prints_next_steps_only_for_unconfigured_commands()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempdir()?;

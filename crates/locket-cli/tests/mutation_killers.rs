@@ -1439,6 +1439,59 @@ env_mode = "strict"
         Ok(store)
     }
 
+    #[test]
+    fn noninteractive_cli_policy_add_and_require_stay_unapproved_for_verify_policy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let workspace = tempfile::tempdir()?;
+        let project = workspace.path().join("repo");
+        let backup = workspace.path().join("backups");
+        fs::create_dir(&project)?;
+        let _store = initialize_project_store(&project)?;
+        fs::write(
+            project.join("locket.toml"),
+            format!(
+                "schema_version = 1\nproject_id = \"{PROJECT}\"\nname = \"mutation\"\ndefault_profile = \"dev\"\n"
+            ),
+        )?;
+
+        let add = command(&project)
+            .env("LOCKET_NO_PROMPT", "1")
+            .args(["policy", "add", "check", "--", "/bin/sh", "-c", "exit 0"])
+            .output()?;
+        assert!(add.status.success(), "{}", String::from_utf8_lossy(&add.stderr));
+        let add_stdout = String::from_utf8_lossy(&add.stdout);
+        assert!(add_stdout.contains("approval: pending"), "{add_stdout}");
+
+        let require = command(&project)
+            .env("LOCKET_NO_PROMPT", "1")
+            .args(["policy", "require", "check", "API_KEY"])
+            .output()?;
+        assert!(require.status.success(), "{}", String::from_utf8_lossy(&require.stderr));
+        let require_stdout = String::from_utf8_lossy(&require.stdout);
+        assert!(require_stdout.contains("approval: pending"), "{require_stdout}");
+
+        fs::write(project.join(".env"), "API_KEY=fixture-value\n")?;
+        let preview = command(&project)
+            .env("LOCKET_NO_PROMPT", "1")
+            .args([
+                "import",
+                ".env",
+                "--archive",
+                backup.to_str().ok_or("non-utf8 backup")?,
+                "--verify-policy",
+                "check",
+                "--dry-run",
+                "--json",
+            ])
+            .output()?;
+        assert!(preview.status.success(), "{}", String::from_utf8_lossy(&preview.stderr));
+        let report: Value = serde_json::from_slice(&preview.stdout)?;
+        assert_eq!(report["verify_policy"], "check");
+        assert_eq!(report["verify_policy_status"], "blocked");
+        assert_eq!(report["delete_env"], "kept");
+        Ok(())
+    }
+
     fn assert_no_runtime_sessions(store: &Store) -> Result<(), rusqlite::Error> {
         let count =
             store.connection().query_row("SELECT COUNT(*) FROM runtime_sessions", [], |row| {

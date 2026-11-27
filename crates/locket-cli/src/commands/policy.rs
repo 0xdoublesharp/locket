@@ -146,6 +146,35 @@ fn detect(
     Ok(())
 }
 
+fn allows_immediate_policy_approval(context: &RuntimeContext) -> bool {
+    !crate::runtime::prompts::prompts_disabled() && context.confirmation_reader.is_interactive()
+}
+
+fn finish_policy_mutation(
+    context: &RuntimeContext,
+    output: &mut impl Write,
+    project_id: &str,
+    document: &toml::Value,
+    policy_document: &PolicyDocument,
+    name: &str,
+    operation: &str,
+) -> Result<(), CliError> {
+    if allows_immediate_policy_approval(context) {
+        write_policy_index_update_if_available(
+            context,
+            project_id,
+            document,
+            policy_document,
+            name,
+            operation,
+        )?;
+        pump_policies_to_agent(context, project_id, policy_document);
+        write_policy_update(output, name, operation, true)
+    } else {
+        write_policy_update(output, name, operation, false)
+    }
+}
+
 fn add(
     context: &RuntimeContext,
     output: &mut impl Write,
@@ -167,16 +196,15 @@ fn add(
     policy.insert("argv".to_owned(), string_array(args.command));
     commands.insert(args.name.clone(), toml::Value::Table(policy));
     let policy_document = write_validated_locket_toml(&path, &document)?;
-    write_policy_index_update_if_available(
+    finish_policy_mutation(
         context,
+        output,
         resolved.config.project_id.as_str(),
         &document,
         &policy_document,
         &args.name,
         "add",
-    )?;
-    pump_policies_to_agent(context, resolved.config.project_id.as_str(), &policy_document);
-    write_policy_update(output, &args.name, "add")
+    )
 }
 
 fn allow(
@@ -191,16 +219,15 @@ fn allow(
     let keys = validate_secret_names(args.keys)?;
     append_without_duplicates(policy, "optional_secrets", &keys)?;
     let policy_document = write_validated_locket_toml(&path, &document)?;
-    write_policy_index_update_if_available(
+    finish_policy_mutation(
         context,
+        output,
         resolved.config.project_id.as_str(),
         &document,
         &policy_document,
         &args.name,
         "allow",
-    )?;
-    pump_policies_to_agent(context, resolved.config.project_id.as_str(), &policy_document);
-    write_policy_update(output, &args.name, "allow")
+    )
 }
 
 fn require(
@@ -216,16 +243,15 @@ fn require(
     append_without_duplicates(policy, "required_secrets", &keys)?;
     remove_values(policy, "optional_secrets", &keys)?;
     let policy_document = write_validated_locket_toml(&path, &document)?;
-    write_policy_index_update_if_available(
+    finish_policy_mutation(
         context,
+        output,
         resolved.config.project_id.as_str(),
         &document,
         &policy_document,
         &args.name,
         "require",
-    )?;
-    pump_policies_to_agent(context, resolved.config.project_id.as_str(), &policy_document);
-    write_policy_update(output, &args.name, "require")
+    )
 }
 
 fn delete(
@@ -250,7 +276,7 @@ fn delete(
     let policy_document = write_validated_locket_toml(&path, &document)?;
     write_policy_index_delete_if_available(context, resolved.config.project_id.as_str(), &name)?;
     pump_policies_to_agent(context, resolved.config.project_id.as_str(), &policy_document);
-    write_policy_update(output, &name, "delete")
+    write_policy_update(output, &name, "delete", true)
 }
 
 fn edit(
@@ -274,16 +300,15 @@ fn edit(
         return Err(error.into());
     }
     let policy_document = edit_result?;
-    write_policy_index_update_if_available(
+    finish_policy_mutation(
         context,
+        output,
         resolved.config.project_id.as_str(),
         &document,
         &policy_document,
         &args.name,
         "edit",
-    )?;
-    pump_policies_to_agent(context, resolved.config.project_id.as_str(), &policy_document);
-    write_policy_update(output, &args.name, "edit")
+    )
 }
 
 fn refresh(
@@ -341,7 +366,7 @@ fn refresh(
         "refresh",
     )?;
     pump_policies_to_agent(context, resolved.config.project_id.as_str(), &parsed);
-    write_policy_update(output, &args.name, "refresh")
+    write_policy_update(output, &args.name, "refresh", true)
 }
 
 fn write_refresh_review(
@@ -1133,9 +1158,17 @@ fn write_policy_update(
     output: &mut impl Write,
     name: &str,
     operation: &str,
+    approved: bool,
 ) -> Result<(), CliError> {
     writeln!(output, "policy: {name}")?;
     writeln!(output, "operation: {operation}")?;
+    if !approved {
+        writeln!(output, "approval: pending")?;
+        writeln!(
+            output,
+            "next: run `locket policy refresh {name}` from an interactive terminal or approve in Locket Desktop"
+        )?;
+    }
     writeln!(output, "metadata_only: yes")?;
     Ok(())
 }
@@ -1571,7 +1604,7 @@ fn apply_editor_policy(
     let parsed = PolicyDocument::from_toml_str(&saved)
         .map_err(|_| metadata_invalid_error("saved policy could not be read"))?;
     pump_policies_to_agent(context, project_id, &parsed);
-    write_policy_update(output, &request.policy.name, &request.mode)
+    write_policy_update(output, &request.policy.name, &request.mode, true)
 }
 
 #[cfg(test)]

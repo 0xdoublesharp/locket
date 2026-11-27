@@ -25,6 +25,11 @@ fn require_prompts_enabled(reason: &str) -> Result<(), CliError> {
 
 pub trait ConfirmationReader {
     fn read_confirmation(&self, prompt: &str) -> Result<String, CliError>;
+
+    /// Whether this reader represents an interactive human terminal capable of immediate approval.
+    fn is_interactive(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -33,6 +38,10 @@ pub struct StdinConfirmationReader;
 impl ConfirmationReader for StdinConfirmationReader {
     fn read_confirmation(&self, prompt: &str) -> Result<String, CliError> {
         read_stdin_confirmation(prompt, io::stdin().is_terminal())
+    }
+
+    fn is_interactive(&self) -> bool {
+        !prompts_disabled() && io::stdin().is_terminal()
     }
 }
 

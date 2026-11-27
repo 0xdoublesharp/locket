@@ -313,4 +313,37 @@ theorem envScanProgress_noninterference (configuredProjects : List String)
       envScanProgress configuredProjects workspace := by
   simp [envScanProgress, replaceWorkspaceValues, List.map_map, Function.comp_def]
 
+structure PolicyApprovalState where
+  sourceDigest : String
+  approvedDigest : Option String
+  deriving DecidableEq
+
+/-- A CLI policy mutation updates `locket.toml` (`newDigest`), and refreshes the local
+SQLite approval index only when running in an interactive human terminal (`!noPrompt ∧ stdinIsTty`). -/
+def applyPolicyMutation (noPrompt stdinIsTty : Bool) (newDigest : String)
+    (state : PolicyApprovalState) : PolicyApprovalState :=
+  let approved := if !noPrompt && stdinIsTty then some newDigest else state.approvedDigest
+  ⟨newDigest, approved⟩
+
+def policyIsApproved (state : PolicyApprovalState) : Bool :=
+  state.approvedDigest == some state.sourceDigest
+
+/-- Non-interactive policy mutations (when `LOCKET_NO_PROMPT` is set or stdin is not a TTY)
+never write or advance the approved digest, so new policies remain unapproved and modified
+policies become unapproved until an explicit interactive refresh. -/
+theorem noninteractive_policy_mutation_never_approves (noPrompt stdinIsTty : Bool)
+    (noninteractive : noPrompt = true ∨ stdinIsTty = false)
+    (newDigest : String) (state : PolicyApprovalState) :
+    (applyPolicyMutation noPrompt stdinIsTty newDigest state).approvedDigest = state.approvedDigest ∧
+      (state.approvedDigest ≠ some newDigest →
+        policyIsApproved (applyPolicyMutation noPrompt stdinIsTty newDigest state) = false) := by
+  have gateFalse : (!noPrompt && stdinIsTty) = false := by
+    cases noninteractive with
+    | inl h => simp [h]
+    | inr h => simp [h]
+  constructor
+  · simp [applyPolicyMutation, gateFalse]
+  · intro diff
+    simp [policyIsApproved, applyPolicyMutation, gateFalse, diff]
+
 end LocketProofs.MigrationSafety
