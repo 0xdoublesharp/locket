@@ -1488,6 +1488,7 @@ env_mode = "strict"
         let report: Value = serde_json::from_slice(&preview.stdout)?;
         assert_eq!(report["verify_policy"], "check");
         assert_eq!(report["verify_policy_status"], "blocked");
+        assert_eq!(report["verify_policy_blocked_reason"], "needs approval");
         assert_eq!(report["delete_env"], "kept");
         Ok(())
     }

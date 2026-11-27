@@ -345,6 +345,8 @@ fn finalize_archive_action(
                 Some(match verification.preview(root, &report.project_id) {
                     Ok(()) => "would-run",
                     Err(error) => {
+                        report.verify_policy_blocked_reason =
+                            Some(classify_verify_policy_blocked_reason(&error));
                         report.block_archive(&error);
                         "blocked"
                     }
@@ -392,6 +394,20 @@ fn finalize_archive_action(
     report.delete_env = "archived";
     report.archived_to = Some(archived.display().to_string());
     Ok(())
+}
+
+fn classify_verify_policy_blocked_reason(error: &CliError) -> String {
+    let message = error.to_string();
+    if message.contains("needs local approval") {
+        return "needs approval".to_owned();
+    }
+    match error.exit_code() {
+        code if code == LocketError::PolicyNotFound.exit_code() => "policy not found".to_owned(),
+        code if code == LocketError::ProfileNotFound.exit_code() => "profile not found".to_owned(),
+        code if code == LocketError::UnlockRequired.exit_code() => "vault locked".to_owned(),
+        code if code == LocketError::AgentUnavailable.exit_code() => "agent unavailable".to_owned(),
+        _ => message,
+    }
 }
 
 struct ArchiveVerification<'a> {
@@ -545,6 +561,9 @@ fn write_import_report(
         if let (Some(name), Some(status)) = (&report.verify_policy, report.verify_policy_status) {
             writeln!(output, "verify_policy: {name} ({status})")?;
         }
+        if let Some(reason) = &report.verify_policy_blocked_reason {
+            writeln!(output, "verify_policy_blocked_reason: {reason}")?;
+        }
         if let Some(error) = &report.archive_error {
             writeln!(output, "archive_error: {error}")?;
         }
@@ -607,6 +626,8 @@ struct ImportReport {
     verify_policy: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     verify_policy_status: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verify_policy_blocked_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     verify_policy_exit_code: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -760,6 +781,7 @@ fn run_import(
         archive_error: None,
         verify_policy: None,
         verify_policy_status: None,
+        verify_policy_blocked_reason: None,
         verify_policy_exit_code: None,
         archived_to: None,
         metadata_only: true,
