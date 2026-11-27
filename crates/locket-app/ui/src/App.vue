@@ -538,13 +538,44 @@ const secretRows = computed<SecretRowMeta[]>(() =>
 
 const settings = ref<SettingsState>({
   privacyRedactNames: false,
+  uiTheme: 'system',
+  uiDensity: 'comfortable',
+  editorDefault: null,
+  agentAutostart: false,
   unlockTtlSeconds: 900,
   unlockTtl: null,
+  sessionSecretNameRetention: null,
+  revealTtl: null,
+  rotationMaxGraceTtl: null,
+  shellIntegration: 'off',
+  updatesChannel: 'off',
+  updatesManifestUrl: null,
+  exampleAutoRefresh: true,
+  runRedactOutput: 'auto',
   verification: null,
   dangerousProfile: null,
   dangerousProfileFlag: false,
   agentVersion: status.value?.agent_version ?? agentStatus.value?.agent_version ?? 'unknown',
 });
+
+watch(
+  [() => settings.value.uiTheme, () => settings.value.uiDensity],
+  ([theme, density]) => {
+    const dataset = typeof document !== 'undefined' ? document.documentElement?.dataset : undefined;
+    if (!dataset) return;
+    if (theme === 'light' || theme === 'dark') {
+      dataset.theme = theme;
+    } else {
+      delete dataset.theme;
+    }
+    if (density === 'compact') {
+      dataset.density = 'compact';
+    } else {
+      delete dataset.density;
+    }
+  },
+  { immediate: true },
+);
 
 watch(
   [status, () => settings.value.privacyRedactNames],
@@ -585,8 +616,20 @@ function applyAgentConfig(config: AgentConfigSettings): void {
   settings.value = {
     ...settings.value,
     privacyRedactNames: config.privacy_redact_names,
+    uiTheme: config.ui_theme ?? 'system',
+    uiDensity: config.ui_density ?? 'comfortable',
+    editorDefault: config.editor_default ?? null,
+    agentAutostart: config.agent_autostart ?? false,
     unlockTtlSeconds: configuredDurationSeconds(config.agent_unlock_ttl) || 900,
     unlockTtl: config.agent_unlock_ttl,
+    sessionSecretNameRetention: config.runtime_session_secret_name_retention ?? null,
+    revealTtl: config.reveal_ttl ?? null,
+    rotationMaxGraceTtl: config.rotation_max_grace_ttl ?? null,
+    shellIntegration: config.shell_integration ?? 'off',
+    updatesChannel: config.updates_channel ?? 'off',
+    updatesManifestUrl: config.updates_manifest_url ?? null,
+    exampleAutoRefresh: config.example_auto_refresh ?? true,
+    runRedactOutput: config.run_redact_output ?? 'auto',
     verification: config.user_verification_required_for,
     dangerousProfile: config.dangerous_profile,
     dangerousProfileFlag: config.dangerous_profile?.dangerous ?? false,
@@ -646,6 +689,12 @@ async function handleSettingsPatch(changes: WriteConfigChanges): Promise<void> {
   if (!projectId) {
     if (typeof changes.privacy_redact_names === 'boolean') {
       settings.value.privacyRedactNames = changes.privacy_redact_names;
+    }
+    if (changes.ui_theme) {
+      settings.value.uiTheme = changes.ui_theme;
+    }
+    if (changes.ui_density) {
+      settings.value.uiDensity = changes.ui_density;
     }
     return;
   }

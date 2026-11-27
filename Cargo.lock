@@ -3181,6 +3181,7 @@ dependencies = [
  "locket-core",
  "locket-crypto",
  "locket-platform",
+ "locket-scan",
  "locket-store",
  "proptest",
  "rand 0.10.4",

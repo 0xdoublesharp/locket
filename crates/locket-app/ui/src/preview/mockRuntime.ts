@@ -83,7 +83,37 @@ export function createMockRuntime(params: URLSearchParams) {
     team_accept: false,
     device_register: true,
   };
-  const config = { privacy_redact_names: false, agent_unlock_ttl: '1h' };
+  const config: {
+    privacy_redact_names: boolean;
+    ui_theme: 'system' | 'light' | 'dark';
+    ui_density: 'comfortable' | 'compact';
+    editor_default: string | null;
+    agent_autostart: boolean;
+    agent_unlock_ttl: string | null;
+    runtime_session_secret_name_retention: string | null;
+    reveal_ttl: string | null;
+    rotation_max_grace_ttl: string | null;
+    shell_integration: 'off' | 'prompt-only' | 'hook';
+    updates_channel: 'off' | 'stable' | 'beta';
+    updates_manifest_url: string | null;
+    example_auto_refresh: boolean;
+    run_redact_output: 'auto' | 'always' | 'never';
+  } = {
+    privacy_redact_names: false,
+    ui_theme: 'system',
+    ui_density: 'comfortable',
+    editor_default: null,
+    agent_autostart: false,
+    agent_unlock_ttl: '1h',
+    runtime_session_secret_name_retention: null,
+    reveal_ttl: null,
+    rotation_max_grace_ttl: null,
+    shell_integration: 'off',
+    updates_channel: 'off',
+    updates_manifest_url: null,
+    example_auto_refresh: true,
+    run_redact_output: 'auto',
+  };
 
   const isWelcome = scenario === 'welcome';
   const projects: DesktopProjectContext[] = isWelcome
@@ -1002,9 +1032,36 @@ export function createMockRuntime(params: URLSearchParams) {
         const { changes } = request as unknown as WriteConfigRequest;
         if (typeof changes.privacy_redact_names === 'boolean')
           config.privacy_redact_names = changes.privacy_redact_names;
+        if (changes.ui_theme) config.ui_theme = changes.ui_theme;
+        if (changes.ui_density) config.ui_density = changes.ui_density;
+        if (changes.editor_default) config.editor_default = changes.editor_default;
+        if (typeof changes.agent_autostart === 'boolean')
+          config.agent_autostart = changes.agent_autostart;
         if (changes.agent_unlock_ttl) config.agent_unlock_ttl = changes.agent_unlock_ttl;
+        if (changes.runtime_session_secret_name_retention)
+          config.runtime_session_secret_name_retention =
+            changes.runtime_session_secret_name_retention;
+        if (changes.reveal_ttl) config.reveal_ttl = changes.reveal_ttl;
+        if (changes.rotation_max_grace_ttl)
+          config.rotation_max_grace_ttl = changes.rotation_max_grace_ttl;
+        if (changes.shell_integration) config.shell_integration = changes.shell_integration;
+        if (changes.updates_channel) config.updates_channel = changes.updates_channel;
+        if (changes.updates_manifest_url)
+          config.updates_manifest_url = changes.updates_manifest_url;
+        if (typeof changes.example_auto_refresh === 'boolean')
+          config.example_auto_refresh = changes.example_auto_refresh;
+        if (changes.run_redact_output) config.run_redact_output = changes.run_redact_output;
         if (changes.user_verification_required_for)
           Object.assign(verification, changes.user_verification_required_for);
+        for (const key of changes.unset_keys ?? []) {
+          if (key === 'editor.default') config.editor_default = null;
+          if (key === 'agent.unlock_ttl') config.agent_unlock_ttl = null;
+          if (key === 'runtime.session_secret_name_retention')
+            config.runtime_session_secret_name_retention = null;
+          if (key === 'reveal.ttl') config.reveal_ttl = null;
+          if (key === 'rotation.max_grace_ttl') config.rotation_max_grace_ttl = null;
+          if (key === 'updates.manifest_url') config.updates_manifest_url = null;
+        }
         const profile = selected ? profiles.get(selected.profile_id) : undefined;
         if (profile && typeof changes.dangerous_profile === 'boolean')
           profile.dangerous = changes.dangerous_profile;

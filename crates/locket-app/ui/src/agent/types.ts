@@ -493,10 +493,29 @@ export interface WriteConfigRequest {
   changes: WriteConfigChanges;
 }
 
+export type UiThemeSetting = 'system' | 'light' | 'dark';
+export type UiDensitySetting = 'comfortable' | 'compact';
+export type ShellIntegrationSetting = 'off' | 'prompt-only' | 'hook';
+export type UpdatesChannelSetting = 'off' | 'stable' | 'beta';
+export type RunRedactOutputSetting = 'auto' | 'always' | 'never';
+
 export interface WriteConfigChanges {
   privacy_redact_names?: boolean | null;
+  ui_theme?: UiThemeSetting | null;
+  ui_density?: UiDensitySetting | null;
+  editor_default?: string | null;
+  agent_autostart?: boolean | null;
   agent_unlock_ttl?: string | null;
+  runtime_session_secret_name_retention?: string | null;
+  reveal_ttl?: string | null;
+  rotation_max_grace_ttl?: string | null;
+  shell_integration?: ShellIntegrationSetting | null;
+  updates_channel?: UpdatesChannelSetting | null;
+  updates_manifest_url?: string | null;
+  example_auto_refresh?: boolean | null;
+  run_redact_output?: RunRedactOutputSetting | null;
   user_verification_required_for?: UserVerificationSettings | null;
+  unset_keys?: string[];
   dangerous_profile?: boolean | null;
 }
 
@@ -529,7 +548,19 @@ export interface DangerousProfileSetting {
 
 export interface AgentConfigSettings {
   privacy_redact_names: boolean;
+  ui_theme?: UiThemeSetting;
+  ui_density?: UiDensitySetting;
+  editor_default?: string | null;
+  agent_autostart?: boolean;
   agent_unlock_ttl: string | null;
+  runtime_session_secret_name_retention?: string | null;
+  reveal_ttl?: string | null;
+  rotation_max_grace_ttl?: string | null;
+  shell_integration?: ShellIntegrationSetting;
+  updates_channel?: UpdatesChannelSetting;
+  updates_manifest_url?: string | null;
+  example_auto_refresh?: boolean;
+  run_redact_output?: RunRedactOutputSetting;
   user_verification_required_for: EffectiveUserVerificationSettings;
   dangerous_profile: DangerousProfileSetting | null;
 }

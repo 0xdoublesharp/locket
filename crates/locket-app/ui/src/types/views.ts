@@ -1,4 +1,12 @@
-import type { DangerousProfileSetting, EffectiveUserVerificationSettings } from '../agent/types';
+import type {
+  DangerousProfileSetting,
+  EffectiveUserVerificationSettings,
+  RunRedactOutputSetting,
+  ShellIntegrationSetting,
+  UiDensitySetting,
+  UiThemeSetting,
+  UpdatesChannelSetting,
+} from '../agent/types';
 
 // Prop types for the metadata-only desktop views in `src/views/`.
 // These mirror the Rust descriptor inventory in `crates/locket-app/src/lib.rs`
@@ -129,8 +137,20 @@ export interface ScanFindingRow {
 
 export interface SettingsState {
   privacyRedactNames: boolean;
+  uiTheme?: UiThemeSetting;
+  uiDensity?: UiDensitySetting;
+  editorDefault?: string | null;
+  agentAutostart?: boolean;
   unlockTtlSeconds: number;
   unlockTtl: string | null;
+  sessionSecretNameRetention?: string | null;
+  revealTtl?: string | null;
+  rotationMaxGraceTtl?: string | null;
+  shellIntegration?: ShellIntegrationSetting;
+  updatesChannel?: UpdatesChannelSetting;
+  updatesManifestUrl?: string | null;
+  exampleAutoRefresh?: boolean;
+  runRedactOutput?: RunRedactOutputSetting;
   verification: EffectiveUserVerificationSettings | null;
   dangerousProfile: DangerousProfileSetting | null;
   dangerousProfileFlag: boolean;

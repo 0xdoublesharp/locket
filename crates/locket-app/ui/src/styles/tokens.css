@@ -35,7 +35,7 @@
 }
 
 @media (prefers-color-scheme: light) {
-  :root {
+  :root:not([data-theme='dark']) {
     color-scheme: light;
     --bg-app: #f3f5f8;
     --bg-surface: #fff;
@@ -64,6 +64,40 @@
     --shadow-md: 0 8px 24px rgba(24, 33, 45, 0.12);
     --shadow-lg: 0 16px 56px rgba(24, 33, 45, 0.18);
   }
+}
+
+:root[data-theme='light'] {
+  color-scheme: light;
+  --bg-app: #f3f5f8;
+  --bg-surface: #fff;
+  --bg-elevated: #fff;
+  --bg-subtle: #e9edf3;
+  --border-subtle: #ccd4df;
+  --border-strong: #738194;
+  --border-required: #ae8841;
+  --text-primary: #18212d;
+  --text-secondary: #3b495b;
+  --text-muted: #536173;
+  --accent: #6e4900;
+  --accent-fg: #fff;
+  --accent-soft: #f8ebcd;
+  --danger: #9b283b;
+  --danger-soft: #fbe6e8;
+  --success: #17663f;
+  --success-soft: #e2f2e9;
+  --status-unlocked: var(--success);
+  --warn: #813b16;
+  --warn-soft: #faebde;
+  --info: #254d96;
+  --info-soft: #e5edfc;
+  --backdrop: rgba(24, 33, 45, 0.45);
+  --shadow-sm: 0 1px 2px rgba(24, 33, 45, 0.09);
+  --shadow-md: 0 8px 24px rgba(24, 33, 45, 0.12);
+  --shadow-lg: 0 16px 56px rgba(24, 33, 45, 0.18);
+}
+
+:root[data-density='compact'] {
+  font-size: 14px;
 }
 
 :where(button, input, select, textarea, summary, a):focus-visible {

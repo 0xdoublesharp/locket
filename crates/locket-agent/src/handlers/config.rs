@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Mutex, MutexGuard};
 
-use locket_core::{Duration as LocketDuration, privacy_alias};
+use locket_core::{Duration as LocketDuration, OutputRedaction, privacy_alias};
 use locket_platform::write_user_only_file;
-use locket_store::{AuditWrite, Store};
+use locket_scan::{FindingKind, scan_text};
+use locket_store::{AuditWrite, RuntimeSessionSecretNameRetention, Store};
 use rusqlite::OptionalExtension as _;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -17,8 +18,20 @@ use sha2::{Digest, Sha256};
 use crate::envelope::{ErrorEnvelope, RequestEnvelope, ResponseEnvelope, SuccessEnvelope};
 use crate::keys::{KeyError, cached_master_key, unwrap_audit_key_with_master};
 
+const UI_THEME: &str = "ui.theme";
+const UI_DENSITY: &str = "ui.density";
 const PRIVACY_REDACT_NAMES: &str = "privacy.redact_names";
+const EDITOR_DEFAULT: &str = "editor.default";
+const AGENT_AUTOSTART: &str = "agent.autostart";
 const AGENT_UNLOCK_TTL: &str = "agent.unlock_ttl";
+const RUNTIME_SESSION_SECRET_NAME_RETENTION: &str = "runtime.session_secret_name_retention";
+const REVEAL_TTL: &str = "reveal.ttl";
+const ROTATION_MAX_GRACE_TTL: &str = "rotation.max_grace_ttl";
+const SHELL_INTEGRATION: &str = "shell.integration";
+const UPDATES_CHANNEL: &str = "updates.channel";
+const UPDATES_MANIFEST_URL: &str = "updates.manifest_url";
+const EXAMPLE_AUTO_REFRESH: &str = "example.auto_refresh";
+const RUN_REDACT_OUTPUT: &str = "run.redact_output";
 const VERIFICATION_UNLOCK: &str = "user_verification_required_for.unlock";
 const VERIFICATION_REVEAL: &str = "user_verification_required_for.reveal";
 const VERIFICATION_COPY: &str = "user_verification_required_for.copy";
@@ -27,6 +40,57 @@ const VERIFICATION_DANGEROUS_PROFILE_SWITCH: &str =
 const VERIFICATION_RECOVERY: &str = "user_verification_required_for.recovery";
 const VERIFICATION_TEAM_ACCEPT: &str = "user_verification_required_for.team_accept";
 const VERIFICATION_DEVICE_REGISTER: &str = "user_verification_required_for.device_register";
+
+const UI_THEME_VALUES: &[&str] = &["system", "light", "dark"];
+const UI_DENSITY_VALUES: &[&str] = &["comfortable", "compact"];
+const SHELL_INTEGRATION_VALUES: &[&str] = &["off", "prompt-only", "hook"];
+const UPDATES_CHANNEL_VALUES: &[&str] = &["off", "stable", "beta"];
+const MAX_REVEAL_TTL_SECS: u64 = 300;
+const MAX_ROTATION_GRACE_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+
+const SUPPORTED_CONFIG_KEYS: &[&str] = &[
+    UI_THEME,
+    UI_DENSITY,
+    PRIVACY_REDACT_NAMES,
+    EDITOR_DEFAULT,
+    AGENT_AUTOSTART,
+    AGENT_UNLOCK_TTL,
+    RUNTIME_SESSION_SECRET_NAME_RETENTION,
+    REVEAL_TTL,
+    ROTATION_MAX_GRACE_TTL,
+    SHELL_INTEGRATION,
+    UPDATES_CHANNEL,
+    UPDATES_MANIFEST_URL,
+    EXAMPLE_AUTO_REFRESH,
+    RUN_REDACT_OUTPUT,
+    VERIFICATION_UNLOCK,
+    VERIFICATION_REVEAL,
+    VERIFICATION_COPY,
+    VERIFICATION_DANGEROUS_PROFILE_SWITCH,
+    VERIFICATION_RECOVERY,
+    VERIFICATION_TEAM_ACCEPT,
+    VERIFICATION_DEVICE_REGISTER,
+];
+
+fn default_ui_theme() -> String {
+    "system".to_owned()
+}
+
+fn default_ui_density() -> String {
+    "comfortable".to_owned()
+}
+
+fn default_off() -> String {
+    "off".to_owned()
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+fn default_run_redact_output() -> String {
+    "auto".to_owned()
+}
 static CONFIG_WRITES: Mutex<()> = Mutex::new(());
 
 fn lock_config() -> io::Result<MutexGuard<'static, ()>> {
@@ -134,12 +198,51 @@ pub struct WriteConfigChanges {
     /// Set `privacy.redact_names`.
     #[serde(default)]
     pub privacy_redact_names: Option<bool>,
+    /// Set `ui.theme` (`system`, `light`, or `dark`).
+    #[serde(default)]
+    pub ui_theme: Option<String>,
+    /// Set `ui.density` (`comfortable` or `compact`).
+    #[serde(default)]
+    pub ui_density: Option<String>,
+    /// Set `editor.default` (command name or absolute path).
+    #[serde(default)]
+    pub editor_default: Option<String>,
+    /// Set `agent.autostart`.
+    #[serde(default)]
+    pub agent_autostart: Option<bool>,
     /// Set `agent.unlock_ttl` to a duration string.
     #[serde(default)]
     pub agent_unlock_ttl: Option<String>,
+    /// Set `runtime.session_secret_name_retention` (duration string or `off`).
+    #[serde(default)]
+    pub runtime_session_secret_name_retention: Option<String>,
+    /// Set `reveal.ttl` (duration string, 5m or less).
+    #[serde(default)]
+    pub reveal_ttl: Option<String>,
+    /// Set `rotation.max_grace_ttl` (duration string, 30d or less).
+    #[serde(default)]
+    pub rotation_max_grace_ttl: Option<String>,
+    /// Set `shell.integration` (`off`, `prompt-only`, or `hook`).
+    #[serde(default)]
+    pub shell_integration: Option<String>,
+    /// Set `updates.channel` (`off`, `stable`, or `beta`).
+    #[serde(default)]
+    pub updates_channel: Option<String>,
+    /// Set `updates.manifest_url` (HTTPS URL).
+    #[serde(default)]
+    pub updates_manifest_url: Option<String>,
+    /// Set `example.auto_refresh`.
+    #[serde(default)]
+    pub example_auto_refresh: Option<bool>,
+    /// Set `run.redact_output` (`auto`, `always`, or `never`).
+    #[serde(default)]
+    pub run_redact_output: Option<String>,
     /// Set any user-verification policy booleans.
     #[serde(default)]
     pub user_verification_required_for: Option<UserVerificationSettings>,
+    /// Config keys to remove from `config.toml` (reset to built-in default).
+    #[serde(default)]
+    pub unset_keys: Vec<String>,
     /// Set the selected profile's dangerous marker.
     #[serde(default)]
     pub dangerous_profile: Option<bool>,
@@ -176,8 +279,44 @@ pub struct UserVerificationSettings {
 pub struct AgentConfigSettings {
     /// Effective `privacy.redact_names`; missing config defaults to false.
     pub privacy_redact_names: bool,
+    /// Effective `ui.theme`; missing config defaults to `system`.
+    #[serde(default = "default_ui_theme")]
+    pub ui_theme: String,
+    /// Effective `ui.density`; missing config defaults to `comfortable`.
+    #[serde(default = "default_ui_density")]
+    pub ui_density: String,
+    /// Configured `editor.default`, if present.
+    #[serde(default)]
+    pub editor_default: Option<String>,
+    /// Effective `agent.autostart`; missing config defaults to false.
+    #[serde(default)]
+    pub agent_autostart: bool,
     /// Configured `agent.unlock_ttl`, if present.
     pub agent_unlock_ttl: Option<String>,
+    /// Configured `runtime.session_secret_name_retention`, if present.
+    #[serde(default)]
+    pub runtime_session_secret_name_retention: Option<String>,
+    /// Configured `reveal.ttl`, if present.
+    #[serde(default)]
+    pub reveal_ttl: Option<String>,
+    /// Configured `rotation.max_grace_ttl`, if present.
+    #[serde(default)]
+    pub rotation_max_grace_ttl: Option<String>,
+    /// Effective `shell.integration`; missing config defaults to `off`.
+    #[serde(default = "default_off")]
+    pub shell_integration: String,
+    /// Effective `updates.channel`; missing config defaults to `off`.
+    #[serde(default = "default_off")]
+    pub updates_channel: String,
+    /// Configured `updates.manifest_url`, if present.
+    #[serde(default)]
+    pub updates_manifest_url: Option<String>,
+    /// Effective `example.auto_refresh`; missing config defaults to true.
+    #[serde(default = "default_true")]
+    pub example_auto_refresh: bool,
+    /// Effective `run.redact_output`; missing config defaults to `auto`.
+    #[serde(default = "default_run_redact_output")]
+    pub run_redact_output: String,
     /// Effective user-verification gates; missing keys default to false.
     pub user_verification_required_for: EffectiveUserVerificationSettings,
     /// Dangerous marker for the requested profile, when profile context was supplied.
@@ -449,41 +588,181 @@ fn apply_settings_patch(
     changes: &WriteConfigChanges,
 ) -> Result<Vec<String>, ConfigRpcError> {
     let mut changed_keys = Vec::new();
-    if let Some(value) = changes.privacy_redact_names {
-        set_config_value(config, PRIVACY_REDACT_NAMES, toml::Value::Boolean(value))?;
-        changed_keys.push(PRIVACY_REDACT_NAMES.to_owned());
-    }
-    if let Some(value) = changes.agent_unlock_ttl.as_deref() {
-        validate_duration(value)?;
-        set_config_value(config, AGENT_UNLOCK_TTL, toml::Value::String(value.to_owned()))?;
-        changed_keys.push(AGENT_UNLOCK_TTL.to_owned());
-    }
-    if let Some(verification) = &changes.user_verification_required_for {
-        push_bool_patch(config, &mut changed_keys, VERIFICATION_UNLOCK, verification.unlock)?;
-        push_bool_patch(config, &mut changed_keys, VERIFICATION_REVEAL, verification.reveal)?;
-        push_bool_patch(config, &mut changed_keys, VERIFICATION_COPY, verification.copy)?;
-        push_bool_patch(
-            config,
-            &mut changed_keys,
-            VERIFICATION_DANGEROUS_PROFILE_SWITCH,
-            verification.dangerous_profile_switch,
-        )?;
-        push_bool_patch(config, &mut changed_keys, VERIFICATION_RECOVERY, verification.recovery)?;
-        push_bool_patch(
-            config,
-            &mut changed_keys,
-            VERIFICATION_TEAM_ACCEPT,
-            verification.team_accept,
-        )?;
-        push_bool_patch(
-            config,
-            &mut changed_keys,
-            VERIFICATION_DEVICE_REGISTER,
-            verification.device_register,
-        )?;
-    }
-
+    apply_enum_patches(config, &mut changed_keys, changes)?;
+    apply_scalar_patches(config, &mut changed_keys, changes)?;
+    apply_verification_patch(
+        config,
+        &mut changed_keys,
+        changes.user_verification_required_for.as_ref(),
+    )?;
+    apply_unset_keys(config, &mut changed_keys, &changes.unset_keys)?;
     Ok(changed_keys)
+}
+
+fn apply_enum_patches(
+    config: &mut toml::Table,
+    changed_keys: &mut Vec<String>,
+    changes: &WriteConfigChanges,
+) -> Result<(), ConfigRpcError> {
+    let enum_fields: [(&str, Option<&str>, &[&str], &str); 5] = [
+        (
+            UI_THEME,
+            changes.ui_theme.as_deref(),
+            UI_THEME_VALUES,
+            "ui.theme must be system, light, or dark",
+        ),
+        (
+            UI_DENSITY,
+            changes.ui_density.as_deref(),
+            UI_DENSITY_VALUES,
+            "ui.density must be comfortable or compact",
+        ),
+        (
+            SHELL_INTEGRATION,
+            changes.shell_integration.as_deref(),
+            SHELL_INTEGRATION_VALUES,
+            "shell.integration must be off, prompt-only, or hook",
+        ),
+        (
+            UPDATES_CHANNEL,
+            changes.updates_channel.as_deref(),
+            UPDATES_CHANNEL_VALUES,
+            "updates.channel must be off, stable, or beta",
+        ),
+        (
+            RUN_REDACT_OUTPUT,
+            changes.run_redact_output.as_deref(),
+            OutputRedaction::VALUES,
+            "run.redact_output must be auto, always, or never",
+        ),
+    ];
+    for (key, value, allowed, message) in enum_fields {
+        push_string_patch(config, changed_keys, key, value, |item| {
+            validate_enum(item, allowed, message)
+        })?;
+    }
+    Ok(())
+}
+
+fn apply_scalar_patches(
+    config: &mut toml::Table,
+    changed_keys: &mut Vec<String>,
+    changes: &WriteConfigChanges,
+) -> Result<(), ConfigRpcError> {
+    push_bool_patch(config, changed_keys, PRIVACY_REDACT_NAMES, changes.privacy_redact_names)?;
+    push_bool_patch(config, changed_keys, AGENT_AUTOSTART, changes.agent_autostart)?;
+    push_bool_patch(config, changed_keys, EXAMPLE_AUTO_REFRESH, changes.example_auto_refresh)?;
+    push_string_patch(
+        config,
+        changed_keys,
+        EDITOR_DEFAULT,
+        changes.editor_default.as_deref(),
+        |v| {
+            validate_not_secret_like(v)?;
+            validate_editor_default(v)
+        },
+    )?;
+    push_string_patch(
+        config,
+        changed_keys,
+        AGENT_UNLOCK_TTL,
+        changes.agent_unlock_ttl.as_deref(),
+        validate_duration,
+    )?;
+    push_string_patch(
+        config,
+        changed_keys,
+        RUNTIME_SESSION_SECRET_NAME_RETENTION,
+        changes.runtime_session_secret_name_retention.as_deref(),
+        validate_session_retention,
+    )?;
+    push_string_patch(config, changed_keys, REVEAL_TTL, changes.reveal_ttl.as_deref(), |v| {
+        validate_duration_max(v, MAX_REVEAL_TTL_SECS, "reveal.ttl must be 5m or less")
+    })?;
+    push_string_patch(
+        config,
+        changed_keys,
+        ROTATION_MAX_GRACE_TTL,
+        changes.rotation_max_grace_ttl.as_deref(),
+        |v| {
+            validate_duration_max(
+                v,
+                MAX_ROTATION_GRACE_TTL_SECS,
+                "rotation.max_grace_ttl must be 30d or less",
+            )
+        },
+    )?;
+    push_string_patch(
+        config,
+        changed_keys,
+        UPDATES_MANIFEST_URL,
+        changes.updates_manifest_url.as_deref(),
+        |v| {
+            validate_not_secret_like(v)?;
+            validate_https_url(v)
+        },
+    )?;
+    Ok(())
+}
+
+fn push_string_patch(
+    config: &mut toml::Table,
+    changed_keys: &mut Vec<String>,
+    key: &str,
+    value: Option<&str>,
+    validate: impl FnOnce(&str) -> Result<(), ConfigRpcError>,
+) -> Result<(), ConfigRpcError> {
+    if let Some(value) = value {
+        validate(value)?;
+        set_config_value(config, key, toml::Value::String(value.to_owned()))?;
+        changed_keys.push(key.to_owned());
+    }
+    Ok(())
+}
+
+fn apply_verification_patch(
+    config: &mut toml::Table,
+    changed_keys: &mut Vec<String>,
+    verification: Option<&UserVerificationSettings>,
+) -> Result<(), ConfigRpcError> {
+    let Some(verification) = verification else {
+        return Ok(());
+    };
+    push_bool_patch(config, changed_keys, VERIFICATION_UNLOCK, verification.unlock)?;
+    push_bool_patch(config, changed_keys, VERIFICATION_REVEAL, verification.reveal)?;
+    push_bool_patch(config, changed_keys, VERIFICATION_COPY, verification.copy)?;
+    push_bool_patch(
+        config,
+        changed_keys,
+        VERIFICATION_DANGEROUS_PROFILE_SWITCH,
+        verification.dangerous_profile_switch,
+    )?;
+    push_bool_patch(config, changed_keys, VERIFICATION_RECOVERY, verification.recovery)?;
+    push_bool_patch(config, changed_keys, VERIFICATION_TEAM_ACCEPT, verification.team_accept)?;
+    push_bool_patch(
+        config,
+        changed_keys,
+        VERIFICATION_DEVICE_REGISTER,
+        verification.device_register,
+    )?;
+    Ok(())
+}
+
+fn apply_unset_keys(
+    config: &mut toml::Table,
+    changed_keys: &mut Vec<String>,
+    unset_keys: &[String],
+) -> Result<(), ConfigRpcError> {
+    for key in unset_keys {
+        if !SUPPORTED_CONFIG_KEYS.contains(&key.as_str()) {
+            return Err(ConfigRpcError::Protocol("unsupported config key".to_owned()));
+        }
+        unset_config_value(config, key)?;
+        if !changed_keys.iter().any(|existing| existing == key) {
+            changed_keys.push(key.clone());
+        }
+    }
+    Ok(())
 }
 
 fn update_profile_dangerous(
@@ -586,7 +865,65 @@ fn settings_from_config(
     profile_name: Option<&str>,
 ) -> Result<AgentConfigSettings, ConfigRpcError> {
     let privacy_redact_names = bool_config_value(config, PRIVACY_REDACT_NAMES)?.unwrap_or(false);
+    let ui_theme = enum_config_value(
+        config,
+        UI_THEME,
+        UI_THEME_VALUES,
+        "ui.theme must be system, light, or dark",
+    )?
+    .unwrap_or_else(default_ui_theme);
+    let ui_density = enum_config_value(
+        config,
+        UI_DENSITY,
+        UI_DENSITY_VALUES,
+        "ui.density must be comfortable or compact",
+    )?
+    .unwrap_or_else(default_ui_density);
+    let editor_default = string_config_value(config, EDITOR_DEFAULT, |value| {
+        validate_editor_default(value)?;
+        Ok(())
+    })?;
+    let agent_autostart = bool_config_value(config, AGENT_AUTOSTART)?.unwrap_or(false);
     let agent_unlock_ttl = duration_config_value(config, AGENT_UNLOCK_TTL)?;
+    let runtime_session_secret_name_retention = string_config_value(
+        config,
+        RUNTIME_SESSION_SECRET_NAME_RETENTION,
+        validate_session_retention,
+    )?;
+    let reveal_ttl = string_config_value(config, REVEAL_TTL, |value| {
+        validate_duration_max(value, MAX_REVEAL_TTL_SECS, "reveal.ttl must be 5m or less")
+    })?;
+    let rotation_max_grace_ttl = string_config_value(config, ROTATION_MAX_GRACE_TTL, |value| {
+        validate_duration_max(
+            value,
+            MAX_ROTATION_GRACE_TTL_SECS,
+            "rotation.max_grace_ttl must be 30d or less",
+        )
+    })?;
+    let shell_integration = enum_config_value(
+        config,
+        SHELL_INTEGRATION,
+        SHELL_INTEGRATION_VALUES,
+        "shell.integration must be off, prompt-only, or hook",
+    )?
+    .unwrap_or_else(default_off);
+    let updates_channel = enum_config_value(
+        config,
+        UPDATES_CHANNEL,
+        UPDATES_CHANNEL_VALUES,
+        "updates.channel must be off, stable, or beta",
+    )?
+    .unwrap_or_else(default_off);
+    let updates_manifest_url =
+        string_config_value(config, UPDATES_MANIFEST_URL, validate_https_url)?;
+    let example_auto_refresh = bool_config_value(config, EXAMPLE_AUTO_REFRESH)?.unwrap_or(true);
+    let run_redact_output = enum_config_value(
+        config,
+        RUN_REDACT_OUTPUT,
+        OutputRedaction::VALUES,
+        "run.redact_output must be auto, always, or never",
+    )?
+    .unwrap_or_else(default_run_redact_output);
     let user_verification_required_for = EffectiveUserVerificationSettings {
         unlock: bool_config_value(config, VERIFICATION_UNLOCK)?.unwrap_or(false),
         reveal: bool_config_value(config, VERIFICATION_REVEAL)?.unwrap_or(false),
@@ -602,7 +939,19 @@ fn settings_from_config(
 
     Ok(AgentConfigSettings {
         privacy_redact_names,
+        ui_theme,
+        ui_density,
+        editor_default,
+        agent_autostart,
         agent_unlock_ttl,
+        runtime_session_secret_name_retention,
+        reveal_ttl,
+        rotation_max_grace_ttl,
+        shell_integration,
+        updates_channel,
+        updates_manifest_url,
+        example_auto_refresh,
+        run_redact_output,
         user_verification_required_for,
         dangerous_profile,
     })
@@ -676,20 +1025,135 @@ fn duration_config_value(
     config: &toml::Table,
     key: &str,
 ) -> Result<Option<String>, ConfigRpcError> {
+    string_config_value(config, key, validate_duration)
+}
+
+fn string_config_value(
+    config: &toml::Table,
+    key: &str,
+    validate: impl FnOnce(&str) -> Result<(), ConfigRpcError>,
+) -> Result<Option<String>, ConfigRpcError> {
     let Some(value) = config_value(config, key)? else {
         return Ok(None);
     };
     let value = value.as_str().ok_or_else(|| {
         ConfigRpcError::MetadataInvalid(format!("invalid stored config value for {key}"))
     })?;
-    validate_duration(value)?;
+    validate(value)?;
     Ok(Some(value.to_owned()))
+}
+
+fn enum_config_value(
+    config: &toml::Table,
+    key: &str,
+    values: &[&str],
+    message: &str,
+) -> Result<Option<String>, ConfigRpcError> {
+    string_config_value(config, key, |value| validate_enum(value, values, message))
+}
+
+fn validate_enum(value: &str, values: &[&str], message: &str) -> Result<(), ConfigRpcError> {
+    if values.contains(&value) {
+        Ok(())
+    } else {
+        Err(ConfigRpcError::MetadataInvalid(message.to_owned()))
+    }
 }
 
 fn validate_duration(value: &str) -> Result<(), ConfigRpcError> {
     LocketDuration::from_str(value)
         .map(|_| ())
         .map_err(|_| ConfigRpcError::MetadataInvalid("invalid config duration".to_owned()))
+}
+
+fn validate_duration_max(value: &str, max_secs: u64, message: &str) -> Result<(), ConfigRpcError> {
+    let duration = LocketDuration::from_str(value)
+        .map_err(|_| ConfigRpcError::MetadataInvalid("invalid config duration".to_owned()))?;
+    if duration.as_secs() > max_secs {
+        return Err(ConfigRpcError::MetadataInvalid(message.to_owned()));
+    }
+    Ok(())
+}
+
+fn validate_session_retention(value: &str) -> Result<(), ConfigRpcError> {
+    RuntimeSessionSecretNameRetention::from_str(value).map(|_| ()).map_err(|_| {
+        ConfigRpcError::MetadataInvalid(
+            "runtime.session_secret_name_retention must be a duration or off".to_owned(),
+        )
+    })
+}
+
+fn validate_editor_default(value: &str) -> Result<(), ConfigRpcError> {
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return Err(ConfigRpcError::MetadataInvalid(
+            "editor.default must be a command name or absolute path".to_owned(),
+        ));
+    }
+    if value.starts_with('~') || value.contains('$') || value.contains('`') {
+        return Err(ConfigRpcError::MetadataInvalid(
+            "editor.default must not use shell expansion".to_owned(),
+        ));
+    }
+    if Path::new(value).is_absolute() {
+        return Ok(());
+    }
+    let shell_meta = ['/', '\\', '|', '&', ';', '<', '>', '(', ')'];
+    if value.chars().any(char::is_whitespace) || value.chars().any(|c| shell_meta.contains(&c)) {
+        return Err(ConfigRpcError::MetadataInvalid(
+            "editor.default must be a command name or absolute path".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_https_url(value: &str) -> Result<(), ConfigRpcError> {
+    let Some(rest) = value.strip_prefix("https://") else {
+        return Err(ConfigRpcError::MetadataInvalid(
+            "updates.manifest_url must be an HTTPS URL".to_owned(),
+        ));
+    };
+    if rest.is_empty()
+        || value.chars().any(char::is_whitespace)
+        || value.chars().any(char::is_control)
+    {
+        return Err(ConfigRpcError::MetadataInvalid(
+            "updates.manifest_url must be an HTTPS URL".to_owned(),
+        ));
+    }
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if host.is_empty() || host.starts_with(':') || host.contains('@') {
+        return Err(ConfigRpcError::MetadataInvalid(
+            "updates.manifest_url must be an HTTPS URL".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_not_secret_like(value: &str) -> Result<(), ConfigRpcError> {
+    let secret_like = scan_text("config.toml", value).iter().any(|finding| {
+        matches!(finding.kind, FindingKind::HighEntropy | FindingKind::ProviderTokenPattern)
+    });
+    if secret_like {
+        return Err(ConfigRpcError::MetadataInvalid(
+            "config value looks like a secret; refusing to store it".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn unset_config_value(config: &mut toml::Table, key: &str) -> Result<(), ConfigRpcError> {
+    let (section, name) = split_config_key(key)?;
+    let Some(section_value) = config.get_mut(section) else {
+        return Ok(());
+    };
+    let Some(section_table) = section_value.as_table_mut() else {
+        return Err(ConfigRpcError::MetadataInvalid("config section is not a table".to_owned()));
+    };
+    section_table.remove(name);
+    if section_table.is_empty() {
+        config.remove(section);
+    }
+    Ok(())
 }
 
 fn config_value<'a>(
@@ -1107,6 +1571,142 @@ mod tests {
         };
 
         assert_eq!(error.error, "MetadataInvalid");
+        assert!(!config_path.exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_and_unset_cover_all_user_config_keys() {
+        let directory = tempdir().expect("tempdir");
+        let config_path = directory.path().join("config.toml");
+        let store_path = directory.path().join("store.db");
+        let _store = initialized_store(&store_path);
+        let state = AgentSocketState::locked("test-version");
+        state.unlock_cache.lock().await.insert(
+            "lk_proj_test".to_owned(),
+            UnlockEntry::new(
+                vec![42; 32],
+                current_unix_nanos(),
+                Duration::from_secs(60),
+                UnlockMethod::Passphrase,
+            ),
+        );
+        let write_all = RequestEnvelope::new(
+            "req-all",
+            AgentMethod::WriteConfig,
+            json!({
+                "config_path": config_path,
+                "store_path": store_path,
+                "project_id": "lk_proj_test",
+                "changes": {
+                    "ui_theme": "dark",
+                    "ui_density": "compact",
+                    "editor_default": "vim",
+                    "agent_autostart": true,
+                    "agent_unlock_ttl": "2h",
+                    "runtime_session_secret_name_retention": "30d",
+                    "reveal_ttl": "2m",
+                    "rotation_max_grace_ttl": "14d",
+                    "shell_integration": "prompt-only",
+                    "updates_channel": "stable",
+                    "updates_manifest_url": "https://updates.example.test/manifest.json",
+                    "example_auto_refresh": false,
+                    "run_redact_output": "always",
+                    "user_verification_required_for": {
+                        "recovery": true,
+                        "team_accept": true,
+                        "device_register": true
+                    }
+                }
+            }),
+        );
+        let ResponseEnvelope::Success(success) = dispatch(&write_all, &state).await else {
+            panic!("full config write should succeed");
+        };
+        let response: WriteConfigResponse =
+            serde_json::from_value(success.payload).expect("response payload");
+        assert_eq!(response.settings.ui_theme, "dark");
+        assert_eq!(response.settings.ui_density, "compact");
+        assert_eq!(response.settings.editor_default.as_deref(), Some("vim"));
+        assert!(response.settings.agent_autostart);
+        assert_eq!(response.settings.agent_unlock_ttl.as_deref(), Some("2h"));
+        assert_eq!(response.settings.runtime_session_secret_name_retention.as_deref(), Some("30d"));
+        assert_eq!(response.settings.reveal_ttl.as_deref(), Some("2m"));
+        assert_eq!(response.settings.rotation_max_grace_ttl.as_deref(), Some("14d"));
+        assert_eq!(response.settings.shell_integration, "prompt-only");
+        assert_eq!(response.settings.updates_channel, "stable");
+        assert_eq!(
+            response.settings.updates_manifest_url.as_deref(),
+            Some("https://updates.example.test/manifest.json")
+        );
+        assert!(!response.settings.example_auto_refresh);
+        assert_eq!(response.settings.run_redact_output, "always");
+        assert!(response.settings.user_verification_required_for.recovery);
+        assert!(response.settings.user_verification_required_for.team_accept);
+        assert!(response.settings.user_verification_required_for.device_register);
+
+        let unset = RequestEnvelope::new(
+            "req-unset",
+            AgentMethod::WriteConfig,
+            json!({
+                "config_path": config_path,
+                "store_path": store_path,
+                "project_id": "lk_proj_test",
+                "changes": {
+                    "unset_keys": ["editor.default", "updates.manifest_url", "reveal.ttl"]
+                }
+            }),
+        );
+        let ResponseEnvelope::Success(success) = dispatch(&unset, &state).await else {
+            panic!("unset should succeed");
+        };
+        let response: WriteConfigResponse =
+            serde_json::from_value(success.payload).expect("unset response");
+        assert!(response.settings.editor_default.is_none());
+        assert!(response.settings.updates_manifest_url.is_none());
+        assert!(response.settings.reveal_ttl.is_none());
+        assert_eq!(response.settings.ui_theme, "dark");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_config_rejects_invalid_and_secret_like_values() {
+        let directory = tempdir().expect("tempdir");
+        let config_path = directory.path().join("config.toml");
+        let store_path = directory.path().join("store.db");
+        let _store = initialized_store(&store_path);
+        let state = AgentSocketState::locked("test-version");
+        state.unlock_cache.lock().await.insert(
+            "lk_proj_test".to_owned(),
+            UnlockEntry::new(
+                vec![42; 32],
+                current_unix_nanos(),
+                Duration::from_secs(60),
+                UnlockMethod::Passphrase,
+            ),
+        );
+        for bad_changes in [
+            json!({"reveal_ttl": "6m"}),
+            json!({"rotation_max_grace_ttl": "31d"}),
+            json!({"updates_manifest_url": "http://updates.example.test/manifest.json"}),
+            json!({"editor_default": "~/bin/editor"}),
+            json!({"editor_default": "ghp_1234567890abcdefghijklmnopqrstuvwxyz"}),
+            json!({"ui_theme": "purple"}),
+            json!({"unset_keys": ["unknown.key"]}),
+        ] {
+            let bad = RequestEnvelope::new(
+                "req-bad",
+                AgentMethod::WriteConfig,
+                json!({
+                    "config_path": config_path,
+                    "store_path": store_path,
+                    "project_id": "lk_proj_test",
+                    "changes": bad_changes
+                }),
+            );
+            assert!(
+                matches!(dispatch(&bad, &state).await, ResponseEnvelope::Error(_)),
+                "expected error for {bad_changes}"
+            );
+        }
         assert!(!config_path.exists());
     }
 }

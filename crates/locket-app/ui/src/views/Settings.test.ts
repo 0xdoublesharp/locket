@@ -260,3 +260,98 @@ it('moves between MCP tabs with the keyboard and drops stale copy feedback', asy
     vi.mocked(invoke).mockReset();
   }
 });
+
+it('exposes and validates all user config.toml sections in Settings', async () => {
+  const onUpdate = vi.fn();
+  const view = mountComponent(Settings, {
+    state: {
+      privacyRedactNames: false,
+      uiTheme: 'system',
+      uiDensity: 'comfortable',
+      editorDefault: 'vim',
+      agentAutostart: false,
+      unlockTtlSeconds: 900,
+      unlockTtl: '15m',
+      sessionSecretNameRetention: '90d',
+      revealTtl: '60s',
+      rotationMaxGraceTtl: '7d',
+      shellIntegration: 'off',
+      updatesChannel: 'off',
+      updatesManifestUrl: 'https://updates.example.test/manifest.json',
+      exampleAutoRefresh: true,
+      runRedactOutput: 'auto',
+      verification: {
+        unlock: false,
+        reveal: false,
+        copy: false,
+        dangerous_profile_switch: false,
+        recovery: false,
+        team_accept: false,
+        device_register: false,
+      },
+      dangerousProfile: null,
+      dangerousProfileFlag: false,
+      agentVersion: 'fixture',
+    },
+    loading: false,
+    canEditVault: true,
+    projectConnected: true,
+    errorMessage: null,
+    onUpdate,
+  });
+  const { root } = view;
+  try {
+    await click(button(root, 'Dark'));
+    expect(onUpdate).toHaveBeenLastCalledWith({ ui_theme: 'dark' });
+    await click(button(root, 'Compact'));
+    expect(onUpdate).toHaveBeenLastCalledWith({ ui_density: 'compact' });
+    await click(button(root, 'Always'));
+    expect(onUpdate).toHaveBeenLastCalledWith({ run_redact_output: 'always' });
+    await click(button(root, 'Prompt only'));
+    expect(onUpdate).toHaveBeenLastCalledWith({ shell_integration: 'prompt-only' });
+    await click(button(root, 'Stable'));
+    expect(onUpdate).toHaveBeenLastCalledWith({ updates_channel: 'stable' });
+
+    await check(control(root, 'Autostart agent'), true);
+    expect(onUpdate).toHaveBeenLastCalledWith({ agent_autostart: true });
+    await check(control(root, 'Auto-refresh'), false);
+    expect(onUpdate).toHaveBeenLastCalledWith({ example_auto_refresh: false });
+    await check(control(root, 'Account recovery'), true);
+    expect(onUpdate).toHaveBeenLastCalledWith({
+      user_verification_required_for: { recovery: true },
+    });
+
+    const limits = byProp(root, 'aria-labelledby', 'settings-limits');
+    const revealInput = control(limits, 'Reveal TTL');
+    await input(revealInput, '6m');
+    await submit(limits);
+    expect(nodeText(limits)).toContain('Enter a duration of 5m or less');
+    await input(revealInput, '2m');
+    await submit(limits);
+    expect(onUpdate).toHaveBeenLastCalledWith({ reveal_ttl: '2m' });
+
+    const cli = byProp(root, 'aria-labelledby', 'settings-cli');
+    const editorInput = control(cli, 'Default editor');
+    await input(editorInput, '~/bin/editor');
+    await submit(cli);
+    expect(nodeText(cli)).toContain('Editor path must not use shell expansion.');
+    await input(editorInput, '/usr/bin/nano');
+    await submit(cli);
+    expect(onUpdate).toHaveBeenLastCalledWith({ editor_default: '/usr/bin/nano' });
+    await click(button(cli, 'Reset'));
+    expect(onUpdate).toHaveBeenLastCalledWith({ unset_keys: ['editor.default'] });
+
+    const companion = byProp(root, 'aria-labelledby', 'settings-companion');
+    const manifestInput = control(companion, 'Signed update manifest URL');
+    await input(manifestInput, 'http://insecure.example.test/manifest.json');
+    await submit(companion);
+    expect(nodeText(companion)).toContain('Enter a valid https:// manifest URL.');
+    await input(manifestInput, 'https://releases.example.test/manifest.json');
+    await submit(companion);
+    expect(onUpdate).toHaveBeenLastCalledWith({
+      updates_manifest_url: 'https://releases.example.test/manifest.json',
+    });
+  } finally {
+    view.unmount();
+  }
+});
