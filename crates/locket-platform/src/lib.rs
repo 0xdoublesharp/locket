@@ -125,7 +125,29 @@ pub const fn platform_name() -> &'static str {
 }
 
 #[cfg(target_os = "macos")]
-static MACOS_KEYCHAIN_INTERACTION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static MACOS_KEYCHAIN_INTERACTION_STATE: std::sync::Mutex<MacosKeychainInteractionState> =
+    std::sync::Mutex::new(MacosKeychainInteractionState { depth: 0, previous_allowed: true });
+
+#[cfg(target_os = "macos")]
+struct MacosKeychainInteractionState {
+    depth: usize,
+    previous_allowed: bool,
+}
+
+#[cfg(target_os = "macos")]
+struct KeychainInteractionGuard;
+
+#[cfg(target_os = "macos")]
+impl Drop for KeychainInteractionGuard {
+    fn drop(&mut self) {
+        if let Ok(mut state) = MACOS_KEYCHAIN_INTERACTION_STATE.lock() {
+            state.depth = state.depth.saturating_sub(1);
+            if state.depth == 0 && state.previous_allowed && !keyring_prompts_disabled() {
+                set_macos_keychain_interaction_allowed(true);
+            }
+        }
+    }
+}
 
 /// Returns whether `LOCKET_NO_PROMPT` requests non-interactive execution.
 #[must_use]
@@ -148,8 +170,11 @@ pub fn keyring_prompts_disabled() -> bool {
 pub fn set_keyring_user_interaction_allowed(allowed: bool) {
     #[cfg(target_os = "macos")]
     {
-        if let Ok(_guard) = MACOS_KEYCHAIN_INTERACTION_LOCK.lock() {
-            set_macos_keychain_interaction_allowed(allowed);
+        if let Ok(mut state) = MACOS_KEYCHAIN_INTERACTION_STATE.lock() {
+            state.previous_allowed = allowed;
+            if state.depth == 0 {
+                set_macos_keychain_interaction_allowed(allowed);
+            }
         }
     }
     #[cfg(not(target_os = "macos"))]
@@ -160,20 +185,24 @@ pub fn set_keyring_user_interaction_allowed(allowed: bool) {
 
 /// Runs `operation` with OS keychain UI dialogs disabled for the duration of the call.
 ///
-/// On macOS this temporarily calls `SecKeychainSetUserInteractionAllowed(false)` and
-/// restores the prior setting when `operation` returns (unless `LOCKET_NO_PROMPT` is
-/// set, in which case interaction stays disabled).
+/// Re-entrant and panic-safe: on macOS this calls
+/// `SecKeychainSetUserInteractionAllowed(false)` before running `operation` without
+/// holding any lock across `operation`, and restores the prior setting once the
+/// outermost guard drops (unless `LOCKET_NO_PROMPT` is set).
 pub fn without_keyring_user_interaction<T>(operation: impl FnOnce() -> T) -> T {
     #[cfg(target_os = "macos")]
     {
-        let _guard = MACOS_KEYCHAIN_INTERACTION_LOCK.lock();
-        let previous = macos_keychain_interaction_allowed();
-        set_macos_keychain_interaction_allowed(false);
-        let result = operation();
-        if previous && !keyring_prompts_disabled() {
-            set_macos_keychain_interaction_allowed(true);
-        }
-        result
+        let _guard = {
+            if let Ok(mut state) = MACOS_KEYCHAIN_INTERACTION_STATE.lock() {
+                if state.depth == 0 {
+                    state.previous_allowed = macos_keychain_interaction_allowed();
+                    set_macos_keychain_interaction_allowed(false);
+                }
+                state.depth += 1;
+            }
+            KeychainInteractionGuard
+        };
+        operation()
     }
     #[cfg(not(target_os = "macos"))]
     {

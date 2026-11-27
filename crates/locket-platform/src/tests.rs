@@ -1026,3 +1026,11 @@ fn device_key_load_rejects_a_symlink_even_to_a_valid_envelope() -> Result<(), Pl
     ));
     Ok(())
 }
+
+#[test]
+fn without_keyring_user_interaction_is_reentrant() {
+    let nested = crate::without_keyring_user_interaction(|| {
+        crate::without_keyring_user_interaction(|| 42_u8)
+    });
+    assert_eq!(nested, 42);
+}
