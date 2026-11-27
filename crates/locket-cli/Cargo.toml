@@ -26,13 +26,13 @@ directories = { workspace = true }
 ed25519-dalek = { workspace = true }
 flate2 = { workspace = true }
 ignore = { workspace = true }
-locket-crypto = { version = "0.3.9", path = "../locket-crypto" }
-locket-core = { version = "0.3.9", path = "../locket-core" }
-locket-docker = { version = "0.3.9", path = "../locket-docker" }
-locket-exec = { version = "0.3.9", path = "../locket-exec" }
-locket-platform = { version = "0.3.9", path = "../locket-platform" }
-locket-scan = { version = "0.3.9", path = "../locket-scan" }
-locket-store = { version = "0.3.9", path = "../locket-store" }
+locket-crypto = { version = "0.3.10", path = "../locket-crypto" }
+locket-core = { version = "0.3.10", path = "../locket-core" }
+locket-docker = { version = "0.3.10", path = "../locket-docker" }
+locket-exec = { version = "0.3.10", path = "../locket-exec" }
+locket-platform = { version = "0.3.10", path = "../locket-platform" }
+locket-scan = { version = "0.3.10", path = "../locket-scan" }
+locket-store = { version = "0.3.10", path = "../locket-store" }
 rpassword = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
@@ -46,12 +46,12 @@ x25519-dalek = { workspace = true, features = ["static_secrets"] }
 zeroize = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-locket-agent = { version = "0.3.9", path = "../locket-agent" }
+locket-agent = { version = "0.3.10", path = "../locket-agent" }
 rustix = { workspace = true, features = ["process", "fs"] }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-locket-agent = { version = "0.3.9", path = "../locket-agent" }
+locket-agent = { version = "0.3.10", path = "../locket-agent" }
 tokio = { workspace = true, features = ["io-util", "net", "rt", "time"] }
 
 [dev-dependencies]
