@@ -17,9 +17,9 @@ const MAX_CONFIG_BYTES: u64 = 256 * 1024;
 const MAX_SCRIPT_BYTES: u64 = 64 * 1024;
 const MAX_SCRIPTS: usize = 16;
 const MAX_ANCESTORS: usize = 8;
-const MAX_SUBDIR_DEPTH: usize = 2;
+const MAX_SUBDIR_DEPTH: usize = 3;
 const MAX_SUBDIRS: usize = 64;
-const MAX_SUBDIR_COMPOSE_FILES: usize = 32;
+const MAX_SUBDIR_FILES: usize = 64;
 const MAX_INTERPOLATION_KEYS: usize = 12;
 const MAX_STATIC_WORD_BYTES: usize = 4096;
 const MAX_SUBST_DEPTH: usize = 4;
@@ -58,7 +58,7 @@ pub(super) fn detect_archive_consumers(
     if in_project.is_some() {
         let mut visited = BTreeSet::new();
         let mut dirs_budget = MAX_SUBDIRS;
-        let mut files_budget = MAX_SUBDIR_COMPOSE_FILES;
+        let mut files_budget = MAX_SUBDIR_FILES;
         if let Ok(directory) = InputDirectory::open(&parent) {
             scan.scan_subdirectories(
                 &directory,
@@ -143,6 +143,7 @@ impl ConsumerScan<'_> {
             }
         }
         self.package_scripts(directory, dir, &source_name, matches_source);
+        self.tool_config_dotenv_loaders(directory, dir, &source_name, matches_source);
         if implicit {
             self.cargo_dotenv_dependencies(directory, dir, &source_name);
         }
@@ -223,6 +224,14 @@ impl ConsumerScan<'_> {
                 *files_budget -= 1;
                 self.package_scripts(&child_dir, &child_path, &source_name, matches_source);
             }
+            if *files_budget > 0 {
+                self.tool_config_dotenv_loaders(
+                    &child_dir,
+                    &child_path,
+                    &source_name,
+                    matches_source,
+                );
+            }
             if *files_budget > 0
                 && self.source.file_name() == Some(OsStr::new(".env"))
                 && self.source.parent().is_some_and(|root| child_path.starts_with(root))
@@ -240,6 +249,52 @@ impl ConsumerScan<'_> {
                 dirs_budget,
                 files_budget,
             );
+        }
+    }
+
+    fn tool_config_dotenv_loaders(
+        &mut self,
+        directory: &InputDirectory,
+        dir: &Path,
+        source_name: &str,
+        matches_source: impl Fn(&str) -> bool,
+    ) {
+        const TOOL_CONFIG_FILES: &[&str] = &[
+            "prisma.config.ts",
+            "prisma.config.mts",
+            "prisma.config.js",
+            "prisma.config.mjs",
+            "prisma.config.cjs",
+            "drizzle.config.ts",
+            "drizzle.config.mts",
+            "drizzle.config.js",
+            "drizzle.config.mjs",
+            "drizzle.config.cjs",
+            "vite.config.ts",
+            "vite.config.mts",
+            "vite.config.js",
+            "vite.config.mjs",
+            "vitest.config.ts",
+            "vitest.config.mts",
+            "vitest.config.js",
+            "vitest.config.mjs",
+            "next.config.ts",
+            "next.config.mjs",
+            "next.config.js",
+            "playwright.config.ts",
+            "playwright.config.js",
+        ];
+        for file in TOOL_CONFIG_FILES {
+            if !directory.is_regular(file) {
+                continue;
+            }
+            let Some(text) = read_config(directory, file, MAX_SCRIPT_BYTES) else { continue };
+            if config_file_loads_env(&text, &matches_source) {
+                let path = relative_display(self.root, &dir.join(file));
+                self.warnings.push(format!(
+                    "{path} loads {source_name}; run through `locket run <policy>` or `locket exec` once archived"
+                ));
+            }
         }
     }
 
@@ -358,6 +413,36 @@ impl ConsumerScan<'_> {
             None
         }
     }
+}
+
+fn config_file_loads_env(text: &str, matches_source: &impl Fn(&str) -> bool) -> bool {
+    let mut chars = text.chars();
+    let mut quoted_matches_source = false;
+    while let Some(ch) = chars.next() {
+        if matches!(ch, '"' | '\'' | '`') {
+            let quote = ch;
+            let mut literal = String::new();
+            while let Some(inner) = chars.next() {
+                if inner == '\\' {
+                    let _ = chars.next();
+                    continue;
+                }
+                if inner == quote {
+                    break;
+                }
+                if literal.len() < 256 {
+                    literal.push(inner);
+                }
+            }
+            if literal == "dotenv/config" {
+                return true;
+            }
+            if literal.contains(".env") && matches_source(&literal) {
+                quoted_matches_source = true;
+            }
+        }
+    }
+    quoted_matches_source
 }
 
 fn script_parent(parent: &Path, root: &Path) -> Option<PathBuf> {
@@ -1120,6 +1205,10 @@ mod monorepo_consumer_tests {
             root.join("apps/bot/package.json"),
             r#"{"dependencies":{"dotenv":"^16.0.0"},"scripts":{"start":"node --env-file=../../.env dist/index.js"}}"#,
         )?;
+        fs::write(
+            root.join("apps/bot/prisma.config.ts"),
+            r#"import { config as loadDotenv } from "dotenv"; loadDotenv({ path: path.resolve(__dirname, "../../.env") });"#,
+        )?;
         // Subdirectory with its own .env should not trigger the root soft-loader advisory.
         fs::write(root.join("apps/web/.env"), "WEB_KEY=fixture\n")?;
         fs::write(root.join("apps/web/package.json"), r#"{"dependencies":{"dotenv":"^16.0.0"}}"#)?;
@@ -1133,6 +1222,12 @@ mod monorepo_consumer_tests {
         assert!(
             warnings.iter().any(|w| w.contains("apps/bot/package.json") && w.contains("start")),
             "expected apps/bot script warning, got: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("apps/bot/prisma.config.ts") && w.contains("loads .env")),
+            "expected apps/bot prisma.config.ts warning, got: {warnings:?}"
         );
         assert!(
             !warnings.iter().any(|w| w.contains("apps/web/package.json")),

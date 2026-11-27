@@ -294,6 +294,7 @@ impl InputDirectory {
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
+            let _ = rustix::fs::seek(&self.handle, rustix::fs::SeekFrom::Start(0));
             rustix::fs::Dir::read_from(&self.handle)?
                 .filter_map(|entry| match entry {
                     Ok(entry) if matches!(entry.file_name().to_bytes(), b"." | b"..") => None,
@@ -518,10 +519,29 @@ pub fn scan_open_workspace(
     Ok(serde_json::to_value(build_scan_report(root, max_depth, literal, false)?)?)
 }
 
+const PROJECT_MANIFEST_FILES: &[&str] = &[
+    "package.json",
+    "Cargo.toml",
+    "pyproject.toml",
+    "foundry.toml",
+    "go.mod",
+    "Makefile",
+    "compose.yml",
+    "compose.yaml",
+    "docker-compose.yml",
+    "docker-compose.yaml",
+];
+
+fn has_project_manifest(directory: &InputDirectory) -> bool {
+    PROJECT_MANIFEST_FILES.iter().any(|name| directory.is_regular(name))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn scan_directory(
     directory: &InputDirectory,
     inherited_root: &Path,
     inherited_config: bool,
+    inherited_is_project: bool,
     inherited_git_root: Option<&Path>,
     remaining_depth: usize,
     literal: bool,
@@ -537,10 +557,12 @@ fn scan_directory(
     let has_git =
         directory.entry_kind(OsStr::new(".git")).is_ok_and(|kind| kind != EntryKind::Other);
     let git_root = if has_git { Some(directory.path.as_path()) } else { inherited_git_root };
-    let (project_root, has_locket_config) = if has_config || has_git {
-        (directory.path.as_path(), has_config)
+    let (project_root, has_locket_config, is_project) = if has_config || has_git {
+        (directory.path.as_path(), has_config, true)
+    } else if !inherited_is_project && has_project_manifest(directory) {
+        (directory.path.as_path(), false, true)
     } else {
-        (inherited_root, inherited_config)
+        (inherited_root, inherited_config, inherited_is_project)
     };
     let names =
         directory.names().map_err(|_| metadata_invalid_error("could not walk dotenv scan root"))?;
@@ -556,6 +578,7 @@ fn scan_directory(
                         &child,
                         project_root,
                         has_locket_config,
+                        is_project,
                         git_root,
                         remaining_depth - 1,
                         literal,
@@ -576,10 +599,12 @@ fn scan_directory(
                         Ok(report) => (report.keys, report.warnings.len(), report.invalid, None),
                         Err(error) => (BTreeSet::new(), 0, 1, Some(error.to_string())),
                     };
+                let effective_project_root =
+                    if is_project { project_root } else { directory.path.as_path() };
                 found.files.push(ScannedEnvFile {
                     suggested_profile: suggested_profile(&path),
                     path,
-                    project_root: project_root.to_owned(),
+                    project_root: effective_project_root.to_owned(),
                     has_locket_config,
                     suggested_source: "user-local",
                     key_count: keys.len(),
@@ -604,7 +629,16 @@ fn build_scan_report(
     let mut locations = BTreeMap::<String, KeyLocations>::new();
     let mut found = ScanEntries::default();
     let initial_git_root = super::git_worktree_root(&root.path).ok().flatten();
-    scan_directory(root, &root.path, false, initial_git_root, max_depth, literal, &mut found)?;
+    scan_directory(
+        root,
+        &root.path,
+        false,
+        initial_git_root.is_some(),
+        initial_git_root,
+        max_depth,
+        literal,
+        &mut found,
+    )?;
     let ScanEntries { mut files, configured_projects, git_tracked_files, .. } = found;
     files.sort_by(|left, right| left.path.cmp(&right.path));
     let mut staged_roots = BTreeSet::new();
@@ -850,6 +884,34 @@ mod tests {
         assert_eq!(report["total_files"], 1);
         assert_eq!(report["git_tracked_files"], 2);
         assert_eq!(report["files"][0]["path"], repo.join(".env").display().to_string());
+        Ok(())
+    }
+
+    #[test]
+    fn scan_does_not_attribute_nested_projects_to_workspace_container_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = tempfile::tempdir()?;
+        let workspaces = fixture.path().canonicalize()?;
+        fs::create_dir_all(workspaces.join("no-git-app/sub"))?;
+        fs::write(workspaces.join("no-git-app/package.json"), "{}\n")?;
+        fs::write(workspaces.join("no-git-app/.env"), "KEY=1\n")?;
+        fs::write(workspaces.join("no-git-app/sub/.env.local"), "SUB=1\n")?;
+        fs::create_dir_all(workspaces.join("loose-folder"))?;
+        fs::write(workspaces.join("loose-folder/.env"), "LOOSE=1\n")?;
+        fs::create_dir_all(workspaces.join("monorepo/.git"))?;
+        fs::create_dir_all(workspaces.join("monorepo/apps/web"))?;
+        fs::write(workspaces.join("monorepo/apps/web/package.json"), "{}\n")?;
+        fs::write(workspaces.join("monorepo/apps/web/.env"), "WEB=1\n")?;
+
+        let report = scan_workspace_env_files(&workspaces, 4, false, false)?;
+        assert_eq!(
+            report["uninitialized_project_roots"],
+            serde_json::json!([
+                workspaces.join("loose-folder"),
+                workspaces.join("monorepo"),
+                workspaces.join("no-git-app"),
+            ]),
+        );
         Ok(())
     }
 }
